@@ -1,0 +1,27 @@
+# Build output
+build/
+build-*/
+out/
+install/
+
+# CMake
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Editors / tooling
+.vscode/
+.idea/
+.cache/
+*.swp
+perf.data*
+*.nsys-rep
+*.ncu-rep
+
+# Models and weights (never commit)
+models/
+*.safetensors
+*.gguf
+*.bin
