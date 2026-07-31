@@ -48,11 +48,58 @@ StatusOr<TensorView> Upload(const Tensor& host, std::vector<DeviceBuffer>* keep)
 /// Weights for one decoder block. Views into buffers owned by Impl.
 struct LayerWeights {
   TensorView input_norm;
-  TensorView q_w, k_w, v_w, o_w;
-  TensorView q_b, k_b, v_b;  // undefined when the architecture has no bias
+  // Q, K and V concatenated along dim 0 into one [q_dim + 2*kv_dim, hidden]
+  // tensor, and likewise gate and up into [2*intermediate, hidden]. Weights
+  // concatenate along their output dimension, which is contiguous, so this is a
+  // load-time arrangement rather than a runtime one -- and it turns six launches
+  // per layer into two.
+  TensorView qkv_w;
+  TensorView qkv_b;  // undefined when the architecture has no attention bias
+  TensorView o_w;
   TensorView post_norm;
-  TensorView gate_w, up_w, down_w;
+  TensorView gate_up_w, down_w;
 };
+
+/// Uploads several host tensors end to end into one device buffer.
+///
+/// The concatenation happens here rather than on the device because it happens
+/// once, at load, and a copy per tensor into the right offset is simpler than
+/// any kernel that would do the same thing.
+StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
+                                        std::vector<DeviceBuffer>* keep) {
+  int64_t rows = 0;
+  int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
+  size_t bytes = 0;
+
+  for (const Tensor& t : parts) {
+    rows += t.dim(0);
+    bytes += static_cast<size_t>(t.nbytes());
+
+    if (t.rank() == 2 && t.dim(1) != cols) {
+      return InvalidArgumentError("cannot concatenate: widths ", cols, " and ",
+                                  t.dim(1), " differ");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
+                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+
+  size_t offset = 0;
+  for (const Tensor& t : parts) {
+    INFERX_CUDA_RETURN_IF_ERROR(
+        cudaMemcpy(buf.data() + offset, t.data(),
+                   static_cast<size_t>(t.nbytes()), cudaMemcpyHostToDevice));
+    offset += static_cast<size_t>(t.nbytes());
+  }
+
+  keep->push_back(std::move(buf));
+
+  const Shape shape = parts.front().rank() == 2 ? Shape({rows, cols})
+                                                : Shape({rows});
+
+  return TensorView::Create(keep->back().data(), parts.front().dtype(), shape,
+                            DeviceId::Cuda(0));
+}
 
 /// A scratch buffer plus the view over it, so activations are allocated once
 /// and reshaped per call rather than per layer.
@@ -83,6 +130,7 @@ struct Qwen2Model::Impl {
   int64_t capacity_tokens = 0;
   Scratch hidden, residual, normed;
   Scratch q, k, v, attn_out;
+  Scratch qkv_fused, gate_up_fused;
   Scratch gate, up;
   Scratch logits;
   DeviceBuffer positions;
@@ -181,6 +229,8 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   INFERX_RETURN_IF_ERROR(alloc(&hidden, tokens * h, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&residual, tokens * h, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&normed, tokens * h, kBf16));
+  INFERX_RETURN_IF_ERROR(alloc(&qkv_fused, tokens * (qd + 2 * kvd), kBf16));
+  INFERX_RETURN_IF_ERROR(alloc(&gate_up_fused, tokens * 2 * inter, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&q, tokens * qd, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&k, tokens * kvd, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&v, tokens * kvd, kBf16));
@@ -277,8 +327,12 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
       const TensorView gate_v,
       gate.View(DataType::kBFloat16, Shape({tokens, inter})));
   INFERX_ASSIGN_OR_RETURN(
-      const TensorView up_v,
-      up.View(DataType::kBFloat16, Shape({tokens, inter})));
+      const TensorView qkv_v,
+      qkv_fused.View(DataType::kBFloat16,
+                     Shape({tokens, config.q_dim() + 2 * config.kv_dim()})));
+  INFERX_ASSIGN_OR_RETURN(
+      const TensorView gate_up_v,
+      gate_up_fused.View(DataType::kBFloat16, Shape({tokens, 2 * inter})));
 
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
@@ -294,15 +348,9 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                             static_cast<float>(
                                                 config.rms_norm_eps)));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.q_w, qv));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.k_w, kv_));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.v_w, vv));
-
-    if (config.attention_bias) {
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(qv, layer.q_b));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(kv_, layer.k_b));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(vv, layer.v_b));
-    }
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.qkv_w, qkv_v));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv));
 
     // RoPE before attention and after the bias: the bias is part of the
     // projection, and rotating a biased Q is what the reference does.
@@ -323,9 +371,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                             static_cast<float>(
                                                 config.rms_norm_eps)));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_w, gate_v));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.up_w, up_v));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMul(gate_v, up_v, gate_v));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
+    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v));
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
   }
@@ -532,8 +579,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
       const TensorView gate_v,
       gate.View(DataType::kBFloat16, Shape({tokens, inter})));
   INFERX_ASSIGN_OR_RETURN(
-      const TensorView up_v,
-      up.View(DataType::kBFloat16, Shape({tokens, inter})));
+      const TensorView qkv_v,
+      qkv_fused.View(DataType::kBFloat16,
+                     Shape({tokens, config.q_dim() + 2 * config.kv_dim()})));
+  INFERX_ASSIGN_OR_RETURN(
+      const TensorView gate_up_v,
+      gate_up_fused.View(DataType::kBFloat16, Shape({tokens, 2 * inter})));
 
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
@@ -559,15 +610,14 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
         x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.q_w, qv, stream));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.k_w, kv_, stream));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.v_w, vv, stream));
-
-    if (config.attention_bias) {
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(qv, layer.q_b, stream));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(kv_, layer.k_b, stream));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(vv, layer.v_b, stream));
-    }
+    // One GEMM and one split, where this used to be three GEMMs and three bias
+    // adds. The split is unavoidable -- a fused row interleaves Q, K and V per
+    // token, so Q is strided for more than one token -- but folding the bias
+    // into it means the fused path still costs four launches fewer per layer.
+    INFERX_RETURN_IF_ERROR(
+        gemm.LinearBF16(norm, layer.qkv_w, qkv_v, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbedding(
         q3, k3, pos_v, static_cast<float>(config.rope_theta), stream));
@@ -621,9 +671,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
         x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_w, gate_v, stream));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.up_w, up_v, stream));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMul(gate_v, up_v, gate_v, stream));
+    // Gate and up need no split: SiluMul is elementwise, so it reads both
+    // halves straight out of the fused buffer. This fusion is free.
+    INFERX_RETURN_IF_ERROR(
+        gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SiluMulFused(gate_up_v, gate_v, stream));
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
@@ -740,28 +793,56 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
     INFERX_RETURN_IF_ERROR(load("post_attention_layernorm.weight", Shape({h}),
                                 &w.post_norm));
 
-    INFERX_RETURN_IF_ERROR(load("self_attn.q_proj.weight",
-                                Shape({config.q_dim(), h}), &w.q_w));
-    INFERX_RETURN_IF_ERROR(load("self_attn.k_proj.weight",
-                                Shape({config.kv_dim(), h}), &w.k_w));
-    INFERX_RETURN_IF_ERROR(load("self_attn.v_proj.weight",
-                                Shape({config.kv_dim(), h}), &w.v_w));
+    // Fetch the three projections and upload them as one tensor. They are
+    // concatenated along dim 0, which is contiguous, so the fused weight is
+    // byte-identical to the three laid end to end.
+    {
+      std::vector<Tensor> qkv;
+      for (const auto& [name, rows] :
+           {std::pair<std::string_view, int64_t>{"self_attn.q_proj.weight",
+                                                 config.q_dim()},
+            {"self_attn.k_proj.weight", config.kv_dim()},
+            {"self_attn.v_proj.weight", config.kv_dim()}}) {
+        INFERX_ASSIGN_OR_RETURN(
+            Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows, h})));
+        qkv.push_back(std::move(t));
+      }
+      INFERX_ASSIGN_OR_RETURN(w.qkv_w,
+                              UploadConcatenated(qkv, &impl->weight_buffers));
+    }
+
+    if (config.attention_bias) {
+      std::vector<Tensor> qkv_bias;
+      for (const auto& [name, rows] :
+           {std::pair<std::string_view, int64_t>{"self_attn.q_proj.bias",
+                                                 config.q_dim()},
+            {"self_attn.k_proj.bias", config.kv_dim()},
+            {"self_attn.v_proj.bias", config.kv_dim()}}) {
+        INFERX_ASSIGN_OR_RETURN(
+            Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows})));
+        qkv_bias.push_back(std::move(t));
+      }
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_b, UploadConcatenated(qkv_bias, &impl->weight_buffers));
+    }
+
     INFERX_RETURN_IF_ERROR(load("self_attn.o_proj.weight",
                                 Shape({h, config.q_dim()}), &w.o_w));
 
-    if (config.attention_bias) {
-      INFERX_RETURN_IF_ERROR(load("self_attn.q_proj.bias",
-                                  Shape({config.q_dim()}), &w.q_b));
-      INFERX_RETURN_IF_ERROR(load("self_attn.k_proj.bias",
-                                  Shape({config.kv_dim()}), &w.k_b));
-      INFERX_RETURN_IF_ERROR(load("self_attn.v_proj.bias",
-                                  Shape({config.kv_dim()}), &w.v_b));
+    {
+      std::vector<Tensor> gate_up;
+      for (const std::string_view name :
+           {"mlp.gate_proj.weight", "mlp.up_proj.weight"}) {
+        INFERX_ASSIGN_OR_RETURN(
+            Tensor t,
+            ckpt.GetChecked(absl::StrCat(p, name), Shape({inter, h})));
+        gate_up.push_back(std::move(t));
+      }
+      INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
+                              UploadConcatenated(gate_up,
+                                                 &impl->weight_buffers));
     }
 
-    INFERX_RETURN_IF_ERROR(load("mlp.gate_proj.weight", Shape({inter, h}),
-                                &w.gate_w));
-    INFERX_RETURN_IF_ERROR(load("mlp.up_proj.weight", Shape({inter, h}),
-                                &w.up_w));
     INFERX_RETURN_IF_ERROR(load("mlp.down_proj.weight", Shape({h, inter}),
                                 &w.down_w));
 

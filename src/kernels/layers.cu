@@ -298,6 +298,52 @@ __global__ void EmbeddingKernel(const bf16* __restrict__ table,
   for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
 }
 
+// One block per (token, destination). Each thread copies one element from the
+// fused row into whichever of Q/K/V owns it, adding the bias for that column.
+__global__ void SplitQkvKernel(const bf16* __restrict__ fused,
+                               const bf16* __restrict__ bias,
+                               bf16* __restrict__ q, bf16* __restrict__ k,
+                               bf16* __restrict__ v, int64_t tokens,
+                               int64_t q_dim, int64_t kv_dim) {
+  const int64_t width = q_dim + 2 * kv_dim;
+  const int64_t total = tokens * width;
+
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t token = idx / width;
+    const int64_t col = idx % width;
+
+    float value = ToF32(fused[idx]);
+    if (bias != nullptr) value += ToF32(bias[col]);
+
+    if (col < q_dim) {
+      q[token * q_dim + col] = ToBf16(value);
+    } else if (col < q_dim + kv_dim) {
+      k[token * kv_dim + (col - q_dim)] = ToBf16(value);
+    } else {
+      v[token * kv_dim + (col - q_dim - kv_dim)] = ToBf16(value);
+    }
+  }
+}
+
+__global__ void SiluMulFusedKernel(const bf16* __restrict__ fused,
+                                   bf16* __restrict__ out, int64_t tokens,
+                                   int64_t inter) {
+  const int64_t total = tokens * inter;
+
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t token = idx / inter;
+    const int64_t col = idx % inter;
+
+    // gate occupies the first half of each row, up the second.
+    const float g = ToF32(fused[token * 2 * inter + col]);
+    const float u = ToF32(fused[token * 2 * inter + inter + col]);
+
+    out[idx] = ToBf16((g / (1.0f + __expf(-g))) * u);
+  }
+}
+
 __global__ void AddBiasKernel(bf16* __restrict__ out,
                               const bf16* __restrict__ bias, int64_t tokens,
                               int64_t width) {
@@ -671,6 +717,84 @@ Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
       static_cast<const bf16*>(table.Data()),
       static_cast<const int32_t*>(ids.Data()),
       static_cast<bf16*>(out.Data()), hidden, vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
+                        const TensorView& q, const TensorView& k,
+                        const TensorView& v, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(fused, DataType::kBFloat16, 2, "fused"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 2, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 2, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 2, "v"));
+
+  const int64_t tokens = fused.Dim(0);
+  const int64_t q_dim = q.Dim(1);
+  const int64_t kv_dim = k.Dim(1);
+
+  if (fused.Dim(1) != q_dim + 2 * kv_dim) {
+    return InvalidArgumentError("fused is ", fused.Dim(1), " wide but q_dim ",
+                                q_dim, " + 2*kv_dim ", kv_dim, " is ",
+                                q_dim + 2 * kv_dim);
+  }
+  if (q.Dim(0) != tokens || k.Dim(0) != tokens || v.Dim(0) != tokens) {
+    return InvalidArgumentError("q/k/v token counts disagree with fused");
+  }
+  if (v.Dim(1) != kv_dim) {
+    return InvalidArgumentError("k is ", kv_dim, " wide but v is ", v.Dim(1));
+  }
+
+  const bf16* bias_ptr = nullptr;
+  if (bias.IsDefined()) {
+    INFERX_RETURN_IF_ERROR(CheckTensor(bias, DataType::kBFloat16, 1, "bias"));
+    if (bias.Dim(0) != fused.Dim(1)) {
+      return InvalidArgumentError("bias has ", bias.Dim(0), " entries but "
+                                  "fused is ", fused.Dim(1), " wide");
+    }
+    bias_ptr = static_cast<const bf16*>(bias.Data());
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t total = tokens * fused.Dim(1);
+  const int64_t want = (total + kBlock - 1) / kBlock;
+  const unsigned grid = static_cast<unsigned>(want > 4096 ? 4096 : want);
+
+  SplitQkvKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const bf16*>(fused.Data()), bias_ptr,
+      static_cast<bf16*>(q.Data()), static_cast<bf16*>(k.Data()),
+      static_cast<bf16*>(v.Data()), tokens, q_dim, kv_dim);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status SiluMulFused(const TensorView& fused, const TensorView& out,
+                    cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(fused, DataType::kBFloat16, 2, "fused"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+
+  const int64_t tokens = out.Dim(0);
+  const int64_t inter = out.Dim(1);
+
+  if (fused.Dim(0) != tokens || fused.Dim(1) != 2 * inter) {
+    return InvalidArgumentError("fused is ", fused.GetShape().ToString(),
+                                ", expected [", tokens, ", ", 2 * inter, "]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t total = tokens * inter;
+  const int64_t want = (total + kBlock - 1) / kBlock;
+  const unsigned grid = static_cast<unsigned>(want > 4096 ? 4096 : want);
+
+  SiluMulFusedKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const bf16*>(fused.Data()), static_cast<bf16*>(out.Data()),
+      tokens, inter);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

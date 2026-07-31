@@ -148,6 +148,36 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
 Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
                        const TensorView& out, cudaStream_t stream = nullptr);
 
+/// \brief Splits a fused QKV projection into contiguous Q, K and V, adding the
+///        bias on the way through.
+///
+/// A fused `[tokens, q_dim + 2·kv_dim]` GEMM is one launch where three were,
+/// but its output is interleaved per token, so Q is strided as soon as there is
+/// more than one token -- and everything downstream is contiguous-only by
+/// design (T16). A split is therefore unavoidable. Folding the bias into it
+/// makes the fused path cost *two* launches per layer where the unfused one
+/// costs six: three GEMMs and three bias adds.
+///
+/// \param fused `[tokens, q_dim + 2·kv_dim]` bf16, the GEMM's output.
+/// \param bias  `[q_dim + 2·kv_dim]` bf16, or an undefined view for
+///              architectures without attention bias (Llama).
+/// \param q     `[tokens, q_dim]` bf16.
+/// \param k, v  `[tokens, kv_dim]` bf16.
+Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
+                        const TensorView& q, const TensorView& k,
+                        const TensorView& v, cudaStream_t stream = nullptr);
+
+/// \brief `out = silu(fused[..., :n]) * fused[..., n:]` for a fused gate/up.
+///
+/// The FFN's counterpart, and it needs no split at all: SiluMul is elementwise,
+/// so it can read both halves out of one buffer directly. Fusing gate and up
+/// therefore removes a launch for free.
+///
+/// \param fused `[tokens, 2·intermediate]` bf16.
+/// \param out   `[tokens, intermediate]` bf16.
+Status SiluMulFused(const TensorView& fused, const TensorView& out,
+                    cudaStream_t stream = nullptr);
+
 /// \brief `out[t, i] += bias[i]`, broadcasting the bias across tokens.
 ///
 /// Qwen2 biases its Q/K/V projections; Llama biases nothing. Kept separate from
