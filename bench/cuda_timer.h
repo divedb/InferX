@@ -35,6 +35,9 @@ struct Timing {
   double min_ms = 0.0;
   double max_ms = 0.0;
   int iterations = 0;
+  /// Launches per sample. Chosen automatically; reported so a suspiciously
+  /// fast row can be checked against how many launches it was averaged over.
+  int batch = 1;
 
   /// \brief How far the median sits above the best sample, as a fraction.
   ///
@@ -68,27 +71,65 @@ struct Timing {
 
 /// \brief Times `launch` on the default stream.
 ///
-/// `launch` is invoked `warmup + iterations` times. The warmup passes are not
-/// measured: they exist to pay for lazy module loading, the cuBLASLt plan, and
-/// the clock ramp, none of which are properties of the kernel.
+/// Each sample brackets a *batch* of back-to-back launches and divides, rather
+/// than timing one launch. That is not an optimization, it is what makes short
+/// kernels measurable at all: a decode-shaped GEMM runs in tens of
+/// microseconds, and if the device is drained between every sample it idles
+/// long enough to drop its clocks, so the next kernel starts slow. Measured
+/// that way, a 17 us GEMM read as 113 us and the FP8/FP16 ratio inverted.
 ///
-/// \tparam LaunchFn  Callable returning `Status`, enqueuing work and **not**
-///                   synchronizing. A callable that synchronizes internally
-///                   still measures correctly but serializes the iterations.
-/// \param launch     The work to time.
-/// \param warmup     Unmeasured passes before timing starts.
-/// \param iterations Measured passes. The median is taken over these.
-/// \return           The timing, or the first error `launch` reported.
+/// Batching keeps the device busy across the whole sample while the samples
+/// stay independent of each other, and it also amortizes launch overhead the
+/// way real back-to-back layer execution does.
+///
+/// The batch size is chosen automatically from a pilot measurement so that a
+/// sample spans roughly a millisecond -- long enough to dwarf event overhead,
+/// short enough that clocks do not drift within one.
+///
+/// \tparam LaunchFn Callable returning `Status`, enqueuing work and **not**
+///                  synchronizing. One that synchronizes internally defeats the
+///                  batching and will measure the idle-clock case instead.
+/// \param launch    The work to time.
+/// \param warmup    Unmeasured passes before timing starts.
+/// \param samples   Number of measured batches. The statistics are over these.
+/// \return          The timing, per launch, or the first error reported.
 template <typename LaunchFn>
 StatusOr<Timing> TimeLaunch(LaunchFn&& launch, int warmup = 10,
-                            int iterations = 50) {
+                            int samples = 50) {
+  const int iterations = samples;
+
   if (iterations <= 0) {
-    return InvalidArgumentError("TimeLaunch needs iterations > 0, got ",
+    return InvalidArgumentError("TimeLaunch needs samples > 0, got ",
                                 iterations);
   }
 
   for (int i = 0; i < warmup; ++i) INFERX_RETURN_IF_ERROR(launch());
   INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+
+  // Pilot: one timed launch, only to size the batch. Its own accuracy does not
+  // matter -- being wrong by 2x picks a batch that is wrong by 2x, which still
+  // lands the sample in the right order of magnitude.
+  int batch = 1;
+  {
+    cudaEvent_t s0 = nullptr, s1 = nullptr;
+    if (cudaEventCreate(&s0) == cudaSuccess &&
+        cudaEventCreate(&s1) == cudaSuccess) {
+      float pilot_ms = 0.0f;
+
+      if (cudaEventRecord(s0) == cudaSuccess && launch().ok() &&
+          cudaEventRecord(s1) == cudaSuccess &&
+          cudaDeviceSynchronize() == cudaSuccess &&
+          cudaEventElapsedTime(&pilot_ms, s0, s1) == cudaSuccess &&
+          pilot_ms > 0.0f) {
+        constexpr double kTargetMs = 1.0;
+        const double want = kTargetMs / static_cast<double>(pilot_ms);
+        batch = static_cast<int>(want < 1.0 ? 1.0 : (want > 512.0 ? 512.0
+                                                                  : want));
+      }
+    }
+    cudaEventDestroy(s0);
+    cudaEventDestroy(s1);
+  }
 
   std::vector<cudaEvent_t> starts(iterations, nullptr);
   std::vector<cudaEvent_t> stops(iterations, nullptr);
@@ -103,18 +144,21 @@ StatusOr<Timing> TimeLaunch(LaunchFn&& launch, int warmup = 10,
   Status launch_status = OkStatus();
 
   for (int i = 0; i < iterations && launch_status.ok(); ++i) {
-    // Drained before each iteration so that every sample measures one launch
-    // into an idle device. Without this the host runs ahead and the iterations
-    // queue into each other: the event pair still brackets its own kernel, but
-    // that kernel now contends with the tail of its predecessors, and the
-    // samples stop being independent. It shows up as a spread of several
-    // hundred percent, which is how this was found.
+    // Drained between samples, not between launches. This is what keeps the
+    // samples independent -- without it the host runs ahead and a sample
+    // contends with the tail of its predecessors, which showed up as spreads
+    // of several hundred percent. Inside a sample the launches stay
+    // back-to-back so the device never goes idle mid-measurement.
     //
     // The sync is outside the event pair, so its cost is not in the number.
     if (cudaDeviceSynchronize() != cudaSuccess) break;
 
     if (cudaEventRecord(starts[i]) != cudaSuccess) break;
-    launch_status = launch();
+
+    for (int j = 0; j < batch && launch_status.ok(); ++j) {
+      launch_status = launch();
+    }
+
     if (cudaEventRecord(stops[i]) != cudaSuccess) break;
   }
 
@@ -127,7 +171,9 @@ StatusOr<Timing> TimeLaunch(LaunchFn&& launch, int warmup = 10,
     for (int i = 0; i < iterations; ++i) {
       float elapsed = 0.0f;
       if (cudaEventElapsedTime(&elapsed, starts[i], stops[i]) == cudaSuccess) {
-        ms.push_back(static_cast<double>(elapsed));
+        // Per launch, not per batch: everything downstream -- TFLOP/s, GB/s,
+        // the FP8/FP16 ratio -- is stated per launch.
+        ms.push_back(static_cast<double>(elapsed) / batch);
       }
     }
   }
@@ -148,6 +194,7 @@ StatusOr<Timing> TimeLaunch(LaunchFn&& launch, int warmup = 10,
 
   Timing t;
   t.iterations = static_cast<int>(ms.size());
+  t.batch = batch;
   t.min_ms = ms.front();
   t.max_ms = ms.back();
   t.median_ms = ms[ms.size() / 2];

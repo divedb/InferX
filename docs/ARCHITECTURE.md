@@ -445,7 +445,7 @@ Each entry is a decision we should be able to revisit deliberately.
 |---|---|---|---|
 | R1 | **CUDA 12.0 is too old.** CUTLASS 4.x (FP8 + grouped GEMM) and the FlashInfer MLA wrapper both need a current toolkit, and 12.0–12.3 cannot compile against libstdc++ 13 at all. | High | **Resolved in M0:** toolkit floor set to CUDA 13.0, enforced at configure time. `scripts/install-cuda.sh` performs the upgrade. |
 | R2 | TP is designed but untestable for performance here | High | §7.4 — `HostSimComm`, shard-reconstruction tests, numerical differential tests. Accept that perf tuning is deferred. |
-| R3 | Torch-free quantized GEMM (FP8, W4A16, MoE grouped) is the largest single unknown | ~~High~~ **Retired for FP8; Medium for W4A16** | **FP8 e4m3 W8A8 lands at ~2× FP16** on the 4080 SUPER: 214–216 TFLOP/s vs 107–111, i.e. the Ada FP8 tensor-core peak, across all four 7B GEMMs at prefill shapes; up to 5× at decode where the halved weight read dominates. Mean 2.06× over 28 shapes. Torch-free quantized GEMM is therefore demonstrated, not assumed. W4A16 remains open and is the part that still needs CUTLASS. |
+| R3 | Torch-free quantized GEMM (FP8, W4A16, MoE grouped) is the largest single unknown | ~~High~~ **Retired for FP8 at m ≥ 128; Medium for W4A16** | **FP8 e4m3 W8A8 lands at ~2× FP16** on the 4080 SUPER: 214–216 TFLOP/s vs 107–111, the Ada FP8 tensor-core peak, across all four 7B GEMMs. Reproducible to two decimals between independent runs for every shape at m ≥ 128. **Decode shapes (m ≤ 32) are not yet measurable here** — with unlocked clocks the same shape has read 4.03× and 5.77× on consecutive runs, and `gate_up` at m=32 has read 2.04× and 0.32×. FP8 halves the weight read so decode should benefit at least as much, but that is reasoning, not measurement, until the clocks are locked. Torch-free quantized GEMM is demonstrated for prefill; W4A16 remains open and is the part that still needs CUTLASS. |
 | R4 | 16 GB constrains what can be validated end-to-end | Medium | Target 7B-class at W4A16 for the main loop; MoE/MLA validated for correctness at toy sizes |
 | R5 | FlashInfer pinned-commit drift | Medium | Pin, wrap behind our own interface, and write attention conformance tests against a naive reference kernel |
 | R6 | Folly build weight slows iteration | Low | Narrow target build; moodycamel fallback |
@@ -494,7 +494,7 @@ inferx/
 | M | Deliverable | Proves |
 |---|---|---|
 | **M0** | CUDA 13.x toolchain floor; CMake + submodules build; `Tensor`, arenas, Status | Toolchain risk R1 retired |
-| **M1** | ✅ **FP8 e4m3 W8A8 GEMM vs cuBLASLt FP16 baseline**, with `bench/` harness and CI. Delivered on cuBLASLt, *not* CUTLASS (§15 Q2) | R3 retired for FP8 — ~2× at prefill, up to 5× at decode |
+| **M1** | ✅ **FP8 e4m3 W8A8 GEMM vs cuBLASLt FP16 baseline**, with `bench/` harness and CI. Delivered on cuBLASLt, *not* CUTLASS (§15 Q2) | R3 retired for FP8 — ~2× at prefill, reproducibly. Decode pending a clock lock |
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | Beast server, tokenizer FFI, SSE streaming, OpenAI API | End-to-end serving |

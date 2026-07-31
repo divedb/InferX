@@ -13,8 +13,10 @@
 // and quantization buys much less. Reading both columns is how you tell which
 // regime a shape is in.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -180,16 +182,80 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
   return OkStatus();
 }
 
+// Drives the GPU hard for `seconds` before any measurement starts.
+//
+// OFF BY DEFAULT, and measured to be harmful on this card without a clock lock.
+// The intent was to clear the cold-start clock ramp, but a consumer part under
+// four seconds of full-tilt GEMM hits its power limit instead, and the
+// memory-bound shapes then measure the throttled state: gate_up at m=1 fell
+// from 696 GB/s to 310, and its FP8/FP16 ratio inverted to 0.73x. Unsoaked runs
+// reproduce each other to three digits; soaked ones do not.
+//
+// Keep it for the case it was written for -- with `nvidia-smi -lgc` holding a
+// sustainable clock, a soak makes the first measured shapes comparable to the
+// last. Without a lock, leave it at zero.
+Status WarmUpDevice(kernels::CublasLtGemm& gemm, double seconds) {
+  constexpr int64_t m = 4096, n = 4096, k = 4096;
+
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer a, DeviceBuffer::Allocate(
+                          static_cast<size_t>(m * k) * sizeof(__half),
+                          DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer b, DeviceBuffer::Allocate(
+                          static_cast<size_t>(n * k) * sizeof(__half),
+                          DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer c, DeviceBuffer::Allocate(
+                          static_cast<size_t>(m * n) * sizeof(__half),
+                          DeviceId::Cuda(0)));
+
+  INFERX_RETURN_IF_ERROR(FillDevice(a, m * k, 0.3f));
+  INFERX_RETURN_IF_ERROR(FillDevice(b, n * k, 0.9f));
+
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView x, TensorView::Create(a.data(), DataType::kFloat16,
+                                       Shape({m, k}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView w, TensorView::Create(b.data(), DataType::kFloat16,
+                                       Shape({n, k}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView y, TensorView::Create(c.data(), DataType::kFloat16,
+                                       Shape({m, n}), DeviceId::Cuda(0)));
+
+  INFERX_RETURN_IF_ERROR(gemm.Warm(m, n, k));
+
+  const auto start = std::chrono::steady_clock::now();
+
+  while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+             .count() < seconds) {
+    for (int i = 0; i < 20; ++i) INFERX_RETURN_IF_ERROR(gemm.LinearF16(x, w, y));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  }
+
+  return OkStatus();
+}
+
+int ReportClockMhz() {
+  int mhz = 0;
+  cudaDeviceGetAttribute(&mhz, cudaDevAttrClockRate, 0);
+  return mhz / 1000;
+}
+
 int Main(int argc, char** argv) {
   int warmup = 10;
   int iters = 50;
+  double soak = 0.0;  // see WarmUpDevice: only useful with locked clocks
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
     else if (arg == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
+    else if (arg == "--soak" && i + 1 < argc) soak = std::atof(argv[++i]);
     else {
-      std::fprintf(stderr, "usage: %s [--warmup N] [--iters N]\n", argv[0]);
+      std::fprintf(stderr,
+                   "usage: %s [--warmup N] [--iters N] [--soak SECONDS]\n",
+                   argv[0]);
       return 2;
     }
   }
@@ -234,6 +300,18 @@ int Main(int argc, char** argv) {
     std::fprintf(stderr, "failed to create cuBLASLt context: %s\n",
                  gemm.status().ToString().c_str());
     return 1;
+  }
+
+  if (soak > 0.0) {
+    std::printf("soaking %.1fs to bring clocks up from idle...\n", soak);
+
+    const Status s = WarmUpDevice(*gemm, soak);
+    if (!s.ok()) {
+      std::fprintf(stderr, "warm-up failed: %s\n", s.ToString().c_str());
+      return 1;
+    }
+
+    std::printf("done (nominal clock %d MHz)\n\n", ReportClockMhz());
   }
 
   int failures = 0;
