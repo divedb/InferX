@@ -8,6 +8,15 @@ include_guard(GLOBAL)
 # a host compiler. See docs/ARCHITECTURE.md risk R1.
 set(INFERX_CUDA_MIN_VERSION "13.0")
 
+# Whether device code (nvcc-compiled targets) can be built at all. Distinct from
+# INFERX_ENABLE_CUDA, which only says whether the CUDA runtime API is available
+# to host translation units. Below the floor the two diverge: the host layer
+# still builds and links against cudart, but nothing can go through nvcc,
+# because our core headers do not survive its frontend there -- absl's
+# status.h uses std::source_location, which nvcc 12.0 cannot evaluate. Targets
+# containing .cu files must be gated on this, not on INFERX_ENABLE_CUDA.
+set(INFERX_CUDA_MEETS_FLOOR OFF)
+
 if(NOT INFERX_ENABLE_CUDA)
   message(STATUS "CUDA disabled: building host-only core "
                  "(INFERX_WITH_CUDA will not be defined)")
@@ -25,9 +34,9 @@ if(CUDAToolkit_VERSION VERSION_LESS INFERX_CUDA_MIN_VERSION)
       "  Configuring against CUDA ${CUDAToolkit_VERSION}, which is BELOW the\n"
       "  supported floor of ${INFERX_CUDA_MIN_VERSION}.\n"
       "\n"
-      "  This is a compile-check configuration only. It is expected to work for\n"
-      "  the core memory layer, and expected to FAIL once CUTLASS/FlashInfer\n"
-      "  kernels land in M1+.\n"
+      "  This is a compile-check configuration only. It builds the host layer\n"
+      "  against the CUDA runtime API; every target containing device code is\n"
+      "  SKIPPED, starting with src/kernels.\n"
       "\n"
       "  Install CUDA 13.x: ./scripts/install-cuda.sh\n")
   else()
@@ -41,6 +50,8 @@ if(CUDAToolkit_VERSION VERSION_LESS INFERX_CUDA_MIN_VERSION)
       "  Override (unsupported, compile-check only):\n"
       "                       cmake -S . -B build -DINFERX_ALLOW_UNSUPPORTED_CUDA=ON\n")
   endif()
+else()
+  set(INFERX_CUDA_MEETS_FLOOR ON)
 endif()
 
 # nvcc 12.0-12.3 rejects libstdc++ 13 headers. If the user is on that pairing,

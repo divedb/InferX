@@ -15,6 +15,24 @@ function(inferx_add_test name)
   )
 endfunction()
 
+# Kernel tests link the device layer and are labelled separately, so that
+# `ctest -L unit` stays the no-GPU-required suite. Like every GPU test they
+# skip at runtime when no device is present -- the label is about what they
+# link, the skip is about what is plugged in.
+function(inferx_add_kernel_test name)
+  add_executable(${name} ${ARGN})
+  target_link_libraries(${name} PRIVATE
+    inferx::core
+    inferx::kernels
+    inferx::flags
+    GTest::gtest_main
+  )
+  gtest_discover_tests(${name}
+    PROPERTIES LABELS kernel
+    DISCOVERY_TIMEOUT 30
+  )
+endfunction()
+
 inferx_add_test(dtype_test             unit/dtype_test.cc)
 inferx_add_test(intrusive_ref_cnt_ptr_test unit/intrusive_ref_cnt_ptr_test.cc)
 inferx_add_test(shape_test             unit/shape_test.cc)
@@ -23,3 +41,7 @@ inferx_add_test(tensor_test            unit/tensor_test.cc)
 inferx_add_test(arena_test             unit/arena_test.cc)
 inferx_add_test(caching_allocator_test unit/caching_allocator_test.cc)
 inferx_add_test(device_buffer_test     unit/device_buffer_test.cc)
+
+if(INFERX_CUDA_MEETS_FLOOR)
+  inferx_add_kernel_test(kernel_smoke_test kernel/smoke_test.cc)
+endif()

@@ -24,6 +24,10 @@ include(InferXDependencies)
 
 add_subdirectory(src/core)
 
+if(INFERX_CUDA_MEETS_FLOOR)
+  add_subdirectory(src/kernels)
+endif()
+
 if(INFERX_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
@@ -37,6 +41,12 @@ message(STATUS "  Host compiler   : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILE
 if(INFERX_ENABLE_CUDA)
   message(STATUS "  CUDA toolkit    : ${CUDAToolkit_VERSION}")
   message(STATUS "  CUDA archs      : ${CMAKE_CUDA_ARCHITECTURES}")
+  if(INFERX_CUDA_MEETS_FLOOR)
+    message(STATUS "  Device code     : ENABLED")
+  else()
+    message(STATUS "  Device code     : SKIPPED "
+                   "(toolkit below ${INFERX_CUDA_MIN_VERSION})")
+  endif()
 else()
   message(STATUS "  CUDA            : DISABLED (host-only build)")
 endif()

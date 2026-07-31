@@ -86,20 +86,34 @@ cmake -S . -B build -DINFERX_ALLOW_UNSUPPORTED_CUDA=ON
 
 Configures against a pre-13.0 toolkit with a loud warning. This exists so the
 runtime-API layer can be compile-checked on a machine that has not been upgraded
-yet. It is expected to stop working the moment CUTLASS or FlashInfer kernels
-land. Do not use it for anything you intend to measure.
+yet. Do not use it for anything you intend to measure.
+
+Below the floor, **every target containing device code is skipped** —
+`src/kernels` and the kernel tests with it. The configure summary says so
+(`Device code : SKIPPED`). The reason is concrete rather than precautionary:
+nvcc 12.x cannot evaluate `std::source_location::current()`, which
+`absl/status/status.h` uses unconditionally, so any `.cu` that includes an
+inferx core header fails in the frontend. A green build under this flag
+therefore proves less than it looks like it does — it has not compiled a single
+line of device code.
 
 ## Layout
 
 ```
 include/inferx/     Public headers, mirroring src/
 src/core/           DType, Tensor, Status, arenas, allocators
+src/kernels/        .cu — device code. Needs CUDA >= 13.0 to build at all
 cmake/              Options, CUDA config, dependency wiring
 scripts/            Setup and bootstrap
 tests/unit/         Must run with no GPU
+tests/kernel/       Device code. Built only above the CUDA floor
 third_party/        Submodules, pinned
 docs/               ARCHITECTURE.md is the design of record
 ```
+
+Test labels follow that split: `ctest -L unit` is the suite that needs no GPU,
+`ctest -L kernel` is the one that links device code. Both skip individual tests
+at runtime when no device is present.
 
 ## Conventions
 
