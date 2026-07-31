@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include "absl/types/span.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
 
@@ -66,17 +67,34 @@ class FlashInferDecode {
   /// \param v_cache       Same shape.
   /// \param kv_indices    Flat page indices for the whole batch, concatenated
   ///                      in sequence order.
-  /// \param kv_indptr     `[batch + 1]` int32, prefix sums into `kv_indices`.
+  /// \param kv_indptr     `[batch + 1]` int32 **on the device**, prefix sums
+  ///                      into `kv_indices`.
+  /// \param kv_indptr_host The same `batch + 1` values **on the host**.
+  ///
+  ///   Both are required, and passing the host copy rather than reading it back
+  ///   is the whole reason this parameter exists. FlashInfer's planner needs the
+  ///   indptr host-side to estimate how to split the work, and an earlier
+  ///   version of this wrapper obtained it with a device-to-host copy followed
+  ///   by `cudaStreamSynchronize` -- a full device synchronization inside the
+  ///   decode loop, which §5.2 forbids outright and which would have made M6's
+  ///   overlap pipeline impossible.
+  ///
+  ///   The copy was never necessary: the scheduler *computes* this array while
+  ///   walking its own block tables (§3.1), so the host already holds it before
+  ///   anything reaches the device. Round-tripping it was the bug.
+  ///
   /// \param last_page_len `[batch]` int32, tokens used in each sequence's final
   ///                      page. 1..block_size, never 0.
   /// \param out           `[batch, q_heads, head_dim]` bf16.
   /// \param scale         Usually `1/sqrt(head_dim)`.
-  /// \param stream        Stream to launch on. Does **not** synchronize.
+  /// \param stream        Stream to launch on. Does **not** synchronize, and
+  ///                      must not: see above.
   Status Decode(const TensorView& q, const TensorView& k_cache,
                 const TensorView& v_cache, const TensorView& kv_indices,
-                const TensorView& kv_indptr, const TensorView& last_page_len,
-                const TensorView& out, float scale,
-                cudaStream_t stream = nullptr);
+                const TensorView& kv_indptr,
+                absl::Span<const int32_t> kv_indptr_host,
+                const TensorView& last_page_len, const TensorView& out,
+                float scale, cudaStream_t stream = nullptr);
 
  private:
   struct Impl;

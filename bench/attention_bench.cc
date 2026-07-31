@@ -29,6 +29,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
+#include "absl/types/span.h"
 #include "inferx/kernels/flashinfer_attention.h"
 #include "inferx/kernels/layers.h"
 
@@ -190,7 +191,8 @@ Status RunOne(kernels::FlashInferDecode* fi, int64_t batch, int64_t context,
       TimeLaunch(
           [&] {
             return fi->Decode(q, k_cache, v_cache, indices_v, indptr_v,
-                              last_page_v, out, scale);
+                              absl::MakeConstSpan(indptr), last_page_v, out,
+                              scale);
           },
           warmup, iters));
 

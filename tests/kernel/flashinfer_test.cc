@@ -14,7 +14,9 @@
 
 #include "inferx/kernels/flashinfer_attention.h"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <numeric>
 #include <vector>
 
@@ -214,7 +216,7 @@ class FlashInferTest : public ::testing::Test {
     const Status s = fi->Decode(
         qd, k_cache, v_cache,
         dev.I32(indices, Shape({static_cast<int64_t>(indices.size())})),
-        dev.I32(indptr, Shape({batch + 1})),
+        dev.I32(indptr, Shape({batch + 1})), absl::MakeConstSpan(indptr),
         dev.I32(last_page, Shape({batch})), theirs, scale);
     ASSERT_TRUE(s.ok()) << s;
 
@@ -278,6 +280,98 @@ TEST_F(FlashInferTest, AgreesAtQwenGeometry) {
   CompareForLengths({5, 128, 64}, 16, 2, 16, 64);
 }
 
+// The decode path must not synchronize. §5.2 is explicit that a device sync in
+// the decode loop destroys the overlap pipeline, and an earlier version of this
+// wrapper had one: it copied the KV indptr back from the device for
+// FlashInfer's planner and waited on it. The fix was to take the host copy the
+// scheduler already has.
+//
+// Asserted rather than assumed, because "I removed the sync" is exactly the
+// kind of claim that rots.
+//
+// The first version of this test polled cudaStreamQuery after the call and was
+// useless: a sync at the *start* of Decode still leaves that call's own work
+// queued on return, so the stream is legitimately busy either way. It passed
+// with the bug reintroduced, which is the only reason it was caught.
+//
+// What a sync actually costs is host time. So the measurement is: enqueue N
+// launches and time the *host* loop, then drain and time the whole thing. An
+// asynchronous path returns in launch overhead -- microseconds -- while the GPU
+// works for milliseconds. A synchronizing one makes the two nearly equal,
+// because the host waits for each launch before issuing the next.
+TEST_F(FlashInferTest, DecodeDoesNotBlockTheHost) {
+  constexpr int64_t head_dim = 128, q_heads = 16, kv_heads = 2;
+  constexpr int64_t page_size = 16, blocks_per_seq = 128;
+  constexpr int64_t batch = 128;
+  constexpr int64_t num_blocks = batch * blocks_per_seq;
+  constexpr int kLaunches = 10;
+
+  Dev dev;
+
+  cudaStream_t stream = nullptr;
+  ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+  const TensorView k_cache =
+      dev.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+  const TensorView v_cache =
+      dev.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+  const TensorView q = dev.Empty(Shape({batch, q_heads, head_dim}));
+  const TensorView out = dev.Empty(Shape({batch, q_heads, head_dim}));
+
+  std::vector<int32_t> indices, indptr, last_page;
+  for (int64_t s = 0; s < batch; ++s) {
+    indptr.push_back(static_cast<int32_t>(indices.size()));
+    for (int64_t b = 0; b < blocks_per_seq; ++b) {
+      indices.push_back(static_cast<int32_t>(s * blocks_per_seq + b));
+    }
+    last_page.push_back(static_cast<int32_t>(page_size));
+  }
+  indptr.push_back(static_cast<int32_t>(indices.size()));
+
+  const TensorView indices_v =
+      dev.I32(indices, Shape({static_cast<int64_t>(indices.size())}));
+  const TensorView indptr_v = dev.I32(indptr, Shape({batch + 1}));
+  const TensorView last_page_v = dev.I32(last_page, Shape({batch}));
+
+  auto fi = kernels::FlashInferDecode::Create();
+  ASSERT_TRUE(fi.ok()) << fi.status();
+
+  const auto decode = [&] {
+    return fi->Decode(q, k_cache, v_cache, indices_v, indptr_v,
+                      absl::MakeConstSpan(indptr), last_page_v, out, 0.088f,
+                      stream);
+  };
+
+  // Warm, so first-call costs are not what is measured.
+  ASSERT_TRUE(decode().ok());
+  ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kLaunches; ++i) ASSERT_TRUE(decode().ok());
+  const auto t1 = std::chrono::steady_clock::now();
+
+  ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+  const auto t2 = std::chrono::steady_clock::now();
+
+  const double enqueue_ms =
+      std::chrono::duration<double, std::milli>(t1 - t0).count();
+  const double total_ms =
+      std::chrono::duration<double, std::milli>(t2 - t0).count();
+
+  std::printf("  enqueued %d launches in %.3f ms of host time; total %.3f ms\n",
+              kLaunches, enqueue_ms, total_ms);
+
+  // The GPU has to actually be busy for the comparison to mean anything -- if
+  // the work were trivial both numbers would be small and equal.
+  ASSERT_GT(total_ms, 1.0)
+      << "the configuration is too small to distinguish sync from async";
+
+  EXPECT_LT(enqueue_ms, total_ms * 0.5)
+      << "enqueuing took " << enqueue_ms << " ms of the " << total_ms
+      << " ms total, so the host was waiting on the device: Decode is "
+         "synchronizing";
+}
+
 TEST_F(FlashInferTest, CsrConversionMatchesTheDenseTable) {
   // Two sequences: the first holds 3 blocks, the second 1. The rest of each row
   // is padding that must not appear in the output.
@@ -305,8 +399,10 @@ TEST_F(FlashInferTest, RejectsAnUninstantiatedHeadDim) {
   const TensorView vc = dev.Empty(Shape({4, 16, 4, 64}));
   const TensorView out = dev.Empty(Shape({1, 4, 64}));
 
+  const std::vector<int32_t> indptr = {0, 1};
   const Status s = fi->Decode(q, kc, vc, dev.I32({0}, Shape({1})),
-                              dev.I32({0, 1}, Shape({2})),
+                              dev.I32(indptr, Shape({2})),
+                              absl::MakeConstSpan(indptr),
                               dev.I32({16}, Shape({1})), out, 0.125f);
 
   EXPECT_EQ(s.code(), absl::StatusCode::kUnimplemented) << s;

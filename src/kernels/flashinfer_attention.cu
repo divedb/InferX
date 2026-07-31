@@ -105,6 +105,7 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
                                 const TensorView& v_cache,
                                 const TensorView& kv_indices,
                                 const TensorView& kv_indptr,
+                                absl::Span<const int32_t> kv_indptr_host,
                                 const TensorView& last_page_len,
                                 const TensorView& out, float scale,
                                 cudaStream_t stream) {
@@ -155,17 +156,15 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
         head_dim, "; add an instantiation in flashinfer_attention.cu");
   }
 
-  if (batch == 0) return OkStatus();
+  // Checked rather than trusted: the planner reads this array to decide how to
+  // split the work, and a host copy that disagrees with the device one produces
+  // a plan for a batch that is not the one being run -- wrong output, no error.
+  if (static_cast<int64_t>(kv_indptr_host.size()) != batch + 1) {
+    return InvalidArgumentError("kv_indptr_host has ", kv_indptr_host.size(),
+                                " entries, expected batch + 1 = ", batch + 1);
+  }
 
-  // DecodePlan needs the indptr on the *host* to estimate work, so it comes
-  // back across before the launch. It is `batch + 1` integers, and this is the
-  // one synchronous copy in the path -- worth noting for M6, where it will have
-  // to move off the critical path or be produced host-side to begin with.
-  std::vector<IdType> indptr_host(static_cast<size_t>(batch + 1));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      indptr_host.data(), kv_indptr.Data(),
-      indptr_host.size() * sizeof(IdType), cudaMemcpyDeviceToHost, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+  if (batch == 0) return OkStatus();
 
   flashinfer::paged_kv_t<bf16, IdType> paged_kv(
       static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(page_size),
@@ -214,7 +213,8 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
     plan_status = flashinfer::DecodePlan<128, kPos, Variant, Params>(
         impl_->float_workspace.data(), impl_->float_workspace.size(),
         impl_->int_workspace.data(), impl_->page_locked,
-        impl_->int_workspace.size(), plan_info, indptr_host.data(),
+        impl_->int_workspace.size(), plan_info,
+        const_cast<IdType*>(kv_indptr_host.data()),
         static_cast<uint32_t>(batch), static_cast<uint32_t>(q_heads),
         static_cast<uint32_t>(page_size), /*enable_cuda_graph=*/false, stream,
         work_estimation);
