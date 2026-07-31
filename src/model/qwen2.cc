@@ -176,6 +176,12 @@ struct Qwen2Model::Impl {
   void* pinned_logits = nullptr;
   size_t pinned_logits_bytes = 0;
 
+  // Events bracketing the device portion of a step, so the split between work
+  // and the host wrapper around it can be measured rather than inferred.
+  cudaEvent_t step_begin = nullptr;
+  cudaEvent_t step_end = nullptr;
+  float last_device_ms = 0.0f;
+
   /// Grows the index staging buffer. Contents are not preserved; every step
   /// rewrites all of it.
   Status EnsurePinned(size_t bytes) {
@@ -234,6 +240,8 @@ struct Qwen2Model::Impl {
     for (DecodeGraph& g : graphs) {
       if (g.exec != nullptr) cudaGraphExecDestroy(g.exec);
     }
+    if (step_begin != nullptr) cudaEventDestroy(step_begin);
+    if (step_end != nullptr) cudaEventDestroy(step_end);
     if (pinned != nullptr) cudaFreeHost(pinned);
     if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
     if (stream != nullptr) cudaStreamDestroy(stream);
@@ -854,6 +862,8 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   cudaGraphExec_t graph =
       FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
 
+  INFERX_CUDA_RETURN_IF_ERROR(cudaEventRecord(step_begin, stream));
+
   if (graph != nullptr) {
     // The replay reads exactly the buffers PrepareBatchInputs just wrote. That
     // is the whole contract: a graph fixes the *structure* of the step -- which
@@ -867,7 +877,10 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
                                             batch.max_blocks_per_seq));
   }
 
+  INFERX_CUDA_RETURN_IF_ERROR(cudaEventRecord(step_end, stream));
   INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaEventElapsedTime(&last_device_ms, step_begin, step_end));
 
   return OkStatus();
 }
@@ -897,6 +910,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
   // reintroduce exactly the serialization graphs are here to remove.
   INFERX_CUDA_RETURN_IF_ERROR(
       cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl->step_begin));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl->step_end));
 
   const int64_t h = config.hidden_size;
   const int64_t inter = config.intermediate_size;
@@ -1299,6 +1314,10 @@ Status Qwen2Model::QuantizeWeightsToF8() {
 }
 
 bool Qwen2Model::weights_are_f8() const { return impl_->weights_f8; }
+
+double Qwen2Model::last_step_device_ms() const {
+  return impl_->last_device_ms;
+}
 
 Status Qwen2Model::Step(const ForwardBatch& batch,
                         std::vector<float>* out_logits) {

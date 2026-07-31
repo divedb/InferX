@@ -152,6 +152,15 @@ class Qwen2Model {
   /// \brief True once `QuantizeWeightsToF8` has run.
   bool weights_are_f8() const;
 
+  /// \brief GPU time of the last `Step`, in milliseconds.
+  ///
+  /// Measured with events around the launch, so it covers the device work and
+  /// nothing else. Subtracting it from the wall time of `Step` gives the host
+  /// wrapper: index staging, the FlashInfer plan, and the logits copy back.
+  /// That split is the only way to tell whether more of the step belongs inside
+  /// a graph or whether what remains is simply the work.
+  double last_step_device_ms() const;
+
   const ModelConfig& config() const;
 
   /// \brief Device bytes held by the weights.

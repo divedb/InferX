@@ -18,6 +18,7 @@
 // is length-agnostic. The two optimizations are exclusive today, and this is
 // what says which one to keep.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -134,9 +135,9 @@ int Main(int argc, char** argv) {
   // hoisted out of the captured region, so a graph contains the fast attention
   // rather than the reference one. This is a like-for-like comparison of
   // dispatch again, which it was not before.
-  std::printf("%6s %14s %14s %9s  %s\n", "batch", "launches_ms",
-              "graph_ms", "noise_%", "speedup");
-  std::printf("%s\n", std::string(62, '-').c_str());
+  std::printf("%6s %14s %14s %9s %9s %9s  %s\n", "batch", "launches_ms",
+              "graph_ms", "device_ms", "host_ms", "noise_%", "speedup");
+  std::printf("%s\n", std::string(82, '-').c_str());
 
   int failures = 0;
 
@@ -175,8 +176,20 @@ int Main(int argc, char** argv) {
       continue;
     }
 
-    std::printf("%6ld %14.4f %14.4f %9.1f  %6.2fx\n", static_cast<long>(batch),
-                launches->min_ms, graphed->min_ms, graphed->noise() * 100.0,
+    // The device portion, minimum over its own samples so it compares like for
+    // like against graph_ms. Reading it once after the timing loop would put a
+    // single sample against a minimum and produce a negative remainder, which
+    // is how this was first written and how it was caught.
+    double device_ms = 1e9;
+    for (int i = 0; i < iters; ++i) {
+      if (!model.Step(b, &logits).ok()) break;
+      device_ms = std::min(device_ms, model.last_step_device_ms());
+    }
+
+    std::printf("%6ld %14.4f %14.4f %9.4f %9.4f %9.1f  %6.2fx\n",
+                static_cast<long>(batch), launches->min_ms, graphed->min_ms,
+                device_ms, graphed->min_ms - device_ms,
+                graphed->noise() * 100.0,
                 launches->min_ms / graphed->min_ms);
   }
 
