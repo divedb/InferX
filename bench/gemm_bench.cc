@@ -191,9 +191,11 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
 // from 696 GB/s to 310, and its FP8/FP16 ratio inverted to 0.73x. Unsoaked runs
 // reproduce each other to three digits; soaked ones do not.
 //
-// Keep it for the case it was written for -- with `nvidia-smi -lgc` holding a
-// sustainable clock, a soak makes the first measured shapes comparable to the
-// last. Without a lock, leave it at zero.
+// It does not earn its keep with the clock locked either, which was the case it
+// was written for: at `-lgc 2400` a soaked sweep means 2.31x against 2.34x and
+// 2.35x unsoaked, and it does not stabilize the shapes that were still moving.
+// Locking the clock is what fixes the ramp; the soak is left in only because it
+// is the right tool if a future card throttles differently, and it stays off.
 Status WarmUpDevice(kernels::CublasLtGemm& gemm, double seconds) {
   constexpr int64_t m = 4096, n = 4096, k = 4096;
 
