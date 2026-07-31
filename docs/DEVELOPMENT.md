@@ -78,6 +78,35 @@ configuration. The scheduler, KV block manager, prefix cache, and the entire
 memory layer are required to build and test without a GPU, because that is what
 keeps their logic separable from device concerns. See ARCHITECTURE.md §3.1.
 
+### Which CUDA gets used
+
+Two things resolve independently: `find_package(CUDAToolkit)` finds headers and
+libraries, and `enable_language(CUDA)` finds the compiler on `PATH`. They can
+disagree. A distro `nvidia-cuda-toolkit` puts nvcc at `/usr/bin/nvcc`, which
+shadows `/usr/local/cuda/bin/nvcc` — so a build can validate one toolkit and
+then compile every `.cu` with a different, older one.
+
+The build therefore points both at `/usr/local/cuda` unless you say otherwise,
+and **fails hard if they end up mismatched anyway**. To use a different toolkit:
+
+```bash
+cmake -S . -B build -DINFERX_CUDA_ROOT_HINT=/usr/local/cuda-13.0
+```
+
+An explicit `-DCMAKE_CUDA_COMPILER`, `-DCUDAToolkit_ROOT`, or the `CUDACXX` /
+`CUDAToolkit_ROOT` environment variables all take precedence over the default,
+which is what makes a second toolkit testable. The configure summary prints both
+resolved paths — if they ever disagree, that is a bug, and the build says so
+rather than picking one silently:
+
+```
+--   CUDA toolkit    : 13.0.88 (/usr/local/cuda/bin)
+--   CUDA compiler   : 13.0.88 (/usr/local/cuda/bin/nvcc)
+```
+
+The version floor is enforced against the **compiler**, not the toolkit, because
+the compiler is what actually has to swallow our headers.
+
 ### The unsupported-CUDA escape hatch
 
 ```bash

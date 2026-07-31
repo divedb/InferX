@@ -39,7 +39,11 @@ message(STATUS "  Build type      : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard    : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Host compiler   : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 if(INFERX_ENABLE_CUDA)
-  message(STATUS "  CUDA toolkit    : ${CUDAToolkit_VERSION}")
+  message(STATUS "  CUDA toolkit    : ${CUDAToolkit_VERSION} (${CUDAToolkit_BIN_DIR})")
+  # Reported separately from the toolkit, and with its path, because these are
+  # resolved independently and a build that silently used a different nvcc than
+  # the one it validated is exactly the failure this summary should expose.
+  message(STATUS "  CUDA compiler   : ${CMAKE_CUDA_COMPILER_VERSION} (${CMAKE_CUDA_COMPILER})")
   message(STATUS "  CUDA archs      : ${CMAKE_CUDA_ARCHITECTURES}")
   if(INFERX_CUDA_MEETS_FLOOR)
     message(STATUS "  Device code     : ENABLED")
