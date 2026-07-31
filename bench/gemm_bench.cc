@@ -28,6 +28,7 @@
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
+#include "inferx/kernels/quantize.h"
 
 namespace inferx::bench {
 namespace {
@@ -69,8 +70,11 @@ Status FillDevice(const DeviceBuffer& buf, int64_t elems, float salt) {
   return OkStatus();
 }
 
+// One measured row. `fp8` selects the M1 prototype path over the baseline; the
+// two are deliberately run through the same allocation, fill, warm and timing
+// code so that a difference between them is a difference between the kernels.
 Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
-              int warmup, int iters) {
+              int warmup, int iters, bool fp8, double* out_tflops) {
   const int64_t n = shape.n;
   const int64_t k = shape.k;
 
@@ -100,19 +104,66 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
       TensorView y, TensorView::Create(yb.data(), DataType::kFloat16,
                                        Shape({m, n}), DeviceId::Cuda(0)));
 
+  // FP8 needs the operands quantized and their scales resident. Done once, out
+  // of the timed region: on the serving path weights are quantized at load and
+  // activation scales come from the previous layer, so paying for it per launch
+  // would measure a cost the engine will not have.
+  DeviceBuffer xq_buf, wq_buf, scale_buf;
+  TensorView xq, wq;
+  float* x_scale = nullptr;
+  float* w_scale = nullptr;
+
+  if (fp8) {
+    INFERX_ASSIGN_OR_RETURN(
+        xq_buf, DeviceBuffer::Allocate(static_cast<size_t>(m * k),
+                                       DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        wq_buf, DeviceBuffer::Allocate(static_cast<size_t>(n * k),
+                                       DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        scale_buf,
+        DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0)));
+
+    INFERX_ASSIGN_OR_RETURN(
+        xq, TensorView::Create(xq_buf.data(), DataType::kFloat8E4M3FN,
+                               Shape({m, k}), DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        wq, TensorView::Create(wq_buf.data(), DataType::kFloat8E4M3FN,
+                               Shape({n, k}), DeviceId::Cuda(0)));
+
+    x_scale = reinterpret_cast<float*>(scale_buf.data());
+    w_scale = x_scale + 1;
+
+    INFERX_RETURN_IF_ERROR(kernels::ComputeF8Scale(x, x_scale));
+    INFERX_RETURN_IF_ERROR(kernels::ComputeF8Scale(w, w_scale));
+    INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToF8E4M3(x, xq, x_scale));
+    INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToF8E4M3(w, wq, w_scale));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  }
+
   // Planned before timing so the heuristic search is not part of the first
   // measured iteration. This is what Warm() is for on the serving path too.
-  INFERX_RETURN_IF_ERROR(gemm.Warm(m, n, k));
+  INFERX_RETURN_IF_ERROR(gemm.Warm(m, n, k, fp8));
 
   INFERX_ASSIGN_OR_RETURN(
-      Timing t,
-      TimeLaunch([&] { return gemm.LinearF16(x, w, y); }, warmup, iters));
+      Timing t, TimeLaunch(
+                    [&] {
+                      return fp8 ? gemm.LinearF8E4M3(xq, wq, y, x_scale,
+                                                     w_scale)
+                                 : gemm.LinearF16(x, w, y);
+                    },
+                    warmup, iters));
 
   const double flop = 2.0 * static_cast<double>(m) * static_cast<double>(n) *
                       static_cast<double>(k);
-  const double bytes =
-      2.0 * (static_cast<double>(m) * k + static_cast<double>(n) * k +
-             static_cast<double>(m) * n);
+
+  // Bytes moved depends on the path: FP8 halves both operands but the output
+  // stays f16. That asymmetry is the whole argument at small m, where the
+  // weight read dominates and halving it is nearly a 2x.
+  const double elem = fp8 ? 1.0 : 2.0;
+  const double bytes = elem * (static_cast<double>(m) * k +
+                               static_cast<double>(n) * k) +
+                       2.0 * static_cast<double>(m) * n;
 
   // Arithmetic intensity decides the regime, and it is a property of the shape
   // rather than of the measurement: FLOP per byte moved, compared against the
@@ -120,10 +171,12 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
   // shape cannot saturate the tensor cores no matter how good the kernel is.
   const char* bound = flop / bytes < 160.0 ? "memory" : "compute";
 
-  std::printf("%-10s %6ld %6ld %6ld %9.4f %9.4f %7.1f %8.1f %8.1f  %s\n",
-              shape.name, static_cast<long>(m), static_cast<long>(n),
-              static_cast<long>(k), t.min_ms, t.median_ms, t.noise() * 100.0,
-              t.tflops(flop), t.gbytes_per_s(bytes), bound);
+  if (out_tflops != nullptr) *out_tflops = t.tflops(flop);
+
+  std::printf("%-10s %-5s %6ld %6ld %6ld %9.4f %7.1f %8.1f %8.1f  %s\n",
+              shape.name, fp8 ? "fp8" : "f16", static_cast<long>(m),
+              static_cast<long>(n), static_cast<long>(k), t.min_ms,
+              t.noise() * 100.0, t.tflops(flop), t.gbytes_per_s(bytes), bound);
   return OkStatus();
 }
 
@@ -172,9 +225,9 @@ int Main(int argc, char** argv) {
       "      (64 MB) report above-HBM bandwidth. Real decode streams cold\n"
       "      weights per layer; small-m rows are an upper bound.\n\n");
 
-  std::printf("%-10s %6s %6s %6s %9s %9s %7s %8s %8s  %s\n", "gemm", "m", "n",
-              "k", "best_ms", "p50_ms", "noise_%", "TFLOP/s", "GB/s", "bound");
-  std::printf("%s\n", std::string(88, '-').c_str());
+  std::printf("%-10s %-5s %6s %6s %6s %9s %7s %8s %8s  %s\n", "gemm", "path",
+              "m", "n", "k", "best_ms", "noise_%", "TFLOP/s", "GB/s", "bound");
+  std::printf("%s\n", std::string(90, '-').c_str());
 
   auto gemm = kernels::CublasLtGemm::Create();
   if (!gemm.ok()) {
@@ -184,20 +237,42 @@ int Main(int argc, char** argv) {
   }
 
   int failures = 0;
+  double total_speedup = 0.0;
+  int speedup_count = 0;
 
   for (const int64_t m : kTokenCounts) {
     for (const GemmShape& shape : kQwen7B) {
-      const Status s = RunOne(*gemm, shape, m, warmup, iters);
-      if (!s.ok()) {
-        std::fprintf(stderr, "%-10s m=%ld FAILED: %s\n", shape.name,
-                     static_cast<long>(m), s.ToString().c_str());
-        ++failures;
+      double f16_tflops = 0.0;
+      double f8_tflops = 0.0;
+
+      for (const bool fp8 : {false, true}) {
+        const Status s = RunOne(*gemm, shape, m, warmup, iters, fp8,
+                                fp8 ? &f8_tflops : &f16_tflops);
+        if (!s.ok()) {
+          std::fprintf(stderr, "%-10s %s m=%ld FAILED: %s\n", shape.name,
+                       fp8 ? "fp8" : "f16", static_cast<long>(m),
+                       s.ToString().c_str());
+          ++failures;
+        }
+      }
+
+      if (f16_tflops > 0.0 && f8_tflops > 0.0) {
+        const double speedup = f8_tflops / f16_tflops;
+        std::printf("%-10s %-5s %6ld %6s %6s %9s %7s %8s %7.2fx\n", "",
+                    "  ->", static_cast<long>(m), "", "", "", "", "", speedup);
+        total_speedup += speedup;
+        ++speedup_count;
       }
     }
     std::printf("\n");
   }
 
   std::printf("plans cached: %zu\n", gemm->PlanCacheSize());
+
+  if (speedup_count > 0) {
+    std::printf("mean fp8/f16 speedup across %d shapes: %.2fx\n", speedup_count,
+                total_speedup / speedup_count);
+  }
 
   return failures == 0 ? 0 : 1;
 }

@@ -7,6 +7,7 @@
 
 add_library(inferx_kernels
   gemm_cublaslt.cc
+  quantize.cu
   smoke.cu
 )
 add_library(inferx::kernels ALIAS inferx_kernels)

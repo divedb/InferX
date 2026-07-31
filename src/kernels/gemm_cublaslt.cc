@@ -64,16 +64,24 @@ Status CublasErrorToStatus(cublasStatus_t s, const char* expr, const char* file,
     }                                                                       \
   } while (0)
 
+// FP8 and FP16 plans for the same shape are different plans: the layouts carry
+// different element types, so an algorithm the heuristic chose for one is not
+// valid for the other. Keying on the shape alone would hand an FP16 algorithm
+// to an FP8 matmul.
+enum class Path { kF16, kF8E4M3 };
+
 struct ShapeKey {
   int64_t m, n, k;
+  Path path;
 
   friend bool operator==(const ShapeKey& a, const ShapeKey& b) {
-    return a.m == b.m && a.n == b.n && a.k == b.k;
+    return a.m == b.m && a.n == b.n && a.k == b.k && a.path == b.path;
   }
 
   template <typename H>
   friend H AbslHashValue(H h, const ShapeKey& s) {
-    return H::combine(std::move(h), s.m, s.n, s.k);
+    return H::combine(std::move(h), s.m, s.n, s.k,
+                      static_cast<int>(s.path));
   }
 };
 
@@ -109,6 +117,12 @@ struct Plan {
 struct CublasLtGemm::Impl {
   cublasLtHandle_t lt = nullptr;
   DeviceBuffer workspace;
+  // Two floats holding 1.0, used as placeholder scales while the FP8 heuristic
+  // is queried. cuBLASLt wants the descriptor complete before it will pick an
+  // algorithm, but the scales themselves do not influence the choice -- the
+  // real pointers are bound per call, since they belong to the tensors rather
+  // than to the plan.
+  DeviceBuffer unit_scales;
   absl::flat_hash_map<ShapeKey, std::unique_ptr<Plan>> plans;
 
   ~Impl() {
@@ -117,19 +131,19 @@ struct CublasLtGemm::Impl {
     if (lt) cublasLtDestroy(lt);
   }
 
-  StatusOr<const Plan*> GetOrBuild(int64_t m, int64_t n, int64_t k);
+  StatusOr<const Plan*> GetOrBuild(int64_t m, int64_t n, int64_t k, Path path);
 };
 
 StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
-                                                     int64_t k) {
-  const ShapeKey key{m, n, k};
+                                                     int64_t k, Path path) {
+  const ShapeKey key{m, n, k, path};
 
   if (auto it = plans.find(key); it != plans.end()) return it->second.get();
 
   auto plan = std::make_unique<Plan>();
 
-  // FP16 in, FP32 accumulate. The scale type is FP32 to match, which is what
-  // makes alpha/beta below floats rather than halves.
+  // Both paths accumulate in FP32 with FP32 scales, which is what makes
+  // alpha/beta below floats rather than halves.
   INFERX_CUBLAS_RETURN_IF_ERROR(
       cublasLtMatmulDescCreate(&plan->desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
 
@@ -155,10 +169,32 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
       plan->desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
 
+  if (path == Path::kF8E4M3) {
+    // Bound to placeholders here and rebound per call in LinearF8E4M3. A null
+    // scale pointer makes the heuristic decline the problem outright, which
+    // surfaces as "no algorithm" rather than as a missing-attribute error.
+    float* const unit = reinterpret_cast<float*>(unit_scales.data());
+
+    INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
+        plan->desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &unit, sizeof(unit)));
+    INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
+        plan->desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &unit, sizeof(unit)));
+  }
+
+  // The FP8 path is not a variation on the FP16 one, it is the reason the
+  // mapping above is shaped the way it is: cuBLASLt only implements FP8 matmul
+  // for TN -- A transposed, B not -- and that is exactly what the row-major
+  // linear-layer mapping produces. Storing weights [out, in] as checkpoints do
+  // is therefore not just convenient, it is what makes FP8 reachable at all.
+  const cudaDataType_t ab_type =
+      path == Path::kF8E4M3 ? CUDA_R_8F_E4M3 : CUDA_R_16F;
+
   INFERX_CUBLAS_RETURN_IF_ERROR(
-      cublasLtMatrixLayoutCreate(&plan->a, CUDA_R_16F, k, n, k));
+      cublasLtMatrixLayoutCreate(&plan->a, ab_type, k, n, k));
   INFERX_CUBLAS_RETURN_IF_ERROR(
-      cublasLtMatrixLayoutCreate(&plan->b, CUDA_R_16F, k, m, k));
+      cublasLtMatrixLayoutCreate(&plan->b, ab_type, k, m, k));
+  // Output stays f16 on both paths. An f8 output would need a third scale and
+  // would throw away precision the FP32 epilogue is already holding.
   INFERX_CUBLAS_RETURN_IF_ERROR(
       cublasLtMatrixLayoutCreate(&plan->c, CUDA_R_16F, n, m, n));
 
@@ -190,8 +226,9 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
 
   if (returned == 0) {
     return UnimplementedError(
-        "cuBLASLt has no algorithm for m=", m, " n=", n, " k=", k,
-        " (f16 in, f32 accumulate, workspace ", ws_bytes, " B)");
+        "cuBLASLt has no algorithm for m=", m, " n=", n, " k=", k, " (",
+        path == Path::kF8E4M3 ? "f8e4m3" : "f16",
+        " in, f32 accumulate, workspace ", ws_bytes, " B)");
   }
 
   plan->algo = heuristic.algo;
@@ -211,6 +248,14 @@ StatusOr<CublasLtGemm> CublasLtGemm::Create(size_t workspace_bytes) {
       impl->workspace,
       DeviceBuffer::Allocate(workspace_bytes, DeviceId::Cuda(0)));
 
+  INFERX_ASSIGN_OR_RETURN(
+      impl->unit_scales,
+      DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0)));
+
+  const float ones[2] = {1.0f, 1.0f};
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(impl->unit_scales.data(), ones,
+                                         sizeof(ones), cudaMemcpyHostToDevice));
+
   return CublasLtGemm(std::move(impl));
 }
 
@@ -223,13 +268,15 @@ CublasLtGemm& CublasLtGemm::operator=(CublasLtGemm&&) noexcept = default;
 
 size_t CublasLtGemm::PlanCacheSize() const { return impl_->plans.size(); }
 
-Status CublasLtGemm::Warm(int64_t m, int64_t n, int64_t k) {
+Status CublasLtGemm::Warm(int64_t m, int64_t n, int64_t k, bool fp8) {
   if (m <= 0 || n <= 0 || k <= 0) {
     return InvalidArgumentError("GEMM shape must be positive, got m=", m,
                                 " n=", n, " k=", k);
   }
 
-  INFERX_ASSIGN_OR_RETURN(const Plan* plan, impl_->GetOrBuild(m, n, k));
+  INFERX_ASSIGN_OR_RETURN(
+      const Plan* plan,
+      impl_->GetOrBuild(m, n, k, fp8 ? Path::kF8E4M3 : Path::kF16));
   (void)plan;
 
   return OkStatus();
@@ -273,7 +320,89 @@ Status CublasLtGemm::LinearF16(const TensorView& x, const TensorView& w,
 
   if (m == 0 || n == 0 || k == 0) return OkStatus();
 
-  INFERX_ASSIGN_OR_RETURN(const Plan* plan, impl_->GetOrBuild(m, n, k));
+  INFERX_ASSIGN_OR_RETURN(const Plan* plan,
+                          impl_->GetOrBuild(m, n, k, Path::kF16));
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmul(
+      impl_->lt, plan->desc, &alpha, w.Data(), plan->a, x.Data(), plan->b,
+      &beta, y.Data(), plan->c, y.Data(), plan->c, &plan->algo,
+      impl_->workspace.data(), impl_->workspace.size(), stream));
+
+  return OkStatus();
+}
+
+Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
+                                  const TensorView& y, const float* x_scale_dev,
+                                  const float* w_scale_dev,
+                                  cudaStream_t stream) {
+  for (const auto& [name, t, want] :
+       {std::tuple{"x", &x, DataType::kFloat8E4M3FN},
+        {"w", &w, DataType::kFloat8E4M3FN},
+        {"y", &y, DataType::kFloat16}}) {
+    if (!t->IsDefined()) {
+      return InvalidArgumentError("LinearF8E4M3: ", name, " is undefined");
+    }
+    if (!t->IsCuda()) {
+      return InvalidArgumentError("LinearF8E4M3: ", name, " is on ",
+                                  t->Device().ToString(),
+                                  ", not a CUDA device");
+    }
+    if (t->GetDataType() != want) {
+      return InvalidArgumentError("LinearF8E4M3: ", name, " is ",
+                                  DataTypeName(t->GetDataType()),
+                                  ", expected ", DataTypeName(want));
+    }
+    if (t->Rank() != 2) {
+      return InvalidArgumentError("LinearF8E4M3: ", name, " has rank ",
+                                  t->Rank(), ", expected 2");
+    }
+  }
+
+  if (x_scale_dev == nullptr || w_scale_dev == nullptr) {
+    return InvalidArgumentError("LinearF8E4M3: scale pointers must be non-null");
+  }
+
+  const int64_t m = x.Dim(0);
+  const int64_t k = x.Dim(1);
+  const int64_t n = w.Dim(0);
+
+  if (w.Dim(1) != k) {
+    return InvalidArgumentError("LinearF8E4M3: w is [", n, ", ", w.Dim(1),
+                                "], expected [", n, ", ", k, "] to match x");
+  }
+
+  if (y.Dim(0) != m || y.Dim(1) != n) {
+    return InvalidArgumentError("LinearF8E4M3: y is [", y.Dim(0), ", ",
+                                y.Dim(1), "], expected [", m, ", ", n, "]");
+  }
+
+  // Checked explicitly because the alternative is worse than an error: the
+  // FP8 tensor-core path wants 16-byte-aligned rows, and k is the leading
+  // dimension of both operands in this layout. cuBLASLt answers a misaligned
+  // problem with "no algorithm", which reads as "FP8 is unsupported here"
+  // rather than "your k is odd".
+  if (k % 16 != 0) {
+    return InvalidArgumentError(
+        "LinearF8E4M3: k must be a multiple of 16 for the FP8 path, got ", k);
+  }
+
+  if (m == 0 || n == 0 || k == 0) return OkStatus();
+
+  INFERX_ASSIGN_OR_RETURN(const Plan* plan,
+                          impl_->GetOrBuild(m, n, k, Path::kF8E4M3));
+
+  // Rebound per call: the plan is shared by every tensor of this shape, but the
+  // scales belong to the tensors. Cheap -- this copies a pointer into the
+  // descriptor, it does not touch the device.
+  INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
+      plan->desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_scale_dev,
+      sizeof(w_scale_dev)));
+  INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
+      plan->desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &x_scale_dev,
+      sizeof(x_scale_dev)));
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
