@@ -93,15 +93,43 @@ else()
                  "(see cmake/InferXDependencies.cmake to fetch it)")
 endif()
 
+# ---------------------------------------------------------------------------
+# FlashInfer -- attention kernel templates. Optional, like CUTLASS.
+#
+# Headers only, and specifically only include/flashinfer/. §9 predicted that its
+# wrapper layer would be torch- and JIT-coupled while the template layer is not,
+# and that holds: there is no torch include anywhere under include/flashinfer/.
+# We compile those templates ahead of time against our own TensorView, which is
+# why the pin is by commit rather than by version range -- upgrades are manual
+# merges, and that cost is accepted deliberately (§9, R5).
+#
+# Fetch with:
+#   git submodule add --depth 1 https://github.com/flashinfer-ai/flashinfer.git \
+#       third_party/flashinfer
+#   git -C third_party/flashinfer fetch --depth 1 origin tag v0.6.9
+#   git -C third_party/flashinfer checkout v0.6.9
+# ---------------------------------------------------------------------------
+add_library(inferx_flashinfer INTERFACE)
+add_library(inferx::flashinfer ALIAS inferx_flashinfer)
+
+if(EXISTS "${INFERX_THIRD_PARTY}/flashinfer/include/flashinfer/page.cuh")
+  target_include_directories(inferx_flashinfer SYSTEM INTERFACE
+    "${INFERX_THIRD_PARTY}/flashinfer/include")
+  target_compile_definitions(inferx_flashinfer INTERFACE INFERX_WITH_FLASHINFER=1)
+  set(INFERX_HAVE_FLASHINFER ON)
+  message(STATUS "FlashInfer: found at third_party/flashinfer")
+else()
+  set(INFERX_HAVE_FLASHINFER OFF)
+  message(STATUS "FlashInfer: not present -- the naive paged kernel is used "
+                 "(see cmake/InferXDependencies.cmake to fetch it)")
+endif()
+
 set(BUILD_TESTING ${_inferx_saved_build_testing} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
 # Planned dependencies, by milestone. Add with:
 #   git submodule add --depth 1 <url> third_party/<name>
 #
-#   M3  flashinfer       https://github.com/flashinfer-ai/flashinfer.git
-#                        Kernel templates only; we write our own AOT wrappers
-#                        against inferx::Tensor. Pinned by commit, not tag.
 #   M4  boost (beast)    https://github.com/boostorg/boost.git
 #   M4  simdjson         https://github.com/simdjson/simdjson.git
 #   M4  tokenizers-cpp   https://github.com/mlc-ai/tokenizers-cpp.git

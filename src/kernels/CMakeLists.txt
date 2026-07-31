@@ -13,6 +13,10 @@ add_library(inferx_kernels
 )
 add_library(inferx::kernels ALIAS inferx_kernels)
 
+if(INFERX_HAVE_FLASHINFER)
+  target_sources(inferx_kernels PRIVATE flashinfer_attention.cu)
+endif()
+
 target_link_libraries(inferx_kernels
   PUBLIC
     inferx::core
@@ -21,6 +25,7 @@ target_link_libraries(inferx_kernels
     # cuBLASLt is an implementation detail: gemm.h is pimpl'd precisely so that
     # including it does not drag cublasLt.h into the bench harness or the tests.
     CUDA::cublasLt
+    inferx::flashinfer
 )
 
 # Device code is compiled once per architecture in INFERX_CUDA_ARCHS. Set here
