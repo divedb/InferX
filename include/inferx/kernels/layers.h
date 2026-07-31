@@ -140,6 +140,37 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& out, float scale,
                       cudaStream_t stream = nullptr);
 
+/// \brief Greedy sampling: the argmax of each logits row, on the device.
+///
+/// §4 step 7 in its simplest form. Sampling on the GPU is what makes the
+/// overlap pipeline possible at all: if the host has to read the logits to
+/// learn the next token, it has to wait for them, and that wait is the
+/// synchronization §5.2 forbids. Writing the token id straight into the buffer
+/// the next step's embedding lookup reads means the host never needs the value
+/// to keep going -- only positions and slots, which are predictable.
+///
+/// \param logits `[tokens, vocab]` bf16.
+/// \param rows   `[n]` int32, which rows to sample. A prefill produces logits
+///               for every prompt token and wants only the last, so sampling
+///               all of them would be `tokens` times the work to discard all
+///               but one row of it.
+/// \param out    `[n]` int32, receiving one token id per requested row.
+Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
+                    const TensorView& out, cudaStream_t stream = nullptr);
+
+/// \brief Copies `src[i]` into `dst[slot[i]]`, on the device.
+///
+/// Places each sequence's freshly sampled token where the next step's
+/// embedding lookup will read it. A device-to-device scatter rather than a
+/// round trip through the host, which is the entire point: the token never
+/// leaves the GPU on the critical path.
+///
+/// \param src   `[n]` int32, sampled ids in batch order.
+/// \param dst   `[m]` int32, the next step's token buffer.
+/// \param slots `[n]` int32, destination index in `dst` for each entry.
+Status ScatterTokens(const TensorView& src, const TensorView& dst,
+                     const TensorView& slots, cudaStream_t stream = nullptr);
+
 /// \brief `out[t,:] = table[ids[t],:]`, an embedding lookup.
 ///
 /// \param table `[vocab, hidden]` bf16.

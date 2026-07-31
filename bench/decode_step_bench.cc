@@ -19,6 +19,7 @@
 // what says which one to keep.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -117,6 +118,13 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
+  // Before any capture: both quantization and sampling change what a graph
+  // would record, and both refuse once one exists.
+  if (const Status s = model.EnableDeviceSampling(8); !s.ok()) {
+    std::fprintf(stderr, "device sampling: %s\n", s.ToString().c_str());
+    return 1;
+  }
+
   if (fp8) {
     const Status q = model.QuantizeWeightsToF8();
     if (!q.ok()) {
@@ -195,6 +203,90 @@ int Main(int argc, char** argv) {
 
   std::printf("\ncaptured graphs: %ld\n",
               static_cast<long>(model.captured_graphs()));
+
+  // --- §5.2 depth 0 against depth 1 -----------------------------------------
+  // Sustained generation rather than a single step, because that is where the
+  // pipeline shows: overlap hides the host's per-step work behind the GPU, and
+  // a one-shot measurement has nothing to hide it behind.
+  {
+    constexpr int64_t kBatch = 1;
+    constexpr int kSteps = 60;
+
+    model::ForwardBatch b =
+        MakeDecodeBatch(kBatch, kContext, block_size, max_blocks_per_seq);
+
+    std::vector<float> logits;
+    std::vector<int32_t> tokens;
+
+    // Depth 0: wait for every step before issuing the next.
+    for (int i = 0; i < 5; ++i) (void)model.Step(b, &logits);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kSteps; ++i) (void)model.Step(b, &logits);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    // Device sampling but still serialized: issue, then immediately wait. This
+    // isolates what on-device sampling is worth on its own -- it removes a
+    // 304 KB logits copy per token in favour of a 4-byte one -- from what the
+    // overlap adds on top. Without this row the two would be reported as one
+    // number and credited to the pipeline.
+    b.tokens_from_device = true;
+    for (int i = 0; i < 5; ++i) {
+      (void)model.StepAsync(b);
+      (void)model.AwaitStep(&tokens);
+    }
+
+    // Interleaved, per-step minima. Two facts forced this shape.
+    //
+    // First, measuring each configuration as one 60-step block put a 35% drift
+    // between the first block and the rest -- running the *same* loop at both
+    // ends produced 5.90 and 7.98 ms/token. Bulk wall-clock over sustained
+    // generation measures the machine warming up as much as the code.
+    //
+    // Second, and more importantly: the two arrangements below issue the same
+    // sequence of calls. `Await(i); StepAsync(i+1)` never has two steps in
+    // flight, so it is not a pipeline -- it is the serialized loop with the
+    // issue and the wait written in the other order. Real depth-1 overlap needs
+    // step N+1 enqueued *before* step N is awaited, which needs a per-step
+    // event and result buffer rather than the single pair this holds. That is
+    // not built, and reporting these two as "serialized vs overlapped" would
+    // claim it was.
+    //
+    // So what is compared is what actually differs: where sampling happens.
+    double best_host = 1e9, best_gpu = 1e9;
+
+    for (int round = 0; round < 12; ++round) {
+      {
+        b.tokens_from_device = false;
+        const auto a0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) (void)model.Step(b, &logits);
+        const auto a1 = std::chrono::steady_clock::now();
+        best_host = std::min(
+            best_host,
+            std::chrono::duration<double, std::milli>(a1 - a0).count() / 5);
+      }
+      {
+        b.tokens_from_device = true;
+        const auto a0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 5; ++i) {
+          (void)model.StepAsync(b);
+          (void)model.AwaitStep(&tokens);
+        }
+        const auto a1 = std::chrono::steady_clock::now();
+        best_gpu = std::min(
+            best_gpu,
+            std::chrono::duration<double, std::milli>(a1 - a0).count() / 5);
+      }
+    }
+
+    const double sync_ms = best_host;
+    const double sampled_ms = best_gpu;
+
+    std::printf("\nsustained generation, batch 1 (interleaved, per-burst minima):\n");
+    std::printf("  host sampling  %.4f ms/token  %6.1f tok/s\n",
+                sync_ms, 1000.0 / sync_ms);
+    std::printf("  gpu sampling   %.4f ms/token  %6.1f tok/s   %.2fx\n",
+                sampled_ms, 1000.0 / sampled_ms, sync_ms / sampled_ms);
+  }
 
   return failures == 0 ? 0 : 1;
 }

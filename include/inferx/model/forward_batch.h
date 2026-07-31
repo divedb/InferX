@@ -34,6 +34,17 @@ struct ForwardBatch {
   int64_t num_seqs = 0;
   int64_t max_blocks_per_seq = 0;
 
+  /// When true, `token_ids` is ignored and the device buffer is used as it
+  /// stands -- because the previous step's sampler already wrote this step's
+  /// tokens into it.
+  ///
+  /// This is what closes §5.2's loop. Uploading token ids from the host would
+  /// mean the host had to know them, which would mean waiting for the previous
+  /// step to finish, which is the synchronization the pipeline exists to
+  /// remove. A prefill still supplies its tokens normally; only a
+  /// device-sampled continuation sets this.
+  bool tokens_from_device = false;
+
   /// Which token indices need logits. Usually one per sequence -- the last --
   /// because computing the LM head over every prefill token costs a
   /// `[tokens, 151936]` GEMM to throw nearly all of it away.

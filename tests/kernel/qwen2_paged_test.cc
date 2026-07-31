@@ -410,5 +410,84 @@ TEST_F(PagedModelTest, Fp8WeightsStillAnswerCorrectly) {
                                 "quantization should produce";
 }
 
+// The overlap pipeline, against the synchronous path it replaces.
+//
+// §5.2 depth 1: issue a step and return without waiting, so the host can build
+// the next one while the GPU works. T6 keeps depth 0 as the correctness
+// reference, and this is that comparison -- the two must generate identical
+// tokens, because nothing about the arithmetic changed.
+//
+// What makes it possible is sampling on the device. The argmax writes each
+// token straight into the buffer the next replay reads, so the host never has
+// to learn the value to keep issuing work; it only needs positions and slots,
+// which follow from the step count alone.
+TEST_F(PagedModelTest, OverlappedGenerationMatchesSynchronous) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+  constexpr int kGenerate = 12;
+
+  // --- depth 0: sample on the host, wait every step --------------------------
+  std::vector<int32_t> synchronous;
+  {
+    TestSequence seq(model_->kv_pool(), 16);
+    auto batch = seq.MakeBatch(prompt, 0);
+    ASSERT_TRUE(batch.ok()) << batch.status();
+
+    std::vector<float> logits;
+    ASSERT_TRUE(model_->Step(*batch, &logits).ok());
+
+    for (int i = 0; i < kGenerate; ++i) {
+      const int32_t next = static_cast<int32_t>(Argmax(logits));
+      synchronous.push_back(next);
+
+      auto step = seq.MakeBatch(
+          {next}, static_cast<int64_t>(prompt.size()) + i);
+      ASSERT_TRUE(step.ok()) << step.status();
+      ASSERT_TRUE(model_->Step(*step, &logits).ok());
+    }
+  }
+
+  // --- depth 1: sample on the device, never wait inside the loop -------------
+  ASSERT_TRUE(model_->EnableDeviceSampling(8).ok());
+
+  std::vector<int32_t> overlapped;
+  {
+    TestSequence seq(model_->kv_pool(), 16);
+    auto batch = seq.MakeBatch(prompt, 0);
+    ASSERT_TRUE(batch.ok()) << batch.status();
+
+    const Status first = model_->StepAsync(*batch);
+    ASSERT_TRUE(first.ok()) << first;
+
+    for (int i = 0; i < kGenerate; ++i) {
+      // Built *before* the previous step's result is read: positions and slots
+      // do not depend on which token came out, only on how many have. This is
+      // the speculation §5.2 describes, and it is exact rather than a guess --
+      // one token per sequence per step.
+      auto step = seq.MakeBatch(
+          {0}, static_cast<int64_t>(prompt.size()) + i);
+      ASSERT_TRUE(step.ok()) << step.status();
+      step->tokens_from_device = true;  // the sampler already wrote it
+
+      std::vector<int32_t> tokens;
+      ASSERT_TRUE(model_->AwaitStep(&tokens).ok());
+      ASSERT_EQ(tokens.size(), 1u);
+      overlapped.push_back(tokens[0]);
+
+      // The token id in the batch is ignored for a device-sampled step: the
+      // buffer already holds what the sampler wrote.
+      ASSERT_TRUE(model_->StepAsync(*step).ok());
+    }
+
+    std::vector<int32_t> drain;
+    ASSERT_TRUE(model_->AwaitStep(&drain).ok());
+  }
+
+  ASSERT_EQ(overlapped.size(), synchronous.size());
+  EXPECT_EQ(overlapped, synchronous)
+      << "the overlapped pipeline generated different tokens than the "
+         "synchronous reference";
+  EXPECT_EQ(overlapped[0], kParis);
+}
+
 }  // namespace
 }  // namespace inferx::model

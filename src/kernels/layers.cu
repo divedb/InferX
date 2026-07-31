@@ -280,6 +280,62 @@ __global__ void PagedAttentionKernel(
   }
 }
 
+// One block per row. Each thread scans a strided slice of the vocabulary and
+// the block reduces to a single (value, index) pair. Ties go to the lower index
+// so the result is deterministic, which matters because two runs of the same
+// prompt must produce the same token.
+__global__ void ArgmaxKernel(const bf16* __restrict__ logits,
+                             const int32_t* __restrict__ rows,
+                             int32_t* __restrict__ out, int64_t vocab) {
+  __shared__ float best_val[256];
+  __shared__ int32_t best_idx[256];
+
+  const int64_t which = blockIdx.x;
+  const bf16* r = logits + static_cast<int64_t>(rows[which]) * vocab;
+
+  float v = -INFINITY;
+  int32_t i = 0;
+
+  for (int64_t j = threadIdx.x; j < vocab; j += blockDim.x) {
+    const float x = ToF32(r[j]);
+    if (x > v) {
+      v = x;
+      i = static_cast<int32_t>(j);
+    }
+  }
+
+  best_val[threadIdx.x] = v;
+  best_idx[threadIdx.x] = i;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const int other = threadIdx.x + stride;
+      const bool take = best_val[other] > best_val[threadIdx.x] ||
+                        (best_val[other] == best_val[threadIdx.x] &&
+                         best_idx[other] < best_idx[threadIdx.x]);
+      if (take) {
+        best_val[threadIdx.x] = best_val[other];
+        best_idx[threadIdx.x] = best_idx[other];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) out[which] = best_idx[0];
+}
+
+__global__ void ScatterTokensKernel(const int32_t* __restrict__ src,
+                                    int32_t* __restrict__ dst,
+                                    const int32_t* __restrict__ slots,
+                                    int64_t n, int64_t m) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int32_t slot = slots[i];
+    if (slot >= 0 && slot < m) dst[slot] = src[i];
+  }
+}
+
 __global__ void EmbeddingKernel(const bf16* __restrict__ table,
                                 const int32_t* __restrict__ ids,
                                 bf16* __restrict__ out, int64_t hidden,
@@ -689,6 +745,58 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
       static_cast<const int32_t*>(q_pos.Data()),
       static_cast<bf16*>(out.Data()), q_heads, kv_heads, head_dim, block_size,
       max_blocks, scale, max_keys);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
+                    const TensorView& out, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kInt32, 1, "out"));
+
+  const int64_t n = rows.Dim(0);
+  const int64_t vocab = logits.Dim(1);
+
+  if (out.Dim(0) != n) {
+    return InvalidArgumentError("out has ", out.Dim(0), " entries but ", n,
+                                " rows were requested");
+  }
+
+  if (n == 0) return OkStatus();
+
+  ArgmaxKernel<<<static_cast<unsigned>(n), 256, 0, stream>>>(
+      static_cast<const bf16*>(logits.Data()),
+      static_cast<const int32_t*>(rows.Data()),
+      static_cast<int32_t*>(out.Data()), vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status ScatterTokens(const TensorView& src, const TensorView& dst,
+                     const TensorView& slots, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(src, DataType::kInt32, 1, "src"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(dst, DataType::kInt32, 1, "dst"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(slots, DataType::kInt32, 1, "slots"));
+
+  const int64_t n = src.Dim(0);
+
+  if (slots.Dim(0) != n) {
+    return InvalidArgumentError("slots has ", slots.Dim(0), " entries but src "
+                                "has ", n);
+  }
+
+  if (n == 0) return OkStatus();
+
+  constexpr int kBlock = 128;
+  const unsigned grid = static_cast<unsigned>((n + kBlock - 1) / kBlock);
+
+  ScatterTokensKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const int32_t*>(src.Data()),
+      static_cast<int32_t*>(dst.Data()),
+      static_cast<const int32_t*>(slots.Data()), n, dst.Dim(0));
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

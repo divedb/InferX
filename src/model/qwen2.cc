@@ -220,6 +220,16 @@ struct Qwen2Model::Impl {
 
   // FP8 weight mode. The activation staging buffers are sized for the widest
   // GEMM input a layer has, which is the intermediate width feeding down_proj.
+  // On-device sampling, and the buffers that let a decode step feed its own
+  // successor without the host in between.
+  bool sample_on_device = false;
+  DeviceBuffer sampled_ids;      // [logits rows] int32, this step's tokens
+  DeviceBuffer sample_slots;     // where each sampled token lands in token_ids
+  DeviceBuffer sample_rows;      // which logits rows to sample
+  void* pinned_sampled = nullptr;  // host-visible copy, read one step late
+  cudaEvent_t sampled_ready = nullptr;
+  int64_t sampled_count = 0;
+
   bool weights_f8 = false;
   std::vector<DeviceBuffer> f8_buffers;
   DeviceBuffer act_f8;        // quantized activations, reused every GEMM
@@ -240,6 +250,8 @@ struct Qwen2Model::Impl {
     for (DecodeGraph& g : graphs) {
       if (g.exec != nullptr) cudaGraphExecDestroy(g.exec);
     }
+    if (sampled_ready != nullptr) cudaEventDestroy(sampled_ready);
+    if (pinned_sampled != nullptr) cudaFreeHost(pinned_sampled);
     if (step_begin != nullptr) cudaEventDestroy(step_begin);
     if (step_end != nullptr) cudaEventDestroy(step_end);
     if (pinned != nullptr) cudaFreeHost(pinned);
@@ -588,7 +600,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     return OkStatus();
   };
 
-  INFERX_RETURN_IF_ERROR(upload(token_ids, batch.token_ids));
+  // Skipped when the sampler already wrote them: overwriting would replace the
+  // token the GPU chose with whatever placeholder the caller passed.
+  if (!batch.tokens_from_device) {
+    INFERX_RETURN_IF_ERROR(upload(token_ids, batch.token_ids));
+  }
   INFERX_RETURN_IF_ERROR(upload(positions, batch.positions));
   INFERX_RETURN_IF_ERROR(upload(slots_buf, batch.slots));
   INFERX_RETURN_IF_ERROR(upload(seq_of_token_buf, batch.seq_of_token));
@@ -849,6 +865,61 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
       logits.View(DataType::kBFloat16, Shape({tokens, config.vocab_size})));
 
   INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, lm_head, logits_v, stream));
+
+  // Sampling closes the loop inside the captured region. The argmax writes each
+  // sequence's next token, and the scatter drops it straight into the token
+  // buffer the *next* replay will read. Nothing crosses to the host on this
+  // path, which is what lets the host run ahead: it can compute positions and
+  // slots for step N+1 -- both predictable -- without knowing what step N
+  // produced.
+  //
+  // Only the requested logits rows are sampled, which for decode is one per
+  // sequence.
+  if (sample_on_device && sampled_count > 0) {
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView wanted,
+        logits.View(DataType::kBFloat16,
+                    Shape({tokens, config.vocab_size})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView ids_out,
+        TensorView::Create(sampled_ids.data(), DataType::kInt32,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView slots_out,
+        TensorView::Create(sample_slots.data(), DataType::kInt32,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView rows_in,
+        TensorView::Create(sample_rows.data(), DataType::kInt32,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+
+    INFERX_RETURN_IF_ERROR(
+        kernels::ArgmaxSample(wanted, rows_in, ids_out, stream));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView next_ids,
+        TensorView::Create(token_ids.data(), DataType::kInt32, Shape({tokens}),
+                           DeviceId::Cuda(0)));
+
+    INFERX_RETURN_IF_ERROR(
+        kernels::ScatterTokens(ids_out, next_ids, slots_out, stream));
+
+    // A single async copy out, not waited on here. The host reads it a step
+    // later, which is §4 step 8: results from step N are consumed at the start
+    // of step N+1.
+    // The copy out is stream-ordered work and belongs in the graph. The event
+    // that tells the host it has landed does NOT: an event recorded inside a
+    // captured region becomes a graph-internal dependency node, and replaying
+    // the graph never signals the host-visible event. cudaEventSynchronize then
+    // returns immediately on something that was never set, and generation
+    // reports thousands of tokens a second while reading a stale buffer. The
+    // record lives in StepAsync, after the launch.
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        pinned_sampled, sampled_ids.data(),
+        static_cast<size_t>(sampled_count) * sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+  }
 
   return OkStatus();
 }
@@ -1165,8 +1236,15 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
     probe.positions.push_back(0);
     probe.seq_of_token.push_back(static_cast<int32_t>(s));
     probe.slots.push_back(0);
+    // One logits row per sequence, which is what a decode batch asks for. A
+    // probe requesting a single row would bake a one-row sampler into a graph
+    // meant to serve a batch of N.
+    probe.logits_indices.push_back(static_cast<int32_t>(s));
   }
-  probe.logits_indices.push_back(0);
+
+  // The sampler is part of the body and its launch dimensions come from this,
+  // so it has to be set before capture or the graph records no sampling at all.
+  impl_->sampled_count = num_seqs;
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(probe));
 
@@ -1314,6 +1392,130 @@ Status Qwen2Model::QuantizeWeightsToF8() {
 }
 
 bool Qwen2Model::weights_are_f8() const { return impl_->weights_f8; }
+
+Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
+  // Refused after capture, and this one is worth spelling out: a graph records
+  // the kernels present when it was taken. Enabling sampling afterwards leaves
+  // every replay running the body that has no sampler in it -- so no token is
+  // written, no event is recorded, and AwaitStep returns instantly on an event
+  // that was never signalled. Nothing errors; generation simply produces
+  // whatever was in the buffer, at an impossible rate. It was found because a
+  // benchmark read 7952 tokens/second.
+  if (!impl_->graphs.empty()) {
+    return FailedPreconditionError(
+        "cannot enable device sampling after capturing a graph; enable it "
+        "first, then capture");
+  }
+
+  if (max_rows <= 0) {
+    return InvalidArgumentError("max_rows must be positive, got ", max_rows);
+  }
+
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sampled_ids,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
+                             DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_slots,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
+                             DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_rows,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
+                             DeviceId::Cuda(0)));
+
+  if (impl_->pinned_sampled != nullptr) cudaFreeHost(impl_->pinned_sampled);
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaHostAlloc(&impl_->pinned_sampled,
+                    static_cast<size_t>(max_rows) * sizeof(int32_t),
+                    cudaHostAllocDefault));
+
+  if (impl_->sampled_ready == nullptr) {
+    INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl_->sampled_ready));
+  }
+
+  impl_->sample_on_device = true;
+
+  return OkStatus();
+}
+
+Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
+  if (!impl_->sample_on_device) {
+    return FailedPreconditionError(
+        "StepAsync needs device sampling; call EnableDeviceSampling first");
+  }
+
+  if (impl_->pool == nullptr) {
+    return FailedPreconditionError("StepAsync requires a KV cache");
+  }
+
+  const int64_t total_slots =
+      impl_->pool->num_blocks() * impl_->pool->block_size();
+  INFERX_RETURN_IF_ERROR(batch.Validate(impl_->config.vocab_size, total_slots));
+
+  impl_->sampled_count = static_cast<int64_t>(batch.logits_indices.size());
+
+  INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(batch));
+
+  // Where each sampled token belongs in the next step's token buffer. For
+  // decode that is the same index the sequence occupies now, since one token
+  // per sequence goes in and one comes out.
+  {
+    // Which logits rows to sample, and where each result belongs in the next
+    // step's token buffer. For decode these coincide -- one token per sequence
+    // in, one out, same index -- but a prefill samples its last row and writes
+    // to its sequence's slot, so they are uploaded separately.
+    const std::vector<int32_t> rows(batch.logits_indices.begin(),
+                                    batch.logits_indices.end());
+
+    std::vector<int32_t> slots(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      slots[i] = batch.seq_of_token[static_cast<size_t>(rows[i])];
+    }
+
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_rows.data(), rows.data(), rows.size() * sizeof(int32_t),
+        cudaMemcpyHostToDevice, impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_slots.data(), slots.data(),
+        slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+  }
+
+  const int64_t tokens = batch.num_tokens();
+
+  cudaGraphExec_t graph =
+      impl_->FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
+
+  if (graph != nullptr) {
+    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, impl_->stream));
+  } else {
+    INFERX_RETURN_IF_ERROR(impl_->LaunchDecodeBody(
+        tokens, batch.num_seqs, batch.max_blocks_per_seq));
+  }
+
+  // Recorded here rather than inside the body, so it is a real host-visible
+  // event rather than a node buried in the graph. \see LaunchDecodeBody.
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaEventRecord(impl_->sampled_ready, impl_->stream));
+
+  // No synchronize. That absence is the entire feature.
+  return OkStatus();
+}
+
+Status Qwen2Model::AwaitStep(std::vector<int32_t>* out_tokens) {
+  if (impl_->sampled_count == 0) {
+    out_tokens->clear();
+    return OkStatus();
+  }
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaEventSynchronize(impl_->sampled_ready));
+
+  const auto* ids = static_cast<const int32_t*>(impl_->pinned_sampled);
+  out_tokens->assign(ids, ids + impl_->sampled_count);
+
+  return OkStatus();
+}
 
 double Qwen2Model::last_step_device_ms() const {
   return impl_->last_device_ms;

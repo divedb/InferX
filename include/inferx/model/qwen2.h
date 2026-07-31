@@ -152,6 +152,35 @@ class Qwen2Model {
   /// \brief True once `QuantizeWeightsToF8` has run.
   bool weights_are_f8() const;
 
+  /// \brief Turns on device-side greedy sampling.
+  ///
+  /// With it on, a decode step samples its own next token and writes it into
+  /// the buffer the following step reads, so the host never needs the value to
+  /// keep issuing work. That is the precondition for `StepAsync`: §5.2's
+  /// pipeline only exists if the loop can run ahead of its own results.
+  ///
+  /// \param max_rows Sampling rows per step, i.e. the largest batch that will
+  ///                 be run. One row per sequence.
+  Status EnableDeviceSampling(int64_t max_rows);
+
+  /// \brief Issues a step and returns without waiting for it.
+  ///
+  /// §5.2 at depth 1. The step is enqueued and the call returns; the caller is
+  /// free to prepare the next one while the GPU works. Nothing about the
+  /// arithmetic changes -- `Step` is this followed immediately by `AwaitStep`,
+  /// and T6 keeps that synchronous form as the reference the overlapped one is
+  /// diffed against.
+  ///
+  /// Requires `EnableDeviceSampling`: without it the next step's token ids
+  /// would have to come back through the host, which is the wait this removes.
+  Status StepAsync(const ForwardBatch& batch);
+
+  /// \brief Waits for the outstanding `StepAsync` and returns its tokens.
+  ///
+  /// \param out_tokens Receives one sampled token per logits row, in the order
+  ///                   the batch requested them.
+  Status AwaitStep(std::vector<int32_t>* out_tokens);
+
   /// \brief GPU time of the last `Step`, in milliseconds.
   ///
   /// Measured with events around the launch, so it covers the device work and

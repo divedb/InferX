@@ -33,7 +33,10 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
   for (int64_t i = 0; i < n; ++i) {
     const size_t u = static_cast<size_t>(i);
 
-    if (token_ids[u] < 0 || token_ids[u] >= vocab_size) {
+    // Not checked when they come from the device: the value in the vector is a
+    // placeholder the model never reads.
+    if (!tokens_from_device &&
+        (token_ids[u] < 0 || token_ids[u] >= vocab_size)) {
       return InvalidArgumentError("token_ids[", i, "] = ", token_ids[u],
                                   " is outside the vocabulary");
     }
