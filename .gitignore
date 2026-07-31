@@ -25,3 +25,5 @@ models/
 *.safetensors
 *.gguf
 *.bin
+testdata/
+.venv-ref/
