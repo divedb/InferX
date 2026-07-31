@@ -22,7 +22,9 @@ include(InferXOptions)
 include(InferXCuda)
 include(InferXDependencies)
 
+add_subdirectory(src/common)
 add_subdirectory(src/core)
+add_subdirectory(src/model)
 
 if(INFERX_CUDA_MEETS_FLOOR)
   add_subdirectory(src/kernels)

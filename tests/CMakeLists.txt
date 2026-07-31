@@ -6,8 +6,11 @@ function(inferx_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
+    inferx::common
+    inferx::model
     inferx::flags
     GTest::gtest_main
+    GTest::gmock
   )
   gtest_discover_tests(${name}
     PROPERTIES LABELS unit
@@ -34,6 +37,9 @@ function(inferx_add_kernel_test name)
 endfunction()
 
 inferx_add_test(dtype_test             unit/dtype_test.cc)
+inferx_add_test(json_test              unit/json_test.cc)
+inferx_add_test(safetensors_test       unit/safetensors_test.cc)
+inferx_add_test(checkpoint_conformance_test unit/checkpoint_conformance_test.cc)
 inferx_add_test(intrusive_ref_cnt_ptr_test unit/intrusive_ref_cnt_ptr_test.cc)
 inferx_add_test(shape_test             unit/shape_test.cc)
 inferx_add_test(tensor_view_test       unit/tensor_view_test.cc)

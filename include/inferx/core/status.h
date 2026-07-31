@@ -70,6 +70,17 @@ Status UnimplementedError(Args&&... args) {
   return absl::UnimplementedError(absl::StrCat(std::forward<Args>(args)...));
 }
 
+/// \brief Returns a Status with code `absl::StatusCode::kNotFound` and a
+///        message constructed from the given arguments.
+///
+/// \param ...args The arguments to be concatenated into the error message.
+/// \return        A Status with code `absl::StatusCode::kNotFound` and the
+///                constructed message.
+template <typename... Args>
+Status NotFoundError(Args&&... args) {
+  return absl::NotFoundError(absl::StrCat(std::forward<Args>(args)...));
+}
+
 /// \brief Returns a Status with code `absl::StatusCode::kOutOfRange`
 ///        and a message constructed from the given arguments.
 ///
