@@ -5,11 +5,52 @@
 #include <string_view>
 #include <vector>
 
+#include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
 #include "inferx/model/config.h"
 #include "inferx/model/safetensors.h"
 
 namespace inferx::model {
+
+/// \brief One step's worth of work, flattened across every sequence in it.
+///
+/// The precursor to §5's `BatchPlan`, and shaped like it on purpose: the
+/// scheduler decides all of this and the model does none of it. Prefill and
+/// decode are the same structure with different proportions -- prefill is many
+/// tokens from one sequence, decode is one token from each of many -- which is
+/// what lets a single forward path serve both and, later, a mixed batch (§8.1).
+///
+/// Everything is per-token and parallel: index `i` of `token_ids`, `positions`,
+/// `seq_of_token` and `slots` all describe the same token.
+struct ForwardBatch {
+  /// Token ids to run, concatenated across sequences.
+  std::vector<int32_t> token_ids;
+  /// Absolute position of each token in its own sequence. Also how many keys
+  /// precede it, which is what makes the attention causal without a mask.
+  std::vector<int32_t> positions;
+  /// Which sequence each token belongs to: a row index into `block_table`.
+  std::vector<int32_t> seq_of_token;
+  /// Where each token's K/V is written: `block · block_size + offset`.
+  std::vector<int32_t> slots;
+
+  /// Row-major `[num_seqs, max_blocks_per_seq]`. Unused entries may be
+  /// anything; attention never reads past a token's own position.
+  std::vector<int32_t> block_table;
+  int64_t num_seqs = 0;
+  int64_t max_blocks_per_seq = 0;
+
+  /// Which token indices need logits. Usually one per sequence -- the last --
+  /// because computing the LM head over every prefill token costs a
+  /// `[tokens, 151936]` GEMM to throw nearly all of it away.
+  std::vector<int32_t> logits_indices;
+
+  int64_t num_tokens() const {
+    return static_cast<int64_t>(token_ids.size());
+  }
+
+  /// \brief Checks the internal consistency the model would otherwise trust.
+  Status Validate(int64_t vocab_size, int64_t total_slots) const;
+};
 
 /// \brief A Qwen2/Llama decoder stack, resident on one GPU, running in bf16.
 ///
@@ -66,6 +107,34 @@ class Qwen2Model {
   /// moving `tokens × 151936` floats over PCIe when only the last row matters.
   Status ForwardLastLogits(const std::vector<int32_t>& token_ids,
                            std::vector<float>* out_logits);
+
+  /// \brief Allocates the paged KV cache. Required before `Step`.
+  ///
+  /// Separate from `Load` because the pool's size is a serving decision -- how
+  /// much VRAM is left after the weights, and how many concurrent sequences
+  /// that buys -- not a property of the model.
+  ///
+  /// \param num_blocks Blocks in the pool, shared by all sequences.
+  /// \param block_size Tokens per block. 16 by default (T10).
+  Status AttachKvCache(int64_t num_blocks, int64_t block_size = 16);
+
+  /// \brief The pool, for the scheduler to allocate blocks from.
+  ///
+  /// The model owns the allocation because the executor owns device memory
+  /// (§3.1); it never decides *who* gets a block, which is why this is handed
+  /// out rather than wrapped.
+  KvBlockPool* kv_pool();
+
+  /// \brief Runs one step over a batch, reading and writing the KV cache.
+  ///
+  /// This is the path that makes the engine an engine: `batch` may hold a
+  /// prefill, a set of decode steps, or both, and the model neither knows nor
+  /// cares which. Requires `AttachKvCache`.
+  ///
+  /// \param batch      What to run. \see ForwardBatch.
+  /// \param out_logits Receives `[logits_indices.size() × vocab]` fp32,
+  ///                   row-major, in the order `logits_indices` lists.
+  Status Step(const ForwardBatch& batch, std::vector<float>* out_logits);
 
   const ModelConfig& config() const;
 
