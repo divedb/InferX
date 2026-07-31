@@ -5,6 +5,7 @@
 # tests run without a device, the same way the scheduler will (§3.1).
 
 add_library(inferx_model
+  config.cc
   safetensors.cc
 )
 add_library(inferx::model ALIAS inferx_model)

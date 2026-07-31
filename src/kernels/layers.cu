@@ -1,0 +1,476 @@
+#include "inferx/kernels/layers.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include "inferx/core/cuda_utils.h"
+
+namespace inferx::kernels {
+namespace {
+
+using bf16 = __nv_bfloat16;
+
+constexpr int kWarp = 32;
+
+__device__ inline float ToF32(bf16 x) { return __bfloat162float(x); }
+__device__ inline bf16 ToBf16(float x) { return __float2bfloat16(x); }
+
+// Sums `v` across the block via shared memory. `tile` must hold blockDim.x
+// floats. Every thread gets the total.
+template <typename Op>
+__device__ float BlockReduce(float v, float* tile, Op op, float identity) {
+  const int tid = threadIdx.x;
+
+  tile[tid] = v;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) tile[tid] = op(tile[tid], tile[tid + stride]);
+    __syncthreads();
+  }
+
+  const float total = tile[0];
+  __syncthreads();  // before any caller reuses the tile
+
+  (void)identity;
+  return total;
+}
+
+struct SumOp {
+  __device__ float operator()(float a, float b) const { return a + b; }
+};
+
+// One block per token. hidden is a multiple of the block size in every model we
+// target, but the loops are written as grid-strides so an odd width still works.
+__global__ void RmsNormKernel(const bf16* __restrict__ x,
+                              const bf16* __restrict__ weight,
+                              bf16* __restrict__ out, int64_t hidden,
+                              float eps) {
+  extern __shared__ float tile[];
+
+  const int64_t row = blockIdx.x;
+  const bf16* xr = x + row * hidden;
+  bf16* outr = out + row * hidden;
+
+  float sumsq = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const float v = ToF32(xr[i]);
+    sumsq += v * v;
+  }
+
+  sumsq = BlockReduce(sumsq, tile, SumOp{}, 0.0f);
+
+  // rsqrtf of the fp32 mean. Computed once per block and broadcast rather than
+  // per element, which also keeps every element scaled by bitwise the same
+  // factor -- a per-thread recomputation would not be guaranteed to.
+  const float inv = rsqrtf(sumsq / static_cast<float>(hidden) + eps);
+
+  for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+    outr[i] = ToBf16(ToF32(xr[i]) * inv * ToF32(weight[i]));
+  }
+}
+
+// One block per (token, head); each thread owns one index below head_dim/2 and
+// rotates the pair (j, j + half) together.
+__global__ void RopeKernel(bf16* __restrict__ q, bf16* __restrict__ k,
+                           const int32_t* __restrict__ positions,
+                           int64_t q_heads, int64_t kv_heads, int64_t head_dim,
+                           float theta) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t half = head_dim / 2;
+  const float pos = static_cast<float>(positions[token]);
+
+  for (int64_t j = threadIdx.x; j < half; j += blockDim.x) {
+    // inv_freq[j] = theta^(-2j/d). __powf is fine here: the exponent is small
+    // and the result feeds a sinf/cosf whose own error dominates.
+    const float inv_freq =
+        __powf(theta, -2.0f * static_cast<float>(j) / static_cast<float>(head_dim));
+    const float angle = pos * inv_freq;
+
+    float s, c;
+    __sincosf(angle, &s, &c);
+
+    if (head < q_heads) {
+      bf16* row = q + (token * q_heads + head) * head_dim;
+      const float lo = ToF32(row[j]);
+      const float hi = ToF32(row[j + half]);
+      row[j] = ToBf16(lo * c - hi * s);
+      row[j + half] = ToBf16(hi * c + lo * s);
+    }
+
+    if (head < kv_heads) {
+      bf16* row = k + (token * kv_heads + head) * head_dim;
+      const float lo = ToF32(row[j]);
+      const float hi = ToF32(row[j + half]);
+      row[j] = ToBf16(lo * c - hi * s);
+      row[j + half] = ToBf16(hi * c + lo * s);
+    }
+  }
+}
+
+__global__ void SiluMulKernel(const bf16* __restrict__ gate,
+                              const bf16* __restrict__ up,
+                              bf16* __restrict__ out, int64_t n) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const float g = ToF32(gate[i]);
+    // silu(g) = g / (1 + e^-g). Computed in fp32; in bf16 the sigmoid would
+    // quantize to about 256 distinct values over its useful range.
+    const float silu = g / (1.0f + __expf(-g));
+    out[i] = ToBf16(silu * ToF32(up[i]));
+  }
+}
+
+// One block per (query token, query head). Two passes over the keys: one for
+// the max and sum, one to accumulate V. Simple and obviously correct, which is
+// what this kernel is for.
+__global__ void AttentionKernel(const bf16* __restrict__ q,
+                                const bf16* __restrict__ k,
+                                const bf16* __restrict__ v,
+                                bf16* __restrict__ out, int64_t tokens,
+                                int64_t q_heads, int64_t kv_heads,
+                                int64_t head_dim, float scale) {
+  extern __shared__ float smem[];
+  float* tile = smem;              // blockDim.x floats for reductions
+  float* scores = smem + blockDim.x;  // one float per key
+
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t group = q_heads / kv_heads;
+  const int64_t kv_head = head / group;  // GQA, without materializing repeats
+
+  const bf16* qr = q + (token * q_heads + head) * head_dim;
+
+  // Causal: a query at position `token` sees keys 0..token inclusive.
+  const int64_t n_keys = token + 1;
+
+  float running_max = -INFINITY;
+
+  for (int64_t j = 0; j < n_keys; ++j) {
+    const bf16* kr = k + (j * kv_heads + kv_head) * head_dim;
+
+    float dot = 0.0f;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+      dot += ToF32(qr[d]) * ToF32(kr[d]);
+    }
+    dot = BlockReduce(dot, tile, SumOp{}, 0.0f);
+
+    if (threadIdx.x == 0) scores[j] = dot * scale;
+    __syncthreads();
+
+    running_max = fmaxf(running_max, scores[j]);
+  }
+
+  // Softmax in fp32 with the max subtracted. The subtraction is not optional:
+  // scores reach a few hundred at these widths and expf would overflow.
+  float sum = 0.0f;
+  for (int64_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
+    const float e = __expf(scores[j] - running_max);
+    scores[j] = e;
+    sum += e;
+  }
+  sum = BlockReduce(sum, tile, SumOp{}, 0.0f);
+
+  const float inv_sum = 1.0f / sum;
+
+  // Accumulate V. Each thread owns a slice of head_dim and walks every key.
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t j = 0; j < n_keys; ++j) {
+      const bf16* vr = v + (j * kv_heads + kv_head) * head_dim;
+      acc += scores[j] * ToF32(vr[d]);
+    }
+    out[(token * q_heads + head) * head_dim + d] = ToBf16(acc * inv_sum);
+  }
+}
+
+__global__ void EmbeddingKernel(const bf16* __restrict__ table,
+                                const int32_t* __restrict__ ids,
+                                bf16* __restrict__ out, int64_t hidden,
+                                int64_t vocab) {
+  const int64_t token = blockIdx.x;
+  const int32_t id = ids[token];
+
+  // Clamped rather than trusted. An out-of-range id would read arbitrary memory
+  // from the embedding table; the host-side check rejects it before launch, and
+  // this is the belt to that braces.
+  const int64_t row = (id < 0 || id >= vocab) ? 0 : id;
+
+  const bf16* src = table + row * hidden;
+  bf16* dst = out + token * hidden;
+
+  for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
+}
+
+__global__ void AddKernel(bf16* __restrict__ out, const bf16* __restrict__ rhs,
+                          int64_t n) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = ToBf16(ToF32(out[i]) + ToF32(rhs[i]));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side validation. Shared because every kernel below wants the same three
+// questions answered, and a wrong answer is an out-of-bounds device read.
+// ---------------------------------------------------------------------------
+
+Status CheckTensor(const TensorView& t, DataType dtype, int rank,
+                   const char* name) {
+  if (!t.IsDefined()) return InvalidArgumentError(name, " is undefined");
+
+  if (!t.IsCuda()) {
+    return InvalidArgumentError(name, " is on ", t.Device().ToString(),
+                                ", not a CUDA device");
+  }
+
+  if (t.GetDataType() != dtype) {
+    return InvalidArgumentError(name, " is ", DataTypeName(t.GetDataType()),
+                                ", expected ", DataTypeName(dtype));
+  }
+
+  if (t.Rank() != rank) {
+    return InvalidArgumentError(name, " has rank ", t.Rank(), ", expected ",
+                               rank);
+  }
+
+  return OkStatus();
+}
+
+Status CheckSameShape(const TensorView& a, const TensorView& b,
+                      const char* an, const char* bn) {
+  if (a.Rank() != b.Rank()) {
+    return InvalidArgumentError(an, " has rank ", a.Rank(), " but ", bn,
+                                " has rank ", b.Rank());
+  }
+
+  for (int i = 0; i < a.Rank(); ++i) {
+    if (a.Dim(i) != b.Dim(i)) {
+      return InvalidArgumentError(an, " is ", a.GetShape().ToString(), " but ",
+                                  bn, " is ", b.GetShape().ToString());
+    }
+  }
+
+  return OkStatus();
+}
+
+int BlockFor(int64_t width) {
+  // Powers of two only: BlockReduce halves the block each step and would drop
+  // the odd element otherwise.
+  int block = kWarp;
+  while (block < width && block < 1024) block *= 2;
+  return block;
+}
+
+}  // namespace
+
+Status RmsNorm(const TensorView& x, const TensorView& weight,
+               const TensorView& out, float eps, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 2, "x"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(weight, DataType::kBFloat16, 1, "weight"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(x, out, "x", "out"));
+
+  const int64_t tokens = x.Dim(0);
+  const int64_t hidden = x.Dim(1);
+
+  if (weight.Dim(0) != hidden) {
+    return InvalidArgumentError("weight has ", weight.Dim(0), " elements but "
+                                "hidden is ", hidden);
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int block = BlockFor(hidden);
+
+  RmsNormKernel<<<static_cast<unsigned>(tokens), block,
+                  block * sizeof(float), stream>>>(
+      static_cast<const bf16*>(x.Data()),
+      static_cast<const bf16*>(weight.Data()),
+      static_cast<bf16*>(out.Data()), hidden, eps);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status RotaryEmbedding(const TensorView& q, const TensorView& k,
+                       const TensorView& positions, float theta,
+                       cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(positions, DataType::kInt32, 1,
+                                     "positions"));
+
+  const int64_t tokens = q.Dim(0);
+  const int64_t q_heads = q.Dim(1);
+  const int64_t head_dim = q.Dim(2);
+  const int64_t kv_heads = k.Dim(1);
+
+  if (k.Dim(0) != tokens) {
+    return InvalidArgumentError("q has ", tokens, " tokens but k has ",
+                                k.Dim(0));
+  }
+  if (k.Dim(2) != head_dim) {
+    return InvalidArgumentError("q head_dim is ", head_dim, " but k's is ",
+                                k.Dim(2));
+  }
+  if (positions.Dim(0) != tokens) {
+    return InvalidArgumentError("positions has ", positions.Dim(0),
+                                " entries but there are ", tokens, " tokens");
+  }
+  if (head_dim % 2 != 0) {
+    return InvalidArgumentError("head_dim must be even for RoPE, got ",
+                                head_dim);
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int64_t heads = q_heads > kv_heads ? q_heads : kv_heads;
+  const int block = BlockFor(head_dim / 2);
+
+  RopeKernel<<<dim3(static_cast<unsigned>(tokens),
+                    static_cast<unsigned>(heads)),
+               block, 0, stream>>>(
+      static_cast<bf16*>(q.Data()), static_cast<bf16*>(k.Data()),
+      static_cast<const int32_t*>(positions.Data()), q_heads, kv_heads,
+      head_dim, theta);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status SiluMul(const TensorView& gate, const TensorView& up,
+               const TensorView& out, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(gate, DataType::kBFloat16, 2, "gate"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(up, DataType::kBFloat16, 2, "up"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(gate, up, "gate", "up"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(gate, out, "gate", "out"));
+
+  const int64_t n = gate.Numel();
+  if (n == 0) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t grid_want = (n + kBlock - 1) / kBlock;
+  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
+                                                               : grid_want);
+
+  SiluMulKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const bf16*>(gate.Data()),
+      static_cast<const bf16*>(up.Data()),
+      static_cast<bf16*>(out.Data()), n);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
+                 const TensorView& out, float scale, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k, v, "k", "v"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(q, out, "q", "out"));
+
+  const int64_t tokens = q.Dim(0);
+  const int64_t q_heads = q.Dim(1);
+  const int64_t head_dim = q.Dim(2);
+  const int64_t kv_heads = k.Dim(1);
+
+  if (k.Dim(0) != tokens) {
+    return InvalidArgumentError("q has ", tokens, " tokens but k has ",
+                                k.Dim(0));
+  }
+  if (k.Dim(2) != head_dim) {
+    return InvalidArgumentError("q head_dim is ", head_dim, " but k's is ",
+                                k.Dim(2));
+  }
+  if (kv_heads == 0 || q_heads % kv_heads != 0) {
+    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
+                                "kv_heads (", kv_heads, ")");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int block = BlockFor(head_dim);
+
+  // Shared memory holds the reduction tile plus one score per key. The score
+  // array is sized for the longest query, which is the last token.
+  const size_t smem = (static_cast<size_t>(block) +
+                       static_cast<size_t>(tokens)) * sizeof(float);
+
+  // 48 KB is the default per-block limit without opting in to more. At bf16
+  // this caps M2 at ~11k tokens, well past the 32k context we would need a
+  // paged kernel for anyway (that is M3).
+  if (smem > 48u * 1024u) {
+    return ResourceExhaustedError(
+        "naive attention needs ", smem, " B of shared memory for ", tokens,
+        " tokens, over the 48 KB limit; this kernel is the M2 reference, use "
+        "the paged path for long sequences");
+  }
+
+  AttentionKernel<<<dim3(static_cast<unsigned>(tokens),
+                         static_cast<unsigned>(q_heads)),
+                    block, smem, stream>>>(
+      static_cast<const bf16*>(q.Data()), static_cast<const bf16*>(k.Data()),
+      static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()),
+      tokens, q_heads, kv_heads, head_dim, scale);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
+                       const TensorView& out, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(table, DataType::kBFloat16, 2, "table"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(ids, DataType::kInt32, 1, "ids"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+
+  const int64_t tokens = ids.Dim(0);
+  const int64_t hidden = table.Dim(1);
+  const int64_t vocab = table.Dim(0);
+
+  if (out.Dim(0) != tokens || out.Dim(1) != hidden) {
+    return InvalidArgumentError("out is ", out.GetShape().ToString(),
+                                ", expected [", tokens, ", ", hidden, "]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int block = BlockFor(hidden);
+
+  EmbeddingKernel<<<static_cast<unsigned>(tokens), block, 0, stream>>>(
+      static_cast<const bf16*>(table.Data()),
+      static_cast<const int32_t*>(ids.Data()),
+      static_cast<bf16*>(out.Data()), hidden, vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status AddInPlace(const TensorView& out, const TensorView& residual,
+                  cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(residual, DataType::kBFloat16, 2,
+                                     "residual"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(out, residual, "out", "residual"));
+
+  const int64_t n = out.Numel();
+  if (n == 0) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t grid_want = (n + kBlock - 1) / kBlock;
+  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
+                                                               : grid_want);
+
+  AddKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<bf16*>(out.Data()),
+      static_cast<const bf16*>(residual.Data()), n);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+}  // namespace inferx::kernels

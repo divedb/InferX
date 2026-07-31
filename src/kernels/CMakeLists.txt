@@ -7,6 +7,7 @@
 
 add_library(inferx_kernels
   gemm_cublaslt.cc
+  layers.cu
   quantize.cu
   smoke.cu
 )
