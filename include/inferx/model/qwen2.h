@@ -97,6 +97,34 @@ class Qwen2Model {
   ///                   row-major, in the order `logits_indices` lists.
   Status Step(const ForwardBatch& batch, std::vector<float>* out_logits);
 
+  /// \brief Captures a CUDA graph for one decode shape.
+  ///
+  /// A decode step is ~400 launches -- 36 layers of seven GEMMs and half a
+  /// dozen small kernels each -- and at small batch the benchmark in
+  /// bench/attention_bench.cc shows the attention kernel itself is launch-bound
+  /// rather than work-bound. Replaying one graph instead of issuing 400
+  /// launches is what §5.2 and M6 are after.
+  ///
+  /// A graph fixes the step's *structure*: which kernels, at what dimensions,
+  /// reading which addresses. Every value stays live -- token ids, positions,
+  /// slots, block tables and sequence lengths are read from buffers that are
+  /// rewritten before each replay -- so one graph serves a decode step forever,
+  /// as long as the shape holds. That is why the block table lives in a fixed
+  /// preallocated buffer (§6.2): so it can be updated in place without
+  /// re-capture.
+  ///
+  /// Capturing is optional. Without it `Step` runs the same code
+  /// launch-by-launch, and the two are required to produce identical output.
+  ///
+  /// \param num_seqs           Sequences in the batch. Decode is one token
+  ///                           each, so this is also the token count.
+  /// \param max_blocks_per_seq Block table width, which must match what the
+  ///                           scheduler emits.
+  Status CaptureDecodeGraph(int64_t num_seqs, int64_t max_blocks_per_seq);
+
+  /// \brief How many decode shapes are currently captured.
+  int64_t captured_graphs() const;
+
   const ModelConfig& config() const;
 
   /// \brief Device bytes held by the weights.

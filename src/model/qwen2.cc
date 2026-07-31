@@ -92,9 +92,47 @@ struct Qwen2Model::Impl {
   DeviceBuffer slots_buf, seq_of_token_buf, block_table_buf;
   int64_t block_table_capacity = 0;
 
+  // Everything device-side runs on this stream rather than the default one,
+  // because a graph cannot be captured from the legacy default stream.
+  cudaStream_t stream = nullptr;
+
+  // One instantiated graph per decode shape. Keyed on (tokens, seqs, blocks):
+  // a graph records fixed launch dimensions, so a batch of a different shape
+  // needs its own. Decode shapes repeat forever, which is what makes this pay.
+  struct DecodeGraph {
+    int64_t tokens = 0;
+    int64_t num_seqs = 0;
+    int64_t max_blocks = 0;
+    cudaGraphExec_t exec = nullptr;
+  };
+  std::vector<DecodeGraph> graphs;
+
+  ~Impl() {
+    for (DecodeGraph& g : graphs) {
+      if (g.exec != nullptr) cudaGraphExecDestroy(g.exec);
+    }
+    if (stream != nullptr) cudaStreamDestroy(stream);
+  }
+
   Status EnsureCapacity(int64_t tokens);
   Status RunForward(const std::vector<int32_t>& ids, int64_t* out_tokens);
   Status RunPagedForward(const ForwardBatch& batch);
+
+  /// Host-side: sizes buffers and uploads this step's indices. Never captured.
+  Status PrepareBatchInputs(const ForwardBatch& batch);
+
+  /// Device-side: the entire forward pass, stream-ordered and capturable.
+  Status LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
+                          int64_t max_blocks_per_seq);
+
+  cudaGraphExec_t FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
+    for (DecodeGraph& g : graphs) {
+      if (g.tokens == tokens && g.num_seqs == seqs && g.max_blocks == blocks) {
+        return g.exec;
+      }
+    }
+    return nullptr;
+  }
 };
 
 Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
@@ -282,13 +320,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
   return OkStatus();
 }
 
-Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
+Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   const int64_t tokens = batch.num_tokens();
-  const int64_t h = config.hidden_size;
-  const int64_t heads = config.num_attention_heads;
-  const int64_t kv_heads = config.num_key_value_heads;
-  const int64_t hd = config.head_dim;
-  const int64_t inter = config.intermediate_size;
 
   INFERX_RETURN_IF_ERROR(EnsureCapacity(tokens));
 
@@ -330,6 +363,17 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   INFERX_RETURN_IF_ERROR(upload(seq_of_token_buf, batch.seq_of_token));
   INFERX_RETURN_IF_ERROR(upload(block_table_buf, batch.block_table));
 
+  return OkStatus();
+}
+
+Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
+                                          int64_t max_blocks_per_seq) {
+  const int64_t h = config.hidden_size;
+  const int64_t heads = config.num_attention_heads;
+  const int64_t kv_heads = config.num_key_value_heads;
+  const int64_t hd = config.head_dim;
+  const int64_t inter = config.intermediate_size;
+
   const auto i32 = [&](const DeviceBuffer& buf,
                        const Shape& shape) -> StatusOr<TensorView> {
     return TensorView::Create(buf.data(), DataType::kInt32, shape,
@@ -347,7 +391,7 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   INFERX_ASSIGN_OR_RETURN(
       const TensorView table_v,
       i32(block_table_buf,
-          Shape({batch.num_seqs, batch.max_blocks_per_seq})));
+          Shape({num_seqs, max_blocks_per_seq})));
 
   const Shape hidden_shape({tokens, h});
   INFERX_ASSIGN_OR_RETURN(const TensorView x,
@@ -392,31 +436,31 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x));
+  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x, stream));
 
   for (int64_t layer_index = 0;
        layer_index < static_cast<int64_t>(layers.size()); ++layer_index) {
     const LayerWeights& layer = layers[static_cast<size_t>(layer_index)];
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(resid.Data(), x.Data(),
-                                           static_cast<size_t>(x.NBytes()),
-                                           cudaMemcpyDeviceToDevice));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
+        cudaMemcpyDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps)));
+        x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.q_w, qv));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.k_w, kv_));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.v_w, vv));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.q_w, qv, stream));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.k_w, kv_, stream));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.v_w, vv, stream));
 
     if (config.attention_bias) {
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(qv, layer.q_b));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(kv_, layer.k_b));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(vv, layer.v_b));
+      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(qv, layer.q_b, stream));
+      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(kv_, layer.k_b, stream));
+      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(vv, layer.v_b, stream));
     }
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbedding(
-        q3, k3, pos_v, static_cast<float>(config.rope_theta)));
+        q3, k3, pos_v, static_cast<float>(config.rope_theta), stream));
 
     // The cache is written *after* RoPE and *before* attention. Storing rotated
     // keys is what lets a cached key be reused at every later step without
@@ -428,38 +472,63 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
                             pool->ValueCache(layer_index));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v));
+        kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::PagedAttention(
-        q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale));
+        q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale, stream));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x, stream));
+    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(resid.Data(), x.Data(),
-                                           static_cast<size_t>(x.NBytes()),
-                                           cudaMemcpyDeviceToDevice));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
+        cudaMemcpyDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps)));
+        x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_w, gate_v));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.up_w, up_v));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMul(gate_v, up_v, gate_v));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_w, gate_v, stream));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.up_w, up_v, stream));
+    INFERX_RETURN_IF_ERROR(kernels::SiluMul(gate_v, up_v, gate_v, stream));
+    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x, stream));
+    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
 
   INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-      x, final_norm, norm, static_cast<float>(config.rms_norm_eps)));
+      x, final_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView logits_v,
       logits.View(DataType::kBFloat16, Shape({tokens, config.vocab_size})));
 
-  INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, lm_head, logits_v));
+  INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, lm_head, logits_v, stream));
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  return OkStatus();
+}
+
+
+Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
+  INFERX_RETURN_IF_ERROR(PrepareBatchInputs(batch));
+
+  const int64_t tokens = batch.num_tokens();
+
+  cudaGraphExec_t graph =
+      FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
+
+  if (graph != nullptr) {
+    // The replay reads exactly the buffers PrepareBatchInputs just wrote. That
+    // is the whole contract: a graph fixes the *structure* of the step -- which
+    // kernels, what dimensions, which pointers -- while every value it reads
+    // still comes from memory that was updated a moment ago. Sequence lengths,
+    // block tables and token ids all change freely between replays; only the
+    // shape may not.
+    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, stream));
+  } else {
+    INFERX_RETURN_IF_ERROR(LaunchDecodeBody(tokens, batch.num_seqs,
+                                            batch.max_blocks_per_seq));
+  }
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
 
   return OkStatus();
 }
@@ -481,6 +550,14 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
 
   auto impl = std::make_unique<Impl>(std::move(gemm));
   impl->config = config;
+
+  // A dedicated stream, non-blocking. Two reasons, and the first is not
+  // optional: the legacy default stream cannot be captured at all, and
+  // attempting it returns cudaErrorStreamCaptureUnsupported. Non-blocking so it
+  // does not implicitly synchronize against the default stream, which would
+  // reintroduce exactly the serialization graphs are here to remove.
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
 
   const int64_t h = config.hidden_size;
   const int64_t inter = config.intermediate_size;
@@ -651,6 +728,84 @@ Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
 }
 
 KvBlockPool* Qwen2Model::kv_pool() { return impl_->pool.get(); }
+
+
+Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
+                                      int64_t max_blocks_per_seq) {
+  if (impl_->pool == nullptr) {
+    return FailedPreconditionError(
+        "CaptureDecodeGraph requires a KV cache; call AttachKvCache first");
+  }
+
+  if (num_seqs <= 0 || max_blocks_per_seq <= 0) {
+    return InvalidArgumentError("graph shape must be positive, got num_seqs=",
+                                num_seqs, " max_blocks_per_seq=",
+                                max_blocks_per_seq);
+  }
+
+  // Decode is one token per sequence, which is the only shape worth capturing:
+  // prefill lengths vary per request and would need a graph each.
+  const int64_t tokens = num_seqs;
+
+  if (impl_->FindGraph(tokens, num_seqs, max_blocks_per_seq) != nullptr) {
+    return OkStatus();
+  }
+
+  // A dummy batch of the right shape, so every buffer is allocated and every
+  // pointer settled before capture begins. Capture records addresses; anything
+  // allocated during it would be recorded and then freed.
+  ForwardBatch probe;
+  probe.num_seqs = num_seqs;
+  probe.max_blocks_per_seq = max_blocks_per_seq;
+  probe.block_table.assign(
+      static_cast<size_t>(num_seqs * max_blocks_per_seq), 0);
+
+  for (int64_t s = 0; s < num_seqs; ++s) {
+    probe.token_ids.push_back(0);
+    probe.positions.push_back(0);
+    probe.seq_of_token.push_back(static_cast<int32_t>(s));
+    probe.slots.push_back(0);
+  }
+  probe.logits_indices.push_back(0);
+
+  INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(probe));
+
+  // A warm-up run outside capture. cuBLASLt picks and caches an algorithm on
+  // first use for a shape, and that selection does device work of its own; if
+  // it happened during capture it would be baked into the graph.
+  INFERX_RETURN_IF_ERROR(
+      impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
+      impl_->stream, cudaStreamCaptureModeThreadLocal));
+
+  const Status body =
+      impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq);
+
+  cudaGraph_t graph = nullptr;
+  const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
+
+  // Capture must be ended even if the body failed, or the stream stays in
+  // capture mode and every later launch on it fails with an opaque error.
+  INFERX_RETURN_IF_ERROR(body);
+  INFERX_CUDA_RETURN_IF_ERROR(ended);
+
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t instantiated =
+      cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+
+  cudaGraphDestroy(graph);  // the executable owns what it needs
+  INFERX_CUDA_RETURN_IF_ERROR(instantiated);
+
+  impl_->graphs.push_back({tokens, num_seqs, max_blocks_per_seq, exec});
+
+  return OkStatus();
+}
+
+int64_t Qwen2Model::captured_graphs() const {
+  return static_cast<int64_t>(impl_->graphs.size());
+}
 
 Status Qwen2Model::Step(const ForwardBatch& batch,
                         std::vector<float>* out_logits) {

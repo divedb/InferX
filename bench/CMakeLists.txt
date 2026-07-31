@@ -9,6 +9,8 @@ function(inferx_add_bench name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
+    inferx::common
+    inferx::model
     inferx::kernels
     inferx::flags
   )
@@ -20,6 +22,7 @@ function(inferx_add_bench name)
 endfunction()
 
 inferx_add_bench(gemm_bench gemm_bench.cc)
+inferx_add_bench(decode_step_bench decode_step_bench.cc)
 
 # Needs FlashInfer to have something to compare against.
 if(INFERX_HAVE_FLASHINFER)

@@ -318,5 +318,126 @@ TEST_F(EngineTest, GenerationGrowsAcrossBlockBoundaries) {
   EXPECT_EQ(model_->kv_pool()->used_blocks(), 0);
 }
 
+// CUDA graphs must not change the answer. A graph fixes the structure of a
+// decode step and nothing else -- every value it reads still comes from buffers
+// rewritten before each replay -- so capturing one and replaying it has to
+// produce exactly what issuing the launches produced. If it does not, the graph
+// has baked in something that was supposed to stay live.
+TEST_F(EngineTest, CudaGraphReplayMatchesLaunchByLaunch) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+
+  SamplingParams params;
+  params.max_tokens = 8;
+
+  // Without a graph.
+  std::vector<int32_t> ungraphed;
+  {
+    auto sched = MakeScheduler(1);
+    ASSERT_TRUE(sched.ok());
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    ungraphed = done[0].output_tokens;
+  }
+
+  // Capture the decode shape this workload uses: one sequence, and the block
+  // table width the scheduler emits for max_seq_len 512 at 16 tokens a block.
+  const int64_t max_blocks = (512 + 16 - 1) / 16;
+  ASSERT_TRUE(model_->CaptureDecodeGraph(1, max_blocks).ok());
+  EXPECT_GE(model_->captured_graphs(), 1);
+
+  // With one. Prefill still runs launch-by-launch -- only the decode shape was
+  // captured -- which is itself part of what this checks: the two paths have to
+  // interleave correctly within a single request.
+  std::vector<int32_t> graphed;
+  {
+    auto sched = MakeScheduler(1);
+    ASSERT_TRUE(sched.ok());
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    graphed = done[0].output_tokens;
+  }
+
+  EXPECT_EQ(ungraphed, graphed)
+      << "replaying a captured decode step produced different tokens than "
+         "issuing the same launches";
+  EXPECT_EQ(graphed[0], kParis);
+}
+
+// Replays have to stay correct across many steps, not just the first. A graph
+// that captured a stale pointer or a value that should have been live tends to
+// produce the same token forever.
+TEST_F(EngineTest, RepeatedGraphReplaysTrackGrowingContext) {
+  const int64_t max_blocks = (512 + 16 - 1) / 16;
+  ASSERT_TRUE(model_->CaptureDecodeGraph(1, max_blocks).ok());
+
+  auto sched = MakeScheduler(1);
+  ASSERT_TRUE(sched.ok());
+
+  SamplingParams params;
+  params.max_tokens = 30;
+
+  ASSERT_TRUE(sched->AddRequest(1, {kThe, kCapital, kOf, kFrance, kIs}, params)
+                  .ok());
+
+  const std::vector<Completion> done = Drain(&*sched);
+  ASSERT_EQ(done.size(), 1u);
+
+  const auto& out = done[0].output_tokens;
+  ASSERT_EQ(out.size(), 30u);
+  EXPECT_EQ(out[0], kParis);
+
+  const bool all_same = std::all_of(out.begin(), out.end(),
+                                    [&](int32_t t) { return t == out[0]; });
+  EXPECT_FALSE(all_same)
+      << "generation collapsed under graph replay; the graph is likely reading "
+         "a value that should have stayed live";
+}
+
+// A shape with no captured graph must still run, launch-by-launch. Capture is
+// an optimization, never a precondition.
+TEST_F(EngineTest, UncapturedShapesStillRun) {
+  const int64_t max_blocks = (512 + 16 - 1) / 16;
+  ASSERT_TRUE(model_->CaptureDecodeGraph(1, max_blocks).ok());
+
+  // Three concurrent sequences: a shape that was never captured.
+  auto sched = MakeScheduler(4);
+  ASSERT_TRUE(sched.ok());
+
+  SamplingParams params;
+  params.max_tokens = 3;
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(sched->AddRequest(static_cast<scheduler::RequestId>(i),
+                                  {kThe, kCapital, kOf, kFrance, kIs}, params)
+                    .ok());
+  }
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  ASSERT_EQ(done.size(), 3u);
+  for (const Completion& c : done) EXPECT_EQ(c.output_tokens[0], kParis);
+}
+
+TEST_F(EngineTest, CaptureIsIdempotentAndValidated) {
+  const int64_t max_blocks = 32;
+
+  const Status captured = model_->CaptureDecodeGraph(2, max_blocks);
+  ASSERT_TRUE(captured.ok()) << captured;
+  const int64_t after_first = model_->captured_graphs();
+
+  // Same shape again: served from what is already captured.
+  ASSERT_TRUE(model_->CaptureDecodeGraph(2, max_blocks).ok());
+  EXPECT_EQ(model_->captured_graphs(), after_first);
+
+  EXPECT_EQ(model_->CaptureDecodeGraph(0, max_blocks).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(model_->CaptureDecodeGraph(2, -1).code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
 }  // namespace
 }  // namespace inferx
