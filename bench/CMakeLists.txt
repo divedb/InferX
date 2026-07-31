@@ -20,3 +20,8 @@ function(inferx_add_bench name)
 endfunction()
 
 inferx_add_bench(gemm_bench gemm_bench.cc)
+
+# Needs FlashInfer to have something to compare against.
+if(INFERX_HAVE_FLASHINFER)
+  inferx_add_bench(attention_bench attention_bench.cc)
+endif()
