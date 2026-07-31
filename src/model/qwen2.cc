@@ -149,6 +149,35 @@ struct Qwen2Model::Impl {
   // because a graph cannot be captured from the legacy default stream.
   cudaStream_t stream = nullptr;
 
+  // Page-locked staging for the per-step index arrays, and for the logits on
+  // the way back.
+  //
+  // A cudaMemcpy from ordinary pageable memory is synchronous *and* stages
+  // through a driver-owned bounce buffer, so the eight tiny index uploads a
+  // step needs cost 0.149 ms of host time between them -- far more than the
+  // bytes justify. From pinned memory the same copies are asynchronous enqueues
+  // of a few microseconds each. Measured in bench/decode_breakdown_bench.cc.
+  void* pinned = nullptr;
+  size_t pinned_bytes = 0;
+  void* pinned_logits = nullptr;
+  size_t pinned_logits_bytes = 0;
+
+  /// Grows the index staging buffer. Contents are not preserved; every step
+  /// rewrites all of it.
+  Status EnsurePinned(size_t bytes) {
+    if (bytes <= pinned_bytes) return OkStatus();
+
+    if (pinned != nullptr) cudaFreeHost(pinned);
+    pinned = nullptr;
+    pinned_bytes = 0;
+
+    INFERX_CUDA_RETURN_IF_ERROR(
+        cudaHostAlloc(&pinned, bytes, cudaHostAllocDefault));
+    pinned_bytes = bytes;
+
+    return OkStatus();
+  }
+
 #ifdef INFERX_WITH_FLASHINFER
   // The fast decode path. Absent when the submodule is not vendored, in which
   // case every batch takes the reference kernel and the engine still works.
@@ -184,6 +213,8 @@ struct Qwen2Model::Impl {
     for (DecodeGraph& g : graphs) {
       if (g.exec != nullptr) cudaGraphExecDestroy(g.exec);
     }
+    if (pinned != nullptr) cudaFreeHost(pinned);
+    if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
     if (stream != nullptr) cudaStreamDestroy(stream);
   }
 
@@ -247,6 +278,20 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
       token_ids, DeviceBuffer::Allocate(
                      static_cast<size_t>(tokens) * sizeof(int32_t),
                      DeviceId::Cuda(0)));
+
+  // Sized for the largest download any caller can ask for: every token's row.
+  const size_t logits_bytes = static_cast<size_t>(tokens) *
+                              static_cast<size_t>(vocab) * 2;
+
+  if (logits_bytes > pinned_logits_bytes) {
+    if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
+    pinned_logits = nullptr;
+    pinned_logits_bytes = 0;
+
+    INFERX_CUDA_RETURN_IF_ERROR(
+        cudaHostAlloc(&pinned_logits, logits_bytes, cudaHostAllocDefault));
+    pinned_logits_bytes = logits_bytes;
+  }
 
   capacity_tokens = tokens;
   return OkStatus();
@@ -421,11 +466,47 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
                               DeviceId::Cuda(0)));
   }
 
+  // Reserved before anything is staged, and generously: four per-token arrays,
+  // a dense block table, and the CSR form of that table plus its two small
+  // companions. Sizing once is what makes the buffer safe to hold pointers into
+  // while copies are in flight.
+  {
+    const size_t per_token = 4 * static_cast<size_t>(tokens);
+    const size_t table = static_cast<size_t>(batch.num_seqs) *
+                         static_cast<size_t>(batch.max_blocks_per_seq);
+    const size_t needed =
+        (per_token + 2 * table + 2 * static_cast<size_t>(batch.num_seqs) + 1) *
+        sizeof(int32_t);
+
+    INFERX_RETURN_IF_ERROR(EnsurePinned(needed));
+  }
+
+  // Every array a step uploads, staged end to end through one pinned buffer.
+  // The offset walks forward across the calls below; nothing overlaps, because
+  // all of it has to be resident until the copies complete.
+  size_t staged = 0;
+
   const auto upload = [&](const DeviceBuffer& buf,
                           const std::vector<int32_t>& src) -> Status {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), src.data(),
-                                           src.size() * sizeof(int32_t),
-                                           cudaMemcpyHostToDevice));
+    const size_t bytes = src.size() * sizeof(int32_t);
+
+    // Deliberately an error rather than a growth. Reallocating here would free
+    // the buffer that the copies already enqueued are still reading from -- an
+    // asynchronous use-after-free that would corrupt indices intermittently and
+    // be nearly impossible to attribute. The buffer is sized once, before any
+    // copy, by the reservation above.
+    if (staged + bytes > pinned_bytes) {
+      return InternalError("pinned staging exhausted: needed ", staged + bytes,
+                           " bytes but reserved ", pinned_bytes);
+    }
+
+    std::memcpy(static_cast<std::byte*>(pinned) + staged, src.data(), bytes);
+
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        buf.data(), static_cast<std::byte*>(pinned) + staged, bytes,
+        cudaMemcpyHostToDevice, stream));
+
+    staged += bytes;
     return OkStatus();
   };
 
@@ -895,19 +976,24 @@ Status ValidateIds(const std::vector<int32_t>& ids, int64_t vocab) {
   return OkStatus();
 }
 
-/// Copies a bf16 logits row back to the host as fp32.
-Status DownloadLogits(const DeviceBuffer& buf, int64_t offset_elems,
-                      int64_t count, std::vector<float>* out) {
-  std::vector<uint16_t> bits(static_cast<size_t>(count));
+/// Copies a bf16 logits row back to the host as fp32, through pinned memory.
+///
+/// A vocabulary row is 304 KB, and from pageable memory that copy costs 0.054 ms
+/// of host time per step. Pinned, it is a stream-ordered transfer like any
+/// other.
+Status DownloadLogitsPinned(const DeviceBuffer& buf, int64_t offset_elems,
+                            int64_t count, void* pinned, cudaStream_t stream,
+                            std::vector<float>* out) {
+  const auto* bits = static_cast<const uint16_t*>(pinned);
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
-      bits.data(),
-      static_cast<const std::byte*>(buf.data()) + offset_elems * 2,
-      bits.size() * 2, cudaMemcpyDeviceToHost));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+      pinned, static_cast<const std::byte*>(buf.data()) + offset_elems * 2,
+      static_cast<size_t>(count) * 2, cudaMemcpyDeviceToHost, stream));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
 
-  out->resize(bits.size());
+  out->resize(static_cast<size_t>(count));
 
-  for (size_t i = 0; i < bits.size(); ++i) {
+  for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
     // bf16 is the top 16 bits of an fp32, so widening is a shift -- no lookup
     // table and no library call.
     const uint32_t word = static_cast<uint32_t>(bits[i]) << 16;
@@ -928,8 +1014,9 @@ Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
   int64_t tokens = 0;
   INFERX_RETURN_IF_ERROR(impl_->RunForward(token_ids, &tokens));
 
-  return DownloadLogits(impl_->logits.buf, 0,
-                        tokens * impl_->config.vocab_size, out_logits);
+  return DownloadLogitsPinned(impl_->logits.buf, 0,
+                              tokens * impl_->config.vocab_size,
+                              impl_->pinned_logits, impl_->stream, out_logits);
 }
 
 Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
@@ -1055,8 +1142,9 @@ Status Qwen2Model::Step(const ForwardBatch& batch,
 
   for (const int32_t index : batch.logits_indices) {
     std::vector<float> row;
-    INFERX_RETURN_IF_ERROR(
-        DownloadLogits(impl_->logits.buf, index * vocab, vocab, &row));
+    INFERX_RETURN_IF_ERROR(DownloadLogitsPinned(
+        impl_->logits.buf, index * vocab, vocab, impl_->pinned_logits,
+        impl_->stream, &row));
     out_logits->insert(out_logits->end(), row.begin(), row.end());
   }
 
@@ -1072,8 +1160,8 @@ Status Qwen2Model::ForwardLastLogits(const std::vector<int32_t>& token_ids,
 
   const int64_t vocab = impl_->config.vocab_size;
 
-  return DownloadLogits(impl_->logits.buf, (tokens - 1) * vocab, vocab,
-                        out_logits);
+  return DownloadLogitsPinned(impl_->logits.buf, (tokens - 1) * vocab, vocab,
+                              impl_->pinned_logits, impl_->stream, out_logits);
 }
 
 }  // namespace inferx::model

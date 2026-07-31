@@ -11,6 +11,7 @@
 // -- 88-95% of this card's peak -- which leaves very little for a "fix" to
 // recover. Attribution before optimization.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -133,16 +134,18 @@ int Main(int argc, char** argv) {
   const TensorView logits = bf(Shape({kBatch, kVocab}));
 
   // Weights.
-  const TensorView wq = bf(Shape({kQHeads * kHeadDim, kHidden}));
-  const TensorView wk = bf(Shape({kKvHeads * kHeadDim, kHidden}));
-  const TensorView wv = bf(Shape({kKvHeads * kHeadDim, kHidden}));
+  const TensorView wqkv =
+      bf(Shape({kQHeads * kHeadDim + 2 * kKvHeads * kHeadDim, kHidden}));
+  const TensorView qkv_out =
+      bf(Shape({kBatch, kQHeads * kHeadDim + 2 * kKvHeads * kHeadDim}));
+  const TensorView wgate_up = bf(Shape({2 * kInter, kHidden}));
+  const TensorView gate_up_out = bf(Shape({kBatch, 2 * kInter}));
   const TensorView wo = bf(Shape({kHidden, kQHeads * kHeadDim}));
-  const TensorView wgate = bf(Shape({kInter, kHidden}));
-  const TensorView wup = bf(Shape({kInter, kHidden}));
   const TensorView wdown = bf(Shape({kHidden, kInter}));
   const TensorView wembed = bf(Shape({kVocab, kHidden}));
   const TensorView norm_w = bf(Shape({kHidden}));
-  const TensorView bias_q = bf(Shape({kQHeads * kHeadDim}));
+  const TensorView bias_qkv =
+      bf(Shape({kQHeads * kHeadDim + 2 * kKvHeads * kHeadDim}));
 
   const double w2 = 2.0;  // bf16
 
@@ -159,12 +162,11 @@ int Main(int argc, char** argv) {
                     static_cast<double>(w.Numel()) * w2});
   };
 
-  time_gemm("q_proj", x, wq, qv, kLayers);
-  time_gemm("k_proj", x, wk, kv, kLayers);
-  time_gemm("v_proj", x, wv, vv, kLayers);
+  // Fused, matching what the model runs: q/k/v as one [q+2kv, hidden] GEMM and
+  // gate/up as one [2*inter, hidden].
+  time_gemm("qkv_proj (fused)", x, wqkv, qkv_out, kLayers);
   time_gemm("o_proj", av, wo, x, kLayers);
-  time_gemm("gate_proj", x, wgate, gate, kLayers);
-  time_gemm("up_proj", x, wup, up, kLayers);
+  time_gemm("gate_up (fused)", x, wgate_up, gate_up_out, kLayers);
   time_gemm("down_proj", gate, wdown, x, kLayers);
   time_gemm("lm_head", x, wembed, logits, 1);
 
@@ -216,8 +218,9 @@ int Main(int argc, char** argv) {
 
   time_small("rms_norm", [&] { return kernels::RmsNorm(x, norm_w, x, 1e-6f); },
              kLayers * 2 + 1);
-  time_small("add_bias", [&] { return kernels::AddBiasInPlace(qv, bias_q); },
-             kLayers * 3);
+  time_small("qkv split + bias", [&] {
+    return kernels::SplitQkvWithBias(qkv_out, bias_qkv, qv, kv, vv);
+  }, kLayers);
   // Hoisted, deliberately. An earlier version allocated these inside the timed
   // lambda, so every iteration paid a cudaMalloc -- which is tens of
   // microseconds and swamped the kernels being measured. It inflated rope and
@@ -231,13 +234,77 @@ int Main(int argc, char** argv) {
   time_small("rope", [&] {
     return kernels::RotaryEmbedding(q3, k3, pos1, 1e6f);
   }, kLayers);
-  time_small("silu_mul", [&] { return kernels::SiluMul(gate, up, gate); },
-             kLayers);
+  time_small("silu_mul (fused)", [&] {
+    return kernels::SiluMulFused(gate_up_out, gate);
+  }, kLayers);
   time_small("residual_add", [&] { return kernels::AddInPlace(x, x); },
              kLayers * 2);
   time_small("kv_append", [&] {
     return kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slot1);
   }, kLayers);
+
+  // --- host-side per-step work ----------------------------------------------
+  // Not kernels, but they sit on the critical path of every step: the planner
+  // runs on the host, the index uploads are synchronous, and the logits come
+  // back before the caller sees anything.
+  {
+    const std::vector<int32_t> plan_indptr = {0, static_cast<int32_t>(blocks)};
+
+    for (int i = 0; i < 20; ++i) {
+      (void)fi->Plan(kBatch, kQHeads, kKvHeads, kHeadDim, kPageSize,
+                     absl::MakeConstSpan(plan_indptr), true);
+    }
+    cudaDeviceSynchronize();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+      (void)fi->Plan(kBatch, kQHeads, kKvHeads, kHeadDim, kPageSize,
+                     absl::MakeConstSpan(plan_indptr), true);
+    }
+    cudaDeviceSynchronize();
+    const auto t1 = std::chrono::steady_clock::now();
+
+    rows.push_back({"flashinfer plan (host)",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                        iters,
+                    1, 0.0});
+  }
+
+  {
+    // Eight small pageable H2D copies per step, each synchronous.
+    std::vector<int32_t> small(64, 0);
+    auto scratch = a.Alloc(DataType::kInt32, Shape({64}));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+      for (int j = 0; j < 8; ++j) {
+        cudaMemcpy(scratch->Data(), small.data(), small.size() * 4,
+                   cudaMemcpyHostToDevice);
+      }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    rows.push_back({"index uploads (pageable)",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                        iters,
+                    1, 0.0});
+  }
+
+  {
+    std::vector<uint16_t> host_logits(static_cast<size_t>(kVocab));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+      cudaMemcpy(host_logits.data(), logits.Data(), host_logits.size() * 2,
+                 cudaMemcpyDeviceToHost);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    rows.push_back({"logits D2H (pageable)",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count() /
+                        iters,
+                    1, 0.0});
+  }
 
   // --- report ---------------------------------------------------------------
   std::printf("Qwen2.5-3B decode step, batch %ld, context %ld\n\n",
@@ -270,7 +337,9 @@ int Main(int argc, char** argv) {
   std::printf("%-24s %9s %7s %11.3f   (%.2f GB at 736 GB/s)\n",
               "bandwidth floor", "", "", weights_gb / 736e9 * 1e12 / 1e9,
               weights_gb);
-  std::printf("%-24s %9s %7s %11.3f\n", "measured step", "", "", 13.9);
+  // No hardcoded step time. It changes with every optimization and a stale
+  // constant here misattributes the difference to whatever was measured last;
+  // run bench/decode_step_bench.cc for the current figure.
 
   return 0;
 }
