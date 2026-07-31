@@ -51,4 +51,26 @@ Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
                            const float* scale_dev,
                            cudaStream_t stream = nullptr);
 
+/// \brief Computes a scale and quantizes in a single launch.
+///
+/// `ComputeF8Scale` followed by `QuantizeF16ToF8E4M3` costs four launches --
+/// a memset, a reduction, a finalize and the quantize. On the decode path that
+/// happens for four tensors in each of 36 layers, and at ~4.7 us a launch it
+/// would eat most of what FP8 weights save. This does it in one block: a
+/// grid-stride pass to find the maximum magnitude, a block reduction, then a
+/// second pass to write the quantized output.
+///
+/// One block means one scale for the whole tensor, which is what cuBLASLt's
+/// scalar A/B scale pointers want anyway. It also means large tensors are
+/// slower than a multi-block reduction would be -- fine for activations, which
+/// is all this is for; weights are quantized once at load where the four-launch
+/// path is free.
+///
+/// \param src       f16 or bf16 tensor on a CUDA device.
+/// \param dst       f8e4m3 tensor of the same shape.
+/// \param scale_dev Device pointer to one float, receiving the dequant scale.
+Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
+                               float* scale_dev,
+                               cudaStream_t stream = nullptr);
+
 }  // namespace inferx::kernels

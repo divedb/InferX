@@ -80,11 +80,13 @@ model::ForwardBatch MakeDecodeBatch(int64_t batch, int64_t context,
 int Main(int argc, char** argv) {
   int warmup = 5;
   int iters = 30;
+  bool fp8 = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
     else if (arg == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
+    else if (arg == "--fp8") fp8 = true;
     else {
       std::fprintf(stderr, "usage: %s [--warmup N] [--iters N]\n", argv[0]);
       return 2;
@@ -114,7 +116,17 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
+  if (fp8) {
+    const Status q = model.QuantizeWeightsToF8();
+    if (!q.ok()) {
+      std::fprintf(stderr, "cannot quantize: %s\n", q.ToString().c_str());
+      return 1;
+    }
+  }
+
   std::printf("%s\n", model.config().ToString().c_str());
+  std::printf("weights: %s, %.2f GB\n", fp8 ? "fp8 e4m3" : "bf16",
+              model.WeightBytes() / 1e9);
   std::printf("decode step, context %ld, one token per sequence\n\n",
               static_cast<long>(kContext));
 

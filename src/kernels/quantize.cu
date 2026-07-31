@@ -1,5 +1,6 @@
 #include "inferx/kernels/quantize.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -8,6 +9,8 @@
 
 namespace inferx::kernels {
 namespace {
+
+using bf16 = __nv_bfloat16;
 
 constexpr int kBlock = 256;
 
@@ -93,6 +96,49 @@ Status CheckDeviceTensor(const TensorView& t, DataType expected,
   return OkStatus();
 }
 
+// Widens either half format to fp32, so the dynamic kernel below serves both
+// without a second copy of it.
+__device__ inline float Widen(__half x) { return __half2float(x); }
+__device__ inline float Widen(__nv_bfloat16 x) { return __bfloat162float(x); }
+
+// One block, two passes, no global synchronization: find the maximum magnitude
+// across the whole tensor, reduce it within the block, then quantize. Reading
+// the input twice is cheaper than the three extra launches the split version
+// costs, because at these sizes everything is in L2 by the second pass.
+template <typename Src>
+__global__ void QuantizeDynamicKernel(const Src* __restrict__ src,
+                                      __nv_fp8_storage_t* __restrict__ dst,
+                                      int64_t n, float* __restrict__ scale_out) {
+  __shared__ float tile[1024];
+
+  float local = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    local = fmaxf(local, fabsf(Widen(src[i])));
+  }
+
+  tile[threadIdx.x] = local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      tile[threadIdx.x] = fmaxf(tile[threadIdx.x], tile[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  const float amax = tile[0];
+  const float scale = amax > 0.0f ? amax / kFloat8E4M3Max : 1.0f;
+
+  if (threadIdx.x == 0) *scale_out = scale;
+
+  const float inv = 1.0f / scale;
+
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    dst[i] = __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE,
+                                   __NV_E4M3);
+  }
+}
+
 }  // namespace
 
 Status ComputeF8Scale(const TensorView& src, float* scale_dev,
@@ -146,6 +192,45 @@ Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
       static_cast<__nv_fp8_storage_t*>(dst.Data()), n, scale_dev);
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
+  return OkStatus();
+}
+
+Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
+                               float* scale_dev, cudaStream_t stream) {
+  if (!src.IsDefined() || !src.IsCuda()) {
+    return InvalidArgumentError("src must be a defined CUDA tensor");
+  }
+  if (dst.GetDataType() != DataType::kFloat8E4M3FN) {
+    return InvalidArgumentError("dst is ", DataTypeName(dst.GetDataType()),
+                                ", expected f8e4m3");
+  }
+  if (src.Numel() != dst.Numel()) {
+    return InvalidArgumentError("src has ", src.Numel(), " elements, dst has ",
+                                dst.Numel());
+  }
+  if (scale_dev == nullptr) {
+    return InvalidArgumentError("scale_dev is null");
+  }
+
+  const int64_t n = src.Numel();
+  if (n == 0) return OkStatus();
+
+  constexpr int kBlock = 1024;
+
+  if (src.GetDataType() == DataType::kBFloat16) {
+    QuantizeDynamicKernel<__nv_bfloat16><<<1, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(src.Data()),
+        static_cast<__nv_fp8_storage_t*>(dst.Data()), n, scale_dev);
+  } else if (src.GetDataType() == DataType::kFloat16) {
+    QuantizeDynamicKernel<__half><<<1, kBlock, 0, stream>>>(
+        static_cast<const __half*>(src.Data()),
+        static_cast<__nv_fp8_storage_t*>(dst.Data()), n, scale_dev);
+  } else {
+    return InvalidArgumentError("src is ", DataTypeName(src.GetDataType()),
+                                ", expected f16 or bf16");
+  }
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }
 

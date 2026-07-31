@@ -287,5 +287,43 @@ TEST_F(Fp8GemmTest, ScaleMapsAmaxOntoTheFormatMaximum) {
   EXPECT_NEAR(got, 3.5f / kernels::kFloat8E4M3Max, 1e-6f);
 }
 
+// bf16 output, which is what the model needs: an FP8 GEMM has to drop into a
+// bf16 stack without a conversion on either side.
+TEST_F(Fp8GemmTest, ProducesBf16Output) {
+  constexpr int64_t m = 8, n = 32, k = 64;
+
+  auto gemm = kernels::CublasLtGemm::Create();
+  ASSERT_TRUE(gemm.ok()) << gemm.status();
+
+  auto xq_buf = DeviceBuffer::Allocate(m * k, DeviceId::Cuda(0));
+  auto wq_buf = DeviceBuffer::Allocate(n * k, DeviceId::Cuda(0));
+  auto y_buf = DeviceBuffer::Allocate(m * n * 2, DeviceId::Cuda(0));
+  auto scales = DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0));
+  ASSERT_TRUE(xq_buf.ok() && wq_buf.ok() && y_buf.ok() && scales.ok());
+
+  ASSERT_EQ(cudaMemset(xq_buf->data(), 0x38, xq_buf->size()), cudaSuccess);
+  ASSERT_EQ(cudaMemset(wq_buf->data(), 0x38, wq_buf->size()), cudaSuccess);
+
+  const float one[2] = {1.0f, 1.0f};
+  ASSERT_EQ(cudaMemcpy(scales->data(), one, sizeof(one),
+                       cudaMemcpyHostToDevice),
+            cudaSuccess);
+
+  auto xq = TensorView::Create(xq_buf->data(), DataType::kFloat8E4M3FN,
+                               Shape({m, k}), DeviceId::Cuda(0));
+  auto wq = TensorView::Create(wq_buf->data(), DataType::kFloat8E4M3FN,
+                               Shape({n, k}), DeviceId::Cuda(0));
+  auto y = TensorView::Create(y_buf->data(), DataType::kBFloat16,
+                              Shape({m, n}), DeviceId::Cuda(0));
+  ASSERT_TRUE(xq.ok() && wq.ok() && y.ok());
+
+  float* const s = reinterpret_cast<float*>(scales->data());
+
+  const Status st = gemm->LinearF8E4M3(*xq, *wq, *y, s, s + 1);
+  ASSERT_TRUE(st.ok()) << st;
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess)
+      << "bf16-output FP8 GEMM faulted";
+}
+
 }  // namespace
 }  // namespace inferx

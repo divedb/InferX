@@ -68,7 +68,7 @@ Status CublasErrorToStatus(cublasStatus_t s, const char* expr, const char* file,
 // different element types, so an algorithm the heuristic chose for one is not
 // valid for the other. Keying on the shape alone would hand an FP16 algorithm
 // to an FP8 matmul.
-enum class Path { kF16, kBF16, kF8E4M3 };
+enum class Path { kF16, kBF16, kF8E4M3, kF8E4M3BF16Out };
 
 struct ShapeKey {
   int64_t m, n, k;
@@ -169,7 +169,7 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulDescSetAttribute(
       plan->desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_n, sizeof(op_n)));
 
-  if (path == Path::kF8E4M3) {
+  if (path == Path::kF8E4M3 || path == Path::kF8E4M3BF16Out) {
     // Bound to placeholders here and rebound per call in LinearF8E4M3. A null
     // scale pointer makes the heuristic decline the problem outright, which
     // surfaces as "no algorithm" rather than as a missing-attribute error.
@@ -202,6 +202,13 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
       ab_type = CUDA_R_8F_E4M3;
       // Output stays f16: an f8 output would need a third scale and would throw
       // away precision the FP32 epilogue is already holding.
+      break;
+    case Path::kF8E4M3BF16Out:
+      // The path the model runs on. FP8 operands with a bf16 result, so a
+      // quantized GEMM drops into a bf16 stack without a conversion on either
+      // side of it.
+      ab_type = CUDA_R_8F_E4M3;
+      out_type = CUDA_R_16BF;
       break;
   }
 
@@ -241,7 +248,8 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   if (returned == 0) {
     return UnimplementedError(
         "cuBLASLt has no algorithm for m=", m, " n=", n, " k=", k, " (",
-        path == Path::kF8E4M3 ? "f8e4m3" : "f16",
+        (path == Path::kF8E4M3 || path == Path::kF8E4M3BF16Out) ? "f8e4m3"
+                                                                 : "f16",
         " in, f32 accumulate, workspace ", ws_bytes, " B)");
   }
 
@@ -403,10 +411,23 @@ Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
                                   const TensorView& y, const float* x_scale_dev,
                                   const float* w_scale_dev,
                                   cudaStream_t stream) {
+  // The output dtype selects the path. f16 is M1's benchmark form; bf16 is what
+  // the model uses, and having one entry point means the two cannot drift.
+  if (y.GetDataType() != DataType::kFloat16 &&
+      y.GetDataType() != DataType::kBFloat16) {
+    return InvalidArgumentError("LinearF8E4M3: y is ",
+                                DataTypeName(y.GetDataType()),
+                                ", expected f16 or bf16");
+  }
+
+  const Path path = y.GetDataType() == DataType::kBFloat16
+                        ? Path::kF8E4M3BF16Out
+                        : Path::kF8E4M3;
+
   for (const auto& [name, t, want] :
        {std::tuple{"x", &x, DataType::kFloat8E4M3FN},
         {"w", &w, DataType::kFloat8E4M3FN},
-        {"y", &y, DataType::kFloat16}}) {
+        {"y", &y, y.GetDataType()}}) {
     if (!t->IsDefined()) {
       return InvalidArgumentError("LinearF8E4M3: ", name, " is undefined");
     }
@@ -456,8 +477,7 @@ Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
 
   if (m == 0 || n == 0 || k == 0) return OkStatus();
 
-  INFERX_ASSIGN_OR_RETURN(const Plan* plan,
-                          impl_->GetOrBuild(m, n, k, Path::kF8E4M3));
+  INFERX_ASSIGN_OR_RETURN(const Plan* plan, impl_->GetOrBuild(m, n, k, path));
 
   // Rebound per call: the plan is shared by every tensor of this shape, but the
   // scales belong to the tensors. Cheap -- this copies a pointer into the

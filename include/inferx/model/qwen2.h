@@ -125,6 +125,33 @@ class Qwen2Model {
   /// \brief How many decode shapes are currently captured.
   int64_t captured_graphs() const;
 
+  /// \brief Requantizes the layer weights to FP8 e4m3, halving what a step
+  ///        must stream.
+  ///
+  /// A decode step is bandwidth-bound on weights: 6.17 GB per token is 8.4 ms
+  /// at this card's peak, which is the floor everything else has been optimized
+  /// against. FP8 moves the floor rather than approaching it.
+  ///
+  /// **This changes the model's output.** Not by rounding, the way bf16 does,
+  /// but by quantization: one scale per tensor, three mantissa bits. It is a
+  /// serving mode, not an optimization, and it is opt-in for that reason. The
+  /// bf16 path stays the reference and stays default.
+  ///
+  /// Embeddings and the LM head are left in bf16. They are the same tensor here
+  /// (tied), the embedding lookup reads rows out of it directly, and quantizing
+  /// it would mean dequantizing on every lookup for 10% of the weight bytes.
+  ///
+  /// Activations are quantized per step, dynamically, one scale per tensor.
+  /// That is what cuBLASLt's scalar scale pointers accept and it needs no
+  /// calibration pass.
+  ///
+  /// Irreversible: the bf16 weights are freed. Load the model again to get them
+  /// back.
+  Status QuantizeWeightsToF8();
+
+  /// \brief True once `QuantizeWeightsToF8` has run.
+  bool weights_are_f8() const;
+
   const ModelConfig& config() const;
 
   /// \brief Device bytes held by the weights.
@@ -132,6 +159,9 @@ class Qwen2Model {
 
  private:
   struct Impl;
+
+  /// Rejects the bf16-only recompute path once weights are FP8.
+  Status RequireBf16Weights() const;
 
   explicit Qwen2Model(std::unique_ptr<Impl> impl);
 

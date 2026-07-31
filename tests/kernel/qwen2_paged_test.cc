@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -336,6 +337,77 @@ TEST_F(PagedModelTest, RejectsMalformedBatches) {
 
   EXPECT_EQ(model_->Step(bad, &logits).code(),
             absl::StatusCode::kInvalidArgument);
+}
+
+// FP8 weights: does the quantized model still work, and by how much does it
+// differ?
+//
+// This is deliberately not compared against the HuggingFace reference. FP8
+// weights are a different numerical model -- one scale per tensor, three
+// mantissa bits -- and holding them to a bf16 tolerance would be asserting that
+// quantization does nothing, which is the opposite of what it does. What is
+// asserted is that the model still answers correctly and that the divergence
+// from bf16 is bounded and reported.
+TEST_F(PagedModelTest, Fp8WeightsStillAnswerCorrectly) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+
+  // bf16 first, as the thing to compare against.
+  std::vector<float> bf16_logits;
+  {
+    TestSequence seq(model_->kv_pool(), 8);
+    auto batch = seq.MakeBatch(prompt, 0);
+    ASSERT_TRUE(batch.ok()) << batch.status();
+    ASSERT_TRUE(model_->Step(*batch, &bf16_logits).ok());
+  }
+
+  ASSERT_FALSE(model_->weights_are_f8());
+
+  const size_t before = model_->WeightBytes();
+  const Status quantized = model_->QuantizeWeightsToF8();
+  ASSERT_TRUE(quantized.ok()) << quantized;
+  ASSERT_TRUE(model_->weights_are_f8());
+
+  std::vector<float> f8_logits;
+  {
+    TestSequence seq(model_->kv_pool(), 8);
+    auto batch = seq.MakeBatch(prompt, 0);
+    ASSERT_TRUE(batch.ok()) << batch.status();
+    const Status stepped = model_->Step(*batch, &f8_logits);
+    ASSERT_TRUE(stepped.ok()) << stepped;
+  }
+
+  ASSERT_EQ(f8_logits.size(), bf16_logits.size());
+
+  // The answer must survive. This is the assertion that matters: a
+  // quantization that breaks the model shows up here and nowhere subtler.
+  EXPECT_EQ(Argmax(f8_logits), kParis)
+      << "FP8 weights changed the answer; top token was "
+      << Argmax(f8_logits);
+
+  // And the divergence, reported rather than merely bounded, because the number
+  // is what tells you whether FP8 is usable for a given application.
+  double worst = 0, sum = 0;
+  for (size_t i = 0; i < f8_logits.size(); ++i) {
+    worst = std::max<double>(worst, std::abs(f8_logits[i] - bf16_logits[i]));
+    sum += bf16_logits[i];
+  }
+
+  const double mean = sum / bf16_logits.size();
+  double var = 0;
+  for (const float v : bf16_logits) var += (v - mean) * (v - mean);
+  const double sd = std::sqrt(var / bf16_logits.size());
+
+  std::printf("  fp8 vs bf16: worst |diff| %.4f = %.3f sd; weights %.2f GB -> "
+              "%.2f GB\n",
+              worst, worst / sd, before / 1e9,
+              model_->WeightBytes() / 1e9);
+
+  // Loose on purpose, and stated as such: three mantissa bits over 36 layers
+  // is a real perturbation, and the bound exists to catch a broken
+  // quantization rather than to certify accuracy. The printed number is the
+  // useful output.
+  EXPECT_LT(worst / sd, 3.0) << "FP8 divergence is beyond what per-tensor "
+                                "quantization should produce";
 }
 
 }  // namespace

@@ -1,5 +1,6 @@
 #include "inferx/model/qwen2.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -15,6 +16,7 @@
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/layers.h"
+#include "inferx/kernels/quantize.h"
 
 #ifdef INFERX_WITH_FLASHINFER
 #include "absl/types/span.h"
@@ -58,6 +60,18 @@ struct LayerWeights {
   TensorView o_w;
   TensorView post_norm;
   TensorView gate_up_w, down_w;
+
+  // Populated by QuantizeWeightsToF8. Each carries a device-resident dequant
+  // scale, which cuBLASLt folds into the epilogue.
+  TensorView qkv_w8, o_w8, gate_up_w8, down_w8;
+  // Indices into Impl::weight_buffers for the four large tensors, so FP8
+  // conversion can release exactly those. The norm weights and the embedding
+  // share that vector and must survive.
+  int qkv_buf = -1, o_buf = -1, gate_up_buf = -1, down_buf = -1;
+  float* qkv_s = nullptr;
+  float* o_s = nullptr;
+  float* gate_up_s = nullptr;
+  float* down_s = nullptr;
 };
 
 /// Uploads several host tensors end to end into one device buffer.
@@ -198,6 +212,13 @@ struct Qwen2Model::Impl {
   /// Forced false while capturing. \see LaunchDecodeBody.
   bool allow_flashinfer = true;
 
+  // FP8 weight mode. The activation staging buffers are sized for the widest
+  // GEMM input a layer has, which is the intermediate width feeding down_proj.
+  bool weights_f8 = false;
+  std::vector<DeviceBuffer> f8_buffers;
+  DeviceBuffer act_f8;        // quantized activations, reused every GEMM
+  DeviceBuffer act_scales;    // one float per GEMM input per layer
+
   // One instantiated graph per decode shape. Keyed on (tokens, seqs, blocks):
   // a graph records fixed launch dimensions, so a batch of a different shape
   // needs its own. Decode shapes repeat forever, which is what makes this pay.
@@ -216,6 +237,53 @@ struct Qwen2Model::Impl {
     if (pinned != nullptr) cudaFreeHost(pinned);
     if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
     if (stream != nullptr) cudaStreamDestroy(stream);
+  }
+
+  /// One projection, in whichever precision the model is configured for.
+  ///
+  /// The FP8 form quantizes its input first, dynamically, one scale per tensor.
+  /// That costs a launch per GEMM -- against roughly half the weight bytes
+  /// saved, which at these sizes is the trade that pays.
+  Status Linear(const TensorView& in, const TensorView& w_bf16,
+                const TensorView& w_f8, const float* w_scale,
+                const TensorView& out, int scale_slot) {
+    if (!weights_f8 || !w_f8.IsDefined()) {
+      return gemm.LinearBF16(in, w_bf16, out, stream);
+    }
+
+    auto* act_scale = reinterpret_cast<float*>(act_scales.data()) + scale_slot;
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView in_f8,
+        TensorView::Create(act_f8.data(), DataType::kFloat8E4M3FN,
+                           in.GetShape(), DeviceId::Cuda(0)));
+
+    INFERX_RETURN_IF_ERROR(
+        kernels::QuantizeToF8E4M3Dynamic(in, in_f8, act_scale, stream));
+
+    return gemm.LinearF8E4M3(in_f8, w_f8, out, act_scale, w_scale, stream);
+  }
+
+  /// Grows the quantized-activation staging to cover `tokens`.
+  ///
+  /// Separate from EnsureCapacity's early return, and called before it, because
+  /// the two do not grow together: quantization can be switched on when no
+  /// forward has run at all, at which point capacity_tokens is zero and sizing
+  /// this from it yields a null buffer that the first step then writes to. That
+  /// is exactly the bug this shape prevents.
+  Status EnsureActivationF8(int64_t tokens) {
+    if (!weights_f8 || tokens <= 0) return OkStatus();
+
+    const int64_t widest = std::max({config.hidden_size,
+                                     config.q_dim() + 2 * config.kv_dim(),
+                                     config.intermediate_size});
+    const size_t need = static_cast<size_t>(tokens * widest);
+
+    if (need <= act_f8.size()) return OkStatus();
+
+    INFERX_ASSIGN_OR_RETURN(act_f8,
+                            DeviceBuffer::Allocate(need, DeviceId::Cuda(0)));
+    return OkStatus();
   }
 
   Status EnsureCapacity(int64_t tokens);
@@ -240,6 +308,8 @@ struct Qwen2Model::Impl {
 };
 
 Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
+  INFERX_RETURN_IF_ERROR(EnsureActivationF8(tokens));
+
   if (tokens <= capacity_tokens) return OkStatus();
 
   const int64_t h = config.hidden_size;
@@ -695,8 +765,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // adds. The split is unavoidable -- a fused row interleaves Q, K and V per
     // token, so Q is strided for more than one token -- but folding the bias
     // into it means the fused path still costs four launches fewer per layer.
-    INFERX_RETURN_IF_ERROR(
-        gemm.LinearBF16(norm, layer.qkv_w, qkv_v, stream));
+    INFERX_RETURN_IF_ERROR(Linear(norm, layer.qkv_w, layer.qkv_w8,
+                                  layer.qkv_s, qkv_v, 0));
     INFERX_RETURN_IF_ERROR(
         kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
 
@@ -742,7 +812,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale, stream));
     }
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x, stream));
+    INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s, x, 1));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
 
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
@@ -754,11 +824,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
     // Gate and up need no split: SiluMul is elementwise, so it reads both
     // halves straight out of the fused buffer. This fusion is free.
-    INFERX_RETURN_IF_ERROR(
-        gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v, stream));
+    INFERX_RETURN_IF_ERROR(Linear(norm, layer.gate_up_w, layer.gate_up_w8,
+                                  layer.gate_up_s, gate_up_v, 2));
     INFERX_RETURN_IF_ERROR(
         kernels::SiluMulFused(gate_up_v, gate_v, stream));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x, stream));
+    INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
+                                  layer.down_s, x, 3));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
 
@@ -890,6 +961,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
       }
       INFERX_ASSIGN_OR_RETURN(w.qkv_w,
                               UploadConcatenated(qkv, &impl->weight_buffers));
+      w.qkv_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
     }
 
     if (config.attention_bias) {
@@ -909,6 +981,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
 
     INFERX_RETURN_IF_ERROR(load("self_attn.o_proj.weight",
                                 Shape({h, config.q_dim()}), &w.o_w));
+    w.o_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
     {
       std::vector<Tensor> gate_up;
@@ -922,10 +995,12 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
       INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
                               UploadConcatenated(gate_up,
                                                  &impl->weight_buffers));
+      w.gate_up_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
     }
 
     INFERX_RETURN_IF_ERROR(load("mlp.down_proj.weight", Shape({h, inter}),
                                 &w.down_w));
+    w.down_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
     impl->layers.push_back(w);
   }
@@ -1009,6 +1084,7 @@ Status DownloadLogitsPinned(const DeviceBuffer& buf, int64_t offset_elems,
 
 Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
                            std::vector<float>* out_logits) {
+  INFERX_RETURN_IF_ERROR(RequireBf16Weights());
   INFERX_RETURN_IF_ERROR(ValidateIds(token_ids, impl_->config.vocab_size));
 
   int64_t tokens = 0;
@@ -1116,6 +1192,114 @@ int64_t Qwen2Model::captured_graphs() const {
   return static_cast<int64_t>(impl_->graphs.size());
 }
 
+
+// The M2 full-recompute path predates the KV cache and runs everything on the
+// default stream. It is a reference and debugging path, not a serving one, and
+// it was never routed through the precision selector -- so after quantization
+// its projections would read weight buffers that no longer exist. Refusing is
+// the honest boundary; making it FP8-capable means moving it onto the model's
+// stream, which is a change worth making only if something needs it.
+Status Qwen2Model::RequireBf16Weights() const {
+  if (!impl_->weights_f8) return OkStatus();
+
+  return FailedPreconditionError(
+      "Forward()/ForwardLastLogits() run the bf16 recompute path and the "
+      "weights have been quantized to FP8; use Step() with a KV cache");
+}
+
+Status Qwen2Model::QuantizeWeightsToF8() {
+  if (impl_->weights_f8) return OkStatus();
+
+  if (!impl_->graphs.empty()) {
+    // A captured graph holds the bf16 weight addresses and the bf16 kernels.
+    // Requantizing under it would replay against freed memory.
+    return FailedPreconditionError(
+        "cannot quantize weights after capturing a graph; quantize first, then "
+        "capture");
+  }
+
+  // One float per quantized tensor, allocated together so the pointers stay
+  // stable for the life of the model.
+  const int64_t layers = static_cast<int64_t>(impl_->layers.size());
+
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer scales,
+      DeviceBuffer::Allocate(static_cast<size_t>(layers) * 4 * sizeof(float),
+                             DeviceId::Cuda(0)));
+
+  auto* scale_base = reinterpret_cast<float*>(scales.data());
+
+  const auto quantize = [&](const TensorView& src, TensorView* dst,
+                            float** scale, int index) -> Status {
+    INFERX_ASSIGN_OR_RETURN(
+        DeviceBuffer buf,
+        DeviceBuffer::Allocate(static_cast<size_t>(src.Numel()),
+                               DeviceId::Cuda(0)));
+
+    impl_->f8_buffers.push_back(std::move(buf));
+
+    INFERX_ASSIGN_OR_RETURN(
+        *dst, TensorView::Create(impl_->f8_buffers.back().data(),
+                                 DataType::kFloat8E4M3FN, src.GetShape(),
+                                 DeviceId::Cuda(0)));
+
+    *scale = scale_base + index;
+
+    // The single-block kernel, which is slow on a 90 MB tensor -- one SM
+    // cannot saturate memory, so this costs on the order of a second across
+    // all 144 tensors. Paid once at load, which is the right place for it; a
+    // multi-block variant would be the fix if load time ever mattered.
+    return kernels::QuantizeToF8E4M3Dynamic(src, *dst, *scale, impl_->stream);
+  };
+
+  int index = 0;
+  for (LayerWeights& w : impl_->layers) {
+    INFERX_RETURN_IF_ERROR(quantize(w.qkv_w, &w.qkv_w8, &w.qkv_s, index++));
+    INFERX_RETURN_IF_ERROR(quantize(w.o_w, &w.o_w8, &w.o_s, index++));
+    INFERX_RETURN_IF_ERROR(
+        quantize(w.gate_up_w, &w.gate_up_w8, &w.gate_up_s, index++));
+    INFERX_RETURN_IF_ERROR(quantize(w.down_w, &w.down_w8, &w.down_s, index++));
+  }
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+
+  impl_->f8_buffers.push_back(std::move(scales));
+
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->act_scales,
+      DeviceBuffer::Allocate(4 * sizeof(float), DeviceId::Cuda(0)));
+
+  // Release the bf16 originals of exactly the tensors that were quantized, and
+  // only after every quantization has landed. Clearing the whole vector would
+  // free the embedding, the final norm and every layernorm weight along with
+  // them -- all still live, all still bf16, all still pointed at by views that
+  // would then dangle.
+  for (const LayerWeights& w : impl_->layers) {
+    for (const int index : {w.qkv_buf, w.o_buf, w.gate_up_buf, w.down_buf}) {
+      if (index >= 0 &&
+          index < static_cast<int>(impl_->weight_buffers.size())) {
+        impl_->weight_buffers[static_cast<size_t>(index)].Reset();
+      }
+    }
+  }
+
+  impl_->weight_bytes = 0;
+  for (const DeviceBuffer& b : impl_->weight_buffers) {
+    impl_->weight_bytes += b.size();
+  }
+  for (const DeviceBuffer& b : impl_->f8_buffers) impl_->weight_bytes += b.size();
+
+  impl_->weights_f8 = true;
+
+  // Now that the flag is set this does real work; if no forward has run yet it
+  // is a no-op and the first EnsureCapacity will size it.
+  INFERX_RETURN_IF_ERROR(impl_->EnsureActivationF8(impl_->capacity_tokens));
+
+  return OkStatus();
+}
+
+bool Qwen2Model::weights_are_f8() const { return impl_->weights_f8; }
+
 Status Qwen2Model::Step(const ForwardBatch& batch,
                         std::vector<float>* out_logits) {
   if (impl_->pool == nullptr) {
@@ -1153,6 +1337,7 @@ Status Qwen2Model::Step(const ForwardBatch& batch,
 
 Status Qwen2Model::ForwardLastLogits(const std::vector<int32_t>& token_ids,
                                      std::vector<float>* out_logits) {
+  INFERX_RETURN_IF_ERROR(RequireBf16Weights());
   INFERX_RETURN_IF_ERROR(ValidateIds(token_ids, impl_->config.vocab_size));
 
   int64_t tokens = 0;
