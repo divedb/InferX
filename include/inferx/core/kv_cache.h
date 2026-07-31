@@ -71,9 +71,15 @@ class KvBlockPool {
   /// \param block_size  Tokens per block. 16 by default (T10).
   /// \param layout      Per-token geometry. \see KvLayout.
   /// \return            The pool, or ResourceExhausted if it will not fit.
+  /// \param device      Where the pool lives. Defaults to the GPU; `Cpu()`
+  ///                    exists so the scheduler's block bookkeeping can be
+  ///                    unit-tested on a machine with no device at all, which
+  ///                    §3.1 calls the highest-leverage testability decision in
+  ///                    the design. The free list is the same code either way.
   static StatusOr<KvBlockPool> Create(int64_t num_layers, int64_t num_blocks,
                                       int64_t block_size,
-                                      const KvLayout& layout);
+                                      const KvLayout& layout,
+                                      DeviceId device = DeviceId::Cuda(0));
 
   /// \brief Takes a free block. The contents are whatever was there before.
   ///
@@ -134,6 +140,7 @@ class KvBlockPool {
   int64_t layer_stride_ = 0;
   /// Bytes from a layer's K region to its V region.
   int64_t entry_stride_ = 0;
+  DeviceId device_;
 
   // Free blocks, taken from the back. LIFO rather than FIFO on purpose: the
   // most recently freed block is the most likely to still be in L2.

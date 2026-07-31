@@ -1,0 +1,322 @@
+// The engine, end to end: scheduler + paged cache + real model.
+//
+// M3's deliverable is "the engine exists", and this is what that means -- a
+// request goes in, a step loop runs, tokens come out, blocks are returned. The
+// scheduler contributes no CUDA and the model contributes no policy; the loop
+// below is the entire seam between them, and it is §5.2's depth-0 case:
+// prepare, execute, commit, nothing in flight.
+
+#include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "inferx/core/cuda_utils.h"
+#include "inferx/model/qwen2.h"
+#include "inferx/scheduler/scheduler.h"
+
+namespace inferx {
+namespace {
+
+using model::ForwardBatch;
+using scheduler::Completion;
+using scheduler::FinishReason;
+using scheduler::SamplingParams;
+using scheduler::Scheduler;
+using scheduler::SchedulerConfig;
+
+constexpr int32_t kThe = 785;
+constexpr int32_t kCapital = 6722;
+constexpr int32_t kOf = 315;
+constexpr int32_t kFrance = 9625;
+constexpr int32_t kIs = 374;
+constexpr int32_t kParis = 12095;
+
+std::string CheckpointDir() {
+  if (const char* env = std::getenv("INFERX_TEST_CHECKPOINT")) return env;
+
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return "";
+
+  return std::string(home) +
+         "/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/"
+         "aa8e72537993ba99e69dfaafa59ed015b17504d1";
+}
+
+/// Greedy sampling on the host. The on-GPU sampler is §4 step 7 and M4's job;
+/// what matters here is that the loop closes.
+std::vector<int32_t> GreedySample(const std::vector<float>& logits,
+                                  size_t rows) {
+  std::vector<int32_t> out;
+  if (rows == 0) return out;
+
+  const size_t vocab = logits.size() / rows;
+
+  for (size_t r = 0; r < rows; ++r) {
+    const auto begin = logits.begin() + static_cast<long>(r * vocab);
+    out.push_back(static_cast<int32_t>(
+        std::distance(begin, std::max_element(begin,
+                                              begin + static_cast<long>(vocab)))));
+  }
+
+  return out;
+}
+
+class EngineTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    if (!CudaAvailable()) return;
+
+    auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+    if (!loaded.ok()) {
+      status_ = loaded.status();
+      return;
+    }
+
+    model_ = new model::Qwen2Model(*std::move(loaded));
+    status_ = model_->AttachKvCache(512, 16);
+  }
+
+  static void TearDownTestSuite() {
+    delete model_;
+    model_ = nullptr;
+  }
+
+  void SetUp() override {
+    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+    if (model_ == nullptr || !status_.ok()) {
+      GTEST_SKIP() << "model unavailable: " << status_;
+    }
+  }
+
+  /// Runs the loop until nothing is left. Returns everything that finished.
+  std::vector<Completion> Drain(Scheduler* sched, int max_steps = 200) {
+    std::vector<Completion> all;
+    int steps = 0;
+
+    while (sched->HasWork()) {
+      EXPECT_LT(++steps, max_steps) << "step loop did not terminate";
+      if (steps >= max_steps) break;
+
+      ForwardBatch batch;
+      EXPECT_TRUE(sched->PrepareStep(&batch).ok());
+
+      if (batch.num_tokens() > 0) {
+        std::vector<float> logits;
+        const Status s = model_->Step(batch, &logits);
+        EXPECT_TRUE(s.ok()) << "step " << steps << ": " << s;
+        if (!s.ok()) break;
+
+        const std::vector<int32_t> sampled =
+            GreedySample(logits, batch.logits_indices.size());
+
+        EXPECT_TRUE(sched->CommitStep(sampled).ok());
+      }
+
+      for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+    }
+
+    for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+    return all;
+  }
+
+  StatusOr<Scheduler> MakeScheduler(int64_t max_running = 4) {
+    SchedulerConfig config;
+    config.max_running = max_running;
+    config.max_batch_tokens = 2048;
+    config.max_seq_len = 512;
+
+    return Scheduler::Create(config, model_->kv_pool());
+  }
+
+  static model::Qwen2Model* model_;
+  static Status status_;
+};
+
+model::Qwen2Model* EngineTest::model_ = nullptr;
+Status EngineTest::status_ = OkStatus();
+
+// One request, all the way through. The first generated token is the answer the
+// model has given at every milestone since M2, now arrived at through a
+// scheduler and a paged cache instead of a full recompute.
+TEST_F(EngineTest, ServesASingleRequest) {
+  auto sched = MakeScheduler();
+  ASSERT_TRUE(sched.ok()) << sched.status();
+
+  SamplingParams params;
+  params.max_tokens = 5;
+
+  ASSERT_TRUE(sched->AddRequest(1, {kThe, kCapital, kOf, kFrance, kIs}, params)
+                  .ok());
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  ASSERT_EQ(done.size(), 1u);
+  EXPECT_EQ(done[0].id, 1u);
+  EXPECT_EQ(done[0].reason, FinishReason::kMaxTokens);
+  ASSERT_EQ(done[0].output_tokens.size(), 5u);
+  EXPECT_EQ(done[0].output_tokens[0], kParis);
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+}
+
+// Several requests at once, sharing one pool and one batch. Their blocks
+// necessarily interleave, and each must still get the answer it would have got
+// alone -- which is the property that makes batching safe.
+TEST_F(EngineTest, ServesConcurrentRequestsIndependently) {
+  auto sched = MakeScheduler();
+  ASSERT_TRUE(sched.ok()) << sched.status();
+
+  SamplingParams params;
+  params.max_tokens = 3;
+
+  // Same prompt three times, plus one different, so a cross-contamination bug
+  // shows up as the odd one out agreeing with the others.
+  ASSERT_TRUE(sched->AddRequest(1, {kThe, kCapital, kOf, kFrance, kIs}, params).ok());
+  ASSERT_TRUE(sched->AddRequest(2, {kThe, kCapital, kOf, kFrance, kIs}, params).ok());
+  ASSERT_TRUE(sched->AddRequest(3, {kThe, kCapital, kOf, kFrance, kIs}, params).ok());
+  ASSERT_TRUE(sched->AddRequest(4, {kThe, kCapital, kOf, kFrance}, params).ok());
+
+  std::vector<Completion> done = Drain(&*sched);
+  ASSERT_EQ(done.size(), 4u);
+
+  std::sort(done.begin(), done.end(),
+            [](const Completion& a, const Completion& b) { return a.id < b.id; });
+
+  // The three identical prompts must produce identical output.
+  EXPECT_EQ(done[0].output_tokens, done[1].output_tokens);
+  EXPECT_EQ(done[1].output_tokens, done[2].output_tokens);
+  EXPECT_EQ(done[0].output_tokens[0], kParis);
+
+  // And the fourth, which is a different prompt, must not.
+  EXPECT_NE(done[3].output_tokens, done[0].output_tokens)
+      << "a different prompt produced identical output; sequences are sharing "
+         "cache";
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+}
+
+// Batching must not change the answer. The same request run alone and run
+// alongside others has to generate the same tokens -- if it does not, the batch
+// is leaking state between sequences.
+TEST_F(EngineTest, BatchingDoesNotChangeTheOutput) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+
+  SamplingParams params;
+  params.max_tokens = 4;
+
+  std::vector<int32_t> alone;
+  {
+    auto sched = MakeScheduler(1);
+    ASSERT_TRUE(sched.ok());
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    alone = done[0].output_tokens;
+  }
+
+  std::vector<int32_t> batched;
+  {
+    auto sched = MakeScheduler(4);
+    ASSERT_TRUE(sched.ok());
+
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+    // Noise alongside it, with different lengths so the batch is ragged.
+    ASSERT_TRUE(sched->AddRequest(2, {kThe, kIs}, params).ok());
+    ASSERT_TRUE(sched->AddRequest(3, {kOf}, params).ok());
+
+    std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 3u);
+
+    for (const Completion& c : done) {
+      if (c.id == 1) batched = c.output_tokens;
+    }
+  }
+
+  EXPECT_EQ(alone, batched)
+      << "batching changed the output; sequences are not isolated";
+}
+
+TEST_F(EngineTest, StopTokenEndsGenerationEarly) {
+  auto sched = MakeScheduler();
+  ASSERT_TRUE(sched.ok());
+
+  // Stop on whatever the model will actually produce first, so the stop path is
+  // genuinely taken rather than the token cap.
+  SamplingParams params;
+  params.max_tokens = 20;
+  params.stop_tokens = {kParis};
+
+  ASSERT_TRUE(sched->AddRequest(1, {kThe, kCapital, kOf, kFrance, kIs}, params)
+                  .ok());
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  ASSERT_EQ(done.size(), 1u);
+  EXPECT_EQ(done[0].reason, FinishReason::kStopToken);
+  EXPECT_EQ(done[0].output_tokens, (std::vector<int32_t>{kParis}));
+}
+
+// More requests than fit at once: admission has to queue them, and the pool has
+// to recycle blocks between them. This is the shape of real load.
+TEST_F(EngineTest, QueuesMoreRequestsThanCanRunAtOnce) {
+  auto sched = MakeScheduler(/*max_running=*/2);
+  ASSERT_TRUE(sched.ok());
+
+  SamplingParams params;
+  params.max_tokens = 2;
+
+  for (int i = 0; i < 6; ++i) {
+    ASSERT_TRUE(sched->AddRequest(static_cast<scheduler::RequestId>(i),
+                                  {kThe, kCapital, kOf, kFrance, kIs}, params)
+                    .ok());
+  }
+
+  EXPECT_EQ(sched->num_waiting(), 6);
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  EXPECT_EQ(done.size(), 6u);
+  for (const Completion& c : done) {
+    EXPECT_EQ(c.output_tokens.size(), 2u) << "request " << c.id;
+    EXPECT_EQ(c.output_tokens[0], kParis) << "request " << c.id;
+  }
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+}
+
+// Generation long enough to cross several block boundaries, which is where a
+// block table that is appended to mid-sequence gets exercised.
+TEST_F(EngineTest, GenerationGrowsAcrossBlockBoundaries) {
+  auto sched = MakeScheduler(1);
+  ASSERT_TRUE(sched.ok());
+
+  SamplingParams params;
+  params.max_tokens = 40;  // 5 prompt + 40 spans four 16-token blocks
+
+  ASSERT_TRUE(sched->AddRequest(1, {kThe, kCapital, kOf, kFrance, kIs}, params)
+                  .ok());
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  ASSERT_EQ(done.size(), 1u);
+  EXPECT_EQ(done[0].output_tokens.size(), 40u);
+  EXPECT_EQ(done[0].output_tokens[0], kParis);
+
+  // Degenerate repetition is what a block table that stops growing correctly
+  // looks like: history stops mattering and the model loops.
+  const auto& out = done[0].output_tokens;
+  const bool all_same =
+      std::all_of(out.begin(), out.end(),
+                  [&](int32_t t) { return t == out[0]; });
+  EXPECT_FALSE(all_same) << "generation collapsed; the cache likely stopped "
+                            "growing correctly";
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0);
+}
+
+}  // namespace
+}  // namespace inferx

@@ -32,6 +32,7 @@ endif()
 # After src/kernels: the model's forward pass links inferx::kernels when device
 # code is available, and is loader-only when it is not.
 add_subdirectory(src/model)
+add_subdirectory(src/scheduler)
 
 if(INFERX_BUILD_TESTS)
   enable_testing()

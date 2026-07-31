@@ -11,7 +11,8 @@ namespace inferx {
 StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers,
                                           int64_t num_blocks,
                                           int64_t block_size,
-                                          const KvLayout& layout) {
+                                          const KvLayout& layout,
+                                          DeviceId device) {
   if (num_layers <= 0 || num_blocks <= 0 || block_size <= 0) {
     return InvalidArgumentError("KV pool needs positive dimensions, got layers=",
                                 num_layers, " blocks=", num_blocks,
@@ -35,6 +36,7 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers,
   }
 
   KvBlockPool pool;
+  pool.device_ = device;
   pool.layout_ = layout;
   pool.num_layers_ = num_layers;
   pool.num_blocks_ = num_blocks;
@@ -51,7 +53,7 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers,
 
   INFERX_ASSIGN_OR_RETURN(
       pool.storage_,
-      DeviceBuffer::Allocate(static_cast<size_t>(total), DeviceId::Cuda(0)));
+      DeviceBuffer::Allocate(static_cast<size_t>(total), device));
 
   // Descending, so that popping from the back hands out block 0 first. Only
   // cosmetic, but it makes a fresh pool's allocations readable in a dump.
@@ -104,10 +106,10 @@ Status KvBlockPool::FreeBlocks(const std::vector<int32_t>& blocks) {
 namespace {
 
 StatusOr<TensorView> ViewAt(const DeviceBuffer& storage, int64_t offset,
-                            const Shape& shape, DataType dtype) {
+                            const Shape& shape, DataType dtype,
+                            DeviceId device) {
   return TensorView::Create(
-      const_cast<std::byte*>(storage.data()) + offset, dtype, shape,
-      DeviceId::Cuda(0));
+      const_cast<std::byte*>(storage.data()) + offset, dtype, shape, device);
 }
 
 }  // namespace
@@ -121,7 +123,7 @@ StatusOr<TensorView> KvBlockPool::KeyCache(int64_t layer) const {
   return ViewAt(storage_, layer * layer_stride_,
                 Shape({num_blocks_, block_size_, layout_.kv_heads,
                        layout_.head_dim}),
-                layout_.dtype);
+                layout_.dtype, device_);
 }
 
 StatusOr<TensorView> KvBlockPool::ValueCache(int64_t layer) const {
@@ -143,7 +145,7 @@ StatusOr<TensorView> KvBlockPool::ValueCache(int64_t layer) const {
   return ViewAt(storage_, layer * layer_stride_ + entry_stride_ * num_blocks_,
                 Shape({num_blocks_, block_size_, layout_.kv_heads,
                        layout_.head_dim}),
-                layout_.dtype);
+                layout_.dtype, device_);
 }
 
 }  // namespace inferx

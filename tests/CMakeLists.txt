@@ -8,6 +8,7 @@ function(inferx_add_test name)
     inferx::core
     inferx::common
     inferx::model
+    inferx::scheduler
     inferx::flags
     GTest::gtest_main
     GTest::gmock
@@ -28,6 +29,7 @@ function(inferx_add_kernel_test name)
     inferx::core
     inferx::common
     inferx::model
+    inferx::scheduler
     inferx::kernels
     inferx::flags
     GTest::gtest_main
@@ -42,6 +44,7 @@ inferx_add_test(dtype_test             unit/dtype_test.cc)
 inferx_add_test(json_test              unit/json_test.cc)
 inferx_add_test(safetensors_test       unit/safetensors_test.cc)
 inferx_add_test(config_test            unit/config_test.cc)
+inferx_add_test(scheduler_test         unit/scheduler_test.cc)
 inferx_add_test(checkpoint_conformance_test unit/checkpoint_conformance_test.cc)
 inferx_add_test(intrusive_ref_cnt_ptr_test unit/intrusive_ref_cnt_ptr_test.cc)
 inferx_add_test(shape_test             unit/shape_test.cc)
@@ -60,4 +63,5 @@ if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(qwen2_reference_test kernel/qwen2_reference_test.cc)
   inferx_add_kernel_test(paged_attention_test kernel/paged_attention_test.cc)
   inferx_add_kernel_test(qwen2_paged_test  kernel/qwen2_paged_test.cc)
+  inferx_add_kernel_test(engine_test       kernel/engine_test.cc)
 endif()
