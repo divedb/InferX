@@ -446,6 +446,21 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     INFERX_RETURN_IF_ERROR(upload(fi_indices_buf, indices));
     INFERX_RETURN_IF_ERROR(upload(fi_indptr_buf, fi_indptr_host));
     INFERX_RETURN_IF_ERROR(upload(fi_last_page_buf, last_page));
+
+    // Planned here, once per step, and deliberately not inside the launch: the
+    // planner reads the indptr on the host and branches on it, which no graph
+    // can record. Doing it here means all 36 layers share one plan *and* the
+    // launch below becomes capturable.
+    //
+    // graph_safe unconditionally, even when no graph exists. It pins the
+    // workspace offsets so a captured launch keeps addressing the right memory
+    // as sequences grow, and using it always means the graphed and ungraphed
+    // paths run identical kernels -- so a test that says "graphs do not change
+    // the output" is testing dispatch rather than arithmetic.
+    INFERX_RETURN_IF_ERROR(flashinfer->Plan(
+        batch.num_seqs, config.num_attention_heads,
+        config.num_key_value_heads, config.head_dim, block_size,
+        absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
   }
 #endif
 
@@ -523,16 +538,11 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
 #ifdef INFERX_WITH_FLASHINFER
-  // FlashInfer plans on the host and its plan depends on the batch's sequence
-  // lengths, so it cannot be baked into a graph: a replay would reuse a plan
-  // built for whatever lengths were current at capture. Capture therefore
-  // records the reference kernel, which reads everything from device buffers
-  // and is length-agnostic by construction.
-  //
-  // The two optimizations are consequently exclusive today. FlashInfer supports
-  // a fixed-shape planning mode for exactly this, and using it would mean
-  // hoisting the plan out of the captured region -- one plan per step shared by
-  // all 36 layers. Worth doing once the measurements say which matters more.
+  // Capturable now. The planning that could not be recorded happens in
+  // PrepareBatchInputs, once per step; what is left here is a kernel launch
+  // whose every pointer is stable and whose every value lives in device memory
+  // the plan rewrote. allow_flashinfer survives only so a caller can force the
+  // reference kernel.
   const bool use_flashinfer = fi_usable && allow_flashinfer;
 #endif
 
@@ -591,10 +601,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           TensorView::Create(fi_last_page_buf.data(), DataType::kInt32,
                              Shape({num_seqs}), DeviceId::Cuda(0)));
 
-      INFERX_RETURN_IF_ERROR(flashinfer->Decode(
-          q3, k_cache, v_cache, fi_indices, fi_indptr,
-          absl::MakeConstSpan(fi_indptr_host), fi_last_page, a3, attn_scale,
-          stream));
+      INFERX_RETURN_IF_ERROR(flashinfer->Run(q3, k_cache, v_cache, fi_indices,
+                                             fi_indptr, fi_last_page, a3,
+                                             attn_scale, stream));
     } else
 #endif
     {
@@ -909,8 +918,6 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
       impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq));
   INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
 
-  impl_->allow_flashinfer = false;  // see LaunchDecodeBody
-
   INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
       impl_->stream, cudaStreamCaptureModeThreadLocal));
 
@@ -919,8 +926,6 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
 
   cudaGraph_t graph = nullptr;
   const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
-
-  impl_->allow_flashinfer = true;
 
   // Capture must be ended even if the body failed, or the stream stays in
   // capture mode and every later launch on it fails with an opaque error.

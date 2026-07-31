@@ -96,6 +96,46 @@ class FlashInferDecode {
                 const TensorView& last_page_len, const TensorView& out,
                 float scale, cudaStream_t stream = nullptr);
 
+  /// \brief Plans a step without launching it. Host-side; **not capturable**.
+  ///
+  /// The split that lets FlashInfer live inside a CUDA graph. Planning reads
+  /// the indptr on the host and branches on it, so it can never be recorded;
+  /// launching is pure device work and can. Calling `Plan` once per step
+  /// outside the captured region and `Run` inside it gives a graph that
+  /// contains FlashInfer -- which is the only way to reach the launch overhead
+  /// that dominates a small-batch decode step.
+  ///
+  /// \param graph_safe When true, plans in FlashInfer's fixed-shape mode:
+  ///   `padded_batch_size` becomes a function of the device and head count
+  ///   rather than of the batch's sequence lengths, and the workspace offsets
+  ///   it hands back stop moving between steps. That is precisely the property
+  ///   a graph needs -- the structure is pinned while the values stay live --
+  ///   and it is why a graph captured at one context length keeps working as
+  ///   sequences grow. It forces the split-KV path on unconditionally, which
+  ///   costs a reduction pass on short sequences.
+  ///
+  /// \param batch, q_heads, kv_heads, head_dim, page_size  The shape.
+  /// \param kv_indptr_host `[batch + 1]` prefix sums, on the host.
+  Status Plan(int64_t batch, int64_t q_heads, int64_t kv_heads,
+              int64_t head_dim, int64_t page_size,
+              absl::Span<const int32_t> kv_indptr_host, bool graph_safe,
+              cudaStream_t stream = nullptr);
+
+  /// \brief Launches the plan from the last `Plan` call. Capturable.
+  ///
+  /// Every pointer it passes is stable across steps and every value it reads
+  /// lives in device memory that `Plan` rewrote, so a recording of this call
+  /// replays correctly for any later step of the same shape.
+  ///
+  /// The tensors must match the shape last planned; mismatches are rejected
+  /// rather than launched, because a plan built for a different batch produces
+  /// a kernel reading past the end of its indices.
+  Status Run(const TensorView& q, const TensorView& k_cache,
+             const TensorView& v_cache, const TensorView& kv_indices,
+             const TensorView& kv_indptr, const TensorView& last_page_len,
+             const TensorView& out, float scale,
+             cudaStream_t stream = nullptr);
+
  private:
   struct Impl;
 

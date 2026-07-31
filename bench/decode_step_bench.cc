@@ -118,13 +118,12 @@ int Main(int argc, char** argv) {
   std::printf("decode step, context %ld, one token per sequence\n\n",
               static_cast<long>(kContext));
 
-  // The two columns are not two ways of issuing the same work. FlashInfer plans
-  // on the host against the batch's sequence lengths, so it cannot be captured;
-  // a graph therefore records the reference kernel instead. What is compared is
-  // "FlashInfer, launch by launch" against "reference kernel, replayed", and
-  // the header says so rather than calling the ratio a speedup.
-  std::printf("%6s %14s %14s %9s  %s\n", "batch", "flashinfer_ms",
-              "graph+ref_ms", "noise_%", "graph/fi");
+  // Both columns now run the same kernels, FlashInfer included: the planner is
+  // hoisted out of the captured region, so a graph contains the fast attention
+  // rather than the reference one. This is a like-for-like comparison of
+  // dispatch again, which it was not before.
+  std::printf("%6s %14s %14s %9s  %s\n", "batch", "launches_ms",
+              "graph_ms", "noise_%", "speedup");
   std::printf("%s\n", std::string(62, '-').c_str());
 
   int failures = 0;

@@ -65,6 +65,17 @@ Status CheckI32(const TensorView& t, const char* name) {
 struct FlashInferDecode::Impl {
   DeviceBuffer float_workspace;
   DeviceBuffer int_workspace;
+
+  // The last plan, and the shape it was built for. Run() checks against these
+  // rather than trusting the caller: a kernel launched with a plan for another
+  // batch reads past the end of its own indices.
+  flashinfer::DecodePlanInfo plan;
+  bool planned = false;
+  int64_t planned_batch = 0;
+  int64_t planned_q_heads = 0;
+  int64_t planned_kv_heads = 0;
+  int64_t planned_head_dim = 0;
+  int64_t planned_page_size = 0;
   // DecodePlan writes its integer plan through a page-locked staging buffer
   // before the async copy to device, so this cannot be ordinary host memory.
   void* page_locked = nullptr;
@@ -101,14 +112,79 @@ FlashInferDecode::FlashInferDecode(FlashInferDecode&&) noexcept = default;
 FlashInferDecode& FlashInferDecode::operator=(FlashInferDecode&&) noexcept =
     default;
 
-Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
-                                const TensorView& v_cache,
-                                const TensorView& kv_indices,
-                                const TensorView& kv_indptr,
-                                absl::Span<const int32_t> kv_indptr_host,
-                                const TensorView& last_page_len,
-                                const TensorView& out, float scale,
-                                cudaStream_t stream) {
+Status FlashInferDecode::Plan(int64_t batch, int64_t q_heads,
+                              int64_t kv_heads, int64_t head_dim,
+                              int64_t page_size,
+                              absl::Span<const int32_t> kv_indptr_host,
+                              bool graph_safe, cudaStream_t stream) {
+  if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || page_size <= 0) {
+    return InvalidArgumentError("degenerate plan shape: batch=", batch,
+                                " q_heads=", q_heads, " kv_heads=", kv_heads,
+                                " page_size=", page_size);
+  }
+
+  if (q_heads % kv_heads != 0) {
+    return InvalidArgumentError("q_heads ", q_heads,
+                                " is not a multiple of kv_heads ", kv_heads);
+  }
+
+  if (head_dim != 128) {
+    return UnimplementedError(
+        "FlashInfer decode is instantiated for head_dim 128 only, got ",
+        head_dim, "; add an instantiation in flashinfer_attention.cu");
+  }
+
+  if (static_cast<int64_t>(kv_indptr_host.size()) != batch + 1) {
+    return InvalidArgumentError("kv_indptr_host has ", kv_indptr_host.size(),
+                                " entries, expected batch + 1 = ", batch + 1);
+  }
+
+  constexpr auto kPos = flashinfer::PosEncodingMode::kNone;
+
+  cudaError_t status = cudaSuccess;
+  bool group_size_supported = false;
+
+  DISPATCH_GQA_GROUP_SIZE(q_heads / kv_heads, GROUP_SIZE, {
+    group_size_supported = true;
+
+    auto work_estimation =
+        flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+            GROUP_SIZE, 128, kPos, Variant, Params>;
+
+    status = flashinfer::DecodePlan<128, kPos, Variant, Params>(
+        impl_->float_workspace.data(), impl_->float_workspace.size(),
+        impl_->int_workspace.data(), impl_->page_locked,
+        impl_->int_workspace.size(), impl_->plan,
+        const_cast<IdType*>(kv_indptr_host.data()),
+        static_cast<uint32_t>(batch), static_cast<uint32_t>(q_heads),
+        static_cast<uint32_t>(page_size), graph_safe, stream,
+        work_estimation);
+  });
+
+  if (!group_size_supported) {
+    return UnimplementedError("FlashInfer has no instantiation for a GQA group "
+                              "size of ", q_heads / kv_heads);
+  }
+
+  INFERX_CUDA_RETURN_IF_ERROR(status);
+
+  impl_->planned = true;
+  impl_->planned_batch = batch;
+  impl_->planned_q_heads = q_heads;
+  impl_->planned_kv_heads = kv_heads;
+  impl_->planned_head_dim = head_dim;
+  impl_->planned_page_size = page_size;
+
+  return OkStatus();
+}
+
+Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
+                             const TensorView& v_cache,
+                             const TensorView& kv_indices,
+                             const TensorView& kv_indptr,
+                             const TensorView& last_page_len,
+                             const TensorView& out, float scale,
+                             cudaStream_t stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
   INFERX_RETURN_IF_ERROR(CheckBf16(v_cache, 4, "v_cache"));
@@ -117,23 +193,36 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
   INFERX_RETURN_IF_ERROR(CheckI32(kv_indptr, "kv_indptr"));
   INFERX_RETURN_IF_ERROR(CheckI32(last_page_len, "last_page_len"));
 
+  if (!impl_->planned) {
+    return FailedPreconditionError("Run() called before Plan()");
+  }
+
   const int64_t batch = q.Dim(0);
   const int64_t q_heads = q.Dim(1);
   const int64_t head_dim = q.Dim(2);
   const int64_t page_size = k_cache.Dim(1);
   const int64_t kv_heads = k_cache.Dim(2);
 
+  if (batch != impl_->planned_batch || q_heads != impl_->planned_q_heads ||
+      kv_heads != impl_->planned_kv_heads ||
+      head_dim != impl_->planned_head_dim ||
+      page_size != impl_->planned_page_size) {
+    return InvalidArgumentError(
+        "these tensors are [batch=", batch, " q_heads=", q_heads,
+        " kv_heads=", kv_heads, " head_dim=", head_dim,
+        " page=", page_size, "] but the last plan was for [batch=",
+        impl_->planned_batch, " q_heads=", impl_->planned_q_heads,
+        " kv_heads=", impl_->planned_kv_heads, " head_dim=",
+        impl_->planned_head_dim, " page=", impl_->planned_page_size, "]");
+  }
+
   if (k_cache.Dim(3) != head_dim) {
     return InvalidArgumentError("q head_dim ", head_dim,
                                 " does not match the cache's ", k_cache.Dim(3));
   }
-  if (kv_heads == 0 || q_heads % kv_heads != 0) {
-    return InvalidArgumentError("q_heads ", q_heads,
-                                " is not a multiple of kv_heads ", kv_heads);
-  }
   if (kv_indptr.Dim(0) != batch + 1) {
     return InvalidArgumentError("kv_indptr has ", kv_indptr.Dim(0),
-                                " entries, expected batch + 1 = ", batch + 1);
+                                " entries, expected ", batch + 1);
   }
   if (last_page_len.Dim(0) != batch) {
     return InvalidArgumentError("last_page_len has ", last_page_len.Dim(0),
@@ -145,26 +234,6 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
                                 ", expected [", batch, ", ", q_heads, ", ",
                                 head_dim, "]");
   }
-
-  // Only head_dim 128 is instantiated. Every head dimension is a separate
-  // template instantiation and therefore separate compile time and binary size;
-  // 128 is what Qwen2.5 and Llama both use, so the others are not paid for
-  // until something needs them.
-  if (head_dim != 128) {
-    return UnimplementedError(
-        "FlashInfer decode is instantiated for head_dim 128 only, got ",
-        head_dim, "; add an instantiation in flashinfer_attention.cu");
-  }
-
-  // Checked rather than trusted: the planner reads this array to decide how to
-  // split the work, and a host copy that disagrees with the device one produces
-  // a plan for a batch that is not the one being run -- wrong output, no error.
-  if (static_cast<int64_t>(kv_indptr_host.size()) != batch + 1) {
-    return InvalidArgumentError("kv_indptr_host has ", kv_indptr_host.size(),
-                                " entries, expected batch + 1 = ", batch + 1);
-  }
-
-  if (batch == 0) return OkStatus();
 
   flashinfer::paged_kv_t<bf16, IdType> paged_kv(
       static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(page_size),
@@ -183,77 +252,44 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
   params.num_qo_heads = static_cast<uint32_t>(q_heads);
   params.q_stride_n = static_cast<IdType>(q_heads * head_dim);
   params.q_stride_h = static_cast<IdType>(head_dim);
-  params.window_left = -1;      // no sliding window
+  params.window_left = -1;
   params.logits_soft_cap = 0.f;
   params.sm_scale = scale;
-  // RoPE is applied before the cache write in our pipeline, so the kernel must
-  // not apply it again. kNone below makes that explicit; these are unused.
   params.rope_rcp_scale = 1.f;
   params.rope_rcp_theta = 1.f;
 
-  constexpr auto kPos = flashinfer::PosEncodingMode::kNone;
-
-  flashinfer::DecodePlanInfo plan_info;
-
-  // The work estimator is templated on the GQA group size, so it has to be
-  // selected at runtime through FlashInfer's own dispatch macro -- which is a
-  // chain of `if (group_size == N) { constexpr size_t GROUP_SIZE = N; ... }`,
-  // instantiating the estimator once per supported ratio. Qwen2.5-3B is 16 q
-  // heads over 2 kv heads, so it lands on 8.
-  cudaError_t plan_status = cudaSuccess;
-  bool group_size_supported = false;
-
-  DISPATCH_GQA_GROUP_SIZE(q_heads / kv_heads, GROUP_SIZE, {
-    group_size_supported = true;
-
-    auto work_estimation =
-        flashinfer::BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-            GROUP_SIZE, 128, kPos, Variant, Params>;
-
-    plan_status = flashinfer::DecodePlan<128, kPos, Variant, Params>(
-        impl_->float_workspace.data(), impl_->float_workspace.size(),
-        impl_->int_workspace.data(), impl_->page_locked,
-        impl_->int_workspace.size(), plan_info,
-        const_cast<IdType*>(kv_indptr_host.data()),
-        static_cast<uint32_t>(batch), static_cast<uint32_t>(q_heads),
-        static_cast<uint32_t>(page_size), /*enable_cuda_graph=*/false, stream,
-        work_estimation);
-  });
-
-  if (!group_size_supported) {
-    return UnimplementedError("FlashInfer has no instantiation for a GQA group "
-                              "size of ", q_heads / kv_heads);
-  }
-
-  INFERX_CUDA_RETURN_IF_ERROR(plan_status);
-
-  // The plan hands back byte offsets into the int workspace rather than
-  // pointers, so the caller can keep one allocation and re-plan into it.
+  // Offsets rather than pointers is what makes this replayable: the plan hands
+  // back positions in a workspace this object owns, so the addresses below are
+  // the same on every step and only their contents change.
   auto* int_base = static_cast<std::byte*>(impl_->int_workspace.data());
   const auto at = [&](size_t offset) {
     return reinterpret_cast<IdType*>(int_base + offset);
   };
 
-  params.request_indices = at(plan_info.request_indices_offset);
-  params.kv_tile_indices = at(plan_info.kv_tile_indices_offset);
-  params.o_indptr = at(plan_info.o_indptr_offset);
-  params.kv_chunk_size_ptr = at(plan_info.kv_chunk_size_ptr_offset);
-  params.padded_batch_size = static_cast<uint32_t>(plan_info.padded_batch_size);
-  params.partition_kv = plan_info.split_kv;
+  params.request_indices = at(impl_->plan.request_indices_offset);
+  params.kv_tile_indices = at(impl_->plan.kv_tile_indices_offset);
+  params.o_indptr = at(impl_->plan.o_indptr_offset);
+  params.kv_chunk_size_ptr = at(impl_->plan.kv_chunk_size_ptr_offset);
+  params.padded_batch_size =
+      static_cast<uint32_t>(impl_->plan.padded_batch_size);
+  params.partition_kv = impl_->plan.split_kv;
 
   params.block_valid_mask =
-      plan_info.split_kv
-          ? reinterpret_cast<bool*>(int_base + plan_info.block_valid_mask_offset)
+      impl_->plan.split_kv
+          ? reinterpret_cast<bool*>(int_base +
+                                    impl_->plan.block_valid_mask_offset)
           : nullptr;
 
   auto* float_base = static_cast<std::byte*>(impl_->float_workspace.data());
 
   bf16* tmp_v = nullptr;
   float* tmp_s = nullptr;
-  if (plan_info.split_kv) {
-    tmp_v = reinterpret_cast<bf16*>(float_base + plan_info.v_offset);
-    tmp_s = reinterpret_cast<float*>(float_base + plan_info.s_offset);
+  if (impl_->plan.split_kv) {
+    tmp_v = reinterpret_cast<bf16*>(float_base + impl_->plan.v_offset);
+    tmp_s = reinterpret_cast<float*>(float_base + impl_->plan.s_offset);
   }
+
+  constexpr auto kPos = flashinfer::PosEncodingMode::kNone;
 
   INFERX_CUDA_RETURN_IF_ERROR(
       (flashinfer::BatchDecodeWithPagedKVCacheDispatched<128, kPos, Variant,
@@ -261,6 +297,30 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
           params, tmp_v, tmp_s, /*enable_pdl=*/false, stream)));
 
   return OkStatus();
+}
+
+Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
+                                const TensorView& v_cache,
+                                const TensorView& kv_indices,
+                                const TensorView& kv_indptr,
+                                absl::Span<const int32_t> kv_indptr_host,
+                                const TensorView& last_page_len,
+                                const TensorView& out, float scale,
+                                cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
+
+  const int64_t batch = q.Dim(0);
+  if (batch == 0) return OkStatus();
+
+  // Not graph-safe: the one-shot form is for callers that are not capturing,
+  // and the fixed-shape mode costs a reduction pass they need not pay.
+  INFERX_RETURN_IF_ERROR(Plan(batch, q.Dim(1), k_cache.Dim(2), q.Dim(2),
+                              k_cache.Dim(1), kv_indptr_host,
+                              /*graph_safe=*/false, stream));
+
+  return Run(q, k_cache, v_cache, kv_indices, kv_indptr, last_page_len, out,
+             scale, stream);
 }
 
 Status BuildCsrBlockTable(const std::vector<int32_t>& block_table,
