@@ -262,12 +262,21 @@ Tensors come in **two layers**, and which one a piece of code uses is a real des
 ```
 Tensor (8 B handle) ──▶ TensorImpl (refcounted) ──▶ Storage (refcounted) ──▶ bytes
                                                          ▲
-TensorView (48 B POD, non-owning) ───────────────────────┘
+TensorView (80 B POD, non-owning) ───────────────────────┘
 ```
 
 **`Tensor`** is a lightweight owning handle, PyTorch-style: one pointer, copied with a single atomic increment, never copying data. Slice, reshape, and bitcast produce new `TensorImpl`s over the *same* `Storage`, so views are cheap and the bytes live exactly as long as the last handle. `Storage` is either allocated (freed through an `Allocator` on destruction) or **borrowed** — pointing at memory owned elsewhere and freeing nothing, which is the normal case for weights, since loading a 7B model must not mean 400 separate `cudaMalloc`s.
 
 **`TensorView`** is a trivially-copyable non-owning view. It exists because it must: `__global__` parameters have to be trivially copyable, so a handle containing an `IntrusiveRefCntPtr` can never be passed to a kernel. PyTorch has the same split (`at::Tensor` vs `TensorAccessor`).
+
+Trivial copyability is necessary but **not sufficient**, and the difference is easy to miss because it type-checks either way. Copyability is what gets a view *into* a kernel; reading one once it arrives additionally requires every accessor the kernel touches to be callable from device code. Unannotated inline members are host-only to nvcc, and these are not `constexpr`, so `--expt-relaxed-constexpr` does not reach them either — a kernel could receive a view by value and then do nothing with it. The accessors a kernel needs therefore carry `INFERX_HOST_DEVICE` (`__host__ __device__` under `__CUDACC__`, nothing otherwise); the ones it cannot use deliberately do not. Which side a member lands on follows from what its body can reach:
+
+| | Members | Why |
+|---|---|---|
+| **Device-callable** | `Data`, `Bytes`, `DataAs`, `GetDataType`, `Rank`, `Dim`, `Numel`, `NBytes`, `IsDefined`, `IsEmpty`, `Device`, `IsCpu`, `IsCuda`, default ctor | Pointer arithmetic, plus the `constexpr` dtype and `DeviceId` helpers that `--expt-relaxed-constexpr` makes reachable |
+| **Host-only** | `Dims`, `GetShape`, `ToString`, and everything returning `StatusOr` — `Create`, `Slice`, `Reshape`, `Bitcast` | `absl::Span` is third-party and its device-callability is not ours to control; `GetShape` materializes a `Shape` and can allocate; `StatusOr` is a host error idiom |
+
+So a kernel indexes with `Rank()`/`Dim()`/`Numel()` and reads through `Data()`, and anything it cannot express that way belongs on the host side of the launch — a kernel wanting a subrange gets a view sliced before the launch, not a `Slice()` call inside it. The annotation is a promise the compiler checks: adding it to a member that calls a host-only function is an nvcc error, not a silent host-side fallback. The claim is kept honest by a launch rather than an assertion — `tests/kernel/smoke_test.cc` passes a rank-2 view to a real kernel and checks the arithmetic, so a regression that made the accessors host-only again would fail the build rather than the reasoning.
 
 Refcounting comes from LLVM's `IntrusiveRefCntPtr`, vendored as `include/inferx/core/intrusive_ref_cnt_ptr.h` (Apache-2.0 WITH LLVM-exception, reparented into `namespace inferx`). Both `Storage` and `TensorImpl` derive from **`ThreadSafeRefCountedBase`**, never the non-atomic `RefCountedBase` — owning handles cross the scheduler/executor boundary, so the plain base would be a silent data race. Static assertions in the tests pin that choice. The CRTP base deletes through `Derived*`, so neither type carries a vtable: `TensorImpl` is 104 B, `Storage` 40 B, `Tensor` and `StoragePtr` 8 B each.
 
@@ -279,7 +288,7 @@ Refcounting comes from LLVM's `IntrusiveRefCntPtr`, vendored as `include/inferx/
 
 The engine's real rank limit lives on **`TensorView::kMaxRank`**, because that is where it is genuinely forced: `TensorView` stores its extents as a POD `std::array` so it stays trivially copyable, which is required of a `__global__` parameter. Putting the limit there makes it a consequence of a hard constraint rather than an invented cap, and `ValidateTensorLayout` enforces it once for every tensor factory. The two constants are tied (`kMaxRank == kDefaultRank`) so that any shape a tensor accepts is also allocation-free on the host.
 
-Because `InlinedVector` has a user-provided copy constructor and destructor, `Shape` is not trivially copyable — hence the POD extents in `TensorView`, with `shape()` materializing a `Shape` on demand. Sizes today: `Tensor` 8 B, `Shape` 72 B, `TensorView` 80 B, `TensorImpl` 112 B.
+Because `InlinedVector` has a user-provided copy constructor and destructor, `Shape` is not trivially copyable — hence the POD extents in `TensorView`, with `shape()` materializing a `Shape` on demand. Sizes today: `Tensor` 8 B, `Shape` 72 B, `TensorView` 80 B, `TensorImpl` 104 B, `Storage` 40 B.
 
 The rule: **ownership is established once — at weight load or request admission — as a `Tensor`; everything downstream passes `TensorView`.** That keeps atomic refcount traffic and per-tensor heap allocation off the decode path, where neither is affordable, while still getting real lifetime safety everywhere lifetime is actually in question.
 
