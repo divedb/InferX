@@ -10,9 +10,13 @@
 // A graph replaces the 400 launches with one replay, so what is measured here
 // is how much of a decode step was launch overhead.
 //
-// Both paths run the identical kernels on the identical data; the graph is
-// checked against the launch-by-launch path for equality in
-// tests/kernel/engine_test.cc, so this compares only cost.
+// The two paths do NOT run identical kernels, and that is the finding rather
+// than a flaw in the measurement. FlashInfer plans on the host from the batch's
+// sequence lengths, so it cannot go inside a graph -- a replay would reuse a
+// plan built for whatever lengths were current at capture. Capture therefore
+// records the reference kernel, which reads everything from device buffers and
+// is length-agnostic. The two optimizations are exclusive today, and this is
+// what says which one to keep.
 
 #include <cstdio>
 #include <cstdlib>
@@ -114,9 +118,14 @@ int Main(int argc, char** argv) {
   std::printf("decode step, context %ld, one token per sequence\n\n",
               static_cast<long>(kContext));
 
-  std::printf("%6s %12s %12s %9s  %s\n", "batch", "launches_ms", "graph_ms",
-              "noise_%", "speedup");
-  std::printf("%s\n", std::string(56, '-').c_str());
+  // The two columns are not two ways of issuing the same work. FlashInfer plans
+  // on the host against the batch's sequence lengths, so it cannot be captured;
+  // a graph therefore records the reference kernel instead. What is compared is
+  // "FlashInfer, launch by launch" against "reference kernel, replayed", and
+  // the header says so rather than calling the ratio a speedup.
+  std::printf("%6s %14s %14s %9s  %s\n", "batch", "flashinfer_ms",
+              "graph+ref_ms", "noise_%", "graph/fi");
+  std::printf("%s\n", std::string(62, '-').c_str());
 
   int failures = 0;
 
@@ -155,7 +164,7 @@ int Main(int argc, char** argv) {
       continue;
     }
 
-    std::printf("%6ld %12.4f %12.4f %9.1f  %6.2fx\n", static_cast<long>(batch),
+    std::printf("%6ld %14.4f %14.4f %9.1f  %6.2fx\n", static_cast<long>(batch),
                 launches->min_ms, graphed->min_ms, graphed->noise() * 100.0,
                 launches->min_ms / graphed->min_ms);
   }

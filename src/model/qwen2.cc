@@ -16,6 +16,11 @@
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/layers.h"
 
+#ifdef INFERX_WITH_FLASHINFER
+#include "absl/types/span.h"
+#include "inferx/kernels/flashinfer_attention.h"
+#endif
+
 namespace inferx::model {
 namespace {
 
@@ -95,6 +100,26 @@ struct Qwen2Model::Impl {
   // Everything device-side runs on this stream rather than the default one,
   // because a graph cannot be captured from the legacy default stream.
   cudaStream_t stream = nullptr;
+
+#ifdef INFERX_WITH_FLASHINFER
+  // The fast decode path. Absent when the submodule is not vendored, in which
+  // case every batch takes the reference kernel and the engine still works.
+  std::unique_ptr<kernels::FlashInferDecode> flashinfer;
+
+  // CSR view of this step's block table, which is the form FlashInfer wants
+  // (our own kernel reads the dense grid directly). Rebuilt per step.
+  DeviceBuffer fi_indices_buf, fi_indptr_buf, fi_last_page_buf;
+  int64_t fi_indices_capacity = 0;
+  int64_t fi_seq_capacity = 0;
+  std::vector<int32_t> fi_indptr_host;
+
+  /// Set by PrepareBatchInputs: true when this batch is decode-shaped and the
+  /// FlashInfer path is usable for it.
+  bool fi_usable = false;
+#endif
+
+  /// Forced false while capturing. \see LaunchDecodeBody.
+  bool allow_flashinfer = true;
 
   // One instantiated graph per decode shape. Keyed on (tokens, seqs, blocks):
   // a graph records fixed launch dimensions, so a batch of a different shape
@@ -363,6 +388,67 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   INFERX_RETURN_IF_ERROR(upload(seq_of_token_buf, batch.seq_of_token));
   INFERX_RETURN_IF_ERROR(upload(block_table_buf, batch.block_table));
 
+#ifdef INFERX_WITH_FLASHINFER
+  // FlashInfer's decode kernel serves exactly one query token per sequence.
+  // A prefill, or a mixed batch, is a different shape entirely -- its ragged
+  // prefill kernel is a separate integration -- so those keep the reference
+  // kernel. Detecting it here rather than in the launch keeps the device half
+  // free of host-side branching.
+  fi_usable = flashinfer != nullptr && tokens == batch.num_seqs;
+
+  if (fi_usable) {
+    // Each sequence's cached length is its query position plus one, which is
+    // also how many keys it will attend over.
+    std::vector<int32_t> blocks_used(static_cast<size_t>(batch.num_seqs));
+    std::vector<int32_t> last_page(static_cast<size_t>(batch.num_seqs));
+
+    const int64_t block_size = pool->block_size();
+
+    for (int64_t i = 0; i < tokens; ++i) {
+      const int64_t seq = batch.seq_of_token[static_cast<size_t>(i)];
+      const int64_t len = batch.positions[static_cast<size_t>(i)] + 1;
+      const int64_t used = (len + block_size - 1) / block_size;
+
+      blocks_used[static_cast<size_t>(seq)] = static_cast<int32_t>(used);
+
+      // Never zero: a length that exactly fills its last page uses all of it.
+      const int64_t rem = len - (used - 1) * block_size;
+      last_page[static_cast<size_t>(seq)] = static_cast<int32_t>(rem);
+    }
+
+    std::vector<int32_t> indices;
+    INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
+        batch.block_table, batch.num_seqs, batch.max_blocks_per_seq,
+        blocks_used, &indices, &fi_indptr_host));
+
+    if (static_cast<int64_t>(indices.size()) > fi_indices_capacity) {
+      INFERX_ASSIGN_OR_RETURN(
+          fi_indices_buf,
+          DeviceBuffer::Allocate(indices.size() * sizeof(int32_t),
+                                 DeviceId::Cuda(0)));
+      fi_indices_capacity = static_cast<int64_t>(indices.size());
+    }
+
+    if (batch.num_seqs > fi_seq_capacity) {
+      INFERX_ASSIGN_OR_RETURN(
+          fi_indptr_buf,
+          DeviceBuffer::Allocate(
+              static_cast<size_t>(batch.num_seqs + 1) * sizeof(int32_t),
+              DeviceId::Cuda(0)));
+      INFERX_ASSIGN_OR_RETURN(
+          fi_last_page_buf,
+          DeviceBuffer::Allocate(
+              static_cast<size_t>(batch.num_seqs) * sizeof(int32_t),
+              DeviceId::Cuda(0)));
+      fi_seq_capacity = batch.num_seqs;
+    }
+
+    INFERX_RETURN_IF_ERROR(upload(fi_indices_buf, indices));
+    INFERX_RETURN_IF_ERROR(upload(fi_indptr_buf, fi_indptr_host));
+    INFERX_RETURN_IF_ERROR(upload(fi_last_page_buf, last_page));
+  }
+#endif
+
   return OkStatus();
 }
 
@@ -436,6 +522,20 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
+#ifdef INFERX_WITH_FLASHINFER
+  // FlashInfer plans on the host and its plan depends on the batch's sequence
+  // lengths, so it cannot be baked into a graph: a replay would reuse a plan
+  // built for whatever lengths were current at capture. Capture therefore
+  // records the reference kernel, which reads everything from device buffers
+  // and is length-agnostic by construction.
+  //
+  // The two optimizations are consequently exclusive today. FlashInfer supports
+  // a fixed-shape planning mode for exactly this, and using it would mean
+  // hoisting the plan out of the captured region -- one plan per step shared by
+  // all 36 layers. Worth doing once the measurements say which matters more.
+  const bool use_flashinfer = fi_usable && allow_flashinfer;
+#endif
+
   INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x, stream));
 
   for (int64_t layer_index = 0;
@@ -474,8 +574,33 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(
         kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::PagedAttention(
-        q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale, stream));
+#ifdef INFERX_WITH_FLASHINFER
+    if (use_flashinfer) {
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView fi_indices,
+          TensorView::Create(fi_indices_buf.data(), DataType::kInt32,
+                             Shape({static_cast<int64_t>(
+                                 fi_indptr_host.back())}),
+                             DeviceId::Cuda(0)));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView fi_indptr,
+          TensorView::Create(fi_indptr_buf.data(), DataType::kInt32,
+                             Shape({num_seqs + 1}), DeviceId::Cuda(0)));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView fi_last_page,
+          TensorView::Create(fi_last_page_buf.data(), DataType::kInt32,
+                             Shape({num_seqs}), DeviceId::Cuda(0)));
+
+      INFERX_RETURN_IF_ERROR(flashinfer->Decode(
+          q3, k_cache, v_cache, fi_indices, fi_indptr,
+          absl::MakeConstSpan(fi_indptr_host), fi_last_page, a3, attn_scale,
+          stream));
+    } else
+#endif
+    {
+      INFERX_RETURN_IF_ERROR(kernels::PagedAttention(
+          q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale, stream));
+    }
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
@@ -634,6 +759,13 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
     impl->layers.push_back(w);
   }
 
+#ifdef INFERX_WITH_FLASHINFER
+  INFERX_ASSIGN_OR_RETURN(kernels::FlashInferDecode fi,
+                          kernels::FlashInferDecode::Create());
+  impl->flashinfer =
+      std::make_unique<kernels::FlashInferDecode>(std::move(fi));
+#endif
+
   for (const DeviceBuffer& b : impl->weight_buffers) {
     impl->weight_bytes += b.size();
   }
@@ -777,6 +909,8 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
       impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq));
   INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
 
+  impl_->allow_flashinfer = false;  // see LaunchDecodeBody
+
   INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
       impl_->stream, cudaStreamCaptureModeThreadLocal));
 
@@ -785,6 +919,8 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
 
   cudaGraph_t graph = nullptr;
   const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
+
+  impl_->allow_flashinfer = true;
 
   // Capture must be ended even if the body failed, or the stream stays in
   // capture mode and every later launch on it fails with an opaque error.

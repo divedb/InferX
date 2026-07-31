@@ -21,11 +21,17 @@ target_link_libraries(inferx_kernels
   PUBLIC
     inferx::core
     inferx::flags
+    # PUBLIC for the compile definition, not the headers: consumers need
+    # INFERX_WITH_FLASHINFER to know whether the fast decode path exists at all.
+    # flashinfer_attention.h is pimpl'd, so nothing of FlashInfer's own headers
+    # leaks through -- only the flag. Keeping this PRIVATE silently compiled the
+    # model's entire FlashInfer path out of existence, which the tests could not
+    # catch because the reference kernel produces the same answers.
+    inferx::flashinfer
   PRIVATE
     # cuBLASLt is an implementation detail: gemm.h is pimpl'd precisely so that
     # including it does not drag cublasLt.h into the bench harness or the tests.
     CUDA::cublasLt
-    inferx::flashinfer
 )
 
 # Device code is compiled once per architecture in INFERX_CUDA_ARCHS. Set here
