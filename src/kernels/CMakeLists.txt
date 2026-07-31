@@ -6,6 +6,7 @@
 # to be gained by attempting the build.
 
 add_library(inferx_kernels
+  gemm_cublaslt.cc
   smoke.cu
 )
 add_library(inferx::kernels ALIAS inferx_kernels)
@@ -14,6 +15,10 @@ target_link_libraries(inferx_kernels
   PUBLIC
     inferx::core
     inferx::flags
+  PRIVATE
+    # cuBLASLt is an implementation detail: gemm.h is pimpl'd precisely so that
+    # including it does not drag cublasLt.h into the bench harness or the tests.
+    CUDA::cublasLt
 )
 
 # Device code is compiled once per architecture in INFERX_CUDA_ARCHS. Set here

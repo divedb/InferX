@@ -1,0 +1,207 @@
+# CI for InferX.
+#
+# GitHub's hosted runners have no GPU, which shapes everything here. The split
+# is deliberate:
+#
+#   host-only  builds and RUNS the full unit suite. This is the job that has
+#              real coverage, and it exists because ARCHITECTURE.md section 3.1
+#              made the core testable without a device on purpose.
+#
+#   cuda       builds device code but runs only what does not need a GPU. It
+#              cannot tell you the kernels are correct; it tells you they still
+#              compile, which is the failure mode that actually bites -- nvcc
+#              rejecting a core header is invisible to the host-only job.
+#
+#   toolchain  asserts the CUDA toolkit and compiler resolve to the same
+#              installation. This is a regression test for a real bug: the
+#              version gate used to check the toolkit while the build used
+#              whichever nvcc was first on PATH, so a box with a distro
+#              nvidia-cuda-toolkit would validate 13.x and compile with 12.x.
+#              Nothing else in CI would catch that returning.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-only:
+    name: host-only (no CUDA)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DINFERX_ENABLE_CUDA=OFF \
+            -DINFERX_WERROR=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # The whole suite, not just -L unit: with CUDA off there are no kernel
+      # tests to exclude, and the GPU-gated cases skip themselves.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j"$(nproc)"
+
+  host-only-asan:
+    name: host-only + ASan/UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13
+
+      # Debug rather than RelWithDebInfo: the allocator and arena invariants
+      # that ASan is most likely to catch are asserted in debug builds.
+      - name: Configure
+        run: |
+          cmake -S . -B build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DINFERX_ENABLE_CUDA=OFF \
+            -DINFERX_ENABLE_ASAN=ON
+
+      - name: Build
+        run: cmake --build build-asan -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure -j"$(nproc)"
+
+  cuda:
+    name: CUDA compile (no GPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13
+
+      # The network installer rather than the distro package, deliberately:
+      # apt's nvidia-cuda-toolkit is the old one, and installing it is how you
+      # reproduce the toolkit/compiler split this pipeline is meant to prevent.
+      - name: Install CUDA 13.0
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-0
+
+      # INFERX_WERROR is deliberately left off here, unlike the host-only job.
+      # It adds nvcc's -Werror=all-warnings, which is broader than anything this
+      # tree has been built with and which no one has yet confirmed the device
+      # code is clean under. Turn it on once a local
+      # `-DINFERX_WERROR=ON` CUDA build is verified quiet -- switching it on
+      # blind would make the first CI run fail for a reason unrelated to the
+      # change that triggered it.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-13
+
+      # Every .cu and the cuBLASLt baseline compile here. No device is present,
+      # so nothing below is executed -- that is the point of the split.
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Kernel tests are excluded by label rather than by hoping they skip: they
+      # do skip without a device, but running them would make a green result
+      # look like kernel coverage, which CI cannot provide.
+      - name: Test (unit only)
+        run: ctest --test-dir build -L unit --output-on-failure -j"$(nproc)"
+
+  toolchain:
+    name: toolkit/compiler agreement
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++-13
+
+      - name: Install CUDA 13.0
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-0
+
+      # Installed *after* the real toolkit and on purpose: this puts nvcc 12.x
+      # at /usr/bin/nvcc, ahead of /usr/local/cuda/bin on PATH, which is exactly
+      # the shadowing that produced the original bug. A correct build must still
+      # resolve 13.x for both.
+      - name: Install a conflicting older nvcc
+        run: sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
+
+      - name: Configure and assert both resolve to the same toolkit
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=g++-13 2>&1 | tee cfg.log
+
+          toolkit=$(sed -n 's/.*CUDA toolkit *: \([0-9.]*\).*/\1/p' cfg.log | head -1)
+          compiler=$(sed -n 's/.*CUDA compiler *: \([0-9.]*\).*/\1/p' cfg.log | head -1)
+
+          echo "toolkit=$toolkit compiler=$compiler"
+
+          if [ -z "$toolkit" ] || [ -z "$compiler" ]; then
+            echo "::error::configure summary did not report both versions"
+            exit 1
+          fi
+
+          if [ "$toolkit" != "$compiler" ]; then
+            echo "::error::toolkit $toolkit and compiler $compiler disagree"
+            exit 1
+          fi
+
+          case "$compiler" in
+            13.*) ;;
+            *) echo "::error::expected nvcc 13.x, got $compiler"; exit 1 ;;
+          esac
+
+      # And the mismatch must be refused rather than silently accepted.
+      - name: Assert a deliberate mismatch is rejected
+        run: |
+          if cmake -S . -B build-bad -G Ninja \
+               -DCMAKE_CXX_COMPILER=g++-13 \
+               -DCUDAToolkit_ROOT=/usr/local/cuda \
+               -DCMAKE_CUDA_COMPILER=/usr/bin/nvcc > bad.log 2>&1; then
+            echo "::error::configure accepted a mismatched toolkit/compiler"
+            cat bad.log
+            exit 1
+          fi
+
+          grep -q "different installations" bad.log || {
+            echo "::error::rejected, but not with the mismatch diagnostic"
+            cat bad.log
+            exit 1
+          }

@@ -57,15 +57,48 @@ if(INFERX_BUILD_TESTS)
   add_subdirectory("${INFERX_THIRD_PARTY}/googletest" EXCLUDE_FROM_ALL SYSTEM)
 endif()
 
+# ---------------------------------------------------------------------------
+# CUTLASS -- quantized and grouped GEMM. Optional until it is fetched.
+#
+# Detected rather than required, because it is large and only M1+ needs it: a
+# checkout without it builds and tests exactly as before, minus the quantized
+# kernels. Fetch it with
+#
+#   git submodule add --depth 1 https://github.com/NVIDIA/cutlass.git third_party/cutlass
+#   git -C third_party/cutlass fetch --depth 1 origin tag v4.6.1
+#   git -C third_party/cutlass checkout v4.6.1
+#
+# (two steps because --depth 1 cannot check out a tag directly, and v4.6.1 is a
+# tag rather than a branch.)
+#
+# Consumed as headers only, never add_subdirectory'd. CUTLASS's own CMake builds
+# a profiler and a very large test suite; we want the templates and nothing
+# else, which is the same narrowness the Folly note in ARCHITECTURE.md section 9
+# argues for. tools/util is included for the reference/host-side helpers the
+# kernel conformance tests use.
+# ---------------------------------------------------------------------------
+add_library(inferx_cutlass INTERFACE)
+add_library(inferx::cutlass ALIAS inferx_cutlass)
+
+if(EXISTS "${INFERX_THIRD_PARTY}/cutlass/include/cutlass/cutlass.h")
+  target_include_directories(inferx_cutlass SYSTEM INTERFACE
+    "${INFERX_THIRD_PARTY}/cutlass/include"
+    "${INFERX_THIRD_PARTY}/cutlass/tools/util/include")
+  target_compile_definitions(inferx_cutlass INTERFACE INFERX_WITH_CUTLASS=1)
+  set(INFERX_HAVE_CUTLASS ON)
+  message(STATUS "CUTLASS: found at third_party/cutlass")
+else()
+  set(INFERX_HAVE_CUTLASS OFF)
+  message(STATUS "CUTLASS: not present -- quantized GEMM targets are skipped "
+                 "(see cmake/InferXDependencies.cmake to fetch it)")
+endif()
+
 set(BUILD_TESTING ${_inferx_saved_build_testing} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
 # Planned dependencies, by milestone. Add with:
 #   git submodule add --depth 1 <url> third_party/<name>
 #
-#   M1  cutlass          https://github.com/NVIDIA/cutlass.git
-#                        Quantized + grouped GEMM. Requires CUTLASS 4.x for
-#                        CUDA 13.x; 3.x is CUDA 12.x only.
 #   M3  flashinfer       https://github.com/flashinfer-ai/flashinfer.git
 #                        Kernel templates only; we write our own AOT wrappers
 #                        against inferx::Tensor. Pinned by commit, not tag.

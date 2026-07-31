@@ -1,0 +1,82 @@
+#pragma once
+
+#include <cuda_runtime_api.h>
+
+#include <cstddef>
+#include <memory>
+
+#include "inferx/core/device_buffer.h"
+#include "inferx/core/status.h"
+#include "inferx/core/tensor_view.h"
+
+namespace inferx::kernels {
+
+/// \brief A cuBLASLt context with a per-shape plan cache.
+///
+/// Owns the library handle, one workspace allocation, and a cache of matmul
+/// plans keyed on `(m, n, k)`. Move-only, and **not thread-safe** -- cuBLASLt
+/// handles are not, and the cache is a plain hash map. The intent is one
+/// instance per executor rank thread, constructed at startup.
+///
+/// Every plan is built on first use and reused thereafter. `Warm()` exists so
+/// that first use can be moved off the step path deliberately rather than
+/// happening inside whichever request arrives first.
+class CublasLtGemm {
+ public:
+  /// The cuBLASLt workspace. 32 MiB is NVIDIA's guidance for Ada-class parts;
+  /// too small and the heuristic silently declines split-k algorithms that need
+  /// scratch, which shows up as a mysteriously slow GEMM rather than an error.
+  static constexpr size_t kDefaultWorkspaceBytes = 32u << 20;
+
+  /// \brief Creates a context on the current CUDA device.
+  ///
+  /// \param workspace_bytes Size of the algorithm workspace.
+  /// \return                The context, or the cuBLAS/CUDA error.
+  static StatusOr<CublasLtGemm> Create(
+      size_t workspace_bytes = kDefaultWorkspaceBytes);
+
+  ~CublasLtGemm();
+
+  CublasLtGemm(const CublasLtGemm&) = delete;
+  CublasLtGemm& operator=(const CublasLtGemm&) = delete;
+  CublasLtGemm(CublasLtGemm&&) noexcept;
+  CublasLtGemm& operator=(CublasLtGemm&&) noexcept;
+
+  /// \brief Computes `y = x * wᵀ` in FP16 with FP32 accumulation.
+  ///
+  /// The shapes are `nn.Linear`'s, not textbook GEMM's: the weight is stored
+  /// `[out, in]` because that is how every checkpoint on disk stores it, and
+  /// transposing it at load time to suit a GEMM convention would cost a copy of
+  /// the whole model. Both operands are therefore K-major, which is also the
+  /// layout the tensor cores want.
+  ///
+  /// \param x      Activations, `[m, k]` f16, row-major, on a CUDA device.
+  /// \param w      Weights, `[n, k]` f16, row-major, on the same device.
+  /// \param y      Output, `[m, n]` f16, row-major, on the same device.
+  /// \param stream Stream to launch on. Does **not** synchronize.
+  /// \return       OK, InvalidArgument for shapes/dtypes this cannot serve, or
+  ///               the cuBLAS error.
+  Status LinearF16(const TensorView& x, const TensorView& w,
+                   const TensorView& y, cudaStream_t stream = nullptr);
+
+  /// \brief Builds and caches the plan for one shape without running it.
+  ///
+  /// \param m, n, k The problem shape, as in `LinearF16`.
+  /// \return        OK, or the error the heuristic reported.
+  Status Warm(int64_t m, int64_t n, int64_t k);
+
+  /// \brief Number of distinct shapes currently planned.
+  size_t PlanCacheSize() const;
+
+ private:
+  struct Impl;
+
+  explicit CublasLtGemm(std::unique_ptr<Impl> impl);
+
+  // Pimpl so that cublasLt.h stays out of this header -- it is included by the
+  // bench harness and the tests, neither of which should acquire a cuBLAS
+  // dependency to ask for a matrix multiply.
+  std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace inferx::kernels

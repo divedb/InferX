@@ -33,6 +33,10 @@ if(INFERX_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+if(INFERX_BUILD_BENCH AND INFERX_CUDA_MEETS_FLOOR)
+  add_subdirectory(bench)
+endif()
+
 message(STATUS "")
 message(STATUS "==== InferX ${PROJECT_VERSION} ====")
 message(STATUS "  Build type      : ${CMAKE_BUILD_TYPE}")

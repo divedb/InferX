@@ -377,6 +377,7 @@ FCFS with a running-batch cap. Explicitly *not* doing shortest-job-first or prio
 | Collectives | **NCCL** | Behind `Communicator` (§7.4) |
 | HTTP/SSE | **Boost.Beast** | With Asio + C++20 coroutines |
 | Containers, sync, status | **Abseil** | `flat_hash_map`, `InlinedVector`, `Status`/`StatusOr` |
+| Host allocation | **mimalloc** | Backs `HostAllocatorImpl` via `mi_malloc_aligned`. `MI_OVERRIDE` off, so it never replaces global `malloc` and stays out of ASan's way |
 | Concurrent queues | **Folly** (narrow) | `MPMCQueue`, `ProducerConsumerQueue` only |
 | Tokenizer | **HF `tokenizers`** via C FFI | Rust static lib; the only sane way to match HF behavior exactly |
 | JSON | **simdjson** (parse) + custom writer | Parsing is on the request hot path |
@@ -443,7 +444,7 @@ Each entry is a decision we should be able to revisit deliberately.
 |---|---|---|---|
 | R1 | **CUDA 12.0 is too old.** CUTLASS 4.x (FP8 + grouped GEMM) and the FlashInfer MLA wrapper both need a current toolkit, and 12.0–12.3 cannot compile against libstdc++ 13 at all. | High | **Resolved in M0:** toolkit floor set to CUDA 13.0, enforced at configure time. `scripts/install-cuda.sh` performs the upgrade. |
 | R2 | TP is designed but untestable for performance here | High | §7.4 — `HostSimComm`, shard-reconstruction tests, numerical differential tests. Accept that perf tuning is deferred. |
-| R3 | Torch-free quantized GEMM (W4A16, MoE grouped) is the largest single unknown | High | Prototype CUTLASS W4A16 against a cuBLASLt FP16 baseline in week 1, before committing to the model layer |
+| R3 | Torch-free quantized GEMM (FP8, W4A16, MoE grouped) is the largest single unknown | High | **Baseline landed:** `bench/gemm_bench` measures cuBLASLt FP16 across the four GEMMs a 7B issues, from decode to a full prefill chunk. The FP8 e4m3 prototype is measured against it (§15 Q2). W4A16 follows in M8 against the same harness. |
 | R4 | 16 GB constrains what can be validated end-to-end | Medium | Target 7B-class at W4A16 for the main loop; MoE/MLA validated for correctness at toy sizes |
 | R5 | FlashInfer pinned-commit drift | Medium | Pin, wrap behind our own interface, and write attention conformance tests against a naive reference kernel |
 | R6 | Folly build weight slows iteration | Low | Narrow target build; moodycamel fallback |
@@ -457,8 +458,9 @@ Each entry is a decision we should be able to revisit deliberately.
 inferx/
 ├── CMakeLists.txt
 ├── cmake/                     # FindNCCL, CUDA arch config, submodule glue
-├── third_party/               # submodules: folly, abseil, boost, flashinfer,
-│                              #   cutlass, simdjson, spdlog, tokenizers-cpp
+├── third_party/               # submodules: abseil, googletest, mimalloc today;
+│                              #   cutlass, flashinfer, boost, simdjson, folly,
+│                              #   spdlog, tokenizers-cpp as their milestone lands
 ├── include/inferx/            # public headers
 ├── src/
 │   ├── core/                  # Tensor, DType, Status, arena allocators
@@ -491,7 +493,7 @@ inferx/
 | M | Deliverable | Proves |
 |---|---|---|
 | **M0** | CUDA 13.x toolchain floor; CMake + submodules build; `Tensor`, arenas, Status | Toolchain risk R1 retired |
-| **M1** | CUTLASS W4A16 GEMM prototype vs cuBLASLt FP16 baseline | R3 retired — the riskiest unknown, deliberately first |
+| **M1** | CUTLASS **FP8 e4m3** GEMM prototype vs cuBLASLt FP16 baseline (§15 Q2). Baseline, `bench/` harness and CI landed ahead of the kernel | R3 retired — the riskiest unknown, deliberately first |
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | Beast server, tokenizer FFI, SSE streaming, OpenAI API | End-to-end serving |
@@ -509,6 +511,6 @@ M1 before M2 is deliberate: the quantized GEMM story is the largest risk in a to
 ## 15. Open questions
 
 1. **Which arch first — Llama or Qwen?** Qwen2.5-7B at int4 is a better fit for 16 GB and has broader current relevance; Llama has more reference material. Leaning Qwen2.5-7B-Instruct-AWQ as the M2 target.
-2. **Quantization format for v1** — AWQ, GPTQ, or FP8? AWQ has the widest checkpoint availability at 4-bit; FP8 is simpler to implement and sm_89 has native support but is only 2× compression. Possibly FP8 first (simpler, de-risks M1 faster), AWQ second.
+2. ~~**Quantization format for v1** — AWQ, GPTQ, or FP8?~~ **Resolved: FP8 e4m3 first, AWQ second.** M1's job is to retire R3, not to ship the final quantization story, and FP8 gets there on the shortest path: sm_89 has native e4m3 tensor cores, CUTLASS's SM89 FP8 GEMMs are well-trodden against the SM80 collective builders, and `kFloat8E4M3FN` is already in `DType`. There is no packing and no dequant in the mainloop, so a wrong number is a kernel bug rather than a layout bug. The cost is real and accepted: 2× compression leaves a 7B with roughly 5–6 GB for KV where W4A16 would leave ~11 GB, so **FP8 is the de-risking vehicle, not the endpoint** — AWQ still has to land for §1's 16 GB envelope to work, and it follows in M8 against a harness that already exists.
 3. **Structured output (JSON schema / grammar)** — a differentiator and a scheduler-visible feature (the logit mask must be computed per step per sequence, on CPU, in the overlap window). Not in the milestone list; needs a decision on whether it is v1 scope.
 4. **Determinism guarantee** — do we promise bitwise-reproducible output for a fixed seed and batch composition? This constrains kernel selection (split-k reductions, atomics) and is much cheaper to promise now than to retrofit.

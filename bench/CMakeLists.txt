@@ -1,0 +1,22 @@
+# Benchmarks. Built only above the CUDA floor -- every one of them measures
+# device work, so there is nothing here a host-only build could run.
+#
+# Benchmarks are not tests and are never run by ctest: they need a quiet machine
+# and ideally locked clocks, and a number that regresses under CI noise would be
+# a false alarm rather than a signal.
+
+function(inferx_add_bench name)
+  add_executable(${name} ${ARGN})
+  target_link_libraries(${name} PRIVATE
+    inferx::core
+    inferx::kernels
+    inferx::flags
+  )
+  # So that #include "bench/cuda_timer.h" resolves the same way our public
+  # headers do, rather than by relative path.
+  target_include_directories(${name} PRIVATE ${PROJECT_SOURCE_DIR})
+  set_target_properties(${name} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bench")
+endfunction()
+
+inferx_add_bench(gemm_bench gemm_bench.cc)
