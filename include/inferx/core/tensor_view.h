@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "absl/types/span.h"
+#include "inferx/common/host_device.h"
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_spec.h"
@@ -36,6 +37,24 @@ Status CheckRankFitsView(const Shape& shape);
 /// trivially copyable -- an owning Tensor holding an IntrusiveRefCntPtr can
 /// never be passed to a kernel -- and because an atomic increment per tensor
 /// copy would be pure overhead per decode step.
+///
+/// Being trivially copyable is what lets a TensorView be *passed* to a kernel;
+/// it is not what lets a kernel *read* one. For that, the accessors a kernel
+/// needs carry INFERX_HOST_DEVICE, and the ones it cannot use do not. The split
+/// is not stylistic -- it is what each member's body can reach from device code:
+///
+///   device-callable   Data, Bytes, DataAs, GetDataType, Rank, Dim, Numel,
+///                     NBytes, IsDefined, IsEmpty, Device, IsCpu, IsCuda.
+///                     Pointer arithmetic and the constexpr dtype/device
+///                     helpers, nothing else.
+///   host-only         Dims (returns absl::Span), GetShape (materializes a
+///                     Shape, which allocates), ToString, and everything
+///                     returning StatusOr -- Create, Slice, Reshape, Bitcast.
+///                     Shaping and validation are host decisions; a kernel that
+///                     wants a subrange gets a view sliced before the launch.
+///
+/// So a kernel indexes with Rank()/Dim()/Numel() and reads through Data(), and
+/// anything it cannot express that way belongs on the host side of the launch.
 ///
 /// The rule: ownership is established once, at weight load or request
 /// admission, as a Tensor. Everything downstream of that passes TensorView. A
@@ -71,7 +90,11 @@ class TensorView {
                 "the host, so Shape's inline capacity must cover kMaxRank");
 
   /// \brief Constructs an undefined view over no data.
-  TensorView() = default;
+  ///
+  /// Annotated so a kernel can hold one as a local -- an accumulator that is
+  /// only assigned under a branch, say -- without the declaration itself being
+  /// a host call.
+  INFERX_HOST_DEVICE TensorView() = default;
 
   /// \brief Constructs a TensorView without validating it.
   ///
@@ -129,11 +152,15 @@ class TensorView {
   // (viewing a packed i4 weight block as u8 for a memcpy, for instance).
   StatusOr<TensorView> Bitcast(DataType dtype) const;
 
-  bool IsDefined() const { return data_ != nullptr && DataTypeIsValid(dtype_); }
-  bool IsEmpty() const { return Numel() == 0; }
+  INFERX_HOST_DEVICE bool IsDefined() const {
+    return data_ != nullptr && DataTypeIsValid(dtype_);
+  }
+  INFERX_HOST_DEVICE bool IsEmpty() const { return Numel() == 0; }
 
-  void* Data() const { return data_; }
-  std::byte* Bytes() const { return static_cast<std::byte*>(data_); }
+  INFERX_HOST_DEVICE void* Data() const { return data_; }
+  INFERX_HOST_DEVICE std::byte* Bytes() const {
+    return static_cast<std::byte*>(data_);
+  }
 
   /// \brief Typed access, checked against the view's dtype.
   ///
@@ -144,7 +171,7 @@ class TensorView {
   /// \return A pointer to the data as `T*`, or nullptr if `T` is not the
   ///         view's element type.
   template <typename T>
-  T* DataAs() const {
+  INFERX_HOST_DEVICE T* DataAs() const {
     return dtype_ == kDataTypeOf<T> ? static_cast<T*>(data_) : nullptr;
   }
 
@@ -152,14 +179,17 @@ class TensorView {
   // function may not share a name with a type used in the same class -- the
   // accessors would change what `DataType` and `Shape` mean partway through the
   // declaration. TensorSpec spells them the same way.
-  DataType GetDataType() const { return dtype_; }
+  INFERX_HOST_DEVICE DataType GetDataType() const { return dtype_; }
 
-  int Rank() const { return rank_; }
+  INFERX_HOST_DEVICE int Rank() const { return rank_; }
 
   /// \brief Zero-copy access to the extents.
   ///
   /// Prefer this on hot paths; `GetShape()` materializes a Shape and is for
   /// validation and diagnostics.
+  ///
+  /// Host-only: absl::Span is a third-party type whose device-callability we do
+  /// not control. Device code walks the extents with `Rank()` and `Dim()`.
   absl::Span<const int64_t> Dims() const {
     return absl::MakeConstSpan(dims_.data(), rank_);
   }
@@ -174,7 +204,7 @@ class TensorView {
   ///
   /// Negative indices count from the back. Out-of-range reads are clamped
   /// rather than undefined, and a rank-0 view answers 0.
-  int64_t Dim(int i) const {
+  INFERX_HOST_DEVICE int64_t Dim(int i) const {
     if (rank_ == 0) return 0;
 
     int j = i < 0 ? rank_ + i : i;
@@ -185,7 +215,7 @@ class TensorView {
     return dims_[j];
   }
 
-  int64_t Numel() const {
+  INFERX_HOST_DEVICE int64_t Numel() const {
     int64_t n = 1;
 
     for (int i = 0; i < rank_; ++i) n *= dims_[i];
@@ -193,11 +223,13 @@ class TensorView {
     return n;
   }
 
-  int64_t NBytes() const { return DataTypeByteSize(dtype_, Numel()); }
+  INFERX_HOST_DEVICE int64_t NBytes() const {
+    return DataTypeByteSize(dtype_, Numel());
+  }
 
-  bool IsCpu() const { return device_.IsCpu(); }
-  bool IsCuda() const { return device_.IsCuda(); }
-  DeviceId Device() const { return device_; }
+  INFERX_HOST_DEVICE bool IsCpu() const { return device_.IsCpu(); }
+  INFERX_HOST_DEVICE bool IsCuda() const { return device_.IsCuda(); }
+  INFERX_HOST_DEVICE DeviceId Device() const { return device_; }
 
   std::string ToString() const;
 

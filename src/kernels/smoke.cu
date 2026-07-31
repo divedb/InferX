@@ -19,20 +19,21 @@ namespace {
 static_assert(std::is_trivially_copyable_v<TensorView>,
               "TensorView must survive the __global__ parameter ABI");
 
-// NOTE for M1: trivially copyable is necessary but *not* sufficient to pass a
-// TensorView to a kernel usefully. Its accessors -- Data(), Numel(), Dim() --
-// carry no __host__ __device__ annotation, so nvcc treats them as host-only and
-// a kernel cannot call them. They are inline but not constexpr, so
-// --expt-relaxed-constexpr does not reach them either. A kernel can therefore
-// receive a TensorView by value but cannot read anything out of it. Annotating
-// the accessors is the fix; it is a core-header change and deliberately not
-// made here, where the subject is the toolchain. Until then, kernels take
-// unpacked pointers and extents, as this one does.
-
 __global__ void ScaleKernel(float* data, int64_t n, float scale) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
   if (i < n) data[i] *= scale;
+}
+
+// The same work, but reading the view rather than unpacked arguments. This is
+// the pairing that makes the TensorView accessor annotations meaningful: being
+// trivially copyable gets the view *into* the kernel, and INFERX_HOST_DEVICE on
+// Numel()/DataAs() is what lets the kernel read it once it arrives. Both halves
+// have to hold, and only a launch proves the second one.
+__global__ void ScaleViewKernel(TensorView view, float scale) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  if (i < view.Numel()) view.DataAs<float>()[i] *= scale;
 }
 
 }  // namespace
@@ -53,6 +54,38 @@ Status LaunchScale(float* device_data, int64_t n, float scale) {
   // Checked separately: the launch error is sticky and would otherwise be
   // reported by the sync below, attributing a bad launch configuration to a
   // synchronization failure.
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+
+  return OkStatus();
+}
+
+Status LaunchScale(const TensorView& view, float scale) {
+  // Validation is host work, deliberately: the checks below run on types the
+  // kernel cannot see (Status, string formatting), and a kernel that has to
+  // decide whether its own arguments make sense is a kernel that branches per
+  // thread on something the host already knew.
+  if (!view.IsDefined()) {
+    return InvalidArgumentError("LaunchScale: undefined view");
+  }
+
+  if (!view.IsCuda()) {
+    return InvalidArgumentError("LaunchScale: view is on ",
+                                view.Device().ToString(), ", not a CUDA device");
+  }
+
+  if (view.GetDataType() != DataType::kFloat) {
+    return InvalidArgumentError("LaunchScale: expected f32, got ",
+                                DataTypeName(view.GetDataType()));
+  }
+
+  if (view.IsEmpty()) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t grid = (view.Numel() + kBlock - 1) / kBlock;
+
+  ScaleViewKernel<<<static_cast<unsigned int>(grid), kBlock>>>(view, scale);
+
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
 

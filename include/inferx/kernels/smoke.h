@@ -18,16 +18,15 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
+#include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
 
 /// \brief Multiplies `n` floats in device memory by `scale`, in place.
 ///
-/// Deliberately takes raw pointers rather than a TensorView. The view cannot
-/// carry this call today -- its accessors are host-only, so a kernel cannot ask
-/// it for its data pointer or extent (see the note in smoke.cu) -- and the
-/// point here is to isolate the toolchain, not to depend on that being
-/// resolved.
+/// Takes raw pointers so that this overload isolates the toolchain and nothing
+/// else: if it passes and the TensorView overload below does not, the problem
+/// is the view, not nvcc.
 ///
 /// Synchronizes before returning, so a launch failure is reported as an error
 /// rather than surfacing at some later unrelated CUDA call. That is the correct
@@ -38,6 +37,19 @@ namespace inferx::kernels {
 /// \param scale       The factor to multiply by.
 /// \return            OK, or the CUDA error that the launch or sync reported.
 Status LaunchScale(float* device_data, int64_t n, float scale);
+
+/// \brief The same operation, driven entirely by a TensorView.
+///
+/// The view is passed to the kernel by value and read there through its
+/// INFERX_HOST_DEVICE accessors. That pairing -- trivially copyable to get in,
+/// annotated accessors to be useful once in -- is the §7.1 kernel-boundary
+/// claim, and this is the launch that tests it rather than asserting it.
+///
+/// \param view  An f32 view on a CUDA device. Empty views are a no-op.
+/// \param scale The factor to multiply by.
+/// \return      OK, InvalidArgument for a view this cannot act on, or the CUDA
+///              error that the launch or sync reported.
+Status LaunchScale(const TensorView& view, float scale);
 
 }  // namespace inferx::kernels
 
