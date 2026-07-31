@@ -92,6 +92,54 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
                  const TensorView& out, float scale,
                  cudaStream_t stream = nullptr);
 
+/// \brief Scatters new K/V into their paged cache slots.
+///
+/// Each token carries the flat slot it belongs in -- `block_index · block_size
+/// + offset` -- computed host-side by the scheduler, which is the only thing
+/// that knows the block table. Passing slots rather than a block table keeps
+/// this kernel indifferent to how blocks were assigned, and lets prefill (many
+/// tokens, contiguous slots) and decode (one token per sequence, scattered)
+/// use the same launch.
+///
+/// \param k         `[tokens, kv_heads, head_dim]` bf16, new keys.
+/// \param v         Same shape, new values.
+/// \param k_cache   `[blocks, block_size, kv_heads, head_dim]` bf16.
+/// \param v_cache   Same shape.
+/// \param slots     `[tokens]` int32, destination slot per token.
+Status AppendToKvCache(const TensorView& k, const TensorView& v,
+                       const TensorView& k_cache, const TensorView& v_cache,
+                       const TensorView& slots, cudaStream_t stream = nullptr);
+
+/// \brief Causal attention over a paged KV cache.
+///
+/// The M3 replacement for `Attention`: keys and values are read through a block
+/// table rather than from a contiguous buffer, which is what lets sequences
+/// grow without reserving their maximum length up front (§6.2).
+///
+/// One query token per sequence per launch is the decode case; several is
+/// chunked prefill. Both go through the same kernel, because the only thing
+/// that changes is how many queries share a sequence's keys.
+///
+/// Correctness is defined by agreement with `Attention` above, which is the
+/// naive contiguous reference (R5). The paged kernel is the one that will be
+/// swapped for FlashInfer; the reference is the one that stays.
+///
+/// \param q            `[tokens, q_heads, head_dim]` bf16.
+/// \param k_cache      `[blocks, block_size, kv_heads, head_dim]` bf16.
+/// \param v_cache      Same shape.
+/// \param block_table  `[seqs, max_blocks]` int32. Row `s` lists the blocks
+///                     holding sequence `s`, in order.
+/// \param seq_of_token `[tokens]` int32, which sequence each query belongs to.
+/// \param q_pos        `[tokens]` int32, the query's absolute position, which
+///                     is also how many keys precede it.
+/// \param out          `[tokens, q_heads, head_dim]` bf16.
+/// \param scale        Usually `1/sqrt(head_dim)`.
+Status PagedAttention(const TensorView& q, const TensorView& k_cache,
+                      const TensorView& v_cache, const TensorView& block_table,
+                      const TensorView& seq_of_token, const TensorView& q_pos,
+                      const TensorView& out, float scale,
+                      cudaStream_t stream = nullptr);
+
 /// \brief `out[t,:] = table[ids[t],:]`, an embedding lookup.
 ///
 /// \param table `[vocab, hidden]` bf16.

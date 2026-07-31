@@ -185,6 +185,101 @@ __global__ void AttentionKernel(const bf16* __restrict__ q,
   }
 }
 
+// One block per (token, kv_head). The slot is precomputed host-side, so this
+// kernel never sees a block table and does not care how blocks were assigned.
+__global__ void AppendKvKernel(const bf16* __restrict__ k,
+                               const bf16* __restrict__ v,
+                               bf16* __restrict__ k_cache,
+                               bf16* __restrict__ v_cache,
+                               const int32_t* __restrict__ slots,
+                               int64_t kv_heads, int64_t head_dim,
+                               int64_t total_slots) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t slot = slots[token];
+
+  // A bad slot would scatter a token's keys into another sequence's cache,
+  // which surfaces as garbled output from an unrelated request. Dropped rather
+  // than clamped: writing to slot 0 would be silent corruption, and the host
+  // side validates before launch anyway.
+  if (slot < 0 || slot >= total_slots) return;
+
+  const int64_t src = (token * kv_heads + head) * head_dim;
+  const int64_t dst = (slot * kv_heads + head) * head_dim;
+
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    k_cache[dst + d] = k[src + d];
+    v_cache[dst + d] = v[src + d];
+  }
+}
+
+// One block per (query token, query head), same as the contiguous kernel. The
+// only difference is where a key comes from: `block_table[seq][j / block_size]`
+// gives the block, `j % block_size` the slot inside it.
+__global__ void PagedAttentionKernel(
+    const bf16* __restrict__ q, const bf16* __restrict__ k_cache,
+    const bf16* __restrict__ v_cache, const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_of_token, const int32_t* __restrict__ q_pos,
+    bf16* __restrict__ out, int64_t q_heads, int64_t kv_heads,
+    int64_t head_dim, int64_t block_size, int64_t max_blocks, float scale,
+    int64_t max_keys) {
+  extern __shared__ float smem[];
+  float* tile = smem;
+  float* scores = smem + blockDim.x;
+
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t seq = seq_of_token[token];
+  const int64_t group = q_heads / kv_heads;
+  const int64_t kv_head = head / group;
+
+  // Causal: a query at absolute position p attends to keys 0..p.
+  const int64_t n_keys = static_cast<int64_t>(q_pos[token]) + 1;
+  if (n_keys <= 0 || n_keys > max_keys) return;
+
+  const bf16* qr = q + (token * q_heads + head) * head_dim;
+  const int32_t* table = block_table + seq * max_blocks;
+
+  float running_max = -INFINITY;
+
+  for (int64_t j = 0; j < n_keys; ++j) {
+    const int32_t block = table[j / block_size];
+    const int64_t slot = block * block_size + (j % block_size);
+    const bf16* kr = k_cache + (slot * kv_heads + kv_head) * head_dim;
+
+    float dot = 0.0f;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+      dot += ToF32(qr[d]) * ToF32(kr[d]);
+    }
+    dot = BlockReduce(dot, tile, SumOp{}, 0.0f);
+
+    if (threadIdx.x == 0) scores[j] = dot * scale;
+    __syncthreads();
+
+    running_max = fmaxf(running_max, scores[j]);
+  }
+
+  float sum = 0.0f;
+  for (int64_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
+    const float e = __expf(scores[j] - running_max);
+    scores[j] = e;
+    sum += e;
+  }
+  sum = BlockReduce(sum, tile, SumOp{}, 0.0f);
+
+  const float inv_sum = 1.0f / sum;
+
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t j = 0; j < n_keys; ++j) {
+      const int32_t block = table[j / block_size];
+      const int64_t slot = block * block_size + (j % block_size);
+      acc += scores[j] * ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
+    }
+    out[(token * q_heads + head) * head_dim + d] = ToBf16(acc * inv_sum);
+  }
+}
+
 __global__ void EmbeddingKernel(const bf16* __restrict__ table,
                                 const int32_t* __restrict__ ids,
                                 bf16* __restrict__ out, int64_t hidden,
@@ -428,6 +523,126 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
       static_cast<const bf16*>(q.Data()), static_cast<const bf16*>(k.Data()),
       static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()),
       tokens, q_heads, kv_heads, head_dim, scale);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status AppendToKvCache(const TensorView& k, const TensorView& v,
+                       const TensorView& k_cache, const TensorView& v_cache,
+                       const TensorView& slots, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
+                                     "k_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
+                                     "v_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(slots, DataType::kInt32, 1, "slots"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k, v, "k", "v"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
+                                        "v_cache"));
+
+  const int64_t tokens = k.Dim(0);
+  const int64_t kv_heads = k.Dim(1);
+  const int64_t head_dim = k.Dim(2);
+
+  if (slots.Dim(0) != tokens) {
+    return InvalidArgumentError("slots has ", slots.Dim(0), " entries but "
+                                "there are ", tokens, " tokens");
+  }
+  if (k_cache.Dim(2) != kv_heads || k_cache.Dim(3) != head_dim) {
+    return InvalidArgumentError("cache is [.., .., ", k_cache.Dim(2), ", ",
+                                k_cache.Dim(3), "] but k is [.., ", kv_heads,
+                                ", ", head_dim, "]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int64_t total_slots = k_cache.Dim(0) * k_cache.Dim(1);
+  const int block = BlockFor(head_dim);
+
+  AppendKvKernel<<<dim3(static_cast<unsigned>(tokens),
+                        static_cast<unsigned>(kv_heads)),
+                   block, 0, stream>>>(
+      static_cast<const bf16*>(k.Data()), static_cast<const bf16*>(v.Data()),
+      static_cast<bf16*>(k_cache.Data()), static_cast<bf16*>(v_cache.Data()),
+      static_cast<const int32_t*>(slots.Data()), kv_heads, head_dim,
+      total_slots);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status PagedAttention(const TensorView& q, const TensorView& k_cache,
+                      const TensorView& v_cache, const TensorView& block_table,
+                      const TensorView& seq_of_token, const TensorView& q_pos,
+                      const TensorView& out, float scale,
+                      cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
+                                     "k_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
+                                     "v_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(block_table, DataType::kInt32, 2,
+                                     "block_table"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(seq_of_token, DataType::kInt32, 1,
+                                     "seq_of_token"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_pos, DataType::kInt32, 1, "q_pos"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(q, out, "q", "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
+                                        "v_cache"));
+
+  const int64_t tokens = q.Dim(0);
+  const int64_t q_heads = q.Dim(1);
+  const int64_t head_dim = q.Dim(2);
+  const int64_t block_size = k_cache.Dim(1);
+  const int64_t kv_heads = k_cache.Dim(2);
+  const int64_t max_blocks = block_table.Dim(1);
+
+  if (k_cache.Dim(3) != head_dim) {
+    return InvalidArgumentError("q head_dim is ", head_dim, " but the cache's "
+                                "is ", k_cache.Dim(3));
+  }
+  if (kv_heads == 0 || q_heads % kv_heads != 0) {
+    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
+                                "kv_heads (", kv_heads, ")");
+  }
+  if (seq_of_token.Dim(0) != tokens || q_pos.Dim(0) != tokens) {
+    return InvalidArgumentError("seq_of_token/q_pos have ",
+                                seq_of_token.Dim(0), "/", q_pos.Dim(0),
+                                " entries but there are ", tokens, " tokens");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int64_t max_keys = max_blocks * block_size;
+  const int block = BlockFor(head_dim);
+
+  const size_t smem =
+      (static_cast<size_t>(block) + static_cast<size_t>(max_keys)) *
+      sizeof(float);
+
+  // Same 48 KB ceiling as the contiguous kernel, and the same reason it is not
+  // a problem yet: this is the correctness path, and the tiled kernel that
+  // lifts the limit is the one FlashInfer provides.
+  if (smem > 48u * 1024u) {
+    return ResourceExhaustedError(
+        "paged attention needs ", smem, " B of shared memory for ", max_keys,
+        " keys, over the 48 KB limit");
+  }
+
+  PagedAttentionKernel<<<dim3(static_cast<unsigned>(tokens),
+                              static_cast<unsigned>(q_heads)),
+                         block, smem, stream>>>(
+      static_cast<const bf16*>(q.Data()),
+      static_cast<const bf16*>(k_cache.Data()),
+      static_cast<const bf16*>(v_cache.Data()),
+      static_cast<const int32_t*>(block_table.Data()),
+      static_cast<const int32_t*>(seq_of_token.Data()),
+      static_cast<const int32_t*>(q_pos.Data()),
+      static_cast<bf16*>(out.Data()), q_heads, kv_heads, head_dim, block_size,
+      max_blocks, scale, max_keys);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

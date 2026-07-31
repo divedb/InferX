@@ -9,6 +9,7 @@ add_library(inferx_core
   arena.cc
   caching_allocator.cc
   cuda_utils.cc
+  kv_cache.cc
   device_buffer.cc
   shape.cc
   storage.cc
