@@ -203,6 +203,17 @@ __global__ void EmbeddingKernel(const bf16* __restrict__ table,
   for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
 }
 
+__global__ void AddBiasKernel(bf16* __restrict__ out,
+                              const bf16* __restrict__ bias, int64_t tokens,
+                              int64_t width) {
+  const int64_t total = tokens * width;
+
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < total; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    out[i] = ToBf16(ToF32(out[i]) + ToF32(bias[i % width]));
+  }
+}
+
 __global__ void AddKernel(bf16* __restrict__ out, const bf16* __restrict__ rhs,
                           int64_t n) {
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -445,6 +456,34 @@ Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
       static_cast<const bf16*>(table.Data()),
       static_cast<const int32_t*>(ids.Data()),
       static_cast<bf16*>(out.Data()), hidden, vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
+                      cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(bias, DataType::kBFloat16, 1, "bias"));
+
+  const int64_t tokens = out.Dim(0);
+  const int64_t width = out.Dim(1);
+
+  if (bias.Dim(0) != width) {
+    return InvalidArgumentError("bias has ", bias.Dim(0), " elements but out "
+                                "is ", width, " wide");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  constexpr int kBlock = 256;
+  const int64_t grid_want = (tokens * width + kBlock - 1) / kBlock;
+  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
+                                                               : grid_want);
+
+  AddBiasKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<bf16*>(out.Data()), static_cast<const bf16*>(bias.Data()),
+      tokens, width);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

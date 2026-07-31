@@ -24,11 +24,14 @@ include(InferXDependencies)
 
 add_subdirectory(src/common)
 add_subdirectory(src/core)
-add_subdirectory(src/model)
 
 if(INFERX_CUDA_MEETS_FLOOR)
   add_subdirectory(src/kernels)
 endif()
+
+# After src/kernels: the model's forward pass links inferx::kernels when device
+# code is available, and is loader-only when it is not.
+add_subdirectory(src/model)
 
 if(INFERX_BUILD_TESTS)
   enable_testing()

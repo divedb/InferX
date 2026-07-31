@@ -100,6 +100,18 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
 Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
                        const TensorView& out, cudaStream_t stream = nullptr);
 
+/// \brief `out[t, i] += bias[i]`, broadcasting the bias across tokens.
+///
+/// Qwen2 biases its Q/K/V projections; Llama biases nothing. Kept separate from
+/// the GEMM rather than folded into a cuBLASLt epilogue because the epilogue
+/// would have to be part of the cached plan, and the same shape is used with
+/// and without a bias.
+///
+/// \param out  `[tokens, width]` bf16, updated in place.
+/// \param bias `[width]` bf16.
+Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
+                      cudaStream_t stream = nullptr);
+
 /// \brief `out += residual`, elementwise, in bf16 with fp32 accumulation.
 ///
 /// \param out      `[tokens, hidden]` bf16, updated in place.

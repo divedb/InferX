@@ -59,6 +59,20 @@ class CublasLtGemm {
   Status LinearF16(const TensorView& x, const TensorView& w,
                    const TensorView& y, cudaStream_t stream = nullptr);
 
+  /// \brief `y = x · wᵀ` in bf16 with FP32 accumulation.
+  ///
+  /// The path the model layer runs on, because bf16 is what checkpoints store.
+  /// `LinearF16` remains as the M1 benchmark baseline; the two are separate
+  /// entry points rather than a dtype switch so that neither can be reached by
+  /// accident from the other's caller.
+  ///
+  /// \param x      Activations, `[m, k]` bf16, row-major, on a CUDA device.
+  /// \param w      Weights, `[n, k]` bf16, row-major, same device.
+  /// \param y      Output, `[m, n]` bf16, row-major.
+  /// \param stream Stream to launch on. Does **not** synchronize.
+  Status LinearBF16(const TensorView& x, const TensorView& w,
+                    const TensorView& y, cudaStream_t stream = nullptr);
+
   /// \brief Computes `y = (x·x_scale) · (w·w_scale)ᵀ` in FP8 e4m3.
   ///
   /// The M1 prototype (ARCHITECTURE.md §15 Q2). Same shapes and same layout

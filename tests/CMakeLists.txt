@@ -26,6 +26,8 @@ function(inferx_add_kernel_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
+    inferx::common
+    inferx::model
     inferx::kernels
     inferx::flags
     GTest::gtest_main
@@ -54,4 +56,5 @@ if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(gemm_test         kernel/gemm_test.cc)
   inferx_add_kernel_test(gemm_fp8_test     kernel/gemm_fp8_test.cc)
   inferx_add_kernel_test(layers_test       kernel/layers_test.cc)
+  inferx_add_kernel_test(qwen2_forward_test kernel/qwen2_forward_test.cc)
 endif()

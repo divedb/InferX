@@ -68,7 +68,7 @@ Status CublasErrorToStatus(cublasStatus_t s, const char* expr, const char* file,
 // different element types, so an algorithm the heuristic chose for one is not
 // valid for the other. Keying on the shape alone would hand an FP16 algorithm
 // to an FP8 matmul.
-enum class Path { kF16, kF8E4M3 };
+enum class Path { kF16, kBF16, kF8E4M3 };
 
 struct ShapeKey {
   int64_t m, n, k;
@@ -186,17 +186,31 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   // for TN -- A transposed, B not -- and that is exactly what the row-major
   // linear-layer mapping produces. Storing weights [out, in] as checkpoints do
   // is therefore not just convenient, it is what makes FP8 reachable at all.
-  const cudaDataType_t ab_type =
-      path == Path::kF8E4M3 ? CUDA_R_8F_E4M3 : CUDA_R_16F;
+  cudaDataType_t ab_type = CUDA_R_16F;
+  cudaDataType_t out_type = CUDA_R_16F;
+
+  switch (path) {
+    case Path::kF16:
+      break;
+    case Path::kBF16:
+      // bf16 in and out. This is the path the model layer actually uses, since
+      // it is what checkpoints store; f16 stays as the M1 benchmark baseline.
+      ab_type = CUDA_R_16BF;
+      out_type = CUDA_R_16BF;
+      break;
+    case Path::kF8E4M3:
+      ab_type = CUDA_R_8F_E4M3;
+      // Output stays f16: an f8 output would need a third scale and would throw
+      // away precision the FP32 epilogue is already holding.
+      break;
+  }
 
   INFERX_CUBLAS_RETURN_IF_ERROR(
       cublasLtMatrixLayoutCreate(&plan->a, ab_type, k, n, k));
   INFERX_CUBLAS_RETURN_IF_ERROR(
       cublasLtMatrixLayoutCreate(&plan->b, ab_type, k, m, k));
-  // Output stays f16 on both paths. An f8 output would need a third scale and
-  // would throw away precision the FP32 epilogue is already holding.
   INFERX_CUBLAS_RETURN_IF_ERROR(
-      cublasLtMatrixLayoutCreate(&plan->c, CUDA_R_16F, n, m, n));
+      cublasLtMatrixLayoutCreate(&plan->c, out_type, n, m, n));
 
   cublasLtMatmulPreference_t pref = nullptr;
   INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmulPreferenceCreate(&pref));
@@ -278,6 +292,57 @@ Status CublasLtGemm::Warm(int64_t m, int64_t n, int64_t k, bool fp8) {
       const Plan* plan,
       impl_->GetOrBuild(m, n, k, fp8 ? Path::kF8E4M3 : Path::kF16));
   (void)plan;
+
+  return OkStatus();
+}
+
+Status CublasLtGemm::LinearBF16(const TensorView& x, const TensorView& w,
+                                const TensorView& y, cudaStream_t stream) {
+  for (const auto& [name, t] : {std::pair{"x", &x}, {"w", &w}, {"y", &y}}) {
+    if (!t->IsDefined()) {
+      return InvalidArgumentError("LinearBF16: ", name, " is undefined");
+    }
+    if (!t->IsCuda()) {
+      return InvalidArgumentError("LinearBF16: ", name, " is on ",
+                                  t->Device().ToString(),
+                                  ", not a CUDA device");
+    }
+    if (t->GetDataType() != DataType::kBFloat16) {
+      return InvalidArgumentError("LinearBF16: ", name, " is ",
+                                  DataTypeName(t->GetDataType()), ", not bf16");
+    }
+    if (t->Rank() != 2) {
+      return InvalidArgumentError("LinearBF16: ", name, " has rank ", t->Rank(),
+                                  ", expected 2");
+    }
+  }
+
+  const int64_t m = x.Dim(0);
+  const int64_t k = x.Dim(1);
+  const int64_t n = w.Dim(0);
+
+  if (w.Dim(1) != k) {
+    return InvalidArgumentError("LinearBF16: w is [", n, ", ", w.Dim(1),
+                                "], expected [", n, ", ", k, "] to match x");
+  }
+
+  if (y.Dim(0) != m || y.Dim(1) != n) {
+    return InvalidArgumentError("LinearBF16: y is [", y.Dim(0), ", ", y.Dim(1),
+                                "], expected [", m, ", ", n, "]");
+  }
+
+  if (m == 0 || n == 0 || k == 0) return OkStatus();
+
+  INFERX_ASSIGN_OR_RETURN(const Plan* plan,
+                          impl_->GetOrBuild(m, n, k, Path::kBF16));
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtMatmul(
+      impl_->lt, plan->desc, &alpha, w.Data(), plan->a, x.Data(), plan->b,
+      &beta, y.Data(), plan->c, y.Data(), plan->c, &plan->algo,
+      impl_->workspace.data(), impl_->workspace.size(), stream));
 
   return OkStatus();
 }
