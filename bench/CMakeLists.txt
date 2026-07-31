@@ -23,6 +23,7 @@ endfunction()
 
 inferx_add_bench(gemm_bench gemm_bench.cc)
 inferx_add_bench(decode_step_bench decode_step_bench.cc)
+inferx_add_bench(decode_breakdown_bench decode_breakdown_bench.cc)
 
 # Needs FlashInfer to have something to compare against.
 if(INFERX_HAVE_FLASHINFER)
