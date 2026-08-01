@@ -177,10 +177,13 @@ TEST_F(PagedModelTest, PrefillMatchesFullRecompute) {
     worst = std::max<double>(worst, std::abs(paged[i] - recomputed[i]));
   }
 
-  // The same arithmetic in the same order, differing only in where a key was
-  // read from, so this is an equality check with room for nothing but the
-  // reduction order inside attention.
-  EXPECT_LT(worst, 0.05) << "worst logit difference " << worst;
+  // FlashInfer tiles and reduces attention differently from the deliberately
+  // simple full-recompute kernel. Its kernel-level conformance test bounds one
+  // layer to 0.00195 here; across 36 bf16 layers that becomes a few output
+  // ulps. Keep this tight enough to catch a layout or masking error (those move
+  // logits by order one), while separately requiring the exact sampled token
+  // above.
+  EXPECT_LT(worst, 0.25) << "worst logit difference " << worst;
 }
 
 // The real test: prefill a prefix, then feed tokens one at a time, and compare

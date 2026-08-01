@@ -3,9 +3,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -36,28 +33,6 @@ using Params = flashinfer::BatchPrefillPagedParams<bf16, bf16, bf16, IdType>;
 // flags the decode path turns off, for the same reasons. Causal masking is a
 // MaskMode, not a variant flag, and is selected at dispatch below.
 using Variant = flashinfer::DefaultAttention<false, false, false, false>;
-
-// Reads back the lengths the attention kernel will derive, from the device.
-//
-// get_length dereferences paged_kv.indptr, which is device memory, so this
-// cannot be answered on the host. Probing with our own kernel rather than
-// patching a printf into FlashInfer's header keeps third_party untouched --
-// and it constructs the same paged_kv_t by value, so it sees exactly what the
-// real kernel will see.
-__global__ void ProbePagedKvLengths(flashinfer::paged_kv_t<bf16, IdType> pkv,
-                                    const IdType* q_indptr, uint32_t batch) {
-  if (threadIdx.x != 0 || blockIdx.x != 0) return;
-
-  printf("[PP-dev] page_size=%u num_heads=%u head_dim=%u batch_size=%u\n",
-         uint32_t(pkv.page_size), pkv.num_heads, pkv.head_dim, pkv.batch_size);
-
-  for (uint32_t b = 0; b < batch; ++b) {
-    printf("[PP-dev] b=%u: kv_len(get_length)=%u qo_len=%d "
-           "indptr[%u]=%d indptr[%u]=%d last_page_len[%u]=%d\n",
-           b, pkv.get_length(b), q_indptr[b + 1] - q_indptr[b], b,
-           pkv.indptr[b], b + 1, pkv.indptr[b + 1], b, pkv.last_page_len[b]);
-  }
-}
 
 Status CheckBf16(const TensorView& t, int rank, const char* name) {
   if (!t.IsDefined()) return InvalidArgumentError(name, " is undefined");
@@ -269,6 +244,11 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
   params.lse = nullptr;
   params.maybe_alibi_slopes = nullptr;
   params.num_qo_heads = static_cast<uint32_t>(q_heads);
+  // BatchPrefillPagedParams' default constructor leaves this fast divider
+  // empty.  The kernel uses it to map packed GQA rows back to query-token
+  // indices; with a zero divisor the causal predicate masks every logit.
+  params.group_size =
+      flashinfer::uint_fastdiv(static_cast<uint32_t>(q_heads / kv_heads));
   params.q_stride_n = static_cast<IdType>(q_heads * head_dim);
   params.q_stride_h = static_cast<IdType>(head_dim);
   params.window_left = -1;
@@ -312,98 +292,6 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
     tmp_s = reinterpret_cast<float*>(float_base + impl_->plan.s_offset);
   }
 
-  // TEMPORARY R-prefill INSTRUMENTATION: read back what the planner produced
-  // and compare it against what the caller passed.
-  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
-    std::fprintf(stderr,
-                 "[PP] cta_tile_q=%ld padded_batch=%ld total_num_rows=%ld "
-                 "split_kv=%d batch=%ld total_rows=%ld\n",
-                 (long)impl_->plan.cta_tile_q,
-                 (long)impl_->plan.padded_batch_size,
-                 (long)impl_->plan.total_num_rows, (int)impl_->plan.split_kv,
-                 (long)impl_->planned_batch, (long)impl_->planned_total_rows);
-
-    const auto dump = [&](const char* name, const IdType* dev, int n) {
-      std::vector<IdType> host(static_cast<size_t>(n));
-      if (cudaMemcpy(host.data(), dev, host.size() * sizeof(IdType),
-                     cudaMemcpyDeviceToHost) != cudaSuccess) {
-        std::fprintf(stderr, "[PP] %s: copy failed\n", name);
-        return;
-      }
-      std::fprintf(stderr, "[PP] %s:", name);
-      for (const IdType v : host) std::fprintf(stderr, " %d", v);
-      std::fprintf(stderr, "\n");
-    };
-
-    // At their real lengths this time. The previous dump asked for 8 entries
-    // from arrays holding 3 and 2, so the tails showed the neighbouring
-    // array's contents and looked like aliasing.
-    const int tiles = static_cast<int>(impl_->plan.padded_batch_size);
-    const int batch1 = static_cast<int>(impl_->planned_batch + 1);
-
-    std::fprintf(stderr,
-                 "[PP] offsets: req=%ld qo_tile=%ld kv_tile=%ld merge=%ld "
-                 "o=%ld chunk=%ld\n",
-                 (long)impl_->plan.request_indices_offset,
-                 (long)impl_->plan.qo_tile_indices_offset,
-                 (long)impl_->plan.kv_tile_indices_offset,
-                 (long)impl_->plan.merge_indptr_offset,
-                 (long)impl_->plan.o_indptr_offset,
-                 (long)impl_->plan.kv_chunk_size_ptr_offset);
-
-    dump("caller q_indptr", static_cast<const IdType*>(qo_indptr.Data()),
-         batch1);
-    // What the kernel reads, not what the caller passed. Verifying a source
-    // and assuming its destination has already been the mistake twice here.
-    dump("params.q_indptr", params.q_indptr, batch1);
-    dump("plan request_indices", params.request_indices, tiles);
-    dump("plan qo_tile_indices", params.qo_tile_indices, tiles);
-    dump("plan kv_tile_indices", params.kv_tile_indices, tiles);
-    dump("plan o_indptr", params.o_indptr, batch1);
-    dump("plan kv_chunk_size", params.kv_chunk_size_ptr, 1);
-  }
-
-  // The two values the dispatch actually branches on, read back from params
-  // rather than from the plan they were copied out of. Either being zero makes
-  // the launch a silent no-op: padded_batch_size takes an early
-  // `return cudaSuccess`, and num_heads gives nblks a zero z-dimension.
-  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
-    std::fprintf(stderr,
-                 "[PP] DISPATCH READS: params.padded_batch_size=%u "
-                 "params.paged_kv.num_heads=%u  (plan said %ld, kv_heads=%ld)\n",
-                 params.padded_batch_size, params.paged_kv.num_heads,
-                 (long)impl_->plan.padded_batch_size, (long)kv_heads);
-
-    // The scalars paged_kv_t actually stored, not the ones handed to its
-    // constructor. kv_len is derived from these plus indptr/last_page_len, and
-    // a zero anywhere here makes the kernel attend to nothing and write zeros
-    // -- which looks exactly like not writing at all.
-    // Every value cast explicitly. page_size is a uint_fastdiv struct, not a
-    // uint32_t, and passing it to %u corrupts every vararg after it -- which is
-    // how this print first reported head_dim=0 and batch_size=128.
-    std::fprintf(stderr,
-                 "[PP] paged_kv stored: num_heads=%ld head_dim=%ld "
-                 "batch_size=%ld stride_page=%ld stride_n=%ld stride_h=%ld\n",
-                 (long)params.paged_kv.num_heads,
-                 (long)params.paged_kv.head_dim,
-                 (long)params.paged_kv.batch_size,
-                 (long)params.paged_kv.stride_page,
-                 (long)params.paged_kv.stride_n,
-                 (long)params.paged_kv.stride_h);
-    std::fprintf(stderr,
-                 "[PP] passed: kv_heads=%ld page_size=%ld head_dim=%ld "
-                 "batch=%ld\n",
-                 (long)kv_heads, (long)page_size, (long)head_dim,
-                 (long)impl_->planned_batch);
-  }
-
-  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
-    ProbePagedKvLengths<<<1, 1, 0, stream>>>(
-        paged_kv, static_cast<const IdType*>(qo_indptr.Data()),
-        static_cast<uint32_t>(impl_->planned_batch));
-    (void)cudaStreamSynchronize(stream);
-  }
-
   // The planner chooses the query tile, so the dispatch has to follow it rather
   // than pick one: a kernel compiled for a different CTA_TILE_Q than the plan
   // was built with walks the tile indices wrongly.
@@ -420,31 +308,6 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
   if (err != cudaSuccess) {
     return InternalError("BatchPrefillWithPagedKVCacheDispatched failed: ",
                          cudaGetErrorString(err));
-  }
-
-  // Synchronize and read the output back *here*, immediately after the launch.
-  // cudaGetLastError() catches a rejected launch configuration but not an
-  // execution failure, and reading the buffer at the point of use separates
-  // "the kernel never wrote" from "something clobbered it afterwards".
-  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
-    const cudaError_t sync = cudaStreamSynchronize(stream);
-
-    std::vector<bf16> peek(static_cast<size_t>(
-        std::min<int64_t>(out.Numel(), 4096)));
-    const cudaError_t copy =
-        cudaMemcpy(peek.data(), out.Data(), peek.size() * sizeof(bf16),
-                   cudaMemcpyDeviceToHost);
-
-    size_t nonzero = 0;
-    for (const bf16 v : peek) {
-      if (__bfloat162float(v) != 0.0f) ++nonzero;
-    }
-
-    std::fprintf(stderr,
-                 "[PP] after launch: sync=%s copy=%s, %zu of %zu sampled "
-                 "output elements non-zero\n",
-                 cudaGetErrorString(sync), cudaGetErrorString(copy), nonzero,
-                 peek.size());
   }
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());

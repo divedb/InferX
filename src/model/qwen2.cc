@@ -21,6 +21,7 @@
 #ifdef INFERX_WITH_FLASHINFER
 #include "absl/types/span.h"
 #include "inferx/kernels/flashinfer_attention.h"
+#include "inferx/kernels/flashinfer_prefill.h"
 #endif
 
 namespace inferx::model {
@@ -202,17 +203,21 @@ struct Qwen2Model::Impl {
   // The fast decode path. Absent when the submodule is not vendored, in which
   // case every batch takes the reference kernel and the engine still works.
   std::unique_ptr<kernels::FlashInferDecode> flashinfer;
+  std::unique_ptr<kernels::FlashInferPrefill> flashinfer_prefill;
 
   // CSR view of this step's block table, which is the form FlashInfer wants
   // (our own kernel reads the dense grid directly). Rebuilt per step.
   DeviceBuffer fi_indices_buf, fi_indptr_buf, fi_last_page_buf;
+  DeviceBuffer fi_qo_indptr_buf;
   int64_t fi_indices_capacity = 0;
   int64_t fi_seq_capacity = 0;
   std::vector<int32_t> fi_indptr_host;
+  std::vector<int32_t> fi_qo_indptr_host;
 
   /// Set by PrepareBatchInputs: true when this batch is decode-shaped and the
   /// FlashInfer path is usable for it.
   bool fi_usable = false;
+  bool fi_prefill_usable = false;
 
 #endif
 
@@ -571,7 +576,7 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     const size_t table = static_cast<size_t>(batch.num_seqs) *
                          static_cast<size_t>(batch.max_blocks_per_seq);
     const size_t needed =
-        (per_token + 2 * table + 2 * static_cast<size_t>(batch.num_seqs) + 1) *
+        (per_token + 2 * table + 3 * static_cast<size_t>(batch.num_seqs) + 2) *
         sizeof(int32_t);
 
     INFERX_RETURN_IF_ERROR(EnsurePinned(needed));
@@ -626,14 +631,14 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   }
 
 #ifdef INFERX_WITH_FLASHINFER
-  // FlashInfer's decode kernel serves exactly one query token per sequence.
-  // A prefill, or a mixed batch, is a different shape entirely -- its ragged
-  // prefill kernel is a separate integration -- so those keep the reference
-  // kernel. Detecting it here rather than in the launch keeps the device half
-  // free of host-side branching.
-  fi_usable = flashinfer != nullptr && tokens == batch.num_seqs;
+  // Decode serves one query per sequence; the ragged prefill kernel serves
+  // every other all-contributing shape.  A deferred sequence has no query rows
+  // and no length in ForwardBatch, so a mixed step containing one still uses
+  // the reference kernel until M5 makes sequence lengths explicit in the plan.
+  fi_usable = false;
+  fi_prefill_usable = false;
 
-  if (fi_usable) {
+  if (flashinfer != nullptr || flashinfer_prefill != nullptr) {
     // Each sequence's cached length is its query position plus one, which is
     // also how many keys it will attend over.
     std::vector<int32_t> blocks_used(static_cast<size_t>(batch.num_seqs));
@@ -641,17 +646,56 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 
     const int64_t block_size = pool->block_size();
 
+    std::vector<int32_t> query_counts(static_cast<size_t>(batch.num_seqs));
+    std::vector<int32_t> previous_position(static_cast<size_t>(batch.num_seqs),
+                                           -1);
+    int64_t previous_seq = -1;
+
     for (int64_t i = 0; i < tokens; ++i) {
       const int64_t seq = batch.seq_of_token[static_cast<size_t>(i)];
       const int64_t len = batch.positions[static_cast<size_t>(i)] + 1;
       const int64_t used = (len + block_size - 1) / block_size;
 
+      if (seq < previous_seq ||
+          (previous_position[static_cast<size_t>(seq)] >= 0 &&
+           batch.positions[static_cast<size_t>(i)] !=
+               previous_position[static_cast<size_t>(seq)] + 1)) {
+        return InvalidArgumentError(
+            "FlashInfer prefill requires rows grouped by sequence with "
+            "contiguous positions");
+      }
+      previous_seq = seq;
+      previous_position[static_cast<size_t>(seq)] =
+          batch.positions[static_cast<size_t>(i)];
+
+      ++query_counts[static_cast<size_t>(seq)];
       blocks_used[static_cast<size_t>(seq)] = static_cast<int32_t>(used);
 
       // Never zero: a length that exactly fills its last page uses all of it.
       const int64_t rem = len - (used - 1) * block_size;
       last_page[static_cast<size_t>(seq)] = static_cast<int32_t>(rem);
     }
+
+    bool every_sequence_contributes = true;
+    bool exactly_one_query_per_sequence = true;
+    fi_qo_indptr_host.assign(static_cast<size_t>(batch.num_seqs + 1), 0);
+    for (int64_t seq = 0; seq < batch.num_seqs; ++seq) {
+      const int32_t count = query_counts[static_cast<size_t>(seq)];
+      every_sequence_contributes &= count > 0;
+      exactly_one_query_per_sequence &= count == 1;
+      fi_qo_indptr_host[static_cast<size_t>(seq + 1)] =
+          fi_qo_indptr_host[static_cast<size_t>(seq)] + count;
+
+    }
+
+    fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
+    // The wrapper is structurally ragged, but only the single-request path has
+    // a conformance oracle today. A three-request serving batch exposed
+    // lifecycle-dependent token output after earlier engines had run, so keep
+    // multi-request prefill on the reference kernel until that shape has its
+    // own page-permutation and repeatability coverage.
+    fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
+                        batch.num_seqs == 1 && every_sequence_contributes;
 
     std::vector<int32_t> indices;
     INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
@@ -677,12 +721,18 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
           DeviceBuffer::Allocate(
               static_cast<size_t>(batch.num_seqs) * sizeof(int32_t),
               DeviceId::Cuda(0)));
+      INFERX_ASSIGN_OR_RETURN(
+          fi_qo_indptr_buf,
+          DeviceBuffer::Allocate(
+              static_cast<size_t>(batch.num_seqs + 1) * sizeof(int32_t),
+              DeviceId::Cuda(0)));
       fi_seq_capacity = batch.num_seqs;
     }
 
     INFERX_RETURN_IF_ERROR(upload(fi_indices_buf, indices));
     INFERX_RETURN_IF_ERROR(upload(fi_indptr_buf, fi_indptr_host));
     INFERX_RETURN_IF_ERROR(upload(fi_last_page_buf, last_page));
+    INFERX_RETURN_IF_ERROR(upload(fi_qo_indptr_buf, fi_qo_indptr_host));
 
     // Planned here, once per step, and deliberately not inside the launch: the
     // planner reads the indptr on the host and branches on it, which no graph
@@ -694,10 +744,18 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     // as sequences grow, and using it always means the graphed and ungraphed
     // paths run identical kernels -- so a test that says "graphs do not change
     // the output" is testing dispatch rather than arithmetic.
-    INFERX_RETURN_IF_ERROR(flashinfer->Plan(
-        batch.num_seqs, config.num_attention_heads,
-        config.num_key_value_heads, config.head_dim, block_size,
-        absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+    if (fi_usable) {
+      INFERX_RETURN_IF_ERROR(flashinfer->Plan(
+          batch.num_seqs, config.num_attention_heads,
+          config.num_key_value_heads, config.head_dim, block_size,
+          absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+    } else if (fi_prefill_usable) {
+      INFERX_RETURN_IF_ERROR(flashinfer_prefill->Plan(
+          batch.num_seqs, config.num_attention_heads,
+          config.num_key_value_heads, config.head_dim, block_size,
+          absl::MakeConstSpan(fi_qo_indptr_host),
+          absl::MakeConstSpan(fi_indptr_host), tokens, stream));
+    }
   }
 #endif
 
@@ -785,6 +843,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   // the plan rewrote. allow_flashinfer survives only so a caller can force the
   // reference kernel.
   const bool use_flashinfer = fi_usable && allow_flashinfer;
+  const bool use_flashinfer_prefill = fi_prefill_usable && allow_flashinfer;
 #endif
 
   INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x, stream));
@@ -825,7 +884,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
 
 #ifdef INFERX_WITH_FLASHINFER
-    if (use_flashinfer) {
+    if (use_flashinfer || use_flashinfer_prefill) {
       INFERX_ASSIGN_OR_RETURN(
           const TensorView fi_indices,
           TensorView::Create(fi_indices_buf.data(), DataType::kInt32,
@@ -841,9 +900,19 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           TensorView::Create(fi_last_page_buf.data(), DataType::kInt32,
                              Shape({num_seqs}), DeviceId::Cuda(0)));
 
-      INFERX_RETURN_IF_ERROR(flashinfer->Run(q3, k_cache, v_cache, fi_indices,
-                                             fi_indptr, fi_last_page, a3,
-                                             attn_scale, stream));
+      if (use_flashinfer) {
+        INFERX_RETURN_IF_ERROR(flashinfer->Run(
+            q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
+            attn_scale, stream));
+      } else {
+        INFERX_ASSIGN_OR_RETURN(
+            const TensorView fi_qo_indptr,
+            TensorView::Create(fi_qo_indptr_buf.data(), DataType::kInt32,
+                               Shape({num_seqs + 1}), DeviceId::Cuda(0)));
+        INFERX_RETURN_IF_ERROR(flashinfer_prefill->Run(
+            q3, k_cache, v_cache, fi_qo_indptr, fi_indices, fi_indptr,
+            fi_last_page, a3, attn_scale, stream));
+      }
     } else
 #endif
     {
@@ -1115,6 +1184,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
                           kernels::FlashInferDecode::Create());
   impl->flashinfer =
       std::make_unique<kernels::FlashInferDecode>(std::move(fi));
+  INFERX_ASSIGN_OR_RETURN(impl->flashinfer_prefill,
+                          kernels::FlashInferPrefill::Create());
 #endif
 
   for (const DeviceBuffer& b : impl->weight_buffers) {
