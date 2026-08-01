@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -240,6 +241,83 @@ TEST_F(EngineTest, BatchingDoesNotChangeTheOutput) {
 
   EXPECT_EQ(alone, batched)
       << "batching changed the output; sequences are not isolated";
+}
+
+TEST_F(EngineTest, RaggedPrefillCacheIsRepeatableAfterBlockReuse) {
+  struct ExperimentalRaggedPrefill {
+    ExperimentalRaggedPrefill() {
+      EXPECT_EQ(setenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL", "1", 1), 0);
+    }
+    ~ExperimentalRaggedPrefill() {
+      EXPECT_EQ(unsetenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL"), 0);
+    }
+  } enable;
+
+  const std::vector<std::vector<int32_t>> prompts = {
+      {kThe, kCapital, kOf, kFrance, kIs},
+      {kThe, kCapital, kOf, kFrance},
+      {kThe, kIs}};
+
+  struct Snapshot {
+    std::vector<float> logits;
+    std::vector<uint16_t> kv;
+  };
+
+  const auto prefill = [&] {
+    auto sched = MakeScheduler(4);
+    EXPECT_TRUE(sched.ok()) << sched.status();
+
+    SamplingParams params;
+    params.max_tokens = 1;
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      EXPECT_TRUE(sched->AddRequest(i + 1, prompts[i], params).ok());
+    }
+
+    ForwardBatch batch;
+    EXPECT_TRUE(sched->PrepareStep(&batch).ok());
+
+    Snapshot snapshot;
+    EXPECT_TRUE(model_->Step(batch, &snapshot.logits).ok());
+
+    const int64_t entry_elems = model_->config().num_key_value_heads *
+                                model_->config().head_dim;
+    std::vector<uint16_t> entry(static_cast<size_t>(entry_elems));
+    for (int64_t layer = 0; layer < model_->config().num_hidden_layers;
+         ++layer) {
+      for (const bool value : {false, true}) {
+        const StatusOr<TensorView> cache =
+            value ? model_->kv_pool()->ValueCache(layer)
+                  : model_->kv_pool()->KeyCache(layer);
+        EXPECT_TRUE(cache.ok()) << cache.status();
+        for (const int32_t slot : batch.slots) {
+          const size_t offset = static_cast<size_t>(slot * entry_elems) *
+                                sizeof(uint16_t);
+          EXPECT_EQ(cudaMemcpy(
+                        entry.data(),
+                        static_cast<const std::byte*>(cache->Data()) + offset,
+                        entry.size() * sizeof(uint16_t),
+                        cudaMemcpyDeviceToHost),
+                    cudaSuccess);
+          snapshot.kv.insert(snapshot.kv.end(), entry.begin(), entry.end());
+        }
+      }
+    }
+
+    EXPECT_TRUE(sched->CommitStep(
+        GreedySample(snapshot.logits, batch.logits_indices.size())).ok());
+    (void)sched->TakeCompleted();
+    return snapshot;
+  };
+
+  const Snapshot first = prefill();
+  const Snapshot second = prefill();
+  EXPECT_EQ(first.logits, second.logits);
+  ASSERT_EQ(first.kv.size(), second.kv.size());
+
+  for (size_t i = 0; i < first.kv.size(); ++i) {
+    ASSERT_EQ(first.kv[i], second.kv[i])
+        << "first cached K/V difference at flattened element " << i;
+  }
 }
 
 TEST_F(EngineTest, StopTokenEndsGenerationEarly) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -689,13 +690,17 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     }
 
     fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
-    // The wrapper-level output and immediate full-model logits are repeatable,
-    // but long graph-served continuations still diverge intermittently after
-    // repeated engine lifecycles. Keep multi-request prefill on the reference
-    // path until the cached per-layer K/V state has its own repeatability
-    // oracle, not merely the final prefill logits.
+    // Wrapper output, immediate logits, and every cached per-layer K/V element
+    // are repeatable, but long graph-served continuations still diverge
+    // intermittently unless CUDA launches are serialized. That points at a
+    // later timing race, so keep multi-request prefill on the reference path.
+    // The environment override lets regression tests exercise the quarantined
+    // route without making it the serving default.
     fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
-                        batch.num_seqs == 1 && every_sequence_contributes;
+                        (batch.num_seqs == 1 ||
+                         std::getenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL") !=
+                             nullptr) &&
+                        every_sequence_contributes;
 
     std::vector<int32_t> indices;
     INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
