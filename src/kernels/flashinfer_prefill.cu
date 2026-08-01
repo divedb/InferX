@@ -337,6 +337,18 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
     dump("plan kv_chunk_size", params.kv_chunk_size_ptr, 1);
   }
 
+  // The two values the dispatch actually branches on, read back from params
+  // rather than from the plan they were copied out of. Either being zero makes
+  // the launch a silent no-op: padded_batch_size takes an early
+  // `return cudaSuccess`, and num_heads gives nblks a zero z-dimension.
+  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
+    std::fprintf(stderr,
+                 "[PP] DISPATCH READS: params.padded_batch_size=%u "
+                 "params.paged_kv.num_heads=%u  (plan said %ld, kv_heads=%ld)\n",
+                 params.padded_batch_size, params.paged_kv.num_heads,
+                 (long)impl_->plan.padded_batch_size, (long)kv_heads);
+  }
+
   // The planner chooses the query tile, so the dispatch has to follow it rather
   // than pick one: a kernel compiled for a different CTA_TILE_Q than the plan
   // was built with walks the tile indices wrongly.
