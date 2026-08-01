@@ -37,6 +37,28 @@ using Params = flashinfer::BatchPrefillPagedParams<bf16, bf16, bf16, IdType>;
 // MaskMode, not a variant flag, and is selected at dispatch below.
 using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
+// Reads back the lengths the attention kernel will derive, from the device.
+//
+// get_length dereferences paged_kv.indptr, which is device memory, so this
+// cannot be answered on the host. Probing with our own kernel rather than
+// patching a printf into FlashInfer's header keeps third_party untouched --
+// and it constructs the same paged_kv_t by value, so it sees exactly what the
+// real kernel will see.
+__global__ void ProbePagedKvLengths(flashinfer::paged_kv_t<bf16, IdType> pkv,
+                                    const IdType* q_indptr, uint32_t batch) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  printf("[PP-dev] page_size=%u num_heads=%u head_dim=%u batch_size=%u\n",
+         uint32_t(pkv.page_size), pkv.num_heads, pkv.head_dim, pkv.batch_size);
+
+  for (uint32_t b = 0; b < batch; ++b) {
+    printf("[PP-dev] b=%u: kv_len(get_length)=%u qo_len=%d "
+           "indptr[%u]=%d indptr[%u]=%d last_page_len[%u]=%d\n",
+           b, pkv.get_length(b), q_indptr[b + 1] - q_indptr[b], b,
+           pkv.indptr[b], b + 1, pkv.indptr[b + 1], b, pkv.last_page_len[b]);
+  }
+}
+
 Status CheckBf16(const TensorView& t, int rank, const char* name) {
   if (!t.IsDefined()) return InvalidArgumentError(name, " is undefined");
   if (!t.IsCuda()) {
@@ -373,6 +395,13 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
                  "batch=%ld\n",
                  (long)kv_heads, (long)page_size, (long)head_dim,
                  (long)impl_->planned_batch);
+  }
+
+  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
+    ProbePagedKvLengths<<<1, 1, 0, stream>>>(
+        paged_kv, static_cast<const IdType*>(qo_indptr.Data()),
+        static_cast<uint32_t>(impl_->planned_batch));
+    (void)cudaStreamSynchronize(stream);
   }
 
   // The planner chooses the query tile, so the dispatch has to follow it rather
