@@ -529,6 +529,42 @@ and `down_proj` alone are 7.3 ms of the bf16 step at 642-682 GB/s, and no
 amount of launch elimination touches them. That is the argument for FP8 and,
 later, for W4A16 (M8).
 
+#### Prefill, measured for the first time
+
+Batch 1, bf16, one sequence, reference attention kernel (FlashInfer's prefill
+path is not integrated — `fi_usable` requires one token per sequence, so every
+prompt falls to the M2 kernel).
+
+| prompt tokens | prefill ms | tok/s | vs one decode step |
+|---|---|---|---|
+| 128 | 25.9 | 4942 | 2.4x |
+| 256 | 62.2 | 4117 | 5.7x |
+| 512 | 179.1 | 2859 | 16x |
+| 1024 | 601.9 | 1701 | 55x |
+| 2048 | 2246.4 | 912 | 206x |
+| 4096 | 12743.9 | 321 | 1169x |
+| 8192 | 105028.4 | 78 | 9636x |
+| 16384 | — | — | fails: needs 66 KB of shared memory, over the 48 KB limit |
+
+**This is the engine's worst number by a wide margin and it was never
+measured.** A 2k-token prompt takes 2.2 seconds; an 8k prompt takes 105
+seconds. Time-to-first-token, not decode, is what a user of this server would
+actually notice.
+
+The scaling is worse than quadratic past 2k — 4096→8192 costs 8.2x where
+quadratic predicts 4x — which points at occupancy collapse rather than at the
+arithmetic. The kernel stages keys in shared memory at about 4 bytes each, so
+its tile grows linearly with the sequence and squeezes out resident blocks
+until only one fits per SM. The same growth sets the hard ceiling: at 16384
+keys it asks for 66 KB against a 48 KB limit and will not launch.
+
+Two consequences worth stating plainly. First, the ceiling is a function of the
+*block table's width*, which the scheduler derives from `max_seq_len` — not of
+the actual prompt — so configuring a server for 16k context makes every prefill
+fail, including a 10-token one. Second, integrating FlashInfer's prefill kernel
+stops being an optimization and becomes the thing that makes long prompts
+possible at all.
+
 #### The M3-to-M4 progression, re-run
 
 Each commit that claimed a number was checked out, rebuilt and re-measured on
