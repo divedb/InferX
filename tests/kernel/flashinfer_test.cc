@@ -610,6 +610,38 @@ TEST_F(FlashInferTest, PrefillMatchesTheReferenceKernel) {
                "reference rms %.5f, ratio %.4f\n",
                worst, rms, rms > 0 ? worst / rms : 0.0);
 
+  // Row 0 against V[0], which settles the read path on its own.
+  //
+  // Under causal masking query 0 attends to exactly one key, so its softmax is
+  // 1.0 and its output must be V[0] verbatim -- independent of sm_scale and of
+  // every tiling decision the planner makes. Checking both kernels against that
+  // says which of them is reading the values correctly, rather than only that
+  // they disagree.
+  {
+    const int64_t group = kHeads / kKvHeads;
+
+    double ref_err = 0.0;
+    double fi_err = 0.0;
+
+    for (int64_t h = 0; h < kHeads; ++h) {
+      for (int64_t d = 0; d < kHeadDim; ++d) {
+        // V[0] for the kv head this query head shares.
+        const double want =
+            kv_host[static_cast<size_t>((h / group) * kHeadDim + d)];
+
+        const size_t i = static_cast<size_t>(h * kHeadDim + d);
+
+        ref_err = std::max(ref_err, std::abs(ref[i] - want));
+        fi_err = std::max(fi_err, std::abs(got[i] - want));
+      }
+    }
+
+    std::fprintf(stderr,
+                 "  row 0 vs V[0]: reference off by %.5f, flashinfer off by "
+                 "%.5f\n",
+                 ref_err, fi_err);
+  }
+
   // Per query row. Which rows disagree localises the fault far faster than
   // reading the params struct does: row 0 alone points at causal masking, a
   // suffix points at o_indptr, a contiguous band points at a CTA_TILE_Q
