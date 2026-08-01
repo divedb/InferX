@@ -548,9 +548,9 @@ runs after 3 warmups on the RTX 4080 SUPER.
 The integration removes the engine's worst bottleneck: 2k falls from 2.25 s to
 176 ms (12.8x), 8k from 105 s to 774 ms (135.8x), and 16k now runs in 1.78 s
 instead of exceeding the reference kernel's shared-memory ceiling. Throughput
-holds above 9.2k tok/s across the matrix. Fast prefill is currently enabled for
-one sequence; multi-sequence ragged prefill remains on the reference path until
-its page-permutation and lifecycle-repeatability coverage is complete.
+holds above 9.2k tok/s across the matrix. Multi-sequence ragged prefill uses the
+same path and is guarded by page-permutation, block-reuse, per-layer K/V, and
+server-lifecycle repeatability tests.
 
 #### The M3-to-M4 progression, re-run
 

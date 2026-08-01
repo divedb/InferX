@@ -27,6 +27,14 @@ using scheduler::TokenDelta;
 // genuinely empty, since otherwise the loop is bounded by the step itself.
 constexpr auto kIdleWait = std::chrono::milliseconds(2);
 
+// When an idle engine receives a burst, Submit calls arrive one by one even if
+// their callers regard them as concurrent. Waking on the first and immediately
+// forming a batch makes membership depend on thread timing; a faster prefill
+// made that visible as different greedy continuations for identical bursts.
+// Wait for a short quiet period only at the idle-to-busy transition. Decode
+// steps and arrivals while work is already running pay no delay.
+constexpr auto kBatchCoalesceWait = std::chrono::milliseconds(1);
+
 }  // namespace
 
 // --- Generation --------------------------------------------------------------
@@ -300,6 +308,25 @@ struct Engine::Impl {
     while (!stopping.load(std::memory_order_relaxed)) {
       {
         std::unique_lock<std::mutex> lock(mutex);
+
+        if (!intake.empty() && !scheduler.HasWork()) {
+          size_t observed = intake.size();
+          auto quiet_until =
+              std::chrono::steady_clock::now() + kBatchCoalesceWait;
+
+          while (!stopping.load(std::memory_order_relaxed)) {
+            if (wake.wait_until(lock, quiet_until) ==
+                std::cv_status::timeout) {
+              break;
+            }
+
+            if (intake.size() != observed) {
+              observed = intake.size();
+              quiet_until =
+                  std::chrono::steady_clock::now() + kBatchCoalesceWait;
+            }
+          }
+        }
 
         while (!intake.empty()) {
           Pending pending = std::move(intake.front());

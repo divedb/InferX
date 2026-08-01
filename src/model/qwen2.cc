@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -690,16 +689,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     }
 
     fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
-    // Wrapper output, immediate logits, and every cached per-layer K/V element
-    // are repeatable, but long graph-served continuations still diverge
-    // intermittently unless CUDA launches are serialized. That points at a
-    // later timing race, so keep multi-request prefill on the reference path.
-    // The environment override lets regression tests exercise the quarantined
-    // route without making it the serving default.
+    // Every contributing request can share the ragged launch. Deferred
+    // requests have no query rows or explicit length in ForwardBatch yet, so a
+    // mixed step containing one stays on the reference path until M5 carries
+    // those lengths directly.
     fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
-                        (batch.num_seqs == 1 ||
-                         std::getenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL") !=
-                             nullptr) &&
                         every_sequence_contributes;
 
     std::vector<int32_t> indices;

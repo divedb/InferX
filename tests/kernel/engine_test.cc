@@ -244,15 +244,6 @@ TEST_F(EngineTest, BatchingDoesNotChangeTheOutput) {
 }
 
 TEST_F(EngineTest, RaggedPrefillCacheIsRepeatableAfterBlockReuse) {
-  struct ExperimentalRaggedPrefill {
-    ExperimentalRaggedPrefill() {
-      EXPECT_EQ(setenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL", "1", 1), 0);
-    }
-    ~ExperimentalRaggedPrefill() {
-      EXPECT_EQ(unsetenv("INFERX_EXPERIMENTAL_RAGGED_PREFILL"), 0);
-    }
-  } enable;
-
   const std::vector<std::vector<int32_t>> prompts = {
       {kThe, kCapital, kOf, kFrance, kIs},
       {kThe, kCapital, kOf, kFrance},
