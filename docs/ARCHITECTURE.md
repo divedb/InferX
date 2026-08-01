@@ -529,13 +529,39 @@ and `down_proj` alone are 7.3 ms of the bf16 step at 642-682 GB/s, and no
 amount of launch elimination touches them. That is the argument for FP8 and,
 later, for W4A16 (M8).
 
-Two caveats on the older numbers recorded in commit messages. The intermediate
-rows of the M3-to-M4 progression (20.10 -> 13.90 -> 12.70 -> 11.55 -> 11.24 ->
-10.73 -> 8.16 ms) measure code that no longer exists and cannot be re-run
-without checking out those commits. Both endpoints reproduce within noise on
-current code -- 10.73 against 10.90, and 8.16 against 8.29 -- and the floor
-reproduces exactly, so the shape of the progression stands even though the
-middle of it is unverified.
+#### The M3-to-M4 progression, re-run
+
+Each commit that claimed a number was checked out, rebuilt and re-measured on
+current hardware and clocks. The claimed figure is what its commit message
+said; the two columns are what it measures today.
+
+| commit | claim | launch-by-launch | with graphs |
+|---|---|---|---|
+| `35e42aa` FlashInfer wired in | 13.9 ms | 13.46 ms | 18.40 ms (0.73x) |
+| `ba3f060` FlashInfer inside the graph | 11.5 ms | 12.03 ms | 10.93 ms |
+| `10b4d48` fused QKV and gate/up GEMMs | 11.24 ms | 11.30 ms | 10.59 ms |
+| `b6970d9` pinned host copies | 10.73 ms | 11.19 ms | 10.48 ms |
+| `8a73665` FP8 available, bf16 path | 10.75 ms | 11.13 ms | 10.49 ms |
+| `8a73665` FP8 weights | 8.16 ms | 9.03 ms | 7.89 ms |
+
+The shape holds and the ordering is monotonic, but the claimed figures sit
+*between* the two columns rather than on either, so the original measurements
+are not exactly reproducible — today's graphed numbers run 2-4% faster than
+what was recorded. Driver, thermal state and the R9 fix all changed underneath
+them; the discrepancy is small and uniform enough not to disturb any
+conclusion drawn from it.
+
+One step does not reproduce. `b6970d9` claimed pinned host staging was worth
+11.24 -> 10.73 ms, a 4.5% gain; measured against its own parent today it is
+10.59 -> 10.48 ms, **1.0%**. The others hold: FlashInfer-in-graph claimed 17.3%
+and measures 18.8%, the GEMM fusion claimed 2.7% and measures 3.1%, FP8 claimed
+24.1% and measures 24.8%. The pinned-memory win is the one to treat as
+unconfirmed.
+
+Note that `35e42aa` is the commit where graphs made things *worse* — 0.73x,
+because a captured graph there fell back to the reference attention kernel.
+That is what `ba3f060` fixed, and it is why the graph column is not
+monotonic.
 
 M1 before M2 is deliberate: the quantized GEMM story is the largest risk in a torch-free design, and discovering it is intractable *after* building the model layer would be expensive.
 
