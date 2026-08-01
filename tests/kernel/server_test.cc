@@ -56,10 +56,8 @@ class ServerTest : public ::testing::Test {
     config.scheduler.max_batch_tokens = 512;
     config.kv_blocks = 512;
 
-    // Left off deliberately, matching the shipping default: multi-shape capture
-    // is not yet correct, and a test that quietly enabled it would be testing a
-    // configuration nobody runs.
-    config.capture_graphs = false;
+    // Left at the default, which is now on: R9 is fixed, so the served
+    // configuration and the tested one are the same again.
 
     StatusOr<std::unique_ptr<Engine>> created = Engine::Create(config);
     ASSERT_TRUE(created.ok()) << created.status().ToString();

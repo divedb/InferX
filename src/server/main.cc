@@ -35,9 +35,7 @@ void PrintUsage(const char* argv0) {
       "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
       "  --block-size <n>       tokens per block (default 16)\n"
       "  --fp8                  quantize weights to FP8 e4m3\n"
-      "  --cuda-graphs          capture decode graphs at startup.\n"
-      "                         Correct for a single sequence; concurrent\n"
-      "                         decode is currently wrong. Off by default.\n"
+      "  --no-cuda-graphs       skip decode graph capture at startup\n"
       "\n"
       "Only greedy decoding is implemented: temperature and top_p are\n"
       "accepted and ignored, and responses report system_fingerprint\n"
@@ -99,8 +97,8 @@ int main(int argc, char** argv) {
       engine_config.block_size = std::atoll(value.c_str());
     } else if (arg == "--fp8") {
       engine_config.fp8_weights = true;
-    } else if (arg == "--cuda-graphs") {
-      engine_config.capture_graphs = true;
+    } else if (arg == "--no-cuda-graphs") {
+      engine_config.capture_graphs = false;
     } else {
       std::fprintf(stderr, "error: unknown option %s\n\n", arg.c_str());
       PrintUsage(argv[0]);
@@ -154,9 +152,7 @@ int main(int argc, char** argv) {
                http_config.host.c_str(), http_config.port,
                (*engine)->model_name().c_str(),
                engine_config.fp8_weights ? "fp8 e4m3" : "bf16",
-               engine_config.capture_graphs
-                   ? "on (concurrent decode is known-wrong)"
-                   : "off",
+               engine_config.capture_graphs ? "on" : "off",
                static_cast<long long>(engine_config.scheduler.max_running),
                static_cast<long long>(engine_config.scheduler.max_seq_len),
                static_cast<long long>(engine_config.kv_blocks),

@@ -503,41 +503,35 @@ TEST_F(EngineTest, CudaGraphReplayMatchesLaunchByLaunchForABatch) {
 }
 
 
-// KNOWN FAILURE -- R9. Capturing a CUDA graph changes the logits.
+// Capturing a graph must not change a single logit -- R9's regression test.
 //
-// This is the test that finally localised R9, and what it found is larger than
-// the bug we thought we had. Replaying a captured decode step does not
-// reproduce the launch-by-launch result *at all*: on a single sequence the
-// logits differ by ~19, from the very first vocabulary entry. It is not a
-// concurrency bug and it is not intermittent -- it is every graphed decode step
-// we have ever run.
+// Comparing *logits* rather than sampled tokens is the whole point. Every graph
+// test before this one compared tokens, and an argmax survives a surprisingly
+// large error, so a decode step that was wrong in every layer looked fine for
+// two milestones.
 //
-// It went unnoticed since M3 because every graph test compared *sampled tokens*
-// rather than logits, and the argmax usually survives a difference this size.
-// It usually does; when it does not, the sequence derails, which is the garbage
-// output that was reported as a concurrency problem.
+// Three checks, and the order matters, because they separate three different
+// things that all present as "the graph is broken":
 //
-// The control below matters: re-running the same batch with nothing captured in
-// between is bit-identical, so the difference is the graph's doing and not the
-// second append into the KV cache.
+//   1. re-running the same batch with nothing captured must be bit-identical,
+//      or the comparison measures the second KV append rather than the graph;
+//   2. running launch-by-launch after capturing a graph for a *different*
+//      shape must be bit-identical, or capture is corrupting model state and
+//      replay is innocent -- which is exactly what R9 turned out to be;
+//   3. only then does replaying a matching graph mean anything.
 //
-// Sweeping the capture probe's position changes the size of the error (2.4 at
-// position 0, 19.9 at position 5, where the argmax also flips) which means the
-// graph has baked values derived from the probe rather than reading them from
-// device memory each replay. FlashInfer's plan is the prime suspect: `Plan`
-// computes host-side values that `Run` passes as kernel arguments, and a
-// recording freezes them. `graph_safe` was supposed to make exactly those
-// stable.
-//
-// Left failing on purpose. Graph capture is off by default and `--cuda-graphs`
-// is opt-in, so nothing ships broken -- but the measured "1.05x from CUDA
-// graphs" was measuring a computation that was already wrong, and that should
-// not be quietly green.
+// Check 2 is what found it. The capture probe ran the real decode body, so it
+// really appended keys and values, and it wrote them to slot 0 -- physical
+// block 0, which the free list hands out first. Capturing a graph overwrote the
+// first live sequence's position-0 KV in every layer.
+
 TEST_F(EngineTest, GraphedAndUngraphedLogitsAgreeForABatch) {
   auto sched = MakeScheduler(3);
   ASSERT_TRUE(sched.ok());
 
   const std::vector<std::vector<int32_t>> prompts = {
+      {kThe, kCapital, kOf, kFrance, kIs},
+      {kThe, kCapital, kOf, kFrance, kIs, kParis},
       {kThe, kCapital, kOf, kFrance, kIs},
   };
 
@@ -575,6 +569,27 @@ TEST_F(EngineTest, GraphedAndUngraphedLogitsAgreeForABatch) {
   // than the graph, and every conclusion drawn from it would be wrong.
   std::vector<float> repeated;
   ASSERT_TRUE(model_->Step(decode, &repeated).ok());
+
+  // Capture a graph for a *different* shape first. FindGraph will not match
+  // this batch, so the step below still runs launch-by-launch -- which
+  // separates "replay is wrong" from "capturing corrupts model state".
+  ASSERT_TRUE(model_->CaptureDecodeGraph(decode.num_seqs + 1,
+                                         decode.max_blocks_per_seq)
+                  .ok());
+
+  std::vector<float> after_foreign_capture;
+  ASSERT_TRUE(model_->Step(decode, &after_foreign_capture).ok());
+
+  {
+    double d = 0.0;
+    for (size_t i = 0; i < ungraphed.size(); ++i) {
+      d = std::max(d, std::fabs(static_cast<double>(ungraphed[i]) -
+                                after_foreign_capture[i]));
+    }
+    std::fprintf(stderr,
+                 "[R9] AFTER FOREIGN CAPTURE (still ungraphed): max|diff| = "
+                 "%.6g\n", d);
+  }
 
   ASSERT_TRUE(
       model_->CaptureDecodeGraph(decode.num_seqs, decode.max_blocks_per_seq)

@@ -34,19 +34,14 @@ struct EngineConfig {
 
   /// Capture a CUDA graph per batch size at startup.
   ///
-  /// Off by default, and that is a bug rather than a preference. Graphs are a
-  /// real win -- roughly 1.05x on the decode step -- and single-sequence
-  /// capture is correct. Capturing more than one shape is not: preparing a
-  /// larger batch grows buffers that are sized on demand, which strands the
-  /// addresses already recorded by the graphs captured for smaller ones.
-  /// Capturing largest-first fixes the single-sequence case but concurrent
-  /// decode still comes back as fluent nonsense, so the multi-shape path is
-  /// not yet trustworthy.
+  /// On by default again now that R9 is fixed. The capture probe used to write
+  /// its keys and values into physical block 0 -- which the free list hands out
+  /// first -- so capturing a graph corrupted the first live sequence's history
+  /// in every layer. It now borrows a block from the pool and returns it.
   ///
-  /// The un-graphed path is correct at every batch size, including concurrent
-  /// requests, so it is what ships until the capture ordering is understood
-  /// properly rather than worked around.
-  bool capture_graphs = false;
+  /// Costs a few hundred milliseconds of load time and removes per-launch
+  /// overhead from every decode step afterwards.
+  bool capture_graphs = true;
 
   /// Reported as the model name in responses. Defaults to the directory's
   /// basename.

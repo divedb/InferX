@@ -1234,11 +1234,35 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   // A dummy batch of the right shape, so every buffer is allocated and every
   // pointer settled before capture begins. Capture records addresses; anything
   // allocated during it would be recorded and then freed.
+  // A block of its own to scribble in.
+  //
+  // The probe runs the real decode body, which means it really appends keys and
+  // values to the KV cache. Left at slot 0 -- as it was -- that write lands in
+  // physical block 0, and the free list hands block 0 out first, so capturing a
+  // graph overwrote the *first live sequence's* position-0 keys and values in
+  // every layer. That was R9: not a graph bug at all, since a step run
+  // launch-by-launch after an unrelated capture was corrupted just the same.
+  //
+  // Borrowed and returned rather than reserved forever: any sequence that later
+  // receives this block writes its own keys and values over the probe's before
+  // reading them back.
+  INFERX_ASSIGN_OR_RETURN(const int32_t scratch_block,
+                          impl_->pool->AllocateBlock());
+
+  struct ScratchGuard {
+    KvBlockPool* pool;
+    int32_t block;
+    ~ScratchGuard() { (void)pool->FreeBlock(block); }
+  } scratch_guard{impl_->pool.get(), scratch_block};
+
+  const int64_t scratch_slot =
+      static_cast<int64_t>(scratch_block) * impl_->pool->block_size();
+
   ForwardBatch probe;
   probe.num_seqs = num_seqs;
   probe.max_blocks_per_seq = max_blocks_per_seq;
   probe.block_table.assign(
-      static_cast<size_t>(num_seqs * max_blocks_per_seq), 0);
+      static_cast<size_t>(num_seqs * max_blocks_per_seq), scratch_block);
 
   // The probe stands at the *end* of the longest sequence this shape can serve,
   // not at position 0.
@@ -1258,7 +1282,7 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
     probe.token_ids.push_back(0);
     probe.positions.push_back(static_cast<int32_t>(last_position));
     probe.seq_of_token.push_back(static_cast<int32_t>(s));
-    probe.slots.push_back(0);
+    probe.slots.push_back(static_cast<int32_t>(scratch_slot));
     // One logits row per sequence, which is what a decode batch asks for. A
     // probe requesting a single row would bake a one-row sampler into a graph
     // meant to serve a batch of N.
