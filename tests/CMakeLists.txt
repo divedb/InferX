@@ -9,6 +9,7 @@ function(inferx_add_test name)
     inferx::common
     inferx::model
     inferx::scheduler
+    inferx::tokenizer
     inferx::flags
     GTest::gtest_main
     GTest::gmock
@@ -46,6 +47,7 @@ inferx_add_test(safetensors_test       unit/safetensors_test.cc)
 inferx_add_test(config_test            unit/config_test.cc)
 inferx_add_test(scheduler_test         unit/scheduler_test.cc)
 inferx_add_test(checkpoint_conformance_test unit/checkpoint_conformance_test.cc)
+inferx_add_test(tokenizer_conformance_test unit/tokenizer_conformance_test.cc)
 inferx_add_test(intrusive_ref_cnt_ptr_test unit/intrusive_ref_cnt_ptr_test.cc)
 inferx_add_test(shape_test             unit/shape_test.cc)
 inferx_add_test(tensor_view_test       unit/tensor_view_test.cc)
