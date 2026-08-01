@@ -7,6 +7,8 @@
 // prepare, execute, commit, nothing in flight.
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -497,6 +499,136 @@ TEST_F(EngineTest, CudaGraphReplayMatchesLaunchByLaunchForABatch) {
     EXPECT_EQ(ungraphed[i].output_tokens, graphed[i].output_tokens)
         << "request " << graphed[i].id
         << " decoded differently once its shape was captured";
+  }
+}
+
+
+// KNOWN FAILURE -- R9. Capturing a CUDA graph changes the logits.
+//
+// This is the test that finally localised R9, and what it found is larger than
+// the bug we thought we had. Replaying a captured decode step does not
+// reproduce the launch-by-launch result *at all*: on a single sequence the
+// logits differ by ~19, from the very first vocabulary entry. It is not a
+// concurrency bug and it is not intermittent -- it is every graphed decode step
+// we have ever run.
+//
+// It went unnoticed since M3 because every graph test compared *sampled tokens*
+// rather than logits, and the argmax usually survives a difference this size.
+// It usually does; when it does not, the sequence derails, which is the garbage
+// output that was reported as a concurrency problem.
+//
+// The control below matters: re-running the same batch with nothing captured in
+// between is bit-identical, so the difference is the graph's doing and not the
+// second append into the KV cache.
+//
+// Sweeping the capture probe's position changes the size of the error (2.4 at
+// position 0, 19.9 at position 5, where the argmax also flips) which means the
+// graph has baked values derived from the probe rather than reading them from
+// device memory each replay. FlashInfer's plan is the prime suspect: `Plan`
+// computes host-side values that `Run` passes as kernel arguments, and a
+// recording freezes them. `graph_safe` was supposed to make exactly those
+// stable.
+//
+// Left failing on purpose. Graph capture is off by default and `--cuda-graphs`
+// is opt-in, so nothing ships broken -- but the measured "1.05x from CUDA
+// graphs" was measuring a computation that was already wrong, and that should
+// not be quietly green.
+TEST_F(EngineTest, GraphedAndUngraphedLogitsAgreeForABatch) {
+  auto sched = MakeScheduler(3);
+  ASSERT_TRUE(sched.ok());
+
+  const std::vector<std::vector<int32_t>> prompts = {
+      {kThe, kCapital, kOf, kFrance, kIs},
+  };
+
+  SamplingParams params;
+  params.max_tokens = 8;
+
+  for (size_t i = 0; i < prompts.size(); ++i) {
+    ASSERT_TRUE(
+        sched->AddRequest(static_cast<uint64_t>(i + 1), prompts[i], params)
+            .ok());
+  }
+
+  // Step one: the prefill, which is never graphed.
+  ForwardBatch prefill;
+  ASSERT_TRUE(sched->PrepareStep(&prefill).ok());
+  ASSERT_GT(prefill.num_tokens(), 0);
+
+  std::vector<float> logits;
+  ASSERT_TRUE(model_->Step(prefill, &logits).ok());
+  ASSERT_TRUE(sched->CommitStep(
+                   GreedySample(logits, prefill.logits_indices.size()))
+                  .ok());
+
+  // Step two: a decode carrying every sequence. This is the shape that goes
+  // wrong in the server.
+  ForwardBatch decode;
+  ASSERT_TRUE(sched->PrepareStep(&decode).ok());
+  ASSERT_EQ(decode.num_seqs, static_cast<int64_t>(prompts.size()));
+
+  std::vector<float> ungraphed;
+  ASSERT_TRUE(model_->Step(decode, &ungraphed).ok());
+
+  // Control first: the same batch again, with nothing captured in between. If
+  // re-running is not idempotent then the comparison below measures that rather
+  // than the graph, and every conclusion drawn from it would be wrong.
+  std::vector<float> repeated;
+  ASSERT_TRUE(model_->Step(decode, &repeated).ok());
+
+  ASSERT_TRUE(
+      model_->CaptureDecodeGraph(decode.num_seqs, decode.max_blocks_per_seq)
+          .ok());
+
+  std::vector<float> graphed;
+  ASSERT_TRUE(model_->Step(decode, &graphed).ok());
+
+  ASSERT_EQ(ungraphed.size(), graphed.size());
+  ASSERT_EQ(ungraphed.size(), repeated.size());
+
+  const size_t rows = decode.logits_indices.size();
+  const size_t vocab = ungraphed.size() / rows;
+
+  for (size_t r = 0; r < rows; ++r) {
+    double control = 0.0;
+    for (size_t v = 0; v < vocab; ++v) {
+      control = std::max(control, std::fabs(
+          static_cast<double>(ungraphed[r * vocab + v]) -
+          repeated[r * vocab + v]));
+    }
+    std::fprintf(stderr, "[R9] CONTROL row %zu: max|diff| re-running the same "
+                 "batch without any graph = %.6g\n", r, control);
+  }
+
+  for (size_t r = 0; r < rows; ++r) {
+    const float* a = ungraphed.data() + r * vocab;
+    const float* b = graphed.data() + r * vocab;
+
+    double max_abs = 0.0;
+    size_t first_diff = vocab;
+    size_t argmax_a = 0;
+    size_t argmax_b = 0;
+
+    for (size_t v = 0; v < vocab; ++v) {
+      const double d = std::fabs(static_cast<double>(a[v]) - b[v]);
+      if (d > max_abs) max_abs = d;
+      if (d != 0.0 && first_diff == vocab) first_diff = v;
+      if (a[v] > a[argmax_a]) argmax_a = v;
+      if (b[v] > b[argmax_b]) argmax_b = v;
+    }
+
+    // Reported unconditionally: when this fails, the *shape* of the
+    // disagreement is the finding -- a tiny spread means a reduction reordered,
+    // a large one means the replay read different inputs entirely.
+    std::fprintf(stderr,
+                 "[R9] row %zu: max|diff|=%.6g first_diff_index=%zu "
+                 "argmax ungraphed=%zu graphed=%zu\n",
+                 r, max_abs, first_diff, argmax_a, argmax_b);
+
+    EXPECT_EQ(argmax_a, argmax_b)
+        << "row " << r << " sampled a different token once graphed";
+    EXPECT_LT(max_abs, 1e-3)
+        << "row " << r << " logits differ by " << max_abs;
   }
 }
 
