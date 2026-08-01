@@ -12,7 +12,9 @@
 // reduction order, which is the same budget every other numerical test in this
 // tree is stated against.
 
+#include "inferx/core/kv_cache.h"
 #include "inferx/kernels/flashinfer_attention.h"
+#include "inferx/kernels/flashinfer_prefill.h"
 
 #include <chrono>
 #include <cmath>
@@ -497,6 +499,124 @@ TEST_F(FlashInferTest, OutputDoesNotDependOnWhichPagesHoldTheSequence) {
       << mismatches << " of " << ascending.size()
       << " outputs changed when the sequence moved from pages [0,1,2] to "
          "[5,4,3]";
+}
+
+
+// FlashInfer's prefill kernel against our reference paged attention.
+//
+// R5's pattern, applied to the second FlashInfer kernel: ours is written to be
+// obviously correct and theirs to be fast, and agreement is what lets the fast
+// one be trusted. That matters more here than for decode, because prefill is
+// the path that costs 108 s at 8k tokens today and the reference kernel is the
+// only thing that has ever computed it.
+//
+// The two do not accumulate in the same order, so this compares against the
+// reference's own dynamic range rather than demanding bit-equality -- and it
+// reports the divergence, because the number is what says whether the kernel is
+// usable, not the pass.
+TEST_F(FlashInferTest, PrefillMatchesTheReferenceKernel) {
+  constexpr int64_t kPageSize = 16;
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kLen = 40;  // three pages, the last one partial
+
+  const int64_t pages = (kLen + kPageSize - 1) / kPageSize;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+
+  const KvLayout layout{.entries_per_token = 2,
+                        .kv_heads = kKvHeads,
+                        .head_dim = kHeadDim,
+                        .dtype = DataType::kBFloat16};
+
+  Dev dev;
+
+  auto pool = KvBlockPool::Create(1, 8, kPageSize, layout);
+  ASSERT_TRUE(pool.ok()) << pool.status();
+
+  const TensorView k_cache = *pool->KeyCache(0);
+  const TensorView v_cache = *pool->ValueCache(0);
+
+  const std::vector<float> kv_host =
+      Ramp(static_cast<size_t>(kLen * kKvHeads * kHeadDim), 0.2f);
+  const std::vector<float> q_host =
+      Ramp(static_cast<size_t>(kLen * kHeads * kHeadDim), 1.1f);
+
+  std::vector<int32_t> slots(static_cast<size_t>(kLen));
+  std::vector<int32_t> pos(static_cast<size_t>(kLen));
+  std::vector<int32_t> seq_of(static_cast<size_t>(kLen), 0);
+
+  for (int64_t i = 0; i < kLen; ++i) {
+    slots[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+
+  ASSERT_TRUE(kernels::AppendToKvCache(
+                  dev.Bf16(kv_host, Shape({kLen, kKvHeads, kHeadDim})),
+                  dev.Bf16(kv_host, Shape({kLen, kKvHeads, kHeadDim})), k_cache,
+                  v_cache, dev.I32(slots, Shape({kLen})))
+                  .ok());
+
+  const TensorView q = dev.Bf16(q_host, Shape({kLen, kHeads, kHeadDim}));
+
+  // Reference.
+  std::vector<int32_t> table(static_cast<size_t>(pages));
+  for (int64_t b = 0; b < pages; ++b) table[static_cast<size_t>(b)] = b;
+
+  const TensorView ref_out = dev.Empty(Shape({kLen, kHeads, kHeadDim}));
+
+  ASSERT_TRUE(kernels::PagedAttention(
+                  q, k_cache, v_cache, dev.I32(table, Shape({1, pages})),
+                  dev.I32(seq_of, Shape({kLen})), dev.I32(pos, Shape({kLen})),
+                  ref_out, scale, /*max_context=*/kLen)
+                  .ok());
+
+  // FlashInfer.
+  auto fi = kernels::FlashInferPrefill::Create();
+  ASSERT_TRUE(fi.ok()) << fi.status();
+
+  const std::vector<int32_t> qo_indptr = {0, static_cast<int32_t>(kLen)};
+  const std::vector<int32_t> kv_indptr = {0, static_cast<int32_t>(pages)};
+  const int32_t last_page =
+      static_cast<int32_t>(kLen - (pages - 1) * kPageSize);
+
+  const TensorView fi_out = dev.Empty(Shape({kLen, kHeads, kHeadDim}));
+
+  const Status s = (*fi)->Prefill(
+      q, k_cache, v_cache, dev.I32(qo_indptr, Shape({2})),
+      absl::MakeConstSpan(qo_indptr), dev.I32(table, Shape({pages})),
+      dev.I32(kv_indptr, Shape({2})), absl::MakeConstSpan(kv_indptr),
+      dev.I32({last_page}, Shape({1})), fi_out, scale);
+
+  ASSERT_TRUE(s.ok()) << s;
+
+  const std::vector<float> ref = dev.Down(ref_out);
+  const std::vector<float> got = dev.Down(fi_out);
+
+  ASSERT_EQ(ref.size(), got.size());
+
+  double worst = 0.0;
+  double sum_sq = 0.0;
+
+  for (size_t i = 0; i < ref.size(); ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(ref[i]) - got[i]));
+    sum_sq += static_cast<double>(ref[i]) * ref[i];
+  }
+
+  const double rms = std::sqrt(sum_sq / static_cast<double>(ref.size()));
+
+  std::fprintf(stderr,
+               "  flashinfer prefill vs reference: worst |diff| %.5f, "
+               "reference rms %.5f, ratio %.4f\n",
+               worst, rms, rms > 0 ? worst / rms : 0.0);
+
+  // Generous, and deliberately so: this is a reordering bound, not an accuracy
+  // claim. What would fail here is an indexing or masking bug, which moves the
+  // output by a large fraction of its own magnitude rather than by a rounding
+  // step.
+  EXPECT_LT(worst, 0.2 * rms)
+      << "FlashInfer's prefill disagrees with the reference by " << worst
+      << " against an rms of " << rms;
 }
 
 }  // namespace

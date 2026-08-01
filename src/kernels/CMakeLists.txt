@@ -14,7 +14,9 @@ add_library(inferx_kernels
 add_library(inferx::kernels ALIAS inferx_kernels)
 
 if(INFERX_HAVE_FLASHINFER)
-  target_sources(inferx_kernels PRIVATE flashinfer_attention.cu)
+  target_sources(inferx_kernels PRIVATE
+    flashinfer_attention.cu
+    flashinfer_prefill.cu)
 endif()
 
 target_link_libraries(inferx_kernels
