@@ -642,6 +642,35 @@ TEST_F(FlashInferTest, PrefillMatchesTheReferenceKernel) {
                  ref_err, fi_err);
   }
 
+  // Did the kernel write anything at all?
+  //
+  // This should have been the first check and was the seventh. The buffer is
+  // memset before the call, so all-zeros means the launch was a no-op and every
+  // params field is beside the point; a constant non-zero means it ran and
+  // computed the same thing for all 40 rows, which is a different bug.
+  {
+    double max_abs = 0.0;
+    size_t nonzero = 0;
+
+    for (const float v : got) {
+      max_abs = std::max(max_abs, std::abs(static_cast<double>(v)));
+      if (v != 0.0f) ++nonzero;
+    }
+
+    std::fprintf(stderr,
+                 "  flashinfer output: max|value| %.6f, %zu of %zu elements "
+                 "non-zero  -> %s\n",
+                 max_abs, nonzero, got.size(),
+                 nonzero == 0 ? "NEVER WRITTEN" : "written");
+
+    // And what the reference put there, for scale.
+    double ref_max = 0.0;
+    for (const float v : ref) {
+      ref_max = std::max(ref_max, std::abs(static_cast<double>(v)));
+    }
+    std::fprintf(stderr, "  reference output:  max|value| %.6f\n", ref_max);
+  }
+
   // Is FlashInfer's output a permutation of the reference's?
   //
   // paged_kv is constructed identically to the decode wrapper's, which passes
