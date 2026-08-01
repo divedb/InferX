@@ -351,6 +351,28 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
                  "params.paged_kv.num_heads=%u  (plan said %ld, kv_heads=%ld)\n",
                  params.padded_batch_size, params.paged_kv.num_heads,
                  (long)impl_->plan.padded_batch_size, (long)kv_heads);
+
+    // The scalars paged_kv_t actually stored, not the ones handed to its
+    // constructor. kv_len is derived from these plus indptr/last_page_len, and
+    // a zero anywhere here makes the kernel attend to nothing and write zeros
+    // -- which looks exactly like not writing at all.
+    // Every value cast explicitly. page_size is a uint_fastdiv struct, not a
+    // uint32_t, and passing it to %u corrupts every vararg after it -- which is
+    // how this print first reported head_dim=0 and batch_size=128.
+    std::fprintf(stderr,
+                 "[PP] paged_kv stored: num_heads=%ld head_dim=%ld "
+                 "batch_size=%ld stride_page=%ld stride_n=%ld stride_h=%ld\n",
+                 (long)params.paged_kv.num_heads,
+                 (long)params.paged_kv.head_dim,
+                 (long)params.paged_kv.batch_size,
+                 (long)params.paged_kv.stride_page,
+                 (long)params.paged_kv.stride_n,
+                 (long)params.paged_kv.stride_h);
+    std::fprintf(stderr,
+                 "[PP] passed: kv_heads=%ld page_size=%ld head_dim=%ld "
+                 "batch=%ld\n",
+                 (long)kv_heads, (long)page_size, (long)head_dim,
+                 (long)impl_->planned_batch);
   }
 
   // The planner chooses the query tile, so the dispatch has to follow it rather
