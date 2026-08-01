@@ -642,6 +642,43 @@ TEST_F(FlashInferTest, PrefillMatchesTheReferenceKernel) {
                  ref_err, fi_err);
   }
 
+  // Is FlashInfer's output a permutation of the reference's?
+  //
+  // paged_kv is constructed identically to the decode wrapper's, which passes
+  // conformance, so the KV read path is not the difference. What is new here is
+  // the ragged query side: q_indptr says where a request's rows start and
+  // o_indptr says where its results go. If either is wrong the values are all
+  // computed correctly and simply land in the wrong rows -- which looks exactly
+  // like the uniform per-row failure above. Matching each FlashInfer row against
+  // every reference row tells the two apart: a clean match at a shifted index is
+  // a mapping bug, no match anywhere is a value bug.
+  {
+    const size_t per_row = static_cast<size_t>(kHeads * kHeadDim);
+
+    for (int64_t r : {int64_t{0}, int64_t{1}, kLen / 2, kLen - 1}) {
+      double best = 1e30;
+      int64_t best_row = -1;
+
+      for (int64_t c = 0; c < kLen; ++c) {
+        double d = 0.0;
+        for (size_t j = 0; j < per_row; ++j) {
+          d = std::max(d, std::abs(
+              static_cast<double>(got[static_cast<size_t>(r) * per_row + j]) -
+              ref[static_cast<size_t>(c) * per_row + j]));
+        }
+        if (d < best) {
+          best = d;
+          best_row = c;
+        }
+      }
+
+      std::fprintf(stderr,
+                   "  flashinfer row %2ld best matches reference row %2ld "
+                   "(worst |diff| %.5f)\n",
+                   static_cast<long>(r), static_cast<long>(best_row), best);
+    }
+  }
+
   // Per query row. Which rows disagree localises the fault far faster than
   // reading the params struct does: row 0 alone points at causal masking, a
   // suffix points at o_indptr, a contiguous band points at a CTA_TILE_Q
