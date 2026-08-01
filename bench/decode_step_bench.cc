@@ -120,7 +120,14 @@ int Main(int argc, char** argv) {
 
   // Before any capture: both quantization and sampling change what a graph
   // would record, and both refuse once one exists.
-  if (const Status s = model.EnableDeviceSampling(8); !s.ok()) {
+  // Sized for the largest batch measured, not a fixed 8. Sampling allocates
+  // one output slot per logits row, so a smaller reservation made the last two
+  // batches fail inside the timing loop -- reported as a capture error, which
+  // reads like a graph bug and is not one.
+  constexpr int64_t kMaxBatch = *std::max_element(std::begin(kBatches),
+                                                  std::end(kBatches));
+
+  if (const Status s = model.EnableDeviceSampling(kMaxBatch); !s.ok()) {
     std::fprintf(stderr, "device sampling: %s\n", s.ToString().c_str());
     return 1;
   }
