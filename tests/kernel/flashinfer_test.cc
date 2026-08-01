@@ -610,6 +610,33 @@ TEST_F(FlashInferTest, PrefillMatchesTheReferenceKernel) {
                "reference rms %.5f, ratio %.4f\n",
                worst, rms, rms > 0 ? worst / rms : 0.0);
 
+  // Per query row. Which rows disagree localises the fault far faster than
+  // reading the params struct does: row 0 alone points at causal masking, a
+  // suffix points at o_indptr, a contiguous band points at a CTA_TILE_Q
+  // boundary, and every row failing alike points at a stride or scale.
+  const size_t per_row = static_cast<size_t>(kHeads * kHeadDim);
+
+  std::fprintf(stderr, "  per-row worst |diff|:\n");
+
+  for (int64_t r = 0; r < kLen; ++r) {
+    double row_worst = 0.0;
+    double row_sq = 0.0;
+
+    for (size_t j = 0; j < per_row; ++j) {
+      const size_t i = static_cast<size_t>(r) * per_row + j;
+      row_worst = std::max(row_worst,
+                           std::abs(static_cast<double>(ref[i]) - got[i]));
+      row_sq += static_cast<double>(ref[i]) * ref[i];
+    }
+
+    const double row_rms = std::sqrt(row_sq / static_cast<double>(per_row));
+
+    std::fprintf(stderr, "    row %2ld  worst %.5f  rms %.5f  ratio %6.3f%s\n",
+                 static_cast<long>(r), row_worst, row_rms,
+                 row_rms > 0 ? row_worst / row_rms : 0.0,
+                 row_worst > 0.2 * row_rms ? "   <-- differs" : "");
+  }
+
   // Generous, and deliberately so: this is a reordering bound, not an accuracy
   // claim. What would fail here is an indexing or masking bug, which moves the
   // output by a large fraction of its own magnitude rather than by a rounding
