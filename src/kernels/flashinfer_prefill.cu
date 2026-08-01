@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -368,6 +369,31 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
   if (err != cudaSuccess) {
     return InternalError("BatchPrefillWithPagedKVCacheDispatched failed: ",
                          cudaGetErrorString(err));
+  }
+
+  // Synchronize and read the output back *here*, immediately after the launch.
+  // cudaGetLastError() catches a rejected launch configuration but not an
+  // execution failure, and reading the buffer at the point of use separates
+  // "the kernel never wrote" from "something clobbered it afterwards".
+  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
+    const cudaError_t sync = cudaStreamSynchronize(stream);
+
+    std::vector<bf16> peek(static_cast<size_t>(
+        std::min<int64_t>(out.Numel(), 4096)));
+    const cudaError_t copy =
+        cudaMemcpy(peek.data(), out.Data(), peek.size() * sizeof(bf16),
+                   cudaMemcpyDeviceToHost);
+
+    size_t nonzero = 0;
+    for (const bf16 v : peek) {
+      if (__bfloat162float(v) != 0.0f) ++nonzero;
+    }
+
+    std::fprintf(stderr,
+                 "[PP] after launch: sync=%s copy=%s, %zu of %zu sampled "
+                 "output elements non-zero\n",
+                 cudaGetErrorString(sync), cudaGetErrorString(copy), nonzero,
+                 peek.size());
   }
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
