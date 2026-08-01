@@ -3,6 +3,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -285,6 +287,37 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
   if (impl_->plan.split_kv) {
     tmp_v = reinterpret_cast<bf16*>(float_base + impl_->plan.v_offset);
     tmp_s = reinterpret_cast<float*>(float_base + impl_->plan.s_offset);
+  }
+
+  // TEMPORARY R-prefill INSTRUMENTATION: read back what the planner produced
+  // and compare it against what the caller passed.
+  if (std::getenv("INFERX_TRACE_PREFILL_PLAN") != nullptr) {
+    std::fprintf(stderr,
+                 "[PP] cta_tile_q=%ld padded_batch=%ld total_num_rows=%ld "
+                 "split_kv=%d batch=%ld total_rows=%ld\n",
+                 (long)impl_->plan.cta_tile_q,
+                 (long)impl_->plan.padded_batch_size,
+                 (long)impl_->plan.total_num_rows, (int)impl_->plan.split_kv,
+                 (long)impl_->planned_batch, (long)impl_->planned_total_rows);
+
+    const auto dump = [&](const char* name, const IdType* dev, int n) {
+      std::vector<IdType> host(static_cast<size_t>(n));
+      if (cudaMemcpy(host.data(), dev, host.size() * sizeof(IdType),
+                     cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::fprintf(stderr, "[PP] %s: copy failed\n", name);
+        return;
+      }
+      std::fprintf(stderr, "[PP] %s:", name);
+      for (const IdType v : host) std::fprintf(stderr, " %d", v);
+      std::fprintf(stderr, "\n");
+    };
+
+    dump("caller q_indptr", static_cast<const IdType*>(qo_indptr.Data()),
+         static_cast<int>(impl_->planned_batch + 1));
+    dump("plan request_indices", params.request_indices, 8);
+    dump("plan qo_tile_indices", params.qo_tile_indices, 8);
+    dump("plan kv_tile_indices", params.kv_tile_indices, 8);
+    dump("plan o_indptr", params.o_indptr, 8);
   }
 
   // The planner chooses the query tile, so the dispatch has to follow it rather
