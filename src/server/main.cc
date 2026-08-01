@@ -146,10 +146,10 @@ int main(int argc, char** argv) {
                "inferx-serve listening on http://%s:%d\n"
                "  model        : %s\n"
                "  weights      : %s\n"
+               "  cuda graphs  : %s\n"
                "  max running  : %lld\n"
                "  max seq len  : %lld\n"
                "  kv blocks    : %lld x %lld tokens\n"
-               "  cuda graphs  : %s\n"
                "  sampling     : greedy only (temperature/top_p ignored)\n",
                http_config.host.c_str(), http_config.port,
                (*engine)->model_name().c_str(),

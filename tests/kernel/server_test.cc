@@ -243,24 +243,20 @@ TEST_F(ServerTest, CancellingStopsGenerationEarly) {
 }
 
 TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
-  // KNOWN FAILURE. This is the minimal reproduction of a real correctness bug,
-  // written down as a test rather than as a comment because it is the thing
-  // that has to start passing.
-  //
   // Sampling is greedy, so the same prompt must produce the same tokens every
-  // time. It does not: run sequentially against one engine, this alternates
-  // between two different continuations, which means a request's output depends
-  // on what ran before it. Observed on "Name three colours." at 32 tokens,
-  // where consecutive requests returned "...2. Blue\n33\n3. Green" and
-  // "...2. Blue\n3 Oranges\n3. Green" in strict alternation -- both of them
-  // also visibly corrupted at the same position.
+  // time -- a request's output must not depend on what ran before it.
   //
-  // Alternation in step with block recycling points at KV state surviving a
-  // sequence's retirement, but `last_page_len` and the CSR block table are both
-  // computed correctly from `positions`, so the leak is somewhere else and this
-  // is not yet diagnosed. It is not a server bug -- the server is what made it
-  // visible, because it is the first thing to run many sequences through one
-  // pool.
+  // This was R8. Consecutive requests alternated between two continuations
+  // because `PrepareStep` copied a sequence's block-table row before `Reserve`
+  // grew it, so on the one step where a sequence first reached into a new
+  // block, attention was sent to block 0 instead. Whether that mattered
+  // depended on which physical block the stack free list had handed out, which
+  // is why the symptom was alternation rather than a steady error.
+  //
+  // Kept at the server level even though the cause was in the scheduler and is
+  // now covered host-side by SchedulerTest.EveryBatchSlotIsCoveredByTheBatch-
+  // BlockTable: this is the property a user actually cares about, and it is
+  // worth asserting where they would notice it breaking.
   const char* body =
       R"({"messages":[{"role":"user","content":"Name three colours."}],)"
       R"("max_tokens":32})";

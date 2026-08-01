@@ -219,6 +219,31 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
   for (size_t s = 0; s < impl_->running.size(); ++s) {
     Sequence& seq = impl_->running[s];
 
+    const int64_t pending = seq.pending();
+
+    // No chunking yet (M5): a sequence either fits in what is left of the
+    // budget or waits for the next step. Decodes are one token and always fit,
+    // so this only ever defers a prefill.
+    const bool contributes = pending > 0 && pending <= budget;
+
+    // Growth happens *before* the row is written, and that ordering is the
+    // whole point. Reserve appends a block whenever this step's tokens run past
+    // what the sequence already holds, and the slots below are computed from
+    // the grown table -- so a row copied beforehand would describe a table that
+    // no longer exists. The token's key and value would be written into the new
+    // block (slots address the cache directly) while attention, which reads
+    // through this row, would find a zero there and attend to block 0 instead.
+    //
+    // That is R8: on exactly the step that first touches a new block, the model
+    // read one block of some other sequence's history. It was invisible
+    // whenever the zero happened to name the right block, which is why the
+    // symptom was an *alternating* answer rather than a wrong one -- a stack
+    // free list hands consecutive requests their blocks in opposite order.
+    if (contributes) {
+      INFERX_RETURN_IF_ERROR(
+          impl_->Reserve(&seq, static_cast<int64_t>(seq.tokens.size())));
+    }
+
     // A sequence's row in the block table, regardless of whether it contributes
     // tokens this step -- the row index is its identity for the whole batch.
     for (int64_t b = 0; b < seq.table->size(); ++b) {
@@ -227,16 +252,7 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
           seq.table->blocks()[static_cast<size_t>(b)];
     }
 
-    const int64_t pending = seq.pending();
-    if (pending <= 0) continue;
-
-    // No chunking yet (M5): a sequence either fits in what is left of the
-    // budget or waits for the next step. Decodes are one token and always fit,
-    // so this only ever defers a prefill.
-    if (pending > budget) continue;
-
-    INFERX_RETURN_IF_ERROR(
-        impl_->Reserve(&seq, static_cast<int64_t>(seq.tokens.size())));
+    if (!contributes) continue;
 
     const int64_t start = seq.cached;
 

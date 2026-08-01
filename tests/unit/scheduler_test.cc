@@ -462,4 +462,71 @@ TEST_F(SchedulerTest, DrainsAMixedWorkloadToCompletion) {
 }
 
 }  // namespace
+
+// Every position in the batch must be reachable through the batch's own block
+// table.
+//
+// This is R8, and it is the invariant the whole paged design rests on: `slots`
+// says where a token's key and value are written, the block table says where
+// attention looks for them, and the two are only the same memory if the table
+// covers every block the slots touch. They diverged on exactly one step -- the
+// one where a sequence first grows into a new block -- because the row was
+// copied out before the growth happened.
+//
+// The consequence was not a crash. The uncovered entry reads zero, so attention
+// silently attended to block 0, and whether that was wrong depended on which
+// physical block the allocator had handed out. Consecutive requests got their
+// blocks in opposite order from the stack free list, so the same prompt came
+// back with two different answers in alternation.
+//
+// Checked here, on the host, with no device anywhere near it -- which is the
+// argument for §3.1's split. The bug lived in the scheduler the whole time, and
+// it took a GPU, a model and an HTTP server to notice.
+TEST_F(SchedulerTest, EveryBatchSlotIsCoveredByTheBatchBlockTable) {
+  const int64_t block_size = pool_->block_size();
+
+  ASSERT_TRUE(sched_->AddRequest(1, {1, 2, 3}, Params(/*max_tokens=*/50)).ok());
+
+  ForwardBatch batch;
+
+  // Long enough to cross several block boundaries, which is where the two
+  // disagreed.
+  for (int step = 0; step < 60; ++step) {
+    ASSERT_TRUE(sched_->PrepareStep(&batch).ok()) << "step " << step;
+
+    if (batch.token_ids.empty()) break;
+
+    for (size_t i = 0; i < batch.slots.size(); ++i) {
+      const int32_t slot = batch.slots[i];
+      const int64_t position = batch.positions[i];
+      const int64_t seq = batch.seq_of_token[i];
+
+      // Where the token's KV is actually written.
+      const int32_t physical_block =
+          static_cast<int32_t>(slot / block_size);
+
+      // Where attention will look for it: the logical block this position
+      // falls in, resolved through the batch's own table.
+      const int64_t logical_block = position / block_size;
+
+      ASSERT_LT(logical_block, batch.max_blocks_per_seq)
+          << "step " << step << ": position " << position
+          << " is past the table's width";
+
+      const int32_t via_table = batch.block_table[static_cast<size_t>(
+          seq * batch.max_blocks_per_seq + logical_block)];
+
+      EXPECT_EQ(via_table, physical_block)
+          << "step " << step << ": token at position " << position
+          << " is written to block " << physical_block
+          << " but the batch's block table sends attention to block "
+          << via_table
+          << " -- the KV written this step is not the KV that will be read";
+    }
+
+    std::vector<int32_t> sampled(batch.logits_indices.size(), 7);
+    ASSERT_TRUE(sched_->CommitStep(sampled).ok()) << "step " << step;
+  }
+}
+
 }  // namespace inferx::scheduler

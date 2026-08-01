@@ -452,5 +452,205 @@ TEST(BlockTableTest, MapsPositionsToBlocksAndSlots) {
   EXPECT_FALSE(table.Locate(8, &block, &slot));
 }
 
+
+// Which *physical* blocks a sequence occupies must not change its output.
+//
+// This is R8. A block table is a permutation from logical position to physical
+// block, and every read is supposed to go through it, so the same logical
+// sequence stored in blocks [0,1,2] and in blocks [5,4,3] must attend
+// identically. It does not, and that is what makes a request's result depend on
+// which requests ran before it: the free list is a stack, so consecutive
+// sequences receive their blocks in opposite order.
+//
+// Written as two orderings of the *same* logical content rather than as a
+// server-level determinism check, because this is the invariant that is
+// actually broken -- the server only made it visible.
+TEST_F(PagedTest, OutputDoesNotDependOnWhichBlocksHoldTheSequence) {
+  // Qwen2.5-3B's actual attention shape, because head_dim and the GQA group
+  // size both select code paths.
+  constexpr int64_t kBlockSize = 16;
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kLen = 50;  // spans four blocks, last one partial
+
+  const KvLayout layout{.entries_per_token = 2,
+                        .kv_heads = kKvHeads,
+                        .head_dim = kHeadDim,
+                        .dtype = DataType::kBFloat16};
+
+  const std::vector<float> k_host = Ramp(kLen * kKvHeads * kHeadDim, 0.1f);
+  const std::vector<float> v_host = Ramp(kLen * kKvHeads * kHeadDim, 0.7f);
+  const std::vector<float> q_host = Ramp(kHeads * kHeadDim, 1.3f);
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+
+  // Runs one decode query against a sequence of kLen tokens laid out in
+  // `blocks`, in that order.
+  const auto attend = [&](const std::vector<int32_t>& blocks) {
+    Dev d;
+
+    auto pool = KvBlockPool::Create(1, 40, kBlockSize, layout);
+    EXPECT_TRUE(pool.ok()) << pool.status();
+
+    const TensorView k_cache = *pool->KeyCache(0);
+    const TensorView v_cache = *pool->ValueCache(0);
+
+    // Write the prompt's K/V through the block table, exactly as the scheduler
+    // would: logical position i lands in blocks[i / block_size].
+    std::vector<int32_t> slots(static_cast<size_t>(kLen));
+    for (int64_t i = 0; i < kLen; ++i) {
+      slots[static_cast<size_t>(i)] = static_cast<int32_t>(
+          blocks[static_cast<size_t>(i / kBlockSize)] * kBlockSize +
+          i % kBlockSize);
+    }
+
+    EXPECT_TRUE(kernels::AppendToKvCache(
+                    d.Bf16(k_host, Shape({kLen, kKvHeads, kHeadDim})),
+                    d.Bf16(v_host, Shape({kLen, kKvHeads, kHeadDim})), k_cache,
+                    v_cache, d.I32(slots, Shape({kLen})))
+                    .ok());
+
+    // The decode query attends over all kLen cached tokens.
+    const int64_t used = (kLen + kBlockSize - 1) / kBlockSize;
+
+    // Padded to a fixed width with zeros beyond the blocks actually held,
+    // which is exactly what the scheduler hands the model: the row is
+    // max_blocks_per_seq wide regardless of how far the sequence has grown.
+    // A kernel that infers the sequence's block count from this row's *width*
+    // rather than from its length reads block 0 as if it were part of the
+    // sequence.
+    constexpr int64_t kTableWidth = 32;
+
+    std::vector<int32_t> table(static_cast<size_t>(kTableWidth), 0);
+    for (int64_t b = 0; b < used; ++b) {
+      table[static_cast<size_t>(b)] = blocks[static_cast<size_t>(b)];
+    }
+
+    const TensorView out = d.Empty(Shape({1, kHeads, kHeadDim}));
+
+    EXPECT_TRUE(kernels::PagedAttention(
+                    d.Bf16(q_host, Shape({1, kHeads, kHeadDim})), k_cache,
+                    v_cache, d.I32(table, Shape({1, kTableWidth})),
+                    d.I32({0}, Shape({1})),
+                    d.I32({static_cast<int32_t>(kLen - 1)}, Shape({1})), out,
+                    scale)
+                    .ok());
+
+    return d.Down(out);
+  };
+
+  // Ascending versus descending physical blocks: exactly the two orders a
+  // stack-based free list hands to consecutive requests.
+  const std::vector<float> ascending = attend({0, 1, 2, 3});
+  const std::vector<float> descending = attend({7, 6, 5, 4});
+  const std::vector<float> scattered = attend({9, 1, 6, 12});
+
+  ASSERT_EQ(ascending.size(), descending.size());
+
+  // Bitwise equality is the right bar. The arithmetic is identical -- same
+  // values, same order, same reduction -- so any difference at all is an
+  // indexing bug rather than accumulated rounding.
+  for (size_t i = 0; i < ascending.size(); ++i) {
+    EXPECT_EQ(descending[i], ascending[i])
+        << "element " << i << " changed when the sequence moved to blocks "
+        << "[5,4,3]: " << ascending[i] << " vs " << descending[i];
+    EXPECT_EQ(scattered[i], ascending[i])
+        << "element " << i << " changed when the sequence moved to blocks "
+        << "[6,1,4]: " << ascending[i] << " vs " << scattered[i];
+  }
+}
+
+
+// The same invariant, but for a prefill: many query tokens at once.
+//
+// The decode case above passes, which narrows R8 to the multi-token path --
+// and that is the one the model actually uses for prompts, since FlashInfer
+// only takes over when there is exactly one query per sequence.
+TEST_F(PagedTest, PrefillOutputDoesNotDependOnWhichBlocksHoldTheSequence) {
+  constexpr int64_t kBlockSize = 16;
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kLen = 40;
+
+  const KvLayout layout{.entries_per_token = 2,
+                        .kv_heads = kKvHeads,
+                        .head_dim = kHeadDim,
+                        .dtype = DataType::kBFloat16};
+
+  const std::vector<float> k_host = Ramp(kLen * kKvHeads * kHeadDim, 0.1f);
+  const std::vector<float> v_host = Ramp(kLen * kKvHeads * kHeadDim, 0.7f);
+  const std::vector<float> q_host = Ramp(kLen * kHeads * kHeadDim, 1.3f);
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+
+  const auto prefill = [&](const std::vector<int32_t>& blocks) {
+    Dev d;
+
+    auto pool = KvBlockPool::Create(1, 40, kBlockSize, layout);
+    EXPECT_TRUE(pool.ok()) << pool.status();
+
+    const TensorView k_cache = *pool->KeyCache(0);
+    const TensorView v_cache = *pool->ValueCache(0);
+
+    std::vector<int32_t> slots(static_cast<size_t>(kLen));
+    std::vector<int32_t> seq_of(static_cast<size_t>(kLen), 0);
+    std::vector<int32_t> pos(static_cast<size_t>(kLen));
+
+    for (int64_t i = 0; i < kLen; ++i) {
+      slots[static_cast<size_t>(i)] = static_cast<int32_t>(
+          blocks[static_cast<size_t>(i / kBlockSize)] * kBlockSize +
+          i % kBlockSize);
+      pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+
+    EXPECT_TRUE(kernels::AppendToKvCache(
+                    d.Bf16(k_host, Shape({kLen, kKvHeads, kHeadDim})),
+                    d.Bf16(v_host, Shape({kLen, kKvHeads, kHeadDim})), k_cache,
+                    v_cache, d.I32(slots, Shape({kLen})))
+                    .ok());
+
+    const int64_t used = (kLen + kBlockSize - 1) / kBlockSize;
+
+    std::vector<int32_t> table(static_cast<size_t>(used));
+    for (int64_t b = 0; b < used; ++b) {
+      table[static_cast<size_t>(b)] = blocks[static_cast<size_t>(b)];
+    }
+
+    const TensorView out = d.Empty(Shape({kLen, kHeads, kHeadDim}));
+
+    EXPECT_TRUE(kernels::PagedAttention(
+                    d.Bf16(q_host, Shape({kLen, kHeads, kHeadDim})), k_cache,
+                    v_cache, d.I32(table, Shape({1, used})),
+                    d.I32(seq_of, Shape({kLen})), d.I32(pos, Shape({kLen})),
+                    out, scale)
+                    .ok());
+
+    return d.Down(out);
+  };
+
+  const std::vector<float> ascending = prefill({0, 1, 2});
+  const std::vector<float> descending = prefill({5, 4, 3});
+
+  ASSERT_EQ(ascending.size(), descending.size());
+
+  int mismatches = 0;
+  size_t first = 0;
+
+  for (size_t i = 0; i < ascending.size(); ++i) {
+    if (ascending[i] != descending[i]) {
+      if (mismatches == 0) first = i;
+      ++mismatches;
+    }
+  }
+
+  EXPECT_EQ(mismatches, 0)
+      << mismatches << " of " << ascending.size()
+      << " outputs changed when the prompt moved from blocks [0,1,2] to "
+         "[5,4,3]; first at element "
+      << first << " (query token " << first / (kHeads * kHeadDim) << ")";
+}
+
 }  // namespace
 }  // namespace inferx

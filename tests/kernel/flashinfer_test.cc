@@ -408,5 +408,96 @@ TEST_F(FlashInferTest, RejectsAnUninstantiatedHeadDim) {
   EXPECT_EQ(s.code(), absl::StatusCode::kUnimplemented) << s;
 }
 
+
+// Which *physical* pages a sequence occupies must not change its output.
+//
+// This is R8. The block table is a permutation from logical position to
+// physical page, so the same logical sequence stored in pages [0,1,2] and in
+// pages [5,4,3] has to attend identically. Our own paged kernel does; this
+// checks that FlashInfer does too, which matters because the free list is a
+// stack and consecutive sequences therefore receive their pages in opposite
+// order -- making a request's output depend on what ran before it.
+TEST_F(FlashInferTest, OutputDoesNotDependOnWhichPagesHoldTheSequence) {
+  constexpr int64_t head_dim = 128, q_heads = 16, kv_heads = 2;
+  constexpr int64_t page_size = 16;
+  constexpr int64_t num_blocks = 8;
+  constexpr int64_t kLen = 40;  // three pages, the last one partial
+
+  Dev dev;
+
+  const std::vector<float> q_host = Ramp(q_heads * head_dim, 1.3f);
+  const std::vector<float> page_host =
+      Ramp(page_size * kv_heads * head_dim, 0.1f);
+
+  auto fi = kernels::FlashInferDecode::Create();
+  ASSERT_TRUE(fi.ok()) << fi.status();
+
+  // Lays the same three logical pages of K/V into `pages`, then attends.
+  const auto attend = [&](const std::vector<int32_t>& pages) {
+    Dev d;
+
+    const TensorView k_cache =
+        d.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+    const TensorView v_cache =
+        d.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+
+    // Distinct content per logical page, written to whichever physical page
+    // holds it, so a mis-ordered read is visible rather than cancelling out.
+    for (size_t logical = 0; logical < pages.size(); ++logical) {
+      std::vector<float> k = Ramp(page_size * kv_heads * head_dim,
+                                  0.1f + 0.9f * static_cast<float>(logical));
+      std::vector<float> v = Ramp(page_size * kv_heads * head_dim,
+                                  0.5f + 0.9f * static_cast<float>(logical));
+
+      const size_t bytes = k.size() * sizeof(__nv_bfloat16);
+      std::vector<__nv_bfloat16> kb(k.size()), vb(v.size());
+      for (size_t i = 0; i < k.size(); ++i) {
+        kb[i] = __float2bfloat16(k[i]);
+        vb[i] = __float2bfloat16(v[i]);
+      }
+
+      const size_t offset =
+          static_cast<size_t>(pages[logical]) * bytes;
+
+      EXPECT_EQ(cudaMemcpy(static_cast<std::byte*>(k_cache.Data()) + offset,
+                           kb.data(), bytes, cudaMemcpyHostToDevice),
+                cudaSuccess);
+      EXPECT_EQ(cudaMemcpy(static_cast<std::byte*>(v_cache.Data()) + offset,
+                           vb.data(), bytes, cudaMemcpyHostToDevice),
+                cudaSuccess);
+    }
+
+    const std::vector<int32_t> indptr = {0,
+                                         static_cast<int32_t>(pages.size())};
+    const TensorView out = d.Empty(Shape({1, q_heads, head_dim}));
+
+    const Status s = fi->Decode(
+        d.Bf16(q_host, Shape({1, q_heads, head_dim})), k_cache, v_cache,
+        d.I32(pages, Shape({static_cast<int64_t>(pages.size())})),
+        d.I32(indptr, Shape({2})), absl::MakeConstSpan(indptr),
+        d.I32({static_cast<int32_t>(kLen - 2 * page_size)}, Shape({1})), out,
+        0.088f);
+
+    EXPECT_TRUE(s.ok()) << s;
+
+    return d.Down(out);
+  };
+
+  const std::vector<float> ascending = attend({0, 1, 2});
+  const std::vector<float> descending = attend({5, 4, 3});
+
+  ASSERT_EQ(ascending.size(), descending.size());
+
+  int mismatches = 0;
+  for (size_t i = 0; i < ascending.size(); ++i) {
+    if (ascending[i] != descending[i]) ++mismatches;
+  }
+
+  EXPECT_EQ(mismatches, 0)
+      << mismatches << " of " << ascending.size()
+      << " outputs changed when the sequence moved from pages [0,1,2] to "
+         "[5,4,3]";
+}
+
 }  // namespace
 }  // namespace inferx
