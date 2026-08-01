@@ -312,12 +312,29 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
       std::fprintf(stderr, "\n");
     };
 
+    // At their real lengths this time. The previous dump asked for 8 entries
+    // from arrays holding 3 and 2, so the tails showed the neighbouring
+    // array's contents and looked like aliasing.
+    const int tiles = static_cast<int>(impl_->plan.padded_batch_size);
+    const int batch1 = static_cast<int>(impl_->planned_batch + 1);
+
+    std::fprintf(stderr,
+                 "[PP] offsets: req=%ld qo_tile=%ld kv_tile=%ld merge=%ld "
+                 "o=%ld chunk=%ld\n",
+                 (long)impl_->plan.request_indices_offset,
+                 (long)impl_->plan.qo_tile_indices_offset,
+                 (long)impl_->plan.kv_tile_indices_offset,
+                 (long)impl_->plan.merge_indptr_offset,
+                 (long)impl_->plan.o_indptr_offset,
+                 (long)impl_->plan.kv_chunk_size_ptr_offset);
+
     dump("caller q_indptr", static_cast<const IdType*>(qo_indptr.Data()),
-         static_cast<int>(impl_->planned_batch + 1));
-    dump("plan request_indices", params.request_indices, 8);
-    dump("plan qo_tile_indices", params.qo_tile_indices, 8);
-    dump("plan kv_tile_indices", params.kv_tile_indices, 8);
-    dump("plan o_indptr", params.o_indptr, 8);
+         batch1);
+    dump("plan request_indices", params.request_indices, tiles);
+    dump("plan qo_tile_indices", params.qo_tile_indices, tiles);
+    dump("plan kv_tile_indices", params.kv_tile_indices, tiles);
+    dump("plan o_indptr", params.o_indptr, batch1);
+    dump("plan kv_chunk_size", params.kv_chunk_size_ptr, 1);
   }
 
   // The planner chooses the query tile, so the dispatch has to follow it rather
