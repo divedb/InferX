@@ -1,5 +1,7 @@
 #include "inferx/kernels/layers.h"
 
+#include <algorithm>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -678,7 +680,7 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
 Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& v_cache, const TensorView& block_table,
                       const TensorView& seq_of_token, const TensorView& q_pos,
-                      const TensorView& out, float scale,
+                      const TensorView& out, float scale, int64_t max_context,
                       cudaStream_t stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
@@ -718,7 +720,12 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
 
   if (tokens == 0) return OkStatus();
 
-  const int64_t max_keys = max_blocks * block_size;
+  // The table's width is a scheduler configuration, not a property of this
+  // batch. Sizing the tile from it made shared-memory demand a function of
+  // max_seq_len rather than of the prompt.
+  const int64_t table_keys = max_blocks * block_size;
+  const int64_t max_keys =
+      max_context > 0 ? std::min(max_context, table_keys) : table_keys;
   const int block = BlockFor(head_dim);
 
   const size_t smem =

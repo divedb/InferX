@@ -134,10 +134,24 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
 ///                     is also how many keys precede it.
 /// \param out          `[tokens, q_heads, head_dim]` bf16.
 /// \param scale        Usually `1/sqrt(head_dim)`.
+/// \param max_context The longest key sequence any query in this batch attends
+///                    over, which sets the shared-memory tile. Zero means
+///                    "assume the block table's full width", which is what this
+///                    used to do unconditionally -- and that was a bug worth
+///                    naming: the table is `max_blocks_per_seq` wide because the
+///                    *scheduler* was configured that way, so a ten-token prompt
+///                    asked for enough shared memory to hold `max_seq_len` keys
+///                    and failed to launch. A server configured for 16k context
+///                    could not prefill anything at all.
+///
+///                    Callers inside a captured CUDA graph must pass the largest
+///                    value they will ever replay with, since the tile size is
+///                    baked at capture.
 Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& v_cache, const TensorView& block_table,
                       const TensorView& seq_of_token, const TensorView& q_pos,
                       const TensorView& out, float scale,
+                      int64_t max_context = 0,
                       cudaStream_t stream = nullptr);
 
 /// \brief Greedy sampling: the argmax of each logits row, on the device.

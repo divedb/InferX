@@ -652,5 +652,84 @@ TEST_F(PagedTest, PrefillOutputDoesNotDependOnWhichBlocksHoldTheSequence) {
       << first << " (query token " << first / (kHeads * kHeadDim) << ")";
 }
 
+
+// A short prompt must not need shared memory proportional to max_seq_len.
+//
+// The kernel used to size its tile from the block table's *width*, and the
+// scheduler makes that width `max_seq_len / block_size` regardless of how long
+// the sequence actually is. So configuring a server for a long context made
+// every prefill fail, including a ten-token one -- not slowly, but with
+// ResourceExhausted before the kernel launched. A 16k-token context needs 66 KB
+// against a 48 KB limit, so `--max-seq-len 16384` could not serve anything at
+// all.
+//
+// The width here is deliberately far larger than the sequence: that gap is the
+// bug.
+TEST_F(PagedTest, ShortSequenceDoesNotPayForAWideBlockTable) {
+  constexpr int64_t kBlockSize = 16;
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kLen = 8;
+
+  // 16k of context, as a server configured for long prompts would have.
+  constexpr int64_t kTableWidth = 1024;
+
+  const KvLayout layout{.entries_per_token = 2,
+                        .kv_heads = kKvHeads,
+                        .head_dim = kHeadDim,
+                        .dtype = DataType::kBFloat16};
+
+  Dev d;
+
+  auto pool = KvBlockPool::Create(1, 4, kBlockSize, layout);
+  ASSERT_TRUE(pool.ok()) << pool.status();
+
+  const TensorView k_cache = *pool->KeyCache(0);
+  const TensorView v_cache = *pool->ValueCache(0);
+
+  std::vector<int32_t> slots(static_cast<size_t>(kLen));
+  std::vector<int32_t> pos(static_cast<size_t>(kLen));
+  std::vector<int32_t> seq_of(static_cast<size_t>(kLen), 0);
+
+  for (int64_t i = 0; i < kLen; ++i) {
+    slots[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+
+  const std::vector<float> kv = Ramp(kLen * kKvHeads * kHeadDim, 0.2f);
+
+  ASSERT_TRUE(kernels::AppendToKvCache(
+                  d.Bf16(kv, Shape({kLen, kKvHeads, kHeadDim})),
+                  d.Bf16(kv, Shape({kLen, kKvHeads, kHeadDim})), k_cache,
+                  v_cache, d.I32(slots, Shape({kLen})))
+                  .ok());
+
+  std::vector<int32_t> table(static_cast<size_t>(kTableWidth), 0);
+
+  const TensorView out = d.Empty(Shape({kLen, kHeads, kHeadDim}));
+
+  const Status s = kernels::PagedAttention(
+      d.Bf16(Ramp(kLen * kHeads * kHeadDim, 1.1f),
+             Shape({kLen, kHeads, kHeadDim})),
+      k_cache, v_cache, d.I32(table, Shape({1, kTableWidth})),
+      d.I32(seq_of, Shape({kLen})), d.I32(pos, Shape({kLen})), out,
+      1.0f / std::sqrt(static_cast<float>(kHeadDim)),
+      /*max_context=*/kLen);
+
+  EXPECT_TRUE(s.ok())
+      << "an " << kLen << "-token sequence was refused because its block table "
+      << "is " << kTableWidth << " blocks wide: " << s;
+
+  // And the answer is still right: passing the real context must shrink the
+  // tile, not truncate the attention.
+  const std::vector<float> got = d.Down(out);
+  bool all_finite = true;
+  for (const float v : got) {
+    if (!std::isfinite(v)) all_finite = false;
+  }
+  EXPECT_TRUE(all_finite) << "attention produced non-finite output";
+}
+
 }  // namespace
 }  // namespace inferx

@@ -213,7 +213,13 @@ struct Qwen2Model::Impl {
   /// Set by PrepareBatchInputs: true when this batch is decode-shaped and the
   /// FlashInfer path is usable for it.
   bool fi_usable = false;
+
 #endif
+
+  /// Longest context in the batch PrepareBatchInputs last saw, which sizes the
+  /// reference attention kernel's shared-memory tile. Outside the FlashInfer
+  /// guard because the reference kernel is exactly what runs without it.
+  int64_t batch_max_context = 0;
 
   /// Forced false while capturing. \see LaunchDecodeBody.
   bool allow_flashinfer = true;
@@ -610,6 +616,15 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   INFERX_RETURN_IF_ERROR(upload(seq_of_token_buf, batch.seq_of_token));
   INFERX_RETURN_IF_ERROR(upload(block_table_buf, batch.block_table));
 
+  // The longest key sequence any query in this batch attends over. Host-side
+  // because `positions` is host-side here; the device never needs it. Computed
+  // unconditionally: it sizes the reference attention kernel, which is the one
+  // that runs when FlashInfer is absent or when the batch is a prefill.
+  batch_max_context = 0;
+  for (const int32_t p : batch.positions) {
+    batch_max_context = std::max<int64_t>(batch_max_context, p + 1);
+  }
+
 #ifdef INFERX_WITH_FLASHINFER
   // FlashInfer's decode kernel serves exactly one query token per sequence.
   // A prefill, or a mixed batch, is a different shape entirely -- its ragged
@@ -832,8 +847,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     } else
 #endif
     {
+      // The batch's own longest context, not the block table's width. See
+      // PagedAttention's contract: sizing the tile from the table made a short
+      // prompt demand shared memory proportional to max_seq_len.
       INFERX_RETURN_IF_ERROR(kernels::PagedAttention(
-          q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale, stream));
+          q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale,
+          batch_max_context, stream));
     }
 
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s, x, 1));
