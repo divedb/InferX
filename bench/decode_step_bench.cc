@@ -127,6 +127,16 @@ int Main(int argc, char** argv) {
   constexpr int64_t kMaxBatch = *std::max_element(std::begin(kBatches),
                                                   std::end(kBatches));
 
+  // Sized for the largest batch before anything is captured. FP8's activation
+  // staging buffer is allocated on demand, so capturing batch 1 and then
+  // preparing batch 32 reallocated it and left graph 1 replaying freed memory
+  // -- an illegal access that the sustained loop below used to swallow and
+  // report as 582,000 tokens a second.
+  if (const Status s = model.ReserveActivations(kMaxBatch); !s.ok()) {
+    std::fprintf(stderr, "reserve activations: %s\n", s.ToString().c_str());
+    return 1;
+  }
+
   if (const Status s = model.EnableDeviceSampling(kMaxBatch); !s.ok()) {
     std::fprintf(stderr, "device sampling: %s\n", s.ToString().c_str());
     return 1;
@@ -225,10 +235,22 @@ int Main(int argc, char** argv) {
     std::vector<float> logits;
     std::vector<int32_t> tokens;
 
+    // Checked, not discarded. A swallowed failure here does not look like a
+    // failure -- the loop simply returns instantly and the benchmark reports
+    // hundreds of thousands of tokens a second, which is how the FP8 path's
+    // broken sustained loop went unnoticed.
+    const auto must = [&](const Status& s, const char* what) {
+      if (!s.ok()) {
+        std::fprintf(stderr, "sustained %s failed: %s\n", what,
+                     s.ToString().c_str());
+        std::exit(1);
+      }
+    };
+
     // Depth 0: wait for every step before issuing the next.
-    for (int i = 0; i < 5; ++i) (void)model.Step(b, &logits);
+    for (int i = 0; i < 5; ++i) must(model.Step(b, &logits), "warmup");
     const auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < kSteps; ++i) (void)model.Step(b, &logits);
+    for (int i = 0; i < kSteps; ++i) must(model.Step(b, &logits), "step");
     const auto t1 = std::chrono::steady_clock::now();
 
     // Device sampling but still serialized: issue, then immediately wait. This
