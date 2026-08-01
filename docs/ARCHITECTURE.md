@@ -531,39 +531,26 @@ later, for W4A16 (M8).
 
 #### Prefill, measured for the first time
 
-Batch 1, bf16, one sequence, reference attention kernel (FlashInfer's prefill
-path is not integrated — `fi_usable` requires one token per sequence, so every
-prompt falls to the M2 kernel).
+Batch 1, bf16, one sequence, FlashInfer paged prefill. Minimum of 10 measured
+runs after 3 warmups on the RTX 4080 SUPER.
 
 | prompt tokens | prefill ms | tok/s | vs one decode step |
 |---|---|---|---|
-| 128 | 25.9 | 4942 | 2.4x |
-| 256 | 62.2 | 4117 | 5.7x |
-| 512 | 179.1 | 2859 | 16x |
-| 1024 | 601.9 | 1701 | 55x |
-| 2048 | 2246.4 | 912 | 206x |
-| 4096 | 12743.9 | 321 | 1169x |
-| 8192 | 105028.4 | 78 | 9636x |
-| 16384 | — | — | fails: needs 66 KB of shared memory, over the 48 KB limit |
+| 128 | 15.821 | 8091 | 1.5x |
+| 256 | 26.169 | 9783 | 2.4x |
+| 512 | 45.834 | 11171 | 4.2x |
+| 1024 | 89.971 | 11382 | 8.3x |
+| 2048 | 176.127 | 11628 | 16.2x |
+| 4096 | 358.780 | 11417 | 32.9x |
+| 8192 | 773.677 | 10588 | 71.0x |
+| 16384 | 1776.047 | 9225 | 162.9x |
 
-**This is the engine's worst number by a wide margin and it was never
-measured.** A 2k-token prompt takes 2.2 seconds; an 8k prompt takes 105
-seconds. Time-to-first-token, not decode, is what a user of this server would
-actually notice.
-
-The scaling is worse than quadratic past 2k — 4096→8192 costs 8.2x where
-quadratic predicts 4x — which points at occupancy collapse rather than at the
-arithmetic. The kernel stages keys in shared memory at about 4 bytes each, so
-its tile grows linearly with the sequence and squeezes out resident blocks
-until only one fits per SM. The same growth sets the hard ceiling: at 16384
-keys it asks for 66 KB against a 48 KB limit and will not launch.
-
-Two consequences worth stating plainly. First, the ceiling is a function of the
-*block table's width*, which the scheduler derives from `max_seq_len` — not of
-the actual prompt — so configuring a server for 16k context makes every prefill
-fail, including a 10-token one. Second, integrating FlashInfer's prefill kernel
-stops being an optimization and becomes the thing that makes long prompts
-possible at all.
+The integration removes the engine's worst bottleneck: 2k falls from 2.25 s to
+176 ms (12.8x), 8k from 105 s to 774 ms (135.8x), and 16k now runs in 1.78 s
+instead of exceeding the reference kernel's shared-memory ceiling. Throughput
+holds above 9.2k tok/s across the matrix. Fast prefill is currently enabled for
+one sequence; multi-sequence ragged prefill remains on the reference path until
+its page-permutation and lifecycle-repeatability coverage is complete.
 
 #### The M3-to-M4 progression, re-run
 
