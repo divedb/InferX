@@ -251,19 +251,26 @@ struct Engine::Impl {
   // keeps the KV bookkeeping honest -- the sequence retires normally and its
   // blocks go back to the pool, so the warm-up leaves no trace.
   Status Warmup() {
-    constexpr int64_t kWarmupPromptTokens = 8;
-    constexpr int32_t kWarmupSteps = 2;
+    // Long enough to span several blocks and to make the sequences grow into a
+    // new one while decoding, so the warm-up drives the same code paths real
+    // traffic will.
+    constexpr int64_t kWarmupPromptTokens = 40;
+    constexpr int32_t kWarmupSteps = 12;
 
     scheduler::SamplingParams params;
     params.max_tokens = kWarmupSteps;
 
-    // Token 0 exists in every vocabulary; the values do not matter, only the
-    // shapes they drive.
-    std::vector<int32_t> prompt(kWarmupPromptTokens, 0);
+    // As many sequences as will ever run at once, because the shapes that get
+    // captured are per batch size and every one of them has to have been
+    // *executed* before it is recorded.
+    for (int64_t i = 0; i < config.scheduler.max_running; ++i) {
+      // Token 0 exists in every vocabulary; the values do not matter, only the
+      // shapes they drive.
+      std::vector<int32_t> prompt(kWarmupPromptTokens, 0);
 
-    const RequestId id = next_id++;
-
-    INFERX_RETURN_IF_ERROR(scheduler.AddRequest(id, std::move(prompt), params));
+      INFERX_RETURN_IF_ERROR(
+          scheduler.AddRequest(next_id++, std::move(prompt), params));
+    }
 
     ForwardBatch batch;
     std::vector<int32_t> sampled;

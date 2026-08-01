@@ -1240,9 +1240,23 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   probe.block_table.assign(
       static_cast<size_t>(num_seqs * max_blocks_per_seq), 0);
 
+  // The probe stands at the *end* of the longest sequence this shape can serve,
+  // not at position 0.
+  //
+  // Everything sized on demand has to reach its final size before capture,
+  // because capture records addresses and a later reallocation strands them.
+  // The index buffers FlashInfer reads are sized from how many blocks the batch
+  // spans, and a probe at position 0 spans exactly one block per sequence -- so
+  // capturing there sized them for the smallest batch imaginable, and the first
+  // real request with a multi-block prompt grew them and left every captured
+  // graph reading freed memory. Standing at the last position instead makes the
+  // probe span `max_blocks_per_seq` blocks, which is the most any batch of this
+  // shape will ever need.
+  const int64_t last_position = max_blocks_per_seq * impl_->pool->block_size() - 1;
+
   for (int64_t s = 0; s < num_seqs; ++s) {
     probe.token_ids.push_back(0);
-    probe.positions.push_back(0);
+    probe.positions.push_back(static_cast<int32_t>(last_position));
     probe.seq_of_token.push_back(static_cast<int32_t>(s));
     probe.slots.push_back(0);
     // One logits row per sequence, which is what a decode batch asks for. A

@@ -440,4 +440,64 @@ TEST_F(EngineTest, CaptureIsIdempotentAndValidated) {
 }
 
 }  // namespace
+
+// The same equivalence, but for a batch of more than one sequence.
+//
+// This is R9. The single-sequence case above passed throughout, which is
+// exactly what made the multi-shape failure easy to ship: capture one shape and
+// everything looks right. Concurrent decode replays a *different* captured
+// graph, and that one was wrong.
+TEST_F(EngineTest, CudaGraphReplayMatchesLaunchByLaunchForABatch) {
+  const std::vector<std::vector<int32_t>> prompts = {
+      {kThe, kCapital, kOf, kFrance, kIs},
+      {kThe, kCapital, kOf, kFrance, kIs, kParis},
+      {kThe, kCapital, kOf, kFrance, kIs},
+  };
+
+  SamplingParams params;
+  params.max_tokens = 8;
+
+  const auto run = [&](int64_t max_running) {
+    auto sched = MakeScheduler(max_running);
+    EXPECT_TRUE(sched.ok());
+
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      EXPECT_TRUE(
+          sched->AddRequest(static_cast<uint64_t>(i + 1), prompts[i], params)
+              .ok());
+    }
+
+    std::vector<Completion> done = Drain(&*sched);
+    std::sort(done.begin(), done.end(),
+              [](const Completion& a, const Completion& b) {
+                return a.id < b.id;
+              });
+
+    return done;
+  };
+
+  // All three resident at once, so decode steps carry three sequences.
+  const std::vector<Completion> ungraphed = run(3);
+  ASSERT_EQ(ungraphed.size(), prompts.size());
+
+  const int64_t max_blocks = (512 + 16 - 1) / 16;
+
+  // Largest shape first: preparing a bigger batch grows buffers that are sized
+  // on demand, and a graph captured for a smaller shape beforehand would be
+  // left holding addresses that no longer exist.
+  for (int64_t seqs = 3; seqs >= 1; --seqs) {
+    ASSERT_TRUE(model_->CaptureDecodeGraph(seqs, max_blocks).ok())
+        << "capturing " << seqs << " sequences";
+  }
+
+  const std::vector<Completion> graphed = run(3);
+  ASSERT_EQ(graphed.size(), prompts.size());
+
+  for (size_t i = 0; i < graphed.size(); ++i) {
+    EXPECT_EQ(ungraphed[i].output_tokens, graphed[i].output_tokens)
+        << "request " << graphed[i].id
+        << " decoded differently once its shape was captured";
+  }
+}
+
 }  // namespace inferx

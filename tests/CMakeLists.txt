@@ -80,5 +80,10 @@ if(INFERX_CUDA_MEETS_FLOOR)
       inferx::server
       inferx::api
       inferx::cpp_httplib)
+
+    # Its own binary, so the graphed and ungraphed engines it builds never
+    # share a process with server_test's.
+    inferx_add_kernel_test(server_graphs_test kernel/server_graphs_test.cc)
+    target_link_libraries(server_graphs_test PRIVATE inferx::server)
   endif()
 endif()
