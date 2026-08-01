@@ -127,12 +127,41 @@ endif()
 set(BUILD_TESTING ${_inferx_saved_build_testing} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
+# cpp-httplib -- the HTTP/1.1 server behind the OpenAI-compatible API.
+#
+# §9 nominates Boost.Beast and §5.1 designs the I/O around an Asio io_context
+# with C++20 coroutines. This is a deliberate substitution: Beast would have
+# meant vendoring the Boost superproject to serve five endpoints, whereas
+# cpp-httplib is one header with no build-system footprint at all.
+#
+# It is checked in as a file rather than wired as a submodule, because it *is*
+# a file -- httplib.h and its licence, at v0.18.3. Update by replacing them.
+#
+# What this defers: thread-per-connection rather than an event loop, so the
+# ceiling on concurrent streams is threads rather than descriptors. That
+# ceiling is far above what a single 4080 SUPER can serve, since the batch is
+# capped by max_running long before the connection count binds.
+add_library(inferx_cpp_httplib INTERFACE)
+add_library(inferx::cpp_httplib ALIAS inferx_cpp_httplib)
+
+if(EXISTS "${INFERX_THIRD_PARTY}/cpp-httplib/httplib.h")
+  target_include_directories(inferx_cpp_httplib SYSTEM INTERFACE
+    "${INFERX_THIRD_PARTY}/cpp-httplib")
+  set(INFERX_HAVE_HTTPLIB ON)
+  message(STATUS "cpp-httplib: found at third_party/cpp-httplib")
+else()
+  set(INFERX_HAVE_HTTPLIB OFF)
+  message(STATUS "cpp-httplib: not present -- inferx-serve will not be built")
+endif()
+
+# ---------------------------------------------------------------------------
 # Planned dependencies, by milestone. Add with:
 #   git submodule add --depth 1 <url> third_party/<name>
 #
-#   M4  boost (beast)    https://github.com/boostorg/boost.git
 #   M4  simdjson         https://github.com/simdjson/simdjson.git
-#   M4  tokenizers-cpp   https://github.com/mlc-ai/tokenizers-cpp.git
+#                        For the request hot path, if JSON parsing ever shows
+#                        up in a profile. It has not yet: a chat request is a
+#                        few hundred bytes next to a multi-millisecond step.
 #   M5  folly            https://github.com/facebook/folly.git
 #                        NARROW USE ONLY: MPMCQueue + ProducerConsumerQueue.
 #                        See docs/ARCHITECTURE.md section 9.

@@ -1,0 +1,176 @@
+/// inferx-serve -- the OpenAI-compatible server.
+///
+/// M4's deliverable, and the point at which the engine becomes usable by
+/// something other than a test: a checkpoint directory in, an HTTP endpoint out.
+
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+#include "inferx/server/engine.h"
+#include "inferx/server/http_server.h"
+
+namespace {
+
+inferx::server::HttpServer* g_server = nullptr;
+
+void HandleSignal(int /*signum*/) {
+  // Only async-signal-safe work here: flip the listener off and let the main
+  // thread unwind normally, so in-flight generations are cancelled through the
+  // ordinary path rather than by exiting underneath them.
+  if (g_server != nullptr) g_server->Stop();
+}
+
+void PrintUsage(const char* argv0) {
+  std::fprintf(stderr,
+      "usage: %s --model <dir> [options]\n"
+      "\n"
+      "  --model <dir>          checkpoint directory (required)\n"
+      "  --host <addr>          bind address (default 127.0.0.1)\n"
+      "  --port <n>             bind port (default 8000)\n"
+      "  --served-model-name <s>  name reported in responses\n"
+      "  --max-running <n>      concurrent sequences (default 8)\n"
+      "  --max-seq-len <n>      prompt + generation cap (default 2048)\n"
+      "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
+      "  --block-size <n>       tokens per block (default 16)\n"
+      "  --fp8                  quantize weights to FP8 e4m3\n"
+      "  --cuda-graphs          capture decode graphs at startup.\n"
+      "                         Correct for a single sequence; concurrent\n"
+      "                         decode is currently wrong. Off by default.\n"
+      "\n"
+      "Only greedy decoding is implemented: temperature and top_p are\n"
+      "accepted and ignored, and responses report system_fingerprint\n"
+      "\"greedy\".\n",
+      argv0);
+}
+
+// A tiny hand-rolled parser rather than a flags library, because the binary has
+// a dozen options and gflags would be a dependency bought for nothing.
+bool NextValue(int argc, char** argv, int* i, const char* name,
+               std::string* out) {
+  if (*i + 1 >= argc) {
+    std::fprintf(stderr, "error: %s needs a value\n", name);
+    return false;
+  }
+
+  *out = argv[++(*i)];
+  return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  inferx::server::EngineConfig engine_config;
+  inferx::server::HttpServerConfig http_config;
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    std::string value;
+
+    if (arg == "--help" || arg == "-h") {
+      PrintUsage(argv[0]);
+      return 0;
+    } else if (arg == "--model") {
+      if (!NextValue(argc, argv, &i, "--model", &engine_config.model_dir)) {
+        return 2;
+      }
+    } else if (arg == "--host") {
+      if (!NextValue(argc, argv, &i, "--host", &http_config.host)) return 2;
+    } else if (arg == "--port") {
+      if (!NextValue(argc, argv, &i, "--port", &value)) return 2;
+      http_config.port = std::atoi(value.c_str());
+    } else if (arg == "--served-model-name") {
+      if (!NextValue(argc, argv, &i, "--served-model-name",
+                     &engine_config.served_model_name)) {
+        return 2;
+      }
+    } else if (arg == "--max-running") {
+      if (!NextValue(argc, argv, &i, "--max-running", &value)) return 2;
+      engine_config.scheduler.max_running = std::atoll(value.c_str());
+    } else if (arg == "--max-seq-len") {
+      if (!NextValue(argc, argv, &i, "--max-seq-len", &value)) return 2;
+      engine_config.scheduler.max_seq_len = std::atoll(value.c_str());
+    } else if (arg == "--kv-blocks") {
+      if (!NextValue(argc, argv, &i, "--kv-blocks", &value)) return 2;
+      engine_config.kv_blocks = std::atoll(value.c_str());
+    } else if (arg == "--block-size") {
+      if (!NextValue(argc, argv, &i, "--block-size", &value)) return 2;
+      engine_config.block_size = std::atoll(value.c_str());
+    } else if (arg == "--fp8") {
+      engine_config.fp8_weights = true;
+    } else if (arg == "--cuda-graphs") {
+      engine_config.capture_graphs = true;
+    } else {
+      std::fprintf(stderr, "error: unknown option %s\n\n", arg.c_str());
+      PrintUsage(argv[0]);
+      return 2;
+    }
+  }
+
+  if (engine_config.model_dir.empty()) {
+    std::fprintf(stderr, "error: --model is required\n\n");
+    PrintUsage(argv[0]);
+    return 2;
+  }
+
+  // The batch is bounded by how many sequences can be resident, so the token
+  // budget follows from it rather than being set independently.
+  engine_config.scheduler.max_batch_tokens =
+      std::max<int64_t>(engine_config.scheduler.max_batch_tokens,
+                        engine_config.scheduler.max_seq_len);
+
+  std::fprintf(stderr, "loading %s ...\n", engine_config.model_dir.c_str());
+
+  inferx::StatusOr<std::unique_ptr<inferx::server::Engine>> engine =
+      inferx::server::Engine::Create(engine_config);
+
+  if (!engine.ok()) {
+    std::fprintf(stderr, "error: %s\n", engine.status().ToString().c_str());
+    return 1;
+  }
+
+  inferx::StatusOr<std::unique_ptr<inferx::server::HttpServer>> server =
+      inferx::server::HttpServer::Create(engine->get(), http_config);
+
+  if (!server.ok()) {
+    std::fprintf(stderr, "error: %s\n", server.status().ToString().c_str());
+    return 1;
+  }
+
+  g_server = server->get();
+  std::signal(SIGINT, HandleSignal);
+  std::signal(SIGTERM, HandleSignal);
+
+  std::fprintf(stderr,
+               "inferx-serve listening on http://%s:%d\n"
+               "  model        : %s\n"
+               "  weights      : %s\n"
+               "  max running  : %lld\n"
+               "  max seq len  : %lld\n"
+               "  kv blocks    : %lld x %lld tokens\n"
+               "  cuda graphs  : %s\n"
+               "  sampling     : greedy only (temperature/top_p ignored)\n",
+               http_config.host.c_str(), http_config.port,
+               (*engine)->model_name().c_str(),
+               engine_config.fp8_weights ? "fp8 e4m3" : "bf16",
+               engine_config.capture_graphs
+                   ? "on (concurrent decode is known-wrong)"
+                   : "off",
+               static_cast<long long>(engine_config.scheduler.max_running),
+               static_cast<long long>(engine_config.scheduler.max_seq_len),
+               static_cast<long long>(engine_config.kv_blocks),
+               static_cast<long long>(engine_config.block_size));
+
+  const inferx::Status listened = (*server)->Listen();
+
+  g_server = nullptr;
+
+  if (!listened.ok()) {
+    std::fprintf(stderr, "error: %s\n", listened.ToString().c_str());
+    return 1;
+  }
+
+  std::fprintf(stderr, "shutting down\n");
+  return 0;
+}

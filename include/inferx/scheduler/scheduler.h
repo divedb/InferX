@@ -35,6 +35,26 @@ enum class FinishReason {
 
 const char* FinishReasonName(FinishReason reason);
 
+/// \brief One token appended to one running sequence by a single step.
+///
+/// A `Completion` arrives when a sequence is over, which is too late for
+/// streaming -- SSE has to emit each token as it is produced. This is the
+/// per-step view of the same thing: `CommitStep` reports which request each
+/// sampled token belongs to, so the layer above can route it to a client
+/// without having to reconstruct the batch's ordering for itself.
+///
+/// It carries no text. Detokenization is stateful across tokens (a character
+/// can span two of them) and is the caller's business, not the scheduler's --
+/// §3.1 keeps the scheduler to plain integers.
+struct TokenDelta {
+  RequestId id = 0;
+  int32_t token = 0;
+
+  /// Set when this token also ended the sequence, so a streaming caller can
+  /// close the stream on the same step rather than waiting for `TakeCompleted`.
+  FinishReason finish = FinishReason::kNotFinished;
+};
+
 /// \brief A finished sequence, handed back to whatever submitted it.
 struct Completion {
   RequestId id = 0;
@@ -105,9 +125,14 @@ class Scheduler {
 
   /// \brief Applies one sampled token per sequence in the last prepared batch.
   ///
-  /// \param sampled One token per entry of the batch's `logits_indices`, in the
-  ///                same order.
-  Status CommitStep(const std::vector<int32_t>& sampled);
+  /// \param sampled     One token per entry of the batch's `logits_indices`, in
+  ///                    the same order.
+  /// \param out_deltas  Optional. Receives one entry per sampled token, naming
+  ///                    the request it belongs to. Cleared first. Streaming
+  ///                    callers need this; batch callers can ignore it and read
+  ///                    `TakeCompleted` instead.
+  Status CommitStep(const std::vector<int32_t>& sampled,
+                    std::vector<TokenDelta>* out_deltas = nullptr);
 
   /// \brief Removes and returns everything that finished since the last call.
   std::vector<Completion> TakeCompleted();

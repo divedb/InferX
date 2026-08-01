@@ -97,6 +97,23 @@ class Qwen2Model {
   ///                   row-major, in the order `logits_indices` lists.
   Status Step(const ForwardBatch& batch, std::vector<float>* out_logits);
 
+  /// \brief Sizes the activation buffers for a batch of `max_tokens`.
+  ///
+  /// Must be called before `CaptureDecodeGraph` if anything larger than a
+  /// decode batch will ever run, and this is not an optimization -- it is a
+  /// correctness requirement. Capture records device *addresses*. A graph
+  /// captured while the activations are sized for a four-token decode replays
+  /// against those addresses forever, so the first prefill that grows the
+  /// buffers leaves every captured graph reading memory that has been freed,
+  /// and the model quietly emits garbage rather than failing.
+  ///
+  /// Buffers only ever grow, so reserving the largest batch up front is enough
+  /// to make every later `EnsureCapacity` a no-op and every captured pointer
+  /// stable.
+  ///
+  /// \param max_tokens Largest token count any future batch will carry.
+  Status ReserveActivations(int64_t max_tokens);
+
   /// \brief Captures a CUDA graph for one decode shape.
   ///
   /// A decode step is ~400 launches -- 36 layers of seven GEMMs and half a

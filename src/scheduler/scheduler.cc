@@ -271,7 +271,13 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
   return OkStatus();
 }
 
-Status Scheduler::CommitStep(const std::vector<int32_t>& sampled) {
+Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
+                             std::vector<TokenDelta>* out_deltas) {
+  if (out_deltas != nullptr) {
+    out_deltas->clear();
+    out_deltas->reserve(sampled.size());
+  }
+
   if (sampled.size() != impl_->batch_seq_index.size()) {
     return InvalidArgumentError("got ", sampled.size(), " sampled tokens but "
                                 "the batch asked for ",
@@ -296,6 +302,12 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled) {
       seq.finish = FinishReason::kStopToken;
     } else if (seq.generated() >= seq.params.max_tokens) {
       seq.finish = FinishReason::kMaxTokens;
+    }
+
+    // Emitted after the stop checks, so `finish` is already decided and a
+    // streaming caller can close the stream on this same delta.
+    if (out_deltas != nullptr) {
+      out_deltas->push_back({seq.id, sampled[i], seq.finish});
     }
   }
 

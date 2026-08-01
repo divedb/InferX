@@ -1,0 +1,519 @@
+/// The server, end to end: HTTP in, tokens out.
+///
+/// M4's deliverable is "the engine is usable by something other than a test",
+/// and this is the test that says so anyway -- a real socket, a real request
+/// body, a real model, and the answer parsed back out of the response the way a
+/// client would. Everything below the wire format is covered elsewhere; what is
+/// only covered here is that the pieces are actually connected.
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "httplib.h"
+#include "inferx/common/json.h"
+#include "inferx/core/cuda_utils.h"
+#include "inferx/server/engine.h"
+#include "inferx/server/http_server.h"
+
+namespace inferx::server {
+namespace {
+
+std::string CheckpointDir() {
+  if (const char* env = std::getenv("INFERX_TEST_CHECKPOINT")) return env;
+
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return "";
+
+  return std::string(home) +
+         "/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/"
+         "aa8e72537993ba99e69dfaafa59ed015b17504d1";
+}
+
+bool CheckpointPresent() {
+  const std::string dir = CheckpointDir();
+
+  return !dir.empty() &&
+         std::ifstream(dir + "/config.json").good();
+}
+
+// The engine is expensive to build -- weights, KV pool, warm-up -- so the whole
+// suite shares one, and every test is written to leave it usable by the next.
+class ServerTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    if (!CudaAvailable() || !CheckpointPresent()) return;
+
+    EngineConfig config;
+    config.model_dir = CheckpointDir();
+    config.scheduler.max_running = 4;
+    config.scheduler.max_seq_len = 512;
+    config.scheduler.max_batch_tokens = 512;
+    config.kv_blocks = 512;
+
+    // Left off deliberately, matching the shipping default: multi-shape capture
+    // is not yet correct, and a test that quietly enabled it would be testing a
+    // configuration nobody runs.
+    config.capture_graphs = false;
+
+    StatusOr<std::unique_ptr<Engine>> created = Engine::Create(config);
+    ASSERT_TRUE(created.ok()) << created.status().ToString();
+
+    engine_ = created->release();
+
+    HttpServerConfig http;
+    http.host = "127.0.0.1";
+    http.port = 0;  // any free port, so the suite cannot collide
+
+    StatusOr<std::unique_ptr<HttpServer>> server =
+        HttpServer::Create(engine_, http);
+    ASSERT_TRUE(server.ok()) << server.status().ToString();
+
+    server_ = server->release();
+
+    listener_ = new std::thread([] { (void)server_->Listen(); });
+
+    ASSERT_TRUE(server_->WaitUntilReady());
+    ASSERT_GT(server_->port(), 0);
+  }
+
+  static void TearDownTestSuite() {
+    if (server_ != nullptr) server_->Stop();
+
+    if (listener_ != nullptr) {
+      listener_->join();
+      delete listener_;
+      listener_ = nullptr;
+    }
+
+    delete server_;
+    server_ = nullptr;
+
+    delete engine_;
+    engine_ = nullptr;
+  }
+
+  void SetUp() override {
+    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device";
+    if (!CheckpointPresent()) GTEST_SKIP() << "checkpoint not present";
+  }
+
+  static httplib::Client Client() {
+    httplib::Client client("127.0.0.1", server_->port());
+    client.set_read_timeout(120, 0);
+
+    return client;
+  }
+
+  static JsonValue ParseBody(const std::string& body) {
+    StatusOr<JsonValue> parsed = ParseJson(body);
+    EXPECT_TRUE(parsed.ok()) << parsed.status().ToString() << "\n" << body;
+
+    return parsed.ok() ? *parsed : JsonValue();
+  }
+
+  static Engine* engine_;
+  static HttpServer* server_;
+  static std::thread* listener_;
+};
+
+Engine* ServerTest::engine_ = nullptr;
+HttpServer* ServerTest::server_ = nullptr;
+std::thread* ServerTest::listener_ = nullptr;
+
+// --- The engine, without HTTP in the way -------------------------------------
+
+TEST_F(ServerTest, EngineGeneratesTheExpectedContinuation) {
+  // Greedy decoding is deterministic, so this is an equality assertion rather
+  // than a "looks plausible" one. "The capital of France is" continues
+  // " Paris" for any model that has learned anything at all, and if it stops
+  // doing so the engine is broken, not the model.
+  const std::vector<int32_t> prompt =
+      engine_->tokenizer().EncodeOrdinary("The capital of France is");
+
+  StatusOr<std::shared_ptr<Generation>> generation =
+      engine_->Submit(prompt, /*max_tokens=*/4, /*stop=*/{});
+  ASSERT_TRUE(generation.ok()) << generation.status().ToString();
+
+  std::string text;
+  Generation::Event event;
+
+  while ((*generation)->Next(&event)) {
+    if (event.done) break;
+    text += event.text;
+  }
+
+  EXPECT_TRUE(text.rfind(" Paris", 0) == 0)
+      << "expected the continuation to start with \" Paris\", got: " << text;
+}
+
+TEST_F(ServerTest, ConcurrentRequestsDoNotContaminateEachOther) {
+  // Batched decode shares a step, a KV pool and a block table, so a bug in any
+  // of them shows up as one sequence's tokens appearing in another's output.
+  struct Case {
+    std::string prompt;
+    std::string expect;
+  };
+
+  const std::vector<Case> cases = {
+      {"The capital of France is", " Paris"},
+      {"The capital of Japan is", " Tokyo"},
+      {"The capital of Spain is", " Madrid"},
+  };
+
+  std::vector<std::shared_ptr<Generation>> streams;
+
+  for (const Case& test : cases) {
+    StatusOr<std::shared_ptr<Generation>> generation = engine_->Submit(
+        engine_->tokenizer().EncodeOrdinary(test.prompt), 4, {});
+
+    ASSERT_TRUE(generation.ok()) << generation.status().ToString();
+    streams.push_back(*generation);
+  }
+
+  for (size_t i = 0; i < streams.size(); ++i) {
+    std::string text;
+    Generation::Event event;
+
+    while (streams[i]->Next(&event)) {
+      if (event.done) break;
+      text += event.text;
+    }
+
+    EXPECT_TRUE(text.rfind(cases[i].expect, 0) == 0)
+        << "request " << i << " (" << cases[i].prompt << ") expected \""
+        << cases[i].expect << "\", got: " << text;
+  }
+}
+
+TEST_F(ServerTest, CancellingStopsGenerationEarly) {
+  StatusOr<std::shared_ptr<Generation>> generation = engine_->Submit(
+      engine_->tokenizer().EncodeOrdinary("Count upwards forever:"),
+      /*max_tokens=*/200, {});
+  ASSERT_TRUE(generation.ok()) << generation.status().ToString();
+
+  Generation::Event event;
+
+  // Read a little, then walk away, which is what a disconnect looks like from
+  // the engine's side.
+  int chunks = 0;
+  while ((*generation)->Next(&event) && !event.done) {
+    if (++chunks >= 3) break;
+  }
+
+  (*generation)->Cancel();
+
+  // The stream must terminate rather than hang: a client that disconnects must
+  // not leave a sequence occupying KV blocks forever.
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(30);
+
+  bool finished = false;
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!(*generation)->Next(&event)) {
+      finished = true;
+      break;
+    }
+
+    if (event.done) {
+      finished = true;
+      break;
+    }
+  }
+
+  EXPECT_TRUE(finished) << "a cancelled generation never terminated";
+
+  // And the blocks come back.
+  const auto blocks_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
+  while (std::chrono::steady_clock::now() < blocks_deadline) {
+    if (engine_->stats().running == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  EXPECT_EQ(engine_->stats().running, 0)
+      << "a cancelled sequence is still running";
+}
+
+TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
+  // KNOWN FAILURE. This is the minimal reproduction of a real correctness bug,
+  // written down as a test rather than as a comment because it is the thing
+  // that has to start passing.
+  //
+  // Sampling is greedy, so the same prompt must produce the same tokens every
+  // time. It does not: run sequentially against one engine, this alternates
+  // between two different continuations, which means a request's output depends
+  // on what ran before it. Observed on "Name three colours." at 32 tokens,
+  // where consecutive requests returned "...2. Blue\n33\n3. Green" and
+  // "...2. Blue\n3 Oranges\n3. Green" in strict alternation -- both of them
+  // also visibly corrupted at the same position.
+  //
+  // Alternation in step with block recycling points at KV state surviving a
+  // sequence's retirement, but `last_page_len` and the CSR block table are both
+  // computed correctly from `positions`, so the leak is somewhere else and this
+  // is not yet diagnosed. It is not a server bug -- the server is what made it
+  // visible, because it is the first thing to run many sequences through one
+  // pool.
+  const char* body =
+      R"({"messages":[{"role":"user","content":"Name three colours."}],)"
+      R"("max_tokens":32})";
+
+  httplib::Client client = Client();
+
+  std::vector<std::string> answers;
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    const httplib::Result response =
+        client.Post("/v1/chat/completions", body, "application/json");
+
+    ASSERT_TRUE(response);
+    ASSERT_EQ(response->status, 200) << response->body;
+
+    const JsonValue root = ParseBody(response->body);
+    const StatusOr<std::string_view> content =
+        (**root.Find("choices")->AsArray())[0]
+            .Find("message")
+            ->RequiredString("content");
+    ASSERT_TRUE(content.ok());
+
+    answers.emplace_back(*content);
+  }
+
+  for (size_t i = 1; i < answers.size(); ++i) {
+    EXPECT_EQ(answers[i], answers[0])
+        << "greedy decoding returned a different answer on attempt " << i
+        << ";\n  first: " << answers[0] << "\n  this : " << answers[i];
+  }
+}
+
+TEST_F(ServerTest, RejectsAPromptThatLeavesNoRoomToGenerate) {
+  const std::vector<int32_t> prompt(1000, 100);
+
+  EXPECT_FALSE(engine_->Submit(prompt, 8, {}).ok())
+      << "accepted a prompt longer than max_seq_len";
+}
+
+// --- Over HTTP ---------------------------------------------------------------
+
+TEST_F(ServerTest, HealthAndModelsRespond) {
+  httplib::Client client = Client();
+
+  const httplib::Result health = client.Get("/health");
+  ASSERT_TRUE(health) << "no response";
+  EXPECT_EQ(health->status, 200);
+
+  const httplib::Result models = client.Get("/v1/models");
+  ASSERT_TRUE(models);
+  EXPECT_EQ(models->status, 200);
+
+  const JsonValue root = ParseBody(models->body);
+  const StatusOr<std::string_view> object = root.RequiredString("object");
+  ASSERT_TRUE(object.ok());
+  EXPECT_EQ(*object, "list");
+}
+
+TEST_F(ServerTest, ChatCompletionReturnsAnAnswer) {
+  httplib::Client client = Client();
+
+  const httplib::Result response = client.Post(
+      "/v1/chat/completions",
+      R"({"messages":[{"role":"user","content":)"
+      R"("What is the capital of France? Answer in one word."}],)"
+      R"("max_tokens":16})",
+      "application/json");
+
+  ASSERT_TRUE(response) << "no response";
+  ASSERT_EQ(response->status, 200) << response->body;
+
+  const JsonValue root = ParseBody(response->body);
+
+  const JsonValue* choices = root.Find("choices");
+  ASSERT_NE(choices, nullptr);
+
+  const StatusOr<const std::vector<JsonValue>*> list = choices->AsArray();
+  ASSERT_TRUE(list.ok());
+  ASSERT_EQ((*list)->size(), 1u);
+
+  const StatusOr<std::string_view> content =
+      (**list)[0].Find("message")->RequiredString("content");
+  ASSERT_TRUE(content.ok());
+
+  EXPECT_NE(content->find("Paris"), std::string_view::npos)
+      << "answer was: " << *content;
+
+  // The chat template ends the turn on <|im_end|>, so a one-word answer should
+  // stop rather than run to the token limit.
+  const StatusOr<std::string_view> reason =
+      (**list)[0].RequiredString("finish_reason");
+  ASSERT_TRUE(reason.ok());
+  EXPECT_EQ(*reason, "stop");
+}
+
+TEST_F(ServerTest, MalformedRequestsGet400WithAnOpenAiShapedError) {
+  httplib::Client client = Client();
+
+  for (const char* body : {"", "not json", R"({"messages":[]})",
+                           R"({"messages":[{"role":"user"}]})"}) {
+    const httplib::Result response =
+        client.Post("/v1/chat/completions", body, "application/json");
+
+    ASSERT_TRUE(response) << "no response for body: " << body;
+    EXPECT_EQ(response->status, 400) << "body: " << body;
+
+    const JsonValue root = ParseBody(response->body);
+    EXPECT_NE(root.Find("error"), nullptr) << response->body;
+  }
+}
+
+TEST_F(ServerTest, StreamingDeltasConcatenateToTheBlockingAnswer) {
+  // The two endpoints must agree. If they do not, a completion read over SSE
+  // differs from the same completion read in one piece, which gets reported as
+  // a model bug and is not one.
+  httplib::Client client = Client();
+
+  constexpr const char* kBody =
+      R"({"messages":[{"role":"user","content":"Name three colours."}],)"
+      R"("max_tokens":32})";
+
+  const httplib::Result blocking =
+      client.Post("/v1/chat/completions", kBody, "application/json");
+  ASSERT_TRUE(blocking);
+  ASSERT_EQ(blocking->status, 200) << blocking->body;
+
+  const JsonValue root = ParseBody(blocking->body);
+  const StatusOr<std::string_view> expected =
+      (**root.Find("choices")->AsArray())[0]
+          .Find("message")
+          ->RequiredString("content");
+  ASSERT_TRUE(expected.ok());
+
+  const std::string streaming_body =
+      std::string(R"({"messages":[{"role":"user","content":)"
+                  R"("Name three colours."}],"max_tokens":32,"stream":true})");
+
+  std::string raw;
+  const httplib::Result streamed = client.Post(
+      "/v1/chat/completions", streaming_body, "application/json");
+
+  ASSERT_TRUE(streamed);
+  ASSERT_EQ(streamed->status, 200);
+  raw = streamed->body;
+
+  // Reassemble the deltas the way a client would.
+  std::string assembled;
+  bool saw_done = false;
+  bool saw_finish_reason = false;
+
+  size_t at = 0;
+  while ((at = raw.find("data: ", at)) != std::string::npos) {
+    at += 6;
+
+    const size_t end = raw.find('\n', at);
+    const std::string payload =
+        raw.substr(at, end == std::string::npos ? end : end - at);
+
+    if (payload == "[DONE]") {
+      saw_done = true;
+      break;
+    }
+
+    const JsonValue chunk = ParseBody(payload);
+    const JsonValue* choice = &(**chunk.Find("choices")->AsArray())[0];
+
+    if (const JsonValue* reason = choice->Find("finish_reason");
+        reason != nullptr && !reason->IsNull()) {
+      saw_finish_reason = true;
+    }
+
+    if (const JsonValue* delta = choice->Find("delta"); delta != nullptr) {
+      if (const JsonValue* content = delta->Find("content");
+          content != nullptr) {
+        if (const StatusOr<std::string_view> text = content->AsString();
+            text.ok()) {
+          assembled += *text;
+        }
+      }
+    }
+  }
+
+  EXPECT_TRUE(saw_done) << "the stream never sent [DONE]";
+  EXPECT_TRUE(saw_finish_reason) << "no chunk carried a finish_reason";
+  EXPECT_EQ(assembled, *expected);
+}
+
+TEST_F(ServerTest, StopStringIsRemovedFromTheOutput) {
+  httplib::Client client = Client();
+
+  const httplib::Result response = client.Post(
+      "/v1/completions",
+      R"({"prompt":"The capital of France is","max_tokens":32,)"
+      R"("stop":["Germany"]})",
+      "application/json");
+
+  ASSERT_TRUE(response);
+  ASSERT_EQ(response->status, 200) << response->body;
+
+  const JsonValue root = ParseBody(response->body);
+  const JsonValue* choice = &(**root.Find("choices")->AsArray())[0];
+
+  const StatusOr<std::string_view> text = choice->RequiredString("text");
+  ASSERT_TRUE(text.ok());
+
+  // The stop string must not appear, not even partially at the tail -- that is
+  // what the holdback in the streaming path is for.
+  EXPECT_EQ(text->find("Germany"), std::string_view::npos)
+      << "the stop string survived into the output: " << *text;
+
+  const StatusOr<std::string_view> reason =
+      choice->RequiredString("finish_reason");
+  ASSERT_TRUE(reason.ok());
+  EXPECT_EQ(*reason, "stop");
+}
+
+TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
+  httplib::Client client = Client();
+
+  const httplib::Result response = client.Get("/metrics");
+  ASSERT_TRUE(response);
+  ASSERT_EQ(response->status, 200);
+
+  const JsonValue root = ParseBody(response->body);
+
+  for (const char* field : {"running", "waiting", "blocks_in_use",
+                            "blocks_total", "steps", "tokens_generated"}) {
+    EXPECT_TRUE(root.RequiredInt(field).ok())
+        << "/metrics is missing \"" << field << "\": " << response->body;
+  }
+
+  const StatusOr<int64_t> before = root.RequiredInt("steps");
+  ASSERT_TRUE(before.ok());
+
+  // Generate something *here* rather than relying on earlier tests: ctest runs
+  // each test in its own process, so a counter that looks warm when the whole
+  // binary runs is zero when the case runs alone.
+  const httplib::Result generated = client.Post(
+      "/v1/completions", R"({"prompt":"Hello","max_tokens":4})",
+      "application/json");
+
+  ASSERT_TRUE(generated);
+  ASSERT_EQ(generated->status, 200) << generated->body;
+
+  const httplib::Result after_response = client.Get("/metrics");
+  ASSERT_TRUE(after_response);
+
+  const StatusOr<int64_t> after =
+      ParseBody(after_response->body).RequiredInt("steps");
+  ASSERT_TRUE(after.ok());
+
+  EXPECT_GT(*after, *before) << "the step counter did not advance";
+}
+
+}  // namespace
+}  // namespace inferx::server

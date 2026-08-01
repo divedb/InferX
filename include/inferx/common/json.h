@@ -86,4 +86,18 @@ class JsonValue {
 /// \return     The value, or InvalidArgument naming the byte offset.
 StatusOr<JsonValue> ParseJson(std::string_view text);
 
+/// \brief Appends `text` to `out` as a quoted JSON string literal.
+///
+/// The API layer builds responses by concatenation rather than by assembling a
+/// `JsonValue` tree, because the shapes are fixed and known. That is fine for
+/// the scaffolding and lethal for the payload: model output is arbitrary text
+/// that routinely contains quotes, backslashes and newlines, and one unescaped
+/// character turns a completion into a parse error at the client -- or, worse,
+/// lets generated text close the string and forge the rest of the object.
+///
+/// Escapes what RFC 8259 requires and nothing more: quote, backslash, and the
+/// C0 controls, the last as `\uXXXX` where there is no short form. Bytes above
+/// 0x7F are passed through, so valid UTF-8 in gives valid UTF-8 out.
+void AppendJsonString(std::string_view text, std::string* out);
+
 }  // namespace inferx

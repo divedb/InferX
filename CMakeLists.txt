@@ -34,6 +34,13 @@ endif()
 # code is available, and is loader-only when it is not.
 add_subdirectory(src/model)
 add_subdirectory(src/scheduler)
+add_subdirectory(src/api)
+
+# The server owns the model, so it needs device code; the wire format it speaks
+# does not, which is why src/api is unconditional and this is not.
+if(INFERX_CUDA_MEETS_FLOOR AND INFERX_HAVE_HTTPLIB)
+  add_subdirectory(src/server)
+endif()
 
 if(INFERX_BUILD_TESTS)
   enable_testing()

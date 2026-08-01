@@ -1201,6 +1201,15 @@ Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
 KvBlockPool* Qwen2Model::kv_pool() { return impl_->pool.get(); }
 
 
+Status Qwen2Model::ReserveActivations(int64_t max_tokens) {
+  if (max_tokens <= 0) {
+    return InvalidArgumentError("max_tokens must be positive, got ",
+                                max_tokens);
+  }
+
+  return impl_->EnsureCapacity(max_tokens);
+}
+
 Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
                                       int64_t max_blocks_per_seq) {
   if (impl_->pool == nullptr) {

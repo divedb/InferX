@@ -420,4 +420,53 @@ StatusOr<JsonValue> ParseJson(std::string_view text) {
   return Parser(text).ParseDocument();
 }
 
+void AppendJsonString(std::string_view text, std::string* out) {
+  out->push_back('"');
+
+  for (const char c : text) {
+    const auto byte = static_cast<unsigned char>(c);
+
+    switch (c) {
+      case '"':
+        out->append("\\\"");
+        break;
+      case '\\':
+        out->append("\\\\");
+        break;
+      case '\n':
+        out->append("\\n");
+        break;
+      case '\r':
+        out->append("\\r");
+        break;
+      case '\t':
+        out->append("\\t");
+        break;
+      case '\b':
+        out->append("\\b");
+        break;
+      case '\f':
+        out->append("\\f");
+        break;
+      default:
+        if (byte < 0x20) {
+          // The remaining C0 controls have no short escape and are not legal
+          // raw inside a JSON string.
+          static constexpr char kHex[] = "0123456789abcdef";
+
+          out->append("\\u00");
+          out->push_back(kHex[(byte >> 4) & 0xF]);
+          out->push_back(kHex[byte & 0xF]);
+        } else {
+          // Including everything above 0x7F: UTF-8 continuation bytes are
+          // copied verbatim, which is what keeps multi-byte characters intact.
+          out->push_back(c);
+        }
+        break;
+    }
+  }
+
+  out->push_back('"');
+}
+
 }  // namespace inferx
