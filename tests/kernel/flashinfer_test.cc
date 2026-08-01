@@ -16,10 +16,12 @@
 #include "inferx/kernels/flashinfer_attention.h"
 #include "inferx/kernels/flashinfer_prefill.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -499,6 +501,122 @@ TEST_F(FlashInferTest, OutputDoesNotDependOnWhichPagesHoldTheSequence) {
       << mismatches << " of " << ascending.size()
       << " outputs changed when the sequence moved from pages [0,1,2] to "
          "[5,4,3]";
+}
+
+// Ragged prefill is the shape M5 needs: several requests contribute different
+// numbers of query rows in one launch. Re-plan the same wrapper over two
+// physical page layouts, since the server's free-list order changes between
+// otherwise identical request waves.
+TEST_F(FlashInferTest, RaggedPrefillIsRepeatableAcrossPageLayouts) {
+  constexpr int64_t head_dim = 128, q_heads = 16, kv_heads = 2;
+  constexpr int64_t page_size = 16, num_blocks = 12;
+  const std::vector<int64_t> lens = {7, 33, 18};
+  const int64_t batch = static_cast<int64_t>(lens.size());
+  const int64_t total_rows =
+      std::accumulate(lens.begin(), lens.end(), int64_t{0});
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  auto fi = kernels::FlashInferPrefill::Create();
+  ASSERT_TRUE(fi.ok()) << fi.status();
+
+  const auto attend = [&](const std::vector<int32_t>& physical_pages)
+      -> std::pair<std::vector<float>, std::vector<float>> {
+    Dev d;
+    const TensorView k_cache =
+        d.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+    const TensorView v_cache =
+        d.Empty(Shape({num_blocks, page_size, kv_heads, head_dim}));
+
+    std::vector<int32_t> qo_indptr = {0};
+    std::vector<int32_t> kv_indptr = {0};
+    std::vector<int32_t> last_page;
+    std::vector<int32_t> indices;
+    std::vector<int32_t> dense;
+    std::vector<int32_t> seq_of;
+    std::vector<int32_t> positions;
+    std::vector<float> q_host;
+
+    const int64_t max_pages = 3;
+    dense.assign(static_cast<size_t>(batch * max_pages), 0);
+    size_t next_page = 0;
+
+    for (int64_t s = 0; s < batch; ++s) {
+      const int64_t len = lens[static_cast<size_t>(s)];
+      const int64_t pages = (len + page_size - 1) / page_size;
+      const std::vector<float> k = Ramp(
+          static_cast<size_t>(len * kv_heads * head_dim), 0.3f + s);
+      const std::vector<float> v = Ramp(
+          static_cast<size_t>(len * kv_heads * head_dim), 1.3f + s);
+      const std::vector<float> q = Ramp(
+          static_cast<size_t>(len * q_heads * head_dim), 2.3f + s);
+
+      std::vector<int32_t> slots;
+      for (int64_t t = 0; t < len; ++t) {
+        const int32_t page =
+            physical_pages[next_page + static_cast<size_t>(t / page_size)];
+        slots.push_back(page * page_size + static_cast<int32_t>(t % page_size));
+      }
+      EXPECT_TRUE(kernels::AppendToKvCache(
+                      d.Bf16(k, Shape({len, kv_heads, head_dim})),
+                      d.Bf16(v, Shape({len, kv_heads, head_dim})), k_cache,
+                      v_cache, d.I32(slots, Shape({len})))
+                      .ok());
+
+      q_host.insert(q_host.end(), q.begin(), q.end());
+      for (int64_t t = 0; t < len; ++t) {
+        seq_of.push_back(static_cast<int32_t>(s));
+        positions.push_back(static_cast<int32_t>(t));
+      }
+      for (int64_t p = 0; p < pages; ++p) {
+        const int32_t page = physical_pages[next_page++];
+        indices.push_back(page);
+        dense[static_cast<size_t>(s * max_pages + p)] = page;
+      }
+      qo_indptr.push_back(static_cast<int32_t>(q_host.size() /
+                                               (q_heads * head_dim)));
+      kv_indptr.push_back(static_cast<int32_t>(indices.size()));
+      last_page.push_back(static_cast<int32_t>(len - (pages - 1) * page_size));
+    }
+
+    const TensorView q =
+        d.Bf16(q_host, Shape({total_rows, q_heads, head_dim}));
+    const TensorView ref = d.Empty(Shape({total_rows, q_heads, head_dim}));
+    EXPECT_TRUE(kernels::PagedAttention(
+                    q, k_cache, v_cache,
+                    d.I32(dense, Shape({batch, max_pages})),
+                    d.I32(seq_of, Shape({total_rows})),
+                    d.I32(positions, Shape({total_rows})), ref, scale,
+                    *std::max_element(lens.begin(), lens.end()))
+                    .ok());
+
+    const TensorView out = d.Empty(Shape({total_rows, q_heads, head_dim}));
+    const Status status = (*fi)->Prefill(
+        q, k_cache, v_cache, d.I32(qo_indptr, Shape({batch + 1})),
+        absl::MakeConstSpan(qo_indptr),
+        d.I32(indices, Shape({static_cast<int64_t>(indices.size())})),
+        d.I32(kv_indptr, Shape({batch + 1})),
+        absl::MakeConstSpan(kv_indptr),
+        d.I32(last_page, Shape({batch})), out, scale);
+    EXPECT_TRUE(status.ok()) << status;
+
+    return std::pair{d.Down(ref), d.Down(out)};
+  };
+
+  const auto ascending = attend({0, 1, 2, 3, 4, 5, 6});
+  const auto descending = attend({11, 10, 9, 8, 7, 6, 5});
+  ASSERT_EQ(ascending.first.size(), ascending.second.size());
+  ASSERT_EQ(ascending.second.size(), descending.second.size());
+
+  double worst = 0.0;
+  size_t layout_mismatches = 0;
+  for (size_t i = 0; i < ascending.first.size(); ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(
+                                ascending.first[i] - ascending.second[i])));
+    if (ascending.second[i] != descending.second[i]) ++layout_mismatches;
+  }
+  EXPECT_LT(worst, 0.01);
+  EXPECT_EQ(layout_mismatches, 0)
+      << layout_mismatches << " outputs changed with physical page layout";
 }
 
 

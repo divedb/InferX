@@ -689,11 +689,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     }
 
     fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
-    // The wrapper is structurally ragged, but only the single-request path has
-    // a conformance oracle today. A three-request serving batch exposed
-    // lifecycle-dependent token output after earlier engines had run, so keep
-    // multi-request prefill on the reference kernel until that shape has its
-    // own page-permutation and repeatability coverage.
+    // The wrapper-level output and immediate full-model logits are repeatable,
+    // but long graph-served continuations still diverge intermittently after
+    // repeated engine lifecycles. Keep multi-request prefill on the reference
+    // path until the cached per-layer K/V state has its own repeatability
+    // oracle, not merely the final prefill logits.
     fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
                         batch.num_seqs == 1 && every_sequence_contributes;
 
