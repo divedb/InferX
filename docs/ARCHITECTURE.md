@@ -509,6 +509,34 @@ inferx/
 | **M9** | MoE (TP-over-experts) and MLA layers | G6 |
 | **M10** | Benchmark harness; head-to-head vs vLLM/SGLang on this box | G1 |
 
+### Measured decode performance
+
+Qwen2.5-3B-Instruct, batch 1, context 256, RTX 4080 SUPER with SM clocks locked
+at 2400 MHz. Re-measured after R9 was fixed, because every earlier figure was
+taken while graph capture was corrupting a sequence's KV.
+
+| configuration | launch-by-launch | with CUDA graphs | weight-bandwidth floor | % of floor |
+|---|---|---|---|---|
+| bf16 | 11.58 ms | 10.90 ms | 8.39 ms (6.17 GB @ 736 GB/s) | 77% |
+| FP8 e4m3 | 9.28 ms | 8.29 ms | 4.62 ms (3.40 GB @ 736 GB/s) | 56% |
+
+Sustained batch-1 generation with on-device sampling: 89.7 tok/s bf16, 118.4
+tok/s FP8. CUDA graphs are worth 1.06x on bf16 and 1.12x on FP8 -- the same
+~0.4 ms of dispatch overhead against a shorter step.
+
+The step is weight-bandwidth bound, which is why the floor is quoted: `gate_up`
+and `down_proj` alone are 7.3 ms of the bf16 step at 642-682 GB/s, and no
+amount of launch elimination touches them. That is the argument for FP8 and,
+later, for W4A16 (M8).
+
+Two caveats on the older numbers recorded in commit messages. The intermediate
+rows of the M3-to-M4 progression (20.10 -> 13.90 -> 12.70 -> 11.55 -> 11.24 ->
+10.73 -> 8.16 ms) measure code that no longer exists and cannot be re-run
+without checking out those commits. Both endpoints reproduce within noise on
+current code -- 10.73 against 10.90, and 8.16 against 8.29 -- and the floor
+reproduces exactly, so the shape of the progression stands even though the
+middle of it is unverified.
+
 M1 before M2 is deliberate: the quantized GEMM story is the largest risk in a torch-free design, and discovering it is intractable *after* building the model layer would be expensive.
 
 ---

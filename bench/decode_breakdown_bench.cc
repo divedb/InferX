@@ -335,7 +335,10 @@ int Main(int argc, char** argv) {
        static_cast<double>(kVocab) * kHidden) * w2 / 1e9;
 
   std::printf("%-24s %9s %7s %11.3f   (%.2f GB at 736 GB/s)\n",
-              "bandwidth floor", "", "", weights_gb / 736e9 * 1e12 / 1e9,
+              "bandwidth floor", "", "", weights_gb / 736e9 * 1e12,  // GB -> ms at 736 GB/s; the
+                                         // trailing /1e9 here printed 0.000
+                                         // and hid the reference number the
+                                         // whole progression is quoted against
               weights_gb);
   // No hardcoded step time. It changes with every optimization and a stale
   // constant here misattributes the difference to whatever was measured last;
