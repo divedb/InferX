@@ -330,6 +330,9 @@ Status FlashInferPrefill::Run(const TensorView& q, const TensorView& k_cache,
 
     dump("caller q_indptr", static_cast<const IdType*>(qo_indptr.Data()),
          batch1);
+    // What the kernel reads, not what the caller passed. Verifying a source
+    // and assuming its destination has already been the mistake twice here.
+    dump("params.q_indptr", params.q_indptr, batch1);
     dump("plan request_indices", params.request_indices, tiles);
     dump("plan qo_tile_indices", params.qo_tile_indices, tiles);
     dump("plan kv_tile_indices", params.kv_tile_indices, tiles);
