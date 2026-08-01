@@ -46,6 +46,24 @@ FinishReason ToApiReason(scheduler::FinishReason reason) {
   return FinishReason::kLength;
 }
 
+
+// The API's view of sampling, as the scheduler wants it. A seed the caller did
+// not pin is derived per request rather than left at zero, so two concurrent
+// requests at the same temperature do not draw identically.
+scheduler::SamplingParams ToSchedulerParams(const SamplingRequest& s) {
+  static std::atomic<uint64_t> counter{0x243f6a8885a308d3ULL};
+
+  scheduler::SamplingParams params;
+  params.temperature = s.temperature;
+  params.top_p = s.top_p;
+  params.seed = s.has_seed
+                    ? s.seed
+                    : counter.fetch_add(0x9e3779b97f4a7c15ULL,
+                                        std::memory_order_relaxed);
+
+  return params;
+}
+
 void SendError(httplib::Response* response, int code, std::string_view message,
                std::string_view type) {
   response->status = code;
@@ -87,14 +105,17 @@ struct HttpServer::Impl {
   void ServeBlocking(const SamplingRequest& sampling,
                      std::vector<int32_t> prompt, bool chat,
                      httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation =
-        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop);
+    StatusOr<std::shared_ptr<Generation>> generation = engine->Submit(
+        std::move(prompt), sampling.max_tokens, sampling.stop,
+        ToSchedulerParams(sampling));
 
     if (!generation.ok()) {
       SendError(response, StatusToHttp(generation.status()),
                 generation.status().message(), "invalid_request_error");
       return;
     }
+
+    const bool sampled = sampling.temperature > 0.0f;
 
     std::string text;
     Generation::Event event;
@@ -121,9 +142,9 @@ struct HttpServer::Impl {
 
     response->set_content(
         chat ? api::ChatCompletionJson(id, engine->model_name(), text,
-                                       ToApiReason(reason), usage, created)
+                                       ToApiReason(reason), usage, created, sampled)
              : api::CompletionJson(id, engine->model_name(), text,
-                                   ToApiReason(reason), usage, created),
+                                   ToApiReason(reason), usage, created, sampled),
         "application/json");
   }
 
@@ -131,8 +152,9 @@ struct HttpServer::Impl {
   void ServeStreaming(const SamplingRequest& sampling,
                       std::vector<int32_t> prompt, bool chat,
                       httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation =
-        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop);
+    StatusOr<std::shared_ptr<Generation>> generation = engine->Submit(
+        std::move(prompt), sampling.max_tokens, sampling.stop,
+        ToSchedulerParams(sampling));
 
     if (!generation.ok()) {
       SendError(response, StatusToHttp(generation.status()),
@@ -140,6 +162,7 @@ struct HttpServer::Impl {
       return;
     }
 
+    const bool sampled = sampling.temperature > 0.0f;
     const std::string id = MakeId(chat ? "chatcmpl" : "cmpl");
     const int64_t created = NowSeconds();
     const std::string model = engine->model_name();
@@ -153,14 +176,14 @@ struct HttpServer::Impl {
 
     response->set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, chat](
+        [this, stream, id, created, model, chat, sampled](
             size_t /*offset*/, httplib::DataSink& sink) {
           // The first chunk announces the role and carries no content, which is
           // what OpenAI's protocol specifies and what clients key on to open
           // the message.
           if (chat) {
             const std::string first = api::SseFrame(api::ChatCompletionChunkJson(
-                id, model, "assistant", "", nullptr, created));
+                id, model, "assistant", "", nullptr, created, sampled));
 
             if (!sink.write(first.data(), first.size())) {
               stream->Cancel();
@@ -178,9 +201,9 @@ struct HttpServer::Impl {
 
               frame = api::SseFrame(
                   chat ? api::ChatCompletionChunkJson(id, model, "", "",
-                                                      &reason, created)
+                                                      &reason, created, sampled)
                        : api::CompletionChunkJson(id, model, "", &reason,
-                                                  created));
+                                                  created, sampled));
               frame += api::SseFrame("[DONE]");
 
               sink.write(frame.data(), frame.size());
@@ -195,9 +218,9 @@ struct HttpServer::Impl {
 
             frame = api::SseFrame(
                 chat ? api::ChatCompletionChunkJson(id, model, "", event.text,
-                                                    nullptr, created)
+                                                    nullptr, created, sampled)
                      : api::CompletionChunkJson(id, model, event.text, nullptr,
-                                                created));
+                                                created, sampled));
 
             // A failed write means the client is gone. Cancelling here is what
             // stops the engine generating into a socket nobody is reading --

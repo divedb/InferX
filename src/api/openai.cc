@@ -24,6 +24,35 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
 
   INFERX_ASSIGN_OR_RETURN(out->stream, root.OptionalBool("stream", false));
 
+  if (const JsonValue* t = root.Find("temperature");
+      t != nullptr && !t->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, t->AsDouble());
+
+    if (value < 0.0 || value > 2.0) {
+      return InvalidArgumentError("temperature must be in [0, 2], got ", value);
+    }
+
+    out->temperature = static_cast<float>(value);
+  }
+
+  if (const JsonValue* p = root.Find("top_p"); p != nullptr && !p->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, p->AsDouble());
+
+    if (value <= 0.0 || value > 1.0) {
+      return InvalidArgumentError("top_p must be in (0, 1], got ", value);
+    }
+
+    out->top_p = static_cast<float>(value);
+  }
+
+  if (const JsonValue* seed = root.Find("seed");
+      seed != nullptr && !seed->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t value, seed->AsInt());
+
+    out->seed = static_cast<uint64_t>(value);
+    out->has_seed = true;
+  }
+
   // `stop` is either a string or an array of them, and both forms are common
   // enough in the wild that accepting only one breaks real clients.
   if (const JsonValue* stop = root.Find("stop");
@@ -155,7 +184,8 @@ StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body) {
 
 std::string ChatCompletionJson(std::string_view id, std::string_view model,
                                std::string_view content, FinishReason reason,
-                               const Usage& usage, int64_t created) {
+                               const Usage& usage, int64_t created,
+                               bool sampled) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -163,7 +193,9 @@ std::string ChatCompletionJson(std::string_view id, std::string_view model,
   out += std::to_string(created);
   out += ',';
   AppendField("model", model, &out);
-  out += ",\"system_fingerprint\":\"greedy\",\"choices\":[{\"index\":0,"
+  out += ",\"system_fingerprint\":";
+  AppendJsonString(sampled ? "sampled" : "greedy", &out);
+  out += ",\"choices\":[{\"index\":0,"
          "\"message\":{\"role\":\"assistant\",\"content\":";
   AppendJsonString(content, &out);
   out += "},\"logprobs\":null,\"finish_reason\":";
@@ -183,7 +215,7 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
                                     std::string_view role,
                                     std::string_view content,
                                     const FinishReason* reason,
-                                    int64_t created) {
+                                    int64_t created, bool sampled) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -191,8 +223,9 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
   out += std::to_string(created);
   out += ',';
   AppendField("model", model, &out);
-  out += ",\"system_fingerprint\":\"greedy\",\"choices\":[{\"index\":0,"
-         "\"delta\":{";
+  out += ",\"system_fingerprint\":";
+  AppendJsonString(sampled ? "sampled" : "greedy", &out);
+  out += ",\"choices\":[{\"index\":0,\"delta\":{";
 
   bool first = true;
 
@@ -224,7 +257,7 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
 
 std::string CompletionJson(std::string_view id, std::string_view model,
                            std::string_view text, FinishReason reason,
-                           const Usage& usage, int64_t created) {
+                           const Usage& usage, int64_t created, bool sampled) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -232,6 +265,8 @@ std::string CompletionJson(std::string_view id, std::string_view model,
   out += std::to_string(created);
   out += ',';
   AppendField("model", model, &out);
+  out += ",\"system_fingerprint\":";
+  AppendJsonString(sampled ? "sampled" : "greedy", &out);
   out += ",\"choices\":[{\"index\":0,\"text\":";
   AppendJsonString(text, &out);
   out += ",\"logprobs\":null,\"finish_reason\":";
@@ -249,7 +284,8 @@ std::string CompletionJson(std::string_view id, std::string_view model,
 
 std::string CompletionChunkJson(std::string_view id, std::string_view model,
                                 std::string_view text,
-                                const FinishReason* reason, int64_t created) {
+                                const FinishReason* reason, int64_t created,
+                                bool sampled) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -257,6 +293,8 @@ std::string CompletionChunkJson(std::string_view id, std::string_view model,
   out += std::to_string(created);
   out += ',';
   AppendField("model", model, &out);
+  out += ",\"system_fingerprint\":";
+  AppendJsonString(sampled ? "sampled" : "greedy", &out);
   out += ",\"choices\":[{\"index\":0,\"text\":";
   AppendJsonString(text, &out);
   out += ",\"logprobs\":null,\"finish_reason\":";

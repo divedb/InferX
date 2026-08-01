@@ -172,6 +172,39 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
 Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
                     const TensorView& out, cudaStream_t stream = nullptr);
 
+/// \brief Temperature and nucleus (top-p) sampling, on the device.
+///
+/// The API accepts `temperature` and `top_p` and, until this existed, ignored
+/// them: a caller asking for 1.5 got greedy output and only a
+/// `system_fingerprint` of "greedy" hinted otherwise. This closes that gap.
+///
+/// One block per row, and deliberately no sort. Nucleus sampling is usually
+/// written as "sort descending, take the prefix summing to p", but a sort over
+/// a 151936-wide vocabulary per sequence per step is far more work than the
+/// step it decorates. The same *set* is found by binary-searching the
+/// probability cutoff: the nucleus is every token whose probability is at least
+/// the largest threshold whose tail mass still reaches `top_p`. Thirty-two
+/// bisection steps resolve that to well under bf16's precision, and each step
+/// is a block reduction over the row rather than a comparison-sort of it.
+///
+/// Determinism is by seed, not by luck. `seeds[i]` fully determines row i's
+/// draw, so a request that pins its seed reproduces exactly -- which is what
+/// makes a sampled server testable at all.
+///
+/// \param logits      `[rows, vocab]` bf16.
+/// \param rows        `[n]` int32, which logits rows to sample.
+/// \param temperature `[n]` float. Zero or below means greedy, which is not a
+///                    special case bolted on: it is the limit of the
+///                    distribution and callers pass it constantly.
+/// \param top_p       `[n]` float in (0, 1]. Values at or above 1 disable
+///                    truncation.
+/// \param seeds       `[n]` uint64, one per row.
+/// \param out         `[n]` int32, the sampled ids.
+Status SampleTokens(const TensorView& logits, const TensorView& rows,
+                    const TensorView& temperature, const TensorView& top_p,
+                    const TensorView& seeds, const TensorView& out,
+                    cudaStream_t stream = nullptr);
+
 /// \brief Copies `src[i]` into `dst[slot[i]]`, on the device.
 ///
 /// Places each sequence's freshly sampled token where the next step's

@@ -237,6 +237,9 @@ struct Qwen2Model::Impl {
   DeviceBuffer sampled_ids;      // [logits rows] int32, this step's tokens
   DeviceBuffer sample_slots;     // where each sampled token lands in token_ids
   DeviceBuffer sample_rows;      // which logits rows to sample
+  DeviceBuffer sample_temp;      // per-row temperature
+  DeviceBuffer sample_top_p;     // per-row nucleus threshold
+  DeviceBuffer sample_seeds;     // per-row RNG seed
   void* pinned_sampled = nullptr;  // host-visible copy, read one step late
   cudaEvent_t sampled_ready = nullptr;
   int64_t sampled_count = 0;
@@ -981,8 +984,25 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         TensorView::Create(sample_rows.data(), DataType::kInt32,
                            Shape({sampled_count}), DeviceId::Cuda(0)));
 
-    INFERX_RETURN_IF_ERROR(
-        kernels::ArgmaxSample(wanted, rows_in, ids_out, stream));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView temp_in,
+        TensorView::Create(sample_temp.data(), DataType::kFloat,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView top_p_in,
+        TensorView::Create(sample_top_p.data(), DataType::kFloat,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView seeds_in,
+        TensorView::Create(sample_seeds.data(), DataType::kUInt64,
+                           Shape({sampled_count}), DeviceId::Cuda(0)));
+
+    // One kernel for both modes rather than a branch between two. Greedy is
+    // temperature 0 inside SampleTokens, so a captured graph records the same
+    // node whether the batch is sampling or not -- a branch here would bake
+    // whichever mode happened to be live at capture.
+    INFERX_RETURN_IF_ERROR(kernels::SampleTokens(
+        wanted, rows_in, temp_in, top_p_in, seeds_in, ids_out, stream));
 
     INFERX_ASSIGN_OR_RETURN(
         const TensorView next_ids,
@@ -1559,6 +1579,18 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
       impl_->sample_rows,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
                              DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_temp,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(float),
+                             DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_top_p,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(float),
+                             DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_seeds,
+      DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(uint64_t),
+                             DeviceId::Cuda(0)));
 
   if (impl_->pinned_sampled != nullptr) cudaFreeHost(impl_->pinned_sampled);
   INFERX_CUDA_RETURN_IF_ERROR(
@@ -1615,6 +1647,29 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         impl_->sample_slots.data(), slots.data(),
         slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+
+    // Per-row sampling parameters. Absent means greedy, so a caller that never
+    // heard of sampling keeps the behaviour it had.
+    std::vector<float> temps(rows.size(), 0.0f);
+    std::vector<float> tops(rows.size(), 1.0f);
+    std::vector<uint64_t> seeds(rows.size(), 0);
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+      if (i < batch.temperature.size()) temps[i] = batch.temperature[i];
+      if (i < batch.top_p.size()) tops[i] = batch.top_p[i];
+      if (i < batch.seeds.size()) seeds[i] = batch.seeds[i];
+    }
+
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_temp.data(), temps.data(), temps.size() * sizeof(float),
+        cudaMemcpyHostToDevice, impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_top_p.data(), tops.data(), tops.size() * sizeof(float),
+        cudaMemcpyHostToDevice, impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_seeds.data(), seeds.data(),
+        seeds.size() * sizeof(uint64_t), cudaMemcpyHostToDevice,
         impl_->stream));
   }
 

@@ -150,9 +150,12 @@ class Engine {
   ///                    `max_seq_len`.
   /// \param max_tokens  Generation cap.
   /// \param stop        Text sequences that end the generation.
+  /// \param sampling  Temperature, nucleus threshold and seed. Defaults are
+  ///                  greedy, so callers predating sampling are unaffected.
   StatusOr<std::shared_ptr<Generation>> Submit(
       std::vector<int32_t> prompt, int32_t max_tokens,
-      std::vector<std::string> stop);
+      std::vector<std::string> stop,
+      scheduler::SamplingParams sampling = {});
 
   /// \brief The tokenizer, for callers that need to encode prompts.
   const tokenizer::Tokenizer& tokenizer() const;

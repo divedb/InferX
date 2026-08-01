@@ -501,7 +501,7 @@ inferx/
 | **M1** | ✅ **FP8 e4m3 W8A8 GEMM vs cuBLASLt FP16 baseline**, with `bench/` harness and CI. Delivered on cuBLASLt, *not* CUTLASS (§15 Q2) | R3 retired for FP8 — ~2× throughout, 6.2× where FP8 makes weights L2-resident (R3a), one shape slower (R3b) |
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
-| **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, and building it found the paged-attention bug R8 that every single-request test had missed |
+| **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
 | **M5** | Continuous batching, chunked prefill, radix prefix cache, preemption | Competitive throughput |
 | **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |

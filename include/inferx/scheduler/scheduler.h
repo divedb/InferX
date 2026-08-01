@@ -21,6 +21,17 @@ struct SamplingParams {
   int32_t max_tokens = 16;
   /// Any of these ends the sequence. Empty means only `max_tokens` stops it.
   std::vector<int32_t> stop_tokens;
+
+  /// Softmax temperature. Zero or below is greedy, which is the limit of the
+  /// distribution rather than a separate mode.
+  float temperature = 0.0f;
+
+  /// Nucleus threshold. At or above 1 disables truncation.
+  float top_p = 1.0f;
+
+  /// Fixes the draw. A request that pins its seed reproduces exactly, which is
+  /// what makes a sampled server debuggable.
+  uint64_t seed = 0;
 };
 
 enum class FinishReason {

@@ -5,6 +5,7 @@
 #include "inferx/kernels/layers.h"
 
 #include <cmath>
+#include <set>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -58,6 +59,49 @@ class Device {
                                 DeviceId::Cuda(0));
     EXPECT_TRUE(v.ok()) << v.status();
     return *v;
+  }
+
+  // Typed uploads for the sampler, whose inputs are not all bf16: per-row
+  // temperature and top_p are float, and seeds are 64-bit.
+  template <typename T>
+  TensorView Typed(const std::vector<T>& host, const Shape& shape,
+                   DataType dtype) {
+    auto buf = DeviceBuffer::Allocate(host.size() * sizeof(T),
+                                      DeviceId::Cuda(0));
+    EXPECT_TRUE(buf.ok()) << buf.status();
+    EXPECT_EQ(cudaMemcpy(buf->data(), host.data(), host.size() * sizeof(T),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
+    bufs_.push_back(*std::move(buf));
+    auto v = TensorView::Create(bufs_.back().data(), dtype, shape,
+                                DeviceId::Cuda(0));
+    EXPECT_TRUE(v.ok()) << v.status();
+    return *v;
+  }
+
+  TensorView I32(const std::vector<int32_t>& h, const Shape& s) {
+    return Typed(h, s, DataType::kInt32);
+  }
+  TensorView F32(const std::vector<float>& h, const Shape& s) {
+    return Typed(h, s, DataType::kFloat);
+  }
+  TensorView U64(const std::vector<uint64_t>& h, const Shape& s) {
+    return Typed(h, s, DataType::kUInt64);
+  }
+
+  TensorView EmptyI32(const Shape& shape) {
+    return Typed(std::vector<int32_t>(static_cast<size_t>(shape.Numel()), 0),
+                 shape, DataType::kInt32);
+  }
+
+  std::vector<int32_t> DownloadI32(const TensorView& t) {
+    std::vector<int32_t> out(static_cast<size_t>(t.Numel()));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(cudaMemcpy(out.data(), t.Data(), out.size() * sizeof(int32_t),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    return out;
   }
 
   TensorView Empty(const Shape& shape) {
@@ -365,4 +409,153 @@ TEST_F(LayersTest, ShapeMismatchesAreRejected) {
 }
 
 }  // namespace
+
+// Temperature and nucleus sampling.
+//
+// A sampler is the one kernel whose output is *supposed* to vary, which makes
+// it easy to ship broken -- "different every time" is both the correct
+// behaviour and the symptom of a bug. So every property here is one that must
+// hold despite the randomness: the greedy limit, reproducibility from a seed,
+// the nucleus actually truncating, and the empirical distribution matching the
+// softmax it claims to draw from.
+class SamplingTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+  }
+
+  // Draws `n` samples from one logits row, one per call, varying only the seed.
+  std::vector<int32_t> Draw(const std::vector<float>& row, float temperature,
+                            float top_p, int n, uint64_t seed0 = 1) {
+    Device d;
+    const int64_t vocab = static_cast<int64_t>(row.size());
+
+    std::vector<float> flat(row);
+    const TensorView logits = d.Upload(flat, Shape({1, vocab}));
+
+    std::vector<int32_t> rows(static_cast<size_t>(n), 0);
+    std::vector<float> temps(static_cast<size_t>(n), temperature);
+    std::vector<float> ps(static_cast<size_t>(n), top_p);
+    std::vector<uint64_t> seeds(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) seeds[static_cast<size_t>(i)] = seed0 + i;
+
+    const TensorView out = d.EmptyI32(Shape({n}));
+
+    EXPECT_TRUE(kernels::SampleTokens(
+                    logits, d.I32(rows, Shape({n})),
+                    d.F32(temps, Shape({n})), d.F32(ps, Shape({n})),
+                    d.U64(seeds, Shape({n})), out)
+                    .ok());
+
+    return d.DownloadI32(out);
+  }
+};
+
+TEST_F(SamplingTest, TemperatureZeroIsExactlyArgmax) {
+  // Greedy is the temperature -> 0 limit, and the path most requests take, so
+  // it has to be exact rather than merely likely.
+  std::vector<float> row(512, 0.0f);
+  for (size_t i = 0; i < row.size(); ++i) {
+    row[i] = std::sin(static_cast<float>(i) * 0.37f);
+  }
+  row[311] = 5.0f;  // a clear winner
+
+  for (const int32_t id : Draw(row, /*temperature=*/0.0f, /*top_p=*/1.0f, 8)) {
+    EXPECT_EQ(id, 311);
+  }
+}
+
+TEST_F(SamplingTest, SameSeedGivesSameToken) {
+  // Reproducibility is what makes a sampled server debuggable at all: a bug
+  // report with a seed has to be replayable.
+  std::vector<float> row(1024);
+  for (size_t i = 0; i < row.size(); ++i) {
+    row[i] = std::sin(static_cast<float>(i) * 0.11f) * 2.0f;
+  }
+
+  const std::vector<int32_t> a = Draw(row, 1.0f, 1.0f, 16, /*seed0=*/12345);
+  const std::vector<int32_t> b = Draw(row, 1.0f, 1.0f, 16, /*seed0=*/12345);
+
+  EXPECT_EQ(a, b);
+}
+
+TEST_F(SamplingTest, DifferentSeedsExploreTheDistribution) {
+  // The other half of the same property: a sampler that ignores its seed and
+  // returns the argmax would pass the test above and be useless.
+  std::vector<float> row(1024);
+  for (size_t i = 0; i < row.size(); ++i) {
+    row[i] = std::sin(static_cast<float>(i) * 0.11f) * 2.0f;
+  }
+
+  const std::vector<int32_t> draws = Draw(row, 1.0f, 1.0f, 64, /*seed0=*/900);
+  const std::set<int32_t> distinct(draws.begin(), draws.end());
+
+  EXPECT_GT(distinct.size(), 3u)
+      << "64 draws produced only " << distinct.size()
+      << " distinct tokens; the seed is not reaching the draw";
+}
+
+TEST_F(SamplingTest, NucleusExcludesTheTail) {
+  // A distribution with two dominant tokens holding ~99% of the mass. top_p
+  // 0.9 must never return anything else, however many times it is asked.
+  std::vector<float> row(4096, -8.0f);
+  row[7] = 4.0f;
+  row[9] = 4.0f;
+
+  for (const int32_t id : Draw(row, 1.0f, /*top_p=*/0.9f, 128)) {
+    EXPECT_TRUE(id == 7 || id == 9)
+        << "top_p 0.9 sampled token " << id << " from the tail";
+  }
+}
+
+TEST_F(SamplingTest, TopPOneKeepsTheWholeDistribution) {
+  // The complement: with truncation disabled, low-probability tokens must
+  // still be reachable, or top_p is silently always on.
+  std::vector<float> row(64, 0.0f);
+  row[0] = 1.0f;
+
+  const std::vector<int32_t> draws = Draw(row, 1.0f, 1.0f, 256, /*seed0=*/5);
+  const std::set<int32_t> distinct(draws.begin(), draws.end());
+
+  EXPECT_GT(distinct.size(), 20u)
+      << "a near-uniform 64-way distribution produced only " << distinct.size()
+      << " distinct tokens with top_p = 1";
+}
+
+TEST_F(SamplingTest, EmpiricalFrequenciesMatchTheSoftmax) {
+  // The property that says this is sampling rather than just varying: over
+  // many draws the frequencies must track the softmax it claims to draw from.
+  // Four tokens with known probabilities, and a tolerance derived from the
+  // binomial standard error rather than picked -- 4 sigma at n = 4000 is about
+  // 3 percentage points for p near 0.25.
+  constexpr int kDraws = 4000;
+
+  std::vector<float> row(4, 0.0f);
+  row[0] = std::log(4.0f);
+  row[1] = std::log(3.0f);
+  row[2] = std::log(2.0f);
+  row[3] = std::log(1.0f);
+
+  const std::vector<float> expected = {0.4f, 0.3f, 0.2f, 0.1f};
+
+  const std::vector<int32_t> draws = Draw(row, 1.0f, 1.0f, kDraws, 777);
+
+  std::vector<int> counts(4, 0);
+  for (const int32_t id : draws) {
+    ASSERT_GE(id, 0);
+    ASSERT_LT(id, 4);
+    ++counts[static_cast<size_t>(id)];
+  }
+
+  for (size_t i = 0; i < expected.size(); ++i) {
+    const double got = static_cast<double>(counts[i]) / kDraws;
+    const double se = std::sqrt(expected[i] * (1.0 - expected[i]) / kDraws);
+
+    std::fprintf(stderr, "  token %zu: expected %.3f got %.3f (4 sigma %.3f)\n",
+                 i, expected[i], got, 4.0 * se);
+
+    EXPECT_NEAR(got, expected[i], 4.0 * se);
+  }
+}
+
 }  // namespace inferx

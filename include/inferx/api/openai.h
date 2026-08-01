@@ -18,16 +18,29 @@ namespace inferx::api {
 
 /// \brief What a request asks the engine to generate.
 ///
-/// Only greedy decoding is implemented, so `temperature` and `top_p` are parsed
-/// and then ignored. That is a real limitation and it is recorded here rather
-/// than hidden: a caller asking for temperature 1.5 gets greedy output. The
-/// alternative -- rejecting every request that carries the field -- would fail
-/// essentially all clients, since most send OpenAI's default of 1.0 whether or
-/// not the user asked for it. Responses carry `system_fingerprint: "greedy"` so
-/// the behaviour is discoverable from the wire.
+/// Temperature and nucleus sampling are honoured. `temperature` 0 is greedy,
+/// and it is the default here rather than OpenAI's 1.0: a caller that does not
+/// mention sampling almost always wants reproducible output from an inference
+/// server, and defaulting to 1.0 would silently make every existing client
+/// non-deterministic. Responses report `system_fingerprint` as "greedy" or
+/// "sampled", so which path ran is visible on the wire.
 struct SamplingRequest {
   int32_t max_tokens = 128;
   bool stream = false;
+
+  /// Softmax temperature. OpenAI's default is 1.0 and most clients send it
+  /// whether or not the user asked, so this defaults to 0 -- greedy -- and is
+  /// only honoured when the request says so explicitly. That is the opposite
+  /// of ignoring it, which is what this layer used to do.
+  float temperature = 0.0f;
+
+  /// Nucleus threshold; at or above 1 disables truncation.
+  float top_p = 1.0f;
+
+  /// Fixes the draw so a request is reproducible. Absent means the server
+  /// picks one, which it also reports back.
+  uint64_t seed = 0;
+  bool has_seed = false;
 
   /// Text sequences that end the generation. Matched against decoded output,
   /// not against token ids -- a stop string need not be a token boundary, and
@@ -81,9 +94,12 @@ const char* FinishReasonName(FinishReason reason);
 /// \param id      Response id, echoed to the client.
 /// \param model   Model name to report.
 /// \param content The generated text.
+/// \param sampled Reported as `system_fingerprint`, so a client can tell
+///                whether its temperature was acted on.
 std::string ChatCompletionJson(std::string_view id, std::string_view model,
                                std::string_view content, FinishReason reason,
-                               const Usage& usage, int64_t created);
+                               const Usage& usage, int64_t created,
+                               bool sampled = false);
 
 /// \brief Builds one `chat.completion.chunk` for the streaming path.
 ///
@@ -96,17 +112,19 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
                                     std::string_view role,
                                     std::string_view content,
                                     const FinishReason* reason,
-                                    int64_t created);
+                                    int64_t created, bool sampled = false);
 
 /// \brief Builds a complete (non-streaming) text completion response.
 std::string CompletionJson(std::string_view id, std::string_view model,
                            std::string_view text, FinishReason reason,
-                           const Usage& usage, int64_t created);
+                           const Usage& usage, int64_t created,
+                           bool sampled = false);
 
 /// \brief Builds one `text_completion` chunk for the streaming path.
 std::string CompletionChunkJson(std::string_view id, std::string_view model,
                                 std::string_view text,
-                                const FinishReason* reason, int64_t created);
+                                const FinishReason* reason, int64_t created,
+                                bool sampled = false);
 
 /// \brief Builds a `GET /v1/models` listing with a single entry.
 std::string ModelsJson(std::string_view model, int64_t created);

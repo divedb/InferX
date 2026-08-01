@@ -531,7 +531,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
 
 StatusOr<std::shared_ptr<Generation>> Engine::Submit(
     std::vector<int32_t> prompt, int32_t max_tokens,
-    std::vector<std::string> stop) {
+    std::vector<std::string> stop, scheduler::SamplingParams sampling) {
   if (prompt.empty()) return InvalidArgumentError("prompt is empty");
 
   if (max_tokens <= 0) {
@@ -557,6 +557,7 @@ StatusOr<std::shared_ptr<Generation>> Engine::Submit(
 
   Impl::Pending pending;
   pending.prompt = std::move(prompt);
+  pending.params = std::move(sampling);
   pending.params.max_tokens = max_tokens;
   pending.params.stop_tokens = {impl_->tokenizer->eos_id()};
   pending.stop = std::move(stop);

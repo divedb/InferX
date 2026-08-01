@@ -1,5 +1,9 @@
 #include "inferx/kernels/layers.h"
 
+#include <curand_kernel.h>
+
+#include <utility>
+
 #include <algorithm>
 
 #include <cuda_bf16.h>
@@ -757,6 +761,193 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
   return OkStatus();
 }
 
+
+// Temperature + nucleus sampling for one row, in one block.
+//
+// Four block-wide passes over the row and no sort: max, then the partition
+// function, then a bisection on the probability cutoff that defines the
+// nucleus, then an inverse-CDF draw restricted to it. Each pass is a reduction,
+// so the cost is linear in the vocabulary rather than n log n.
+__global__ void SampleKernel(const bf16* __restrict__ logits,
+                             const int32_t* __restrict__ rows,
+                             const float* __restrict__ temperature,
+                             const float* __restrict__ top_p,
+                             const uint64_t* __restrict__ seeds,
+                             int32_t* __restrict__ out, int64_t vocab) {
+  __shared__ float shared[256];
+  __shared__ int shared_idx[256];
+  __shared__ float s_cut;
+  __shared__ float s_mass;
+
+  const int r = static_cast<int>(blockIdx.x);
+  const bf16* row = logits + static_cast<int64_t>(rows[r]) * vocab;
+
+  const float t = temperature[r];
+  const float p = top_p[r];
+
+  // Greedy is the temperature -> 0 limit, and the path most callers take.
+  if (!(t > 0.0f)) {
+    float best = -INFINITY;
+    int best_i = 0;
+
+    for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+      const float v = __bfloat162float(row[i]);
+      if (v > best) {
+        best = v;
+        best_i = static_cast<int>(i);
+      }
+    }
+
+    shared[threadIdx.x] = best;
+    shared_idx[threadIdx.x] = best_i;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride &&
+          shared[threadIdx.x + stride] > shared[threadIdx.x]) {
+        shared[threadIdx.x] = shared[threadIdx.x + stride];
+        shared_idx[threadIdx.x] = shared_idx[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) out[r] = shared_idx[0];
+    return;
+  }
+
+  const float inv_t = 1.0f / t;
+
+  // Pass 1: the maximum, so the exponentials below cannot overflow.
+  float local_max = -INFINITY;
+  for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    local_max = fmaxf(local_max, __bfloat162float(row[i]) * inv_t);
+  }
+
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x],
+                                  shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  const float max_logit = shared[0];
+  __syncthreads();
+
+  // Pass 2: the partition function.
+  float local_sum = 0.0f;
+  for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    local_sum += __expf(__bfloat162float(row[i]) * inv_t - max_logit);
+  }
+
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    __syncthreads();
+  }
+
+  const float total = shared[0];
+  __syncthreads();
+
+  // Pass 3: bisect the probability cutoff. The nucleus is every token whose
+  // normalized probability is at least `cut`, where `cut` is the largest
+  // threshold whose surviving mass still reaches p. Sorting would give the same
+  // set; this gets there with reductions instead.
+  if (threadIdx.x == 0) {
+    s_cut = 0.0f;
+    s_mass = 1.0f;
+  }
+  __syncthreads();
+
+  if (p < 1.0f) {
+    float lo = 0.0f;
+    float hi = 1.0f;
+
+    for (int step = 0; step < 32; ++step) {
+      const float mid = 0.5f * (lo + hi);
+
+      float mass = 0.0f;
+      for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+        const float prob =
+            __expf(__bfloat162float(row[i]) * inv_t - max_logit) / total;
+        if (prob >= mid) mass += prob;
+      }
+
+      shared[threadIdx.x] = mass;
+      __syncthreads();
+
+      for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+          shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+      }
+
+      // Raise the floor while the nucleus is still big enough to hold p.
+      if (shared[0] >= p) {
+        lo = mid;
+        if (threadIdx.x == 0) {
+          s_cut = mid;
+          s_mass = shared[0];
+        }
+      } else {
+        hi = mid;
+      }
+      __syncthreads();
+    }
+  }
+
+  const float cut = s_cut;
+  const float mass = s_mass;
+
+  // Pass 4: inverse CDF over the nucleus. Philox rather than a counter hashed
+  // by hand, so the stream is well-distributed and reproducible from the seed.
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seeds[r], 0, 0, &rng);
+  const float target = curand_uniform(&rng) * mass;
+
+  // Scanned by a single thread. The nucleus is small -- top_p of 0.9 is
+  // typically tens of tokens -- and a parallel scan over 151936 entries to
+  // find one crossing point would cost more than it saves.
+  if (threadIdx.x == 0) {
+    float running = 0.0f;
+    int chosen = -1;
+
+    for (int64_t i = 0; i < vocab; ++i) {
+      const float prob =
+          __expf(__bfloat162float(row[i]) * inv_t - max_logit) / total;
+
+      if (prob < cut) continue;
+
+      running += prob;
+      if (running >= target) {
+        chosen = static_cast<int>(i);
+        break;
+      }
+    }
+
+    // Rounding can leave `target` a hair above the accumulated mass; the last
+    // nucleus member is the right answer there, not a failure.
+    if (chosen < 0) {
+      for (int64_t i = vocab - 1; i >= 0; --i) {
+        const float prob =
+            __expf(__bfloat162float(row[i]) * inv_t - max_logit) / total;
+        if (prob >= cut) {
+          chosen = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+
+    out[r] = chosen < 0 ? 0 : chosen;
+  }
+}
+
 Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
                     const TensorView& out, cudaStream_t stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
@@ -776,6 +967,53 @@ Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
   ArgmaxKernel<<<static_cast<unsigned>(n), 256, 0, stream>>>(
       static_cast<const bf16*>(logits.Data()),
       static_cast<const int32_t*>(rows.Data()),
+      static_cast<int32_t*>(out.Data()), vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+
+Status SampleTokens(const TensorView& logits, const TensorView& rows,
+                    const TensorView& temperature, const TensorView& top_p,
+                    const TensorView& seeds, const TensorView& out,
+                    cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(temperature, DataType::kFloat, 1, "temperature"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(top_p, DataType::kFloat, 1, "top_p"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kInt32, 1, "out"));
+
+  const int64_t n = rows.Dim(0);
+  const int64_t vocab = logits.Dim(1);
+
+  for (const auto& [t, name] : {std::pair{temperature, "temperature"},
+                                std::pair{top_p, "top_p"}}) {
+    if (t.Dim(0) != n) {
+      return InvalidArgumentError(name, " has ", t.Dim(0), " entries but ", n,
+                                  " rows were requested");
+    }
+  }
+
+  if (seeds.Dim(0) != n) {
+    return InvalidArgumentError("seeds has ", seeds.Dim(0), " entries but ", n,
+                                " rows were requested");
+  }
+
+  if (out.Dim(0) != n) {
+    return InvalidArgumentError("out has ", out.Dim(0), " entries but ", n,
+                                " rows were requested");
+  }
+
+  if (n == 0) return OkStatus();
+
+  SampleKernel<<<static_cast<unsigned>(n), 256, 0, stream>>>(
+      static_cast<const bf16*>(logits.Data()),
+      static_cast<const int32_t*>(rows.Data()),
+      static_cast<const float*>(temperature.Data()),
+      static_cast<const float*>(top_p.Data()),
+      static_cast<const uint64_t*>(seeds.Data()),
       static_cast<int32_t*>(out.Data()), vocab);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());

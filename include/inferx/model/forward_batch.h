@@ -50,6 +50,20 @@ struct ForwardBatch {
   /// `[tokens, 151936]` GEMM to throw nearly all of it away.
   std::vector<int32_t> logits_indices;
 
+  /// Per-logits-row sampling parameters, parallel to `logits_indices`.
+  ///
+  /// They ride on the batch rather than being configured on the model because
+  /// they are per *request*: one sequence in a step may be greedy while another
+  /// samples at 0.8. A model-wide setting could not express that, and the
+  /// scheduler is the only component that knows which request each row belongs
+  /// to.
+  ///
+  /// Empty means greedy for every row, which is what every caller predating
+  /// sampling gets without changing.
+  std::vector<float> temperature;
+  std::vector<float> top_p;
+  std::vector<uint64_t> seeds;
+
   int64_t num_tokens() const {
     return static_cast<int64_t>(token_ids.size());
   }

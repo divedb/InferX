@@ -277,6 +277,18 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
     // are prompt, and their predictions are discarded.
     out_batch->logits_indices.push_back(
         static_cast<int32_t>(out_batch->token_ids.size() - 1));
+
+    // Parallel to logits_indices, so the executor never has to ask which
+    // request a row belongs to -- it just reads the row's parameters.
+    out_batch->temperature.push_back(seq.params.temperature);
+    out_batch->top_p.push_back(seq.params.top_p);
+
+    // Mixed into the position so a request's successive tokens draw
+    // differently while staying reproducible from its seed alone.
+    out_batch->seeds.push_back(seq.params.seed ^
+                               (0x9e3779b97f4a7c15ULL *
+                                static_cast<uint64_t>(seq.tokens.size())));
+
     impl_->batch_seq_index.push_back(static_cast<int64_t>(s));
   }
 
