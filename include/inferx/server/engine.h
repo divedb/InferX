@@ -175,6 +175,14 @@ class Engine {
     /// for `max_running`, not that anything is broken -- but every one of them
     /// is a prefill paid for twice.
     int64_t preemptions = 0;
+    /// Blocks the §6.3 prefix cache is holding. Reclaimable, so this being
+    /// large is the cache working rather than memory pressure.
+    int64_t cached_blocks = 0;
+    /// Prompt tokens served from the cache, and tokens that had to be
+    /// computed. Their ratio is the hit rate, and it is the number that says
+    /// whether prefix caching is earning its complexity on this workload.
+    int64_t prefix_hit_tokens = 0;
+    int64_t prefix_miss_tokens = 0;
   };
 
   Stats stats() const;

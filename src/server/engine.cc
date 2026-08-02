@@ -410,6 +410,9 @@ struct Engine::Impl {
         stats.waiting = scheduler.num_waiting();
         stats.blocks_in_use = scheduler.blocks_in_use();
         stats.preemptions = scheduler.preemptions();
+        stats.cached_blocks = scheduler.cached_blocks();
+        stats.prefix_hit_tokens = scheduler.prefix_hit_tokens();
+        stats.prefix_miss_tokens = scheduler.prefix_miss_tokens();
       }
     }
 

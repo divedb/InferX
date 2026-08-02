@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
@@ -241,8 +242,8 @@ TEST_F(ServerTest, CancellingStopsGenerationEarly) {
 }
 
 TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
-  // Sampling is greedy, so the same prompt must produce the same tokens every
-  // time -- a request's output must not depend on what ran before it.
+  // Sampling is greedy, so repeating a prompt must repeat its tokens -- a
+  // request's output must not depend on what ran before it.
   //
   // This was R8. Consecutive requests alternated between two continuations
   // because `PrepareStep` copied a sequence's block-table row before `Reserve`
@@ -255,6 +256,21 @@ TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
   // now covered host-side by SchedulerTest.EveryBatchSlotIsCoveredByTheBatch-
   // BlockTable: this is the property a user actually cares about, and it is
   // worth asserting where they would notice it breaking.
+  //
+  // **The first response is excluded, and that is a real concession.** With
+  // prefix caching on (§6.3), the first request computes its prompt and every
+  // request after it reads that prompt's KV instead, forwarding only the last
+  // block. Fewer rows means cuBLASLt may pick a different algorithm, bf16
+  // reductions do not commute, and the logits land a fraction apart -- enough
+  // to flip a genuinely close call. On this prompt it does: cold answers
+  // "Green", warm answers "Yellow", every time.
+  //
+  // So a cache hit can change a greedy answer. That is a property of prefix
+  // caching rather than a defect in this one, and every engine that does it has
+  // it; `enable_prefix_cache = false` buys the stronger guarantee back. What
+  // must still hold, and what this asserts, is that the answer is stable for a
+  // given cache state -- which is what R8 violated, since alternation between
+  // consecutive warm requests would fail here exactly as it did before.
   const char* body =
       R"({"messages":[{"role":"user","content":"Name three colours."}],)"
       R"("max_tokens":32})";
@@ -263,7 +279,7 @@ TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
 
   std::vector<std::string> answers;
 
-  for (int attempt = 0; attempt < 4; ++attempt) {
+  for (int attempt = 0; attempt < 6; ++attempt) {
     const httplib::Result response =
         client.Post("/v1/chat/completions", body, "application/json");
 
@@ -280,10 +296,15 @@ TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
     answers.emplace_back(*content);
   }
 
-  for (size_t i = 1; i < answers.size(); ++i) {
-    EXPECT_EQ(answers[i], answers[0])
+  ASSERT_GE(answers.size(), 3u);
+
+  // answers[0] warmed the cache. Everything from answers[1] on sees the same
+  // cached prefix as everything else, so they must agree exactly.
+  for (size_t i = 2; i < answers.size(); ++i) {
+    EXPECT_EQ(answers[i], answers[1])
         << "greedy decoding returned a different answer on attempt " << i
-        << ";\n  first: " << answers[0] << "\n  this : " << answers[i];
+        << " with the cache in the same state;\n  first warm: " << answers[1]
+        << "\n  this      : " << answers[i];
   }
 }
 
@@ -375,6 +396,14 @@ TEST_F(ServerTest, StreamingDeltasConcatenateToTheBlockingAnswer) {
   constexpr const char* kBody =
       R"({"messages":[{"role":"user","content":"Name three colours."}],)"
       R"("max_tokens":32})";
+
+  // Warm the prefix cache before comparing anything. Without this the blocking
+  // request below computes its prompt and the streaming one reads the KV that
+  // request left behind, so the two are being asked to agree across a change
+  // in how the arithmetic is arranged rather than across a change of endpoint
+  // -- and on a close call they do not (§6.3). Each test case runs in its own
+  // process here, so the cache really does start empty every time.
+  (void)client.Post("/v1/chat/completions", kBody, "application/json");
 
   const httplib::Result blocking =
       client.Post("/v1/chat/completions", kBody, "application/json");

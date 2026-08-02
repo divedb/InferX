@@ -245,6 +245,19 @@ Chosen over vLLM-style block-hashing because the shared-prefix workloads we care
 
 Eviction: LRU over refcount-zero leaf nodes, triggered on allocation failure. Because the scheduler is the only mutator, eviction is a synchronous tree walk with no coordination.
 
+**Delivered.** `PrefixCache` in `src/scheduler/`, on by default, matched at admission (§4 step 4) and offered back when a sequence retires *or is preempted*. Four things the section did not settle:
+
+- **Complete blocks only.** A block still being written cannot be shared, so every run in the tree is a whole number of blocks and a sequence's partial tail is never offered. That is also what makes sharing safe without copy-on-write: a request that matches reads those blocks and writes only from the match onward, which is a block boundary by construction. The other half of the safety argument is that a key depends on the whole prefix — which is exactly what the path through the tree encodes.
+- **A match is always one token short of the sequence.** A request whose every token is cached would have nothing to forward and so no logits to sample its first token from.
+- **Eviction trims from the tail of a node rather than dropping it whole.** The end of a prefix is the least useful part of it, and what is left after trimming is still a prefix somebody can match. Evicting whole nodes made a preemption reclaim its own donation immediately, which took the hit rate under exactly the pressure the cache exists for to zero.
+- **Preemption donates rather than discards** (§8.2, T7). A preempted sequence's history goes into the tree, where it stays evictable but matchable, so re-admission is usually a lookup instead of the second prefill recompute budgets for. This is the point at which T7's choice of recompute over swapping actually pays.
+
+#### It costs bitwise determinism, and that is not free
+
+A cache hit changes what the model computes *with*, not just how fast. A warm request forwards only its unmatched tail, so cuBLASLt may pick a different algorithm for the shorter GEMM, and bf16 reductions do not commute. Measured on a partial match: `max|diff|` of 0.223 over a logit range of 21.5, the same ~1% as chunked prefill's rearrangement.
+
+Usually invisible. On a close call it is not: `ServerTest.IdenticalRequestsProduceIdenticalOutput` asks for three colours and gets "Green" cold, "Yellow" warm, stably and forever after. **So greedy output can depend on cache state, which depends on other traffic.** Every engine with prefix caching has this; it is worth stating plainly rather than discovering. The answer remains stable for a given cache state — that weaker property is what the test now asserts, and it is still enough to catch R8, whose symptom was alternation between consecutive requests. `SchedulerConfig::enable_prefix_cache = false` buys the stronger guarantee back at the cost of the throughput.
+
 ### 6.4 KV quantization
 
 FP8 (e4m3) KV cache is a **v1 feature, not a stretch goal**, because 16 GB forces it. Per-block scale factors, dequant fused into the attention kernel's K/V load. Doubles effective context capacity for ~0.1% accuracy cost on most models.
@@ -445,10 +458,10 @@ Each entry is a decision we should be able to revisit deliberately.
 | T1 | Torch-free | libtorch | Binary size, control of the decode loop, no allocator/stream conflicts. Costs ~3-4 wks on quantized GEMM + loading. | Never for the core; offline tooling may use it |
 | T2 | One process, thread-per-rank | Process-per-rank | No GIL ⇒ no reason to pay IPC. Zero-copy BatchPlan sharing. Risk: one rank crash kills all. | If per-rank fault isolation becomes a production requirement |
 | T3 | Single-writer scheduler | Sharded/locked scheduler | Lock-free by topology beats lock-free by atomics for thousands of small mutations per step | If one core cannot keep up at batch > 512 |
-| T4 | Radix-tree prefix cache | Block-hash (vLLM) | Token-granular longest-match, no per-block hashing. More complex; safe because single-writer. | If tree walk shows in profiles |
+| T4 | Radix-tree prefix cache | Block-hash (vLLM) | Token-granular longest-match, no per-block hashing. More complex; safe because single-writer. **Built (§6.3).** Eviction is a linear walk over leaves, which is fine while the tree has one node per distinct prefix rather than one per block | If tree walk shows in profiles |
 | T5 | Chunked prefill, decode-priority | Prefill-priority / separate phases | Bounds p99 TBT by construction (G2). Costs some prefill throughput. | With 2+ GPUs, evaluate disaggregated P/D |
 | T6 | Overlap depth 1 | Synchronous stepping | Hides all CPU work behind GPU. Costs < 1% wasted steps on finished seqs. | Depth 0 stays as the correctness reference |
-| T7 | Recompute preemption | Swap to host | Prefix cache makes re-admission cheap; no PCIe contention | Long-context workloads where recompute dominates |
+| T7 | Recompute preemption | Swap to host | Prefix cache makes re-admission cheap; no PCIe contention. **Collectable since §6.3 landed** — a preempted sequence donates its history to the tree, so coming back is usually a match rather than a second prefill | Long-context workloads where recompute dominates |
 | T8 | Rank-0 sampling | All-rank sampling w/ shared seed | Determinism, simpler RNG. Costs a logits all-gather. | If the gather appears in profiles |
 | T9 | No spec-decode in v1, but interfaces admit it | Assume 1 token/seq/step | Retrofitting variable tokens-per-step into the scheduler and KV allocator is a rewrite; admitting it costs a bound parameter | v1.1 |
 | T10 | Block size 16 | 32 or 64 | Less internal fragmentation, finer prefix sharing; larger block tables and slightly worse kernel efficiency | Benchmark once attention is real |
@@ -529,7 +542,7 @@ inferx/
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
-| **M5** | 🚧 **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2). Radix prefix cache still open | Competitive throughput |
+| **M5** | ✅ **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2); **radix prefix cache** (§6.3), which costs bitwise determinism across cache states | Competitive throughput |
 | **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |

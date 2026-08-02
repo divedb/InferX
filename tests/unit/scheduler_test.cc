@@ -44,6 +44,19 @@ SamplingParams Params(int32_t max_tokens,
   return p;
 }
 
+/// Nothing was lost: every block is free, or held by the prefix cache, and
+/// none is still claimed by a sequence.
+///
+/// The plain `free_blocks() == num_blocks()` this replaces stopped being true
+/// once §6.3 landed, and rightly so -- a finished sequence's complete blocks go
+/// into the radix tree rather than back to the free list. They are still
+/// reclaimable, which is what `blocks_in_use()` reporting zero means.
+void ExpectNothingLeaked(const KvBlockPool& pool, const Scheduler& sched) {
+  EXPECT_EQ(sched.blocks_in_use(), 0) << "a finished sequence kept its blocks";
+  EXPECT_EQ(pool.free_blocks() + sched.cached_blocks(), pool.num_blocks())
+      << "blocks belong to neither a sequence, the cache, nor the free list";
+}
+
 class SchedulerTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -360,9 +373,13 @@ TEST_F(SchedulerTest, ExhaustionDefersAdmissionRatherThanLeaking) {
   EXPECT_EQ(sched.num_waiting(), 1) << "the second request should still queue";
   EXPECT_EQ(pool.free_blocks(), 0);
 
-  // Finish the first; its blocks come back and the second is admitted.
+  // Finish the first; its blocks come back and the second is admitted. They
+  // come back into the prefix cache rather than onto the free list (§6.3),
+  // which is why this asks whether a sequence still holds them rather than
+  // whether they are free -- admission evicts to get at them.
   ASSERT_TRUE(sched.CommitStep({9}).ok());
-  EXPECT_EQ(pool.free_blocks(), 2) << "blocks leaked on the deferred admission";
+  EXPECT_EQ(sched.blocks_in_use(), 0)
+      << "blocks leaked on the deferred admission";
 
   ASSERT_TRUE(sched.PrepareStep(&batch).ok());
   EXPECT_EQ(sched.num_running(), 1);
@@ -607,7 +624,7 @@ TEST_F(SchedulerTest, ChunkedPromptsDrainToCompletion) {
         << "request " << c.id << " generated the wrong number of tokens";
   }
 
-  EXPECT_EQ(pool_->free_blocks(), pool_->num_blocks()) << "blocks leaked";
+  ExpectNothingLeaked(*pool_, *sched);
 }
 
 // Every sequence in the batch has a declared length, including one the budget
@@ -753,7 +770,7 @@ TEST_F(SchedulerTest, APreemptedSequenceProducesWhatItWouldHaveAnyway) {
     preempted = DrainDeterministically(sched.get());
     preemptions = sched->preemptions();
 
-    EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+    ExpectNothingLeaked(*owned, *sched);
   }
 
   ASSERT_GT(preemptions, 0)
@@ -811,7 +828,7 @@ TEST_F(SchedulerTest, ExhaustionPreemptsInsteadOfFailingTheStep) {
   }
 
   EXPECT_GT(sched->preemptions(), 0) << "nothing was ever preempted";
-  EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+  ExpectNothingLeaked(*owned, *sched);
 }
 
 // A preempted sequence goes to the *head* of the queue, not the back. It was
@@ -859,7 +876,7 @@ TEST_F(SchedulerTest, APreemptedSequenceGoesToTheFrontOfTheQueue) {
   }
 
   EXPECT_TRUE(saw_99) << "the newcomer never ran";
-  EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+  ExpectNothingLeaked(*owned, *sched);
 }
 
 // Filling max_seq_len is not a shortage and preemption cannot help: the limit
@@ -923,7 +940,7 @@ TEST_F(SchedulerTest, FillingTheContextRetiresOnlyThatSequence) {
 
   // No preemption happened: a full context is not a shortage.
   EXPECT_EQ(sched.preemptions(), 0);
-  EXPECT_EQ(owned->free_blocks(), owned->num_blocks());
+  ExpectNothingLeaked(*owned, sched);
 }
 
 // The one case with nothing to preempt: a single sequence that has drained the
@@ -948,7 +965,271 @@ TEST_F(SchedulerTest, TheLastSequenceStandingRetiresRatherThanSpinning) {
   EXPECT_EQ(done[0].output_tokens.size(), 11u);
 
   EXPECT_EQ(sched->preemptions(), 0) << "there was nobody to preempt";
-  EXPECT_EQ(owned->free_blocks(), owned->num_blocks());
+  ExpectNothingLeaked(*owned, *sched);
+}
+
+// ---------------------------------------------------------------------------
+// Prefix caching (§6.3), where the scheduler meets the tree.
+// ---------------------------------------------------------------------------
+
+/// Drives a workload and reports both what came out and how much forward work
+/// it took. Tokens forwarded is the number prefix caching is supposed to move.
+struct Workload {
+  std::vector<Completion> completions;
+  int64_t tokens_forwarded = 0;
+  int64_t steps = 0;
+};
+
+Workload RunWorkload(Scheduler* sched, int max_steps = 2000) {
+  Workload out;
+
+  for (int step = 0; step < max_steps && sched->HasWork(); ++step) {
+    ForwardBatch batch;
+    if (!sched->PrepareStep(&batch).ok()) break;
+
+    if (batch.num_tokens() > 0) {
+      ++out.steps;
+      out.tokens_forwarded += batch.num_tokens();
+
+      std::vector<int32_t> sampled;
+      for (const int32_t row : batch.logits_indices) {
+        // A function of the sequence's own position, so the "same input gives
+        // the same output" comparison below means something.
+        sampled.push_back(200 + (batch.positions[static_cast<size_t>(row)] * 3) % 40);
+      }
+
+      if (!sched->CommitStep(sampled).ok()) break;
+    }
+
+    for (Completion& c : sched->TakeCompleted()) {
+      out.completions.push_back(std::move(c));
+    }
+  }
+
+  for (Completion& c : sched->TakeCompleted()) {
+    out.completions.push_back(std::move(c));
+  }
+
+  return out;
+}
+
+// The point of §6.3: the second request for a prompt does not recompute the
+// part of it the first already did.
+TEST_F(SchedulerTest, ASecondRequestSkipsThePrefixItWouldHaveRecomputed) {
+  // 16 tokens is 4 blocks at this block size.
+  std::vector<int32_t> prompt(16);
+  for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<int32_t>(i);
+
+  ASSERT_TRUE(sched_->AddRequest(1, prompt, Params(2)).ok());
+  const Workload cold = RunWorkload(sched_.get());
+  ASSERT_EQ(cold.completions.size(), 1u);
+
+  EXPECT_EQ(sched_->prefix_hit_tokens(), 0) << "nothing was cached yet";
+  EXPECT_GT(sched_->cached_blocks(), 0) << "the prompt was not offered";
+
+  ASSERT_TRUE(sched_->AddRequest(2, prompt, Params(2)).ok());
+  const Workload warm = RunWorkload(sched_.get());
+  ASSERT_EQ(warm.completions.size(), 1u);
+
+  // A whole prompt costs 16 forwarded tokens plus its generation; a warm one
+  // starts 12 tokens in, the last block being left to compute.
+  EXPECT_LT(warm.tokens_forwarded, cold.tokens_forwarded);
+  EXPECT_EQ(cold.tokens_forwarded - warm.tokens_forwarded, 12);
+  EXPECT_EQ(sched_->prefix_hit_tokens(), 12);
+
+  // And the tokens are the same ones, which is the part that has to be true
+  // for any of this to be allowed.
+  EXPECT_EQ(warm.completions[0].output_tokens,
+            cold.completions[0].output_tokens);
+}
+
+// The property the whole feature has to clear: caching is invisible in the
+// output. A shared prefix is only reusable because a key depends on the tokens
+// before it, and the path through the tree is exactly those tokens -- get that
+// wrong and a request silently reads someone else's history.
+TEST_F(SchedulerTest, TheCacheDoesNotChangeWhatIsGenerated) {
+  // Overlapping prompts: shared heads, divergent tails, some repeated exactly.
+  const auto build = [](int32_t family, int32_t tail) {
+    std::vector<int32_t> p;
+    for (int32_t i = 0; i < 12; ++i) p.push_back(family * 10 + i);
+    for (int32_t i = 0; i < 6; ++i) p.push_back(tail * 100 + i);
+    return p;
+  };
+
+  const auto run = [&](bool enable_cache) {
+    auto pool = HostPool(128);
+    EXPECT_TRUE(pool.ok());
+    auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+    SchedulerConfig config;
+    config.max_running = 3;
+    config.max_batch_tokens = 64;
+    config.max_seq_len = 64;
+    config.enable_prefix_cache = enable_cache;
+
+    auto created = Scheduler::Create(config, owned.get());
+    EXPECT_TRUE(created.ok());
+    auto sched = std::make_unique<Scheduler>(*std::move(created));
+
+    std::vector<Completion> all;
+    RequestId id = 1;
+
+    // Submitted in waves, so later waves meet a populated cache.
+    for (int wave = 0; wave < 3; ++wave) {
+      for (int32_t family = 0; family < 2; ++family) {
+        for (int32_t tail = 0; tail < 2; ++tail) {
+          EXPECT_TRUE(
+              sched->AddRequest(id++, build(family, tail), Params(4)).ok());
+        }
+      }
+
+      Workload w = RunWorkload(sched.get());
+      for (Completion& c : w.completions) all.push_back(std::move(c));
+    }
+
+    ExpectNothingLeaked(*owned, *sched);
+
+    std::sort(all.begin(), all.end(),
+              [](const Completion& a, const Completion& b) {
+                return a.id < b.id;
+              });
+    return all;
+  };
+
+  const std::vector<Completion> without = run(/*enable_cache=*/false);
+  const std::vector<Completion> with = run(/*enable_cache=*/true);
+
+  ASSERT_EQ(with.size(), without.size());
+  ASSERT_EQ(with.size(), 12u);
+
+  for (size_t i = 0; i < with.size(); ++i) {
+    EXPECT_EQ(with[i].id, without[i].id);
+    EXPECT_EQ(with[i].reason, without[i].reason) << "request " << with[i].id;
+    EXPECT_EQ(with[i].output_tokens, without[i].output_tokens)
+        << "request " << with[i].id << " changed when the cache was enabled";
+  }
+}
+
+// §8.2's bet, now collectable. A preempted sequence's history goes into the
+// tree rather than being discarded, so when it is re-admitted it matches its
+// own prefix and the recompute preemption budgets for does not happen.
+//
+// This is what T7 chose recompute over swapping for, and until §6.3 landed it
+// was an argument rather than a behaviour.
+TEST_F(SchedulerTest, APreemptedSequenceGetsItsOwnHistoryBackFromTheCache) {
+  auto pool = HostPool(/*blocks=*/10);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  SchedulerConfig config;
+  config.max_running = 3;
+  config.max_batch_tokens = 64;
+  config.max_seq_len = 64;
+
+  auto created = Scheduler::Create(config, owned.get());
+  ASSERT_TRUE(created.ok());
+  auto sched = std::make_unique<Scheduler>(*std::move(created));
+
+  // Long-ish prompts against a pool that cannot hold all three growing.
+  for (int i = 0; i < 3; ++i) {
+    std::vector<int32_t> prompt(12);
+    for (size_t k = 0; k < prompt.size(); ++k) {
+      prompt[k] = static_cast<int32_t>(i * 100 + k);
+    }
+    ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompt,
+                                  Params(12))
+                    .ok());
+  }
+
+  const Workload w = RunWorkload(sched.get());
+
+  ASSERT_EQ(w.completions.size(), 3u);
+  ASSERT_GT(sched->preemptions(), 0) << "nothing was preempted";
+
+  // The re-admitted sequences found their own prefixes waiting. Without the
+  // cache every preemption would be a prompt prefilled from scratch again.
+  EXPECT_GT(sched->prefix_hit_tokens(), 0)
+      << "a preempted sequence recomputed what it had already computed";
+
+  ExpectNothingLeaked(*owned, *sched);
+}
+
+// The cache must not make the engine worse at running out of memory. Cached
+// blocks are reclaimable, so a pool that looks full because of them still
+// admits work rather than stalling.
+TEST_F(SchedulerTest, ACacheFullOfBlocksStillYieldsToARunningRequest) {
+  auto pool = HostPool(/*blocks=*/4);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  SchedulerConfig config;
+  config.max_running = 2;
+  config.max_batch_tokens = 64;
+  config.max_seq_len = 64;
+
+  auto created = Scheduler::Create(config, owned.get());
+  ASSERT_TRUE(created.ok());
+  auto sched = std::make_unique<Scheduler>(*std::move(created));
+
+  // Fill the cache with a prompt nobody will ask for again.
+  ASSERT_TRUE(sched->AddRequest(1, {9, 9, 9, 9, 9, 9, 9, 9}, Params(1)).ok());
+  ASSERT_EQ(RunWorkload(sched.get()).completions.size(), 1u);
+
+  ASSERT_GT(sched->cached_blocks(), 0);
+  ASSERT_EQ(owned->free_blocks(), owned->num_blocks() - sched->cached_blocks());
+
+  // An unrelated request now needs that memory. The allocator evicts to get it
+  // rather than reporting the pool full.
+  ASSERT_TRUE(sched->AddRequest(2, {1, 2, 3, 4, 5, 6, 7, 8}, Params(4)).ok());
+
+  const Workload w = RunWorkload(sched.get());
+
+  ASSERT_EQ(w.completions.size(), 1u);
+  EXPECT_EQ(w.completions[0].reason, FinishReason::kMaxTokens)
+      << "the cache starved a request that should have evicted it";
+  EXPECT_EQ(w.completions[0].output_tokens.size(), 4u);
+}
+
+// Once the scheduler is gone, so is every claim on the pool -- including the
+// cache's. Checked after destruction rather than during, because that is the
+// only point at which the answer is unambiguously "all of them": while the
+// scheduler lives, blocks legitimately sit in the radix tree.
+TEST_F(SchedulerTest, DestroyingAPressuredSchedulerReturnsEveryBlock) {
+  auto pool = HostPool(/*blocks=*/16, /*block_size=*/16);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  {
+    SchedulerConfig config;
+    config.max_running = 4;
+    config.max_batch_tokens = 256;
+    config.max_seq_len = 512;
+
+    auto created = Scheduler::Create(config, owned.get());
+    ASSERT_TRUE(created.ok());
+    Scheduler sched = *std::move(created);
+
+    // Four copies of one prompt against a pool that cannot hold them growing,
+    // so the run preempts, evicts, and matches all at once.
+    std::vector<int32_t> prompt(40);
+    for (size_t i = 0; i < prompt.size(); ++i) {
+      prompt[i] = static_cast<int32_t>(i % 4);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+      ASSERT_TRUE(
+          sched.AddRequest(static_cast<RequestId>(i + 1), prompt, Params(48))
+              .ok());
+    }
+
+    const Workload w = RunWorkload(&sched);
+
+    EXPECT_EQ(w.completions.size(), 4u) << "a request was lost";
+    EXPECT_GT(sched.preemptions(), 0) << "the pool was not tight enough";
+  }
+
+  EXPECT_EQ(owned->free_blocks(), owned->num_blocks())
+      << "the scheduler and its cache did not give everything back";
 }
 
 // A scheduler destroyed with requests still in flight gives their blocks back.
@@ -1042,8 +1323,7 @@ TEST_F(SchedulerTest, DrainsAMixedWorkloadToCompletion) {
     EXPECT_FALSE(c.output_tokens.empty()) << "request " << c.id;
   }
 
-  EXPECT_EQ(sched_->blocks_in_use(), 0) << "blocks leaked across the workload";
-  EXPECT_EQ(pool_->free_blocks(), pool_->num_blocks());
+  ExpectNothingLeaked(*pool_, *sched_);
 }
 
 }  // namespace

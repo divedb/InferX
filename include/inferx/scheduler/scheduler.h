@@ -96,6 +96,17 @@ struct SchedulerConfig {
   int64_t max_batch_tokens = 2048;
   /// Longest sequence, prompt plus generation. Bounds `max_blocks_per_seq`.
   int64_t max_seq_len = 2048;
+
+  /// Reuse the KV of prompt prefixes across requests (§6.3).
+  ///
+  /// On by default because the workloads that motivate the whole design --
+  /// a shared system prompt, few-shot examples, multi-turn chat -- are exactly
+  /// the ones it serves, and because it is what makes §8.2's preemption cheap:
+  /// a preempted sequence's history stays in the tree, so coming back is a
+  /// lookup rather than a second prefill.
+  ///
+  /// Off is a diagnostic setting. It costs nothing but the throughput.
+  bool enable_prefix_cache = true;
 };
 
 /// \brief FCFS request scheduling over a paged KV cache. Single-threaded.
@@ -179,8 +190,21 @@ class Scheduler {
   int64_t num_running() const;
   int64_t num_waiting() const;
 
-  /// \brief Blocks currently held by running sequences.
+  /// \brief Blocks owned outright by running sequences.
+  ///
+  /// Excludes the prefix cache's, which are owned by the tree rather than by
+  /// any sequence and are reclaimable on demand. This going to zero when
+  /// everything has finished is the no-leak invariant; the cache's own blocks
+  /// are accounted for separately by `cached_blocks`.
   int64_t blocks_in_use() const;
+
+  /// \brief Blocks the prefix cache is holding (§6.3).
+  int64_t cached_blocks() const;
+
+  /// Prompt tokens the cache supplied, and tokens that had to be computed. The
+  /// ratio is what says whether prefix caching is paying for itself here.
+  int64_t prefix_hit_tokens() const;
+  int64_t prefix_miss_tokens() const;
 
   /// \brief How many times a sequence has been sent back to the queue to free
   ///        KV for another (§8.2). Cumulative over the scheduler's life.

@@ -4,12 +4,12 @@ A high-performance LLM inference server in C++20, aiming at throughput and
 latency comparable to vLLM and SGLang — without Python or libtorch in the
 serving path.
 
-**Status: M4 done, M5 in progress.** `inferx-serve` answers OpenAI-compatible
-completions over HTTP with SSE streaming, running Qwen2.5-3B-Instruct on a
-paged KV cache with FlashInfer attention, CUDA graphs, and on-device
-temperature/top-p sampling — at 89.7 tok/s bf16 and 118.4 tok/s FP8, batch 1.
-What is missing is the throughput work: chunked prefill, a prefix cache, and
-preemption.
+**Status: M5 done.** `inferx-serve` answers OpenAI-compatible completions over
+HTTP with SSE streaming, running Qwen2.5-3B-Instruct on a paged KV cache with
+FlashInfer attention, CUDA graphs, and on-device temperature/top-p sampling —
+at 89.7 tok/s bf16 and 118.4 tok/s FP8, batch 1. The scheduler does continuous
+batching with chunked prefill, recompute preemption, and a radix prefix cache.
+Next is getting the CPU off the critical path (M6).
 
 ## Why another engine
 
@@ -63,8 +63,8 @@ conventions, and troubleshooting.
 | M2 | Safetensors loader + Llama forward pass | **done** |
 | M3 | Paged KV + FlashInfer attention + naive scheduler | **done** |
 | M4 | HTTP server, tokenizer, OpenAI-compatible streaming | **done** |
-| M5 | Continuous batching, chunked prefill, prefix cache, preemption | next |
-| M6 | Overlap pipeline + CUDA graphs for decode | |
+| M5 | Continuous batching, chunked prefill, prefix cache, preemption | **done** |
+| M6 | Overlap pipeline + CUDA graphs for decode | next |
 | M7 | Tensor parallelism | |
 | M8 | W4A16 weights + FP8 KV cache | |
 | M9 | MoE and MLA | |

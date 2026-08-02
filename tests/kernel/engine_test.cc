@@ -568,7 +568,10 @@ TEST_F(EngineTest, GenerationGrowsAcrossBlockBoundaries) {
   EXPECT_FALSE(all_same) << "generation collapsed; the cache likely stopped "
                             "growing correctly";
 
-  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0);
+  // The scheduler still holds its prefix cache, whose blocks are reclaimable
+  // rather than in use (§6.3).
+  EXPECT_EQ(sched->blocks_in_use(), 0);
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), sched->cached_blocks());
 }
 
 // CUDA graphs must not change the answer. A graph fixes the structure of a
@@ -1081,6 +1084,166 @@ TEST_F(PreemptionTest, APreemptedSequenceGeneratesWhatItWouldHaveAnyway) {
   EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
 }
 
+// A prefix cache hit is invisible in the output (§6.3).
+//
+// The second request here never computes most of its prompt -- it reads keys
+// and values another request wrote and left in the radix tree. That is only
+// legitimate because attention is causal, so a key is a function of the tokens
+// before it as well as the token itself, and the path through the tree is
+// exactly that history. If the match were ever off by a token, or a block were
+// shared between two prompts that merely happen to collide, the reader would
+// attend over somebody else's context and carry on producing fluent text.
+//
+// Which is why this compares against a cold run of the same prompt rather than
+// checking that anything was reused: reuse that changes the answer is worse
+// than no reuse at all.
+TEST_F(PreemptionTest, APrefixCacheHitDoesNotChangeTheOutput) {
+  // Long enough to span several blocks, so most of it is matchable.
+  std::vector<int32_t> prompt;
+  for (int i = 0; i < 8; ++i) {
+    for (const int32_t t : {kThe, kCapital, kOf, kFrance}) prompt.push_back(t);
+  }
+  prompt.push_back(kIs);
+
+  SamplingParams params;
+  params.max_tokens = 12;
+
+  // Cold: an empty cache, so every token of the prompt is computed.
+  std::vector<int32_t> cold;
+  int64_t cold_hits = 0;
+  {
+    auto sched = MakeScheduler(/*max_running=*/1);
+    ASSERT_TRUE(sched.ok());
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    cold = done[0].output_tokens;
+    cold_hits = sched->prefix_hit_tokens();
+  }
+  ASSERT_EQ(cold_hits, 0) << "the cold run was itself served from a cache";
+  ASSERT_EQ(cold.size(), 12u);
+
+  // Warm: the same prompt through a scheduler whose cache already holds it.
+  // One scheduler so the tree survives between the two requests.
+  std::vector<int32_t> warm;
+  int64_t hits = 0;
+  {
+    auto sched = MakeScheduler(/*max_running=*/1);
+    ASSERT_TRUE(sched.ok());
+
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+    ASSERT_EQ(Drain(&*sched).size(), 1u);
+
+    ASSERT_TRUE(sched->AddRequest(2, prompt, params).ok());
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+
+    warm = done[0].output_tokens;
+    hits = sched->prefix_hit_tokens();
+  }
+
+  ASSERT_GT(hits, 0) << "the second request did not hit the cache";
+  std::fprintf(stderr, "[prefix cache] %ld of %zu prompt tokens reused\n",
+               static_cast<long>(hits), prompt.size());
+
+  EXPECT_EQ(warm, cold)
+      << "reusing a cached prefix changed what the model generated";
+}
+
+// A partial match: the second prompt shares a head with the first and diverges.
+// Only the shared part may be reused, and the divergent part has to be computed
+// against it -- the case a block-collision bug would sail straight through.
+//
+// Compared as logits rather than as generated text, and deliberately. A warm
+// run forwards only the unmatched tail, so its GEMMs are a different shape than
+// a cold run's, and bf16 reductions do not commute: the same computation
+// arranged differently lands a fraction of a logit apart. Ten greedy steps then
+// amplify that fraction into a visibly different completion whenever the model
+// is near a tie -- which the repetitive prompt below very much is. Comparing
+// the distribution the reuse produced, once, measures the thing in question
+// instead of measuring how long a coin stays on its edge.
+TEST_F(PreemptionTest, APartialPrefixMatchIsStillCorrect) {
+  std::vector<int32_t> shared;
+  for (int i = 0; i < 6; ++i) {
+    for (const int32_t t : {kThe, kCapital, kOf, kFrance}) shared.push_back(t);
+  }
+
+  std::vector<int32_t> first = shared;
+  for (const int32_t t : {kIs, kParis, kIs, kParis}) first.push_back(t);
+
+  std::vector<int32_t> second = shared;
+  for (const int32_t t : {kOf, kThe, kOf, kThe}) second.push_back(t);
+
+  SamplingParams params;
+  params.max_tokens = 10;
+
+  // Logits for `second`'s first generated token, optionally after `first` has
+  // populated the shared head.
+  const auto next_token_logits = [&](bool warm, int64_t* out_hits) {
+    std::vector<float> logits;
+
+    auto sched = MakeScheduler(/*max_running=*/1);
+    EXPECT_TRUE(sched.ok());
+
+    if (warm) {
+      EXPECT_TRUE(sched->AddRequest(1, first, params).ok());
+      EXPECT_EQ(Drain(&*sched).size(), 1u);
+    }
+
+    const int64_t before = sched->prefix_hit_tokens();
+    EXPECT_TRUE(sched->AddRequest(2, second, params).ok());
+
+    ForwardBatch batch;
+    EXPECT_TRUE(sched->PrepareStep(&batch).ok());
+    EXPECT_EQ(batch.logits_indices.size(), 1u)
+        << "the prompt should finish in one step at this budget";
+    EXPECT_TRUE(model_->Step(batch, &logits).ok());
+
+    *out_hits = sched->prefix_hit_tokens() - before;
+    return logits;
+  };
+
+  int64_t cold_hits = 0;
+  int64_t warm_hits = 0;
+
+  const std::vector<float> cold = next_token_logits(false, &cold_hits);
+  const std::vector<float> warm = next_token_logits(true, &warm_hits);
+
+  EXPECT_EQ(cold_hits, 0) << "the cold run was served from a cache";
+
+  ASSERT_GT(warm_hits, 0) << "the shared head was not reused";
+  ASSERT_LE(warm_hits, static_cast<int64_t>(shared.size()))
+      << "more was reused than the two prompts actually share";
+
+  ASSERT_FALSE(cold.empty());
+  ASSERT_EQ(warm.size(), cold.size());
+
+  double worst = 0.0;
+  double scale = 0.0;
+  size_t cold_argmax = 0;
+  size_t warm_argmax = 0;
+
+  for (size_t i = 0; i < cold.size(); ++i) {
+    worst = std::max(worst, std::fabs(static_cast<double>(cold[i]) -
+                                      static_cast<double>(warm[i])));
+    scale = std::max(scale, std::fabs(static_cast<double>(cold[i])));
+    if (cold[i] > cold[cold_argmax]) cold_argmax = i;
+    if (warm[i] > warm[warm_argmax]) warm_argmax = i;
+  }
+
+  std::fprintf(stderr,
+               "[prefix cache] partial match reused %ld of %zu tokens; "
+               "max|diff| = %.6g over range %.6g\n",
+               static_cast<long>(warm_hits), shared.size(), worst, scale);
+
+  EXPECT_EQ(cold_argmax, warm_argmax)
+      << "reusing a shared prefix changed the model's prediction";
+
+  EXPECT_LT(worst, 0.02 * scale)
+      << "the reused prefix moved the logits further than rounding explains";
+}
+
 // The engine survives a pool it cannot satisfy. Before preemption, a shortage
 // left PrepareStep with an error, and the engine's only answer to that is to
 // fail every request in flight -- so one greedy sequence took the server down
@@ -1111,10 +1274,17 @@ TEST_F(PreemptionTest, AnOversubscribedPoolStillDrainsEveryRequest) {
     EXPECT_FALSE(c.output_tokens.empty()) << "request " << c.id;
   }
 
-  std::fprintf(stderr, "[preemption] %ld preemptions to drain 4 requests\n",
-               static_cast<long>(sched->preemptions()));
+  std::fprintf(stderr,
+               "[preemption] %ld preemptions to drain 4 requests, "
+               "%ld prompt tokens reused\n",
+               static_cast<long>(sched->preemptions()),
+               static_cast<long>(sched->prefix_hit_tokens()));
 
-  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+  // The scheduler is still alive, so its prefix cache still legitimately holds
+  // blocks. What must be zero is what the *sequences* hold.
+  EXPECT_EQ(sched->blocks_in_use(), 0) << "a finished sequence kept its blocks";
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), sched->cached_blocks())
+      << "blocks belong to neither a sequence nor the cache";
 }
 
 }  // namespace

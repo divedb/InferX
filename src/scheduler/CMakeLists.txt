@@ -6,6 +6,7 @@
 # device dependency.
 
 add_library(inferx_scheduler
+  prefix_cache.cc
   scheduler.cc
 )
 add_library(inferx::scheduler ALIAS inferx_scheduler)

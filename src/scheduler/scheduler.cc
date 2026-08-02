@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "inferx/scheduler/prefix_cache.h"
+
 namespace inferx::scheduler {
 namespace {
 
@@ -18,6 +20,12 @@ struct Sequence {
   /// Tokens whose K/V is already in the cache. Everything below this has been
   /// through a forward pass; everything at or above it has not.
   int64_t cached = 0;
+
+  /// Leading tokens whose KV came from the prefix cache rather than from a
+  /// forward pass this sequence ran (§6.3). Those blocks are the tree's, not
+  /// this sequence's, and freeing them here would pull them out from under
+  /// everyone else reading the same prefix.
+  int64_t acquired = 0;
 
   std::unique_ptr<BlockTable> table;
 
@@ -69,6 +77,31 @@ struct Scheduler::Impl {
   SchedulerConfig config;
   KvBlockPool* pool = nullptr;
 
+  /// §6.3. Constructed always, consulted only when the config enables it, so
+  /// that the disabled path is one branch rather than a null check everywhere.
+  std::unique_ptr<PrefixCache> cache;
+
+  /// Hands a finished or evicted sequence's blocks to whoever should have them.
+  ///
+  /// With the cache on, the complete ones are offered to the tree and the rest
+  /// go back to the pool; with it off, all of them go back. Every place a
+  /// sequence loses its blocks goes through here, because getting the split
+  /// wrong in one of them either leaks or, worse, frees a block another
+  /// sequence is still reading through the tree.
+  void ReleaseBlocks(Sequence* seq) {
+    if (seq->table == nullptr) return;
+
+    if (config.enable_prefix_cache) {
+      cache->Finish(seq->tokens, seq->cached, seq->table->blocks(),
+                    seq->acquired);
+    } else if (!seq->table->blocks().empty()) {
+      (void)pool->FreeBlocks(seq->table->blocks());
+    }
+
+    seq->table->Clear();
+    seq->acquired = 0;
+  }
+
   std::deque<Sequence> waiting;
   std::vector<Sequence> running;
   std::vector<Completion> completed;
@@ -96,15 +129,12 @@ struct Scheduler::Impl {
   /// those blocks marked used in a pool that outlives it, and nothing ever
   /// hands them back.
   ~Impl() {
-    const auto release = [this](Sequence& seq) {
-      if (seq.table != nullptr && !seq.table->blocks().empty()) {
-        (void)pool->FreeBlocks(seq.table->blocks());
-        seq.table->Clear();
-      }
-    };
+    for (Sequence& seq : running) ReleaseBlocks(&seq);
+    for (Sequence& seq : waiting) ReleaseBlocks(&seq);
 
-    for (Sequence& seq : running) release(seq);
-    for (Sequence& seq : waiting) release(seq);
+    // Destroyed before the pool outlives us: the tree owns blocks too, and its
+    // destructor is what returns them.
+    cache.reset();
   }
 
   /// Grows a sequence's block table to cover `tokens` tokens.
@@ -133,6 +163,16 @@ struct Scheduler::Impl {
       if (seq->table->size() >= max_blocks_per_seq) return Grow::kContextFull;
 
       StatusOr<int32_t> block = pool->AllocateBlock();
+
+      // An unreferenced cached block is free memory that happens to still hold
+      // something useful, so the pool being empty is not the same as there
+      // being nothing left. §6.3 puts eviction here, on allocation failure,
+      // rather than on a timer: the cache should be as large as it can be right
+      // up until the moment the memory is actually wanted.
+      if (!block.ok() && config.enable_prefix_cache && cache->Evict(1) > 0) {
+        block = pool->AllocateBlock();
+      }
+
       if (!block.ok()) return Grow::kPoolEmpty;
 
       seq->table->Append(*block);
@@ -158,10 +198,14 @@ struct Scheduler::Impl {
     Sequence victim = std::move(running[index]);
     running.erase(running.begin() + static_cast<long>(index));
 
-    if (victim.table != nullptr) {
-      (void)pool->FreeBlocks(victim.table->blocks());
-      victim.table.reset();
-    }
+    // Before `cached` is reset, because that is what says how much of the
+    // sequence has real KV behind it -- and with §6.3 on, this is a donation
+    // rather than a discard. The history goes into the tree, where it stays
+    // evictable but matchable, so the sequence's own re-admission is likely to
+    // find it and the recompute §8.2 budgets for never happens. That is the
+    // trade T7 makes against swapping, and this is where it pays.
+    ReleaseBlocks(&victim);
+    victim.table.reset();
 
     // Everything it had cached is gone, so it starts again from token zero.
     victim.cached = 0;
@@ -183,13 +227,12 @@ struct Scheduler::Impl {
                            seq->tokens.end());
     completed.push_back(std::move(c));
 
-    // Freed here rather than at the next step boundary: the blocks are dead the
-    // moment the sequence is, and holding them would refuse admission to a
-    // request that could have used them.
-    if (seq->table != nullptr) {
-      (void)pool->FreeBlocks(seq->table->blocks());
-      seq->table->Clear();
-    }
+    // Released here rather than at the next step boundary: the blocks are dead
+    // the moment the sequence is, and holding them would refuse admission to a
+    // request that could have used them. With §6.3 on, "released" means the
+    // complete ones are offered to the tree -- still reclaimable, but matchable
+    // by the next request that shares this prompt.
+    ReleaseBlocks(seq);
   }
 
   /// Fills `take` with how many tokens each running sequence contributes to the
@@ -262,8 +305,28 @@ struct Scheduler::Impl {
 
       seq.table = std::make_unique<BlockTable>(pool->block_size());
 
-      // Reserved for the prompt only. Growth for generated tokens happens per
-      // step, which is what makes the pool shared rather than partitioned.
+      // §6.3, step 4 of §4: the prefix match happens at admission, because it
+      // decides how much of the prompt there is left to reserve *and* how much
+      // there is left to run. A hit here is a prefill that never happens.
+      //
+      // Capped one token short of the sequence, since a request whose every
+      // token is already cached would have nothing to forward and so no logits
+      // to sample its first token from.
+      if (config.enable_prefix_cache) {
+        const PrefixCache::Match match = cache->Acquire(seq.tokens, needed - 1);
+
+        for (const int32_t block : match.blocks) seq.table->Append(block);
+
+        // Those tokens are already through a forward pass -- someone else's,
+        // but the KV is the same, because a key depends on its prefix and the
+        // path through the tree is that prefix.
+        seq.acquired = match.tokens;
+        seq.cached = match.tokens;
+      }
+
+      // Reserved for the prompt only, and only the part of it not already in
+      // the cache. Growth for generated tokens happens per step, which is what
+      // makes the pool shared rather than partitioned.
       //
       // Deliberately *not* a preemption site. A shortage here means there is
       // not room for a request that has not started yet, and the answer to that
@@ -274,11 +337,13 @@ struct Scheduler::Impl {
       const Grow reserved = Reserve(&seq, needed);
 
       if (reserved != Grow::kOk) {
-        // Not enough blocks right now. Put back what was taken and leave the
-        // request queued -- a running sequence finishing will free room, and
-        // FCFS means this one goes first when it does.
-        (void)pool->FreeBlocks(seq.table->blocks());
-        seq.table->Clear();
+        // Not enough blocks right now. Give back what was taken -- including
+        // the reference on the matched prefix, which would otherwise pin it
+        // against eviction on behalf of a request that is not even running --
+        // and leave the request queued. A running sequence finishing will free
+        // room, and FCFS means this one goes first when it does.
+        ReleaseBlocks(&seq);
+        seq.cached = 0;
         waiting.front() = std::move(seq);
         return;
       }
@@ -301,6 +366,7 @@ StatusOr<Scheduler> Scheduler::Create(const SchedulerConfig& config,
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->pool = pool;
+  impl->cache = std::make_unique<PrefixCache>(pool, pool->block_size());
   impl->max_blocks_per_seq =
       (config.max_seq_len + pool->block_size() - 1) / pool->block_size();
 
@@ -618,7 +684,21 @@ int64_t Scheduler::num_waiting() const {
 }
 
 int64_t Scheduler::blocks_in_use() const {
-  return impl_->pool->used_blocks();
+  // The tree's blocks are not any sequence's, and they are reclaimable on
+  // demand, so counting them here would report a healthy cache as pressure.
+  return impl_->pool->used_blocks() - impl_->cache->cached_blocks();
+}
+
+int64_t Scheduler::cached_blocks() const {
+  return impl_->cache->cached_blocks();
+}
+
+int64_t Scheduler::prefix_hit_tokens() const {
+  return impl_->cache->hit_tokens();
+}
+
+int64_t Scheduler::prefix_miss_tokens() const {
+  return impl_->cache->miss_tokens();
 }
 
 int64_t Scheduler::preemptions() const { return impl_->preemptions; }

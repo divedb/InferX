@@ -268,7 +268,13 @@ struct HttpServer::Impl {
                          ",\"last_step_ms\":" +
                          std::to_string(stats.last_step_ms) +
                          ",\"preemptions\":" +
-                         std::to_string(stats.preemptions) + "}";
+                         std::to_string(stats.preemptions) +
+                         ",\"cached_blocks\":" +
+                         std::to_string(stats.cached_blocks) +
+                         ",\"prefix_hit_tokens\":" +
+                         std::to_string(stats.prefix_hit_tokens) +
+                         ",\"prefix_miss_tokens\":" +
+                         std::to_string(stats.prefix_miss_tokens) + "}";
 
       response.set_content(body, "application/json");
     });
