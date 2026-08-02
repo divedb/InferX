@@ -542,7 +542,7 @@ inferx/
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
-| **M5** | ✅ **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2); **radix prefix cache** (§6.3), which costs bitwise determinism across cache states | Competitive throughput |
+| **M5** | ✅ **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2); **radix prefix cache** (§6.3, 5.9× on warm TTFT behind a shared preamble), which costs bitwise determinism across cache states | Competitive throughput |
 | **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |
@@ -639,6 +639,55 @@ The knob is genuinely two-sided, so `max_batch_tokens` stays at 2048 as a
 default rather than being tuned to the best column: the right value depends on
 whether a deployment is serving chat (TBT dominates) or batch summarization
 (TTFT dominates), and this table is what makes that choice with evidence.
+
+#### What the prefix cache is worth
+
+`bench/prefix_cache_bench.cc`, same box and clocks, CUDA graphs off. Requests
+run one at a time, because this measures the prefill path and interleaving
+another sequence's decodes would put its step time in the denominator. Three
+workloads, each run twice with `enable_prefix_cache` the only difference.
+`cold` is the first request, which can never hit; `warm` is the mean of the
+rest.
+
+| workload | | cold TTFT | warm TTFT | prefill tokens | reused |
+|---|---|---|---|---|---|
+| shared system prompt, 1072 tok | off | 96.5 ms | 96.8 ms | 8576 | 0 |
+| | **on** | 98.5 ms | **16.3 ms** | 1408 | 7168 |
+| multi-turn chat, 6 turns to 736 tok | off | 26.4 ms | 51.8 ms | 2976 | 0 |
+| | **on** | 26.4 ms | **15.4 ms** | 576 | 2400 |
+| distinct prompts, 1024 tok | off | 89.5 ms | 89.5 ms | 8192 | 0 |
+| | **on** | 88.7 ms | 89.5 ms | 8192 | 0 |
+
+**A shared preamble costs 5.9× less to serve after the first request** — 96.8 ms
+of time-to-first-token falls to 16.3 ms, because each warm request forwards 48
+tokens instead of 1072. The match is 1024 rather than the full 1072: it rounds
+down to a block boundary and stops one token short of the sequence, and at
+block 16 that lands on 64 blocks exactly.
+
+**Multi-turn is the case where recomputing is most obviously absurd**, and it is
+the only row where the *uncached* number gets worse as the workload proceeds:
+each turn resends the whole conversation, so without a cache turn 6 re-prefills
+everything turns 1–5 already computed, and warm TTFT (51.8 ms) runs to twice
+cold (26.4 ms). With the cache it is flat at ~15 ms regardless of how long the
+conversation has grown, which is the property a chat deployment actually feels.
+
+**The third row is the one that had to be checked rather than assumed.** A miss
+costs a tree descent against the prompt's first tokens, and if that were
+measurable against a 90 ms prefill it would be the finding. It is not: 1.00×,
+within run-to-run noise.
+
+Two cross-checks that the harness is measuring what it claims. Cold TTFT for the
+256-token chat opening is 26.4 ms against `prefill_bench`'s 26.2 ms for 256
+tokens measured standalone, and the 1072-token cold prompt lands at 96.5 ms
+against 89.97 ms for 1024 — both within what the extra tokens and the
+scheduler's per-step overhead account for. And the reuse arithmetic closes
+exactly: 7168 reused over 7 warm requests is 1024 each, which is the block-
+aligned match of a 1072-token prompt.
+
+Reproducible to ~1% across runs. What is *not* measured here is eviction: the
+pool is deliberately generous, so no row pays for reclaiming anything. What the
+cache costs under memory pressure is a separate question and wants a separate
+harness.
 
 #### The M3-to-M4 progression, re-run
 

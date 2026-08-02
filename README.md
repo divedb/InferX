@@ -96,8 +96,17 @@ quoted because the step is bound by it.
 | FP8 e4m3 | 9.28 ms | 8.29 ms | 4.62 ms | 56% |
 
 Prefill through FlashInfer's paged kernel holds above 9.2k tok/s from 128 to
-16384 prompt tokens — 176 ms for 2k, 774 ms for 8k. Numbers, method, and the
-re-measurement of every historical claim are in ARCHITECTURE.md §14.
+16384 prompt tokens — 176 ms for 2k, 774 ms for 8k.
+
+The M5 scheduler work is measured against the two things it trades between.
+Chunked prefill cuts **p99 inter-token latency 10.6×** (183 → 17 ms) when a 2k
+prompt arrives beside eight decoding sequences, at the cost of 1.6× on that
+prompt's own time-to-first-token. The prefix cache cuts **warm TTFT 5.9×**
+(97 → 16 ms) behind a shared system prompt, and holds multi-turn chat flat at
+~15 ms where recomputing the conversation each turn climbs past 50 ms.
+
+Numbers, method, and the re-measurement of every historical claim are in
+ARCHITECTURE.md §14.
 
 ## Target hardware
 
