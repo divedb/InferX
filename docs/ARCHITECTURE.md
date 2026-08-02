@@ -167,6 +167,26 @@ This is the same trick as SGLang's overlap scheduler, but without a separate pro
 
 **Escape hatch:** the pipeline depth is a config knob (`overlap_depth ∈ {0, 1}`). Depth 0 (synchronous, sync after each step) must remain correct and is the reference for differential testing. Every scheduler bug will first be diagnosed by flipping this to 0.
 
+### 5.2a Not built, and why — the measurement that retired it
+
+`bench/overlap_bench.cc` splits a step into the four phases the host can see and asks how much of it is host work sitting serially in front of the device. That is the ceiling on what this section could ever be worth, and on this hardware it is **1.6–2.1%**.
+
+| batch | prepare | issue | await | commit | step | host % |
+|---|---|---|---|---|---|---|
+| 1 | 0.007 | 0.167 | 11.036 | 0.002 | 11.211 | 1.6% |
+| 8 | 0.015 | 0.180 | 11.650 | 0.003 | 11.848 | 1.7% |
+| 32 | 0.033 | 0.225 | 13.735 | 0.006 | 14.000 | 1.9% |
+
+`prepare` and `commit` are the scheduler — 0.02–0.04 ms, **0.2% of a step**. All of §8's machinery, admission and chunking and preemption and the radix descent, costs a fortieth of a millisecond. The rest of the host time is `issue`, and a depth-1 pipeline cannot remove that: issuing is what the pipeline does with the time it saves, and it cannot overlap with itself.
+
+Two things this does *not* say. It is not an argument that the pipeline is a bad design — the same measurement launch-by-launch puts the host at **20–25%**, which is what §5.2 was written against and what it would in fact recover. And it is not confined to pure decode: a mixed workload with prompts arriving into a decoding batch measures 1.9% overall, with the rare prefill-carrying step at 3.7% of a 94 ms step.
+
+What happened is that **M6's other half already collected M6's win**. CUDA graphs cut `issue` from 2.9 ms to 0.18 ms, and there is no longer enough host time left for an overlap pipeline to hide. The remaining 1.9% would cost speculative scheduling — planning step N+1 without knowing whether a sequence finished at N — plus a permanent second code path, since this section itself requires depth 0 to stay as the differential-testing reference. That is a poor trade against a scheduler that has just absorbed chunked prefill, preemption and prefix caching.
+
+Revisit if any of the premises move: a much faster step (W4A16 at M8 would take the bf16 11.2 ms toward 5), a much larger batch than 32, TP where rank coordination joins the host path, or a workload that defeats graph capture. The benchmark is the thing to re-run, not the reasoning.
+
+One caveat, discovered while writing it: the first mixed-workload measurement read 20.3% host, because the benchmark captured a graph for one sequence count while a mixed workload's count changes on every arrival and completion. The server captures every count from `max_running` down to 1; the benchmark now does the same. A graph that does not match is a graph that is not there.
+
 ### 5.3 Rank coordination (SPMD)
 
 All rank threads execute **identical control flow**. Divergence deadlocks NCCL, so control flow may never depend on rank-local data.
@@ -543,7 +563,7 @@ inferx/
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
 | **M5** | ✅ **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2); **radix prefix cache** (§6.3, 5.9× on warm TTFT behind a shared preamble), which costs bitwise determinism across cache states | Competitive throughput |
-| **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
+| **M6** | ✅ **CUDA graphs for decode** (delivered at M3/M4, 1.06–1.12×). **Overlap pipeline measured and not built**: with graphs on, the host is 1.6–2.1% of a step and the scheduler 0.2%, so there is nothing left to hide (§5.2a) | G4: CPU off the critical path — **met**, 1.9% against a 30% target |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |
 | **M9** | MoE (TP-over-experts) and MLA layers | G6 |

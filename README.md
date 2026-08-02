@@ -9,7 +9,8 @@ HTTP with SSE streaming, running Qwen2.5-3B-Instruct on a paged KV cache with
 FlashInfer attention, CUDA graphs, and on-device temperature/top-p sampling —
 at 89.7 tok/s bf16 and 118.4 tok/s FP8, batch 1. The scheduler does continuous
 batching with chunked prefill, recompute preemption, and a radix prefix cache.
-Next is getting the CPU off the critical path (M6).
+The CPU is already off the critical path — 1.9% of a step — so M6's overlap
+pipeline was measured and deliberately not built. Next is quantization (M8).
 
 ## Why another engine
 
@@ -64,9 +65,9 @@ conventions, and troubleshooting.
 | M3 | Paged KV + FlashInfer attention + naive scheduler | **done** |
 | M4 | HTTP server, tokenizer, OpenAI-compatible streaming | **done** |
 | M5 | Continuous batching, chunked prefill, prefix cache, preemption | **done** |
-| M6 | Overlap pipeline + CUDA graphs for decode | next |
+| M6 | Overlap pipeline + CUDA graphs for decode | **done** (graphs; overlap measured, not built) |
 | M7 | Tensor parallelism | |
-| M8 | W4A16 weights + FP8 KV cache | |
+| M8 | W4A16 weights + FP8 KV cache | next |
 | M9 | MoE and MLA | |
 | M10 | Benchmarks vs vLLM/SGLang | |
 

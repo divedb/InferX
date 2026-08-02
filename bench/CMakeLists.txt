@@ -33,6 +33,7 @@ inferx_add_bench(prefill_bench prefill_bench.cc)
 inferx_add_bench(tbt_bench tbt_bench.cc)
 inferx_add_bench(prefix_cache_bench prefix_cache_bench.cc)
 inferx_add_bench(eviction_bench eviction_bench.cc)
+inferx_add_bench(overlap_bench overlap_bench.cc)
 
 # Needs FlashInfer to have something to compare against.
 if(INFERX_HAVE_FLASHINFER)
