@@ -409,6 +409,7 @@ struct Engine::Impl {
         stats.running = scheduler.num_running();
         stats.waiting = scheduler.num_waiting();
         stats.blocks_in_use = scheduler.blocks_in_use();
+        stats.preemptions = scheduler.preemptions();
       }
     }
 

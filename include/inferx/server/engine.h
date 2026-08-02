@@ -171,6 +171,10 @@ class Engine {
     int64_t steps = 0;
     int64_t tokens_generated = 0;
     double last_step_ms = 0.0;
+    /// Cumulative §8.2 preemptions. Climbing means the KV pool is undersized
+    /// for `max_running`, not that anything is broken -- but every one of them
+    /// is a prefill paid for twice.
+    int64_t preemptions = 0;
   };
 
   Stats stats() const;

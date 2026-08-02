@@ -36,6 +36,7 @@ FinishReason ToApiReason(scheduler::FinishReason reason) {
       return FinishReason::kStop;
     case scheduler::FinishReason::kMaxTokens:
     case scheduler::FinishReason::kOutOfMemory:
+    case scheduler::FinishReason::kContextLimit:
     case scheduler::FinishReason::kCancelled:
     case scheduler::FinishReason::kNotFinished:
       // Everything that is not a clean stop is truncation from the client's
@@ -265,7 +266,9 @@ struct HttpServer::Impl {
                          ",\"tokens_generated\":" +
                          std::to_string(stats.tokens_generated) +
                          ",\"last_step_ms\":" +
-                         std::to_string(stats.last_step_ms) + "}";
+                         std::to_string(stats.last_step_ms) +
+                         ",\"preemptions\":" +
+                         std::to_string(stats.preemptions) + "}";
 
       response.set_content(body, "application/json");
     });

@@ -898,4 +898,225 @@ TEST_F(EngineTest, GraphedAndUngraphedLogitsAgreeForABatch) {
   }
 }
 
+namespace {
+
+// Preemption against the real model, on a KV cache small enough to run out.
+//
+// Its own fixture, and so its own model instance, because it needs a pool it
+// can exhaust -- a few dozen blocks against EngineTest's 512. Re-attaching a
+// smaller pool to the shared model would leave every graph captured by an
+// earlier test holding pointers into freed device memory, which is R9's exact
+// shape and not a thing to reintroduce for the convenience of a fixture. Gtest
+// tears one suite's static state down before it sets the next one up, so the
+// two models never exist at the same time.
+class PreemptionTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    if (!CudaAvailable()) return;
+
+    auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+    if (!loaded.ok()) {
+      status_ = loaded.status();
+      return;
+    }
+
+    model_ = new model::Qwen2Model(*std::move(loaded));
+
+    // 16 blocks of 16 is 256 token slots for the whole engine, against a
+    // workload below that peaks around 20 blocks. Oversubscribed on purpose:
+    // preemption is unreachable from a pool that is merely small.
+    status_ = model_->AttachKvCache(16, 16);
+  }
+
+  static void TearDownTestSuite() {
+    delete model_;
+    model_ = nullptr;
+  }
+
+  void SetUp() override {
+    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+    if (model_ == nullptr || !status_.ok()) {
+      GTEST_SKIP() << "model unavailable: " << status_;
+    }
+  }
+
+  StatusOr<Scheduler> MakeScheduler(int64_t max_running) {
+    SchedulerConfig config;
+    config.max_running = max_running;
+    config.max_batch_tokens = 256;
+    config.max_seq_len = 512;
+
+    return Scheduler::Create(config, model_->kv_pool());
+  }
+
+  /// Runs to completion, greedily, and returns what finished.
+  std::vector<Completion> Drain(Scheduler* sched, int max_steps = 1500) {
+    std::vector<Completion> all;
+
+    for (int step = 0; step < max_steps && sched->HasWork(); ++step) {
+      ForwardBatch batch;
+      EXPECT_TRUE(sched->PrepareStep(&batch).ok()) << "step " << step;
+
+      if (batch.num_tokens() > 0) {
+        std::vector<float> logits;
+        const Status s = model_->Step(batch, &logits);
+        EXPECT_TRUE(s.ok()) << "step " << step << ": " << s;
+        if (!s.ok()) break;
+
+        EXPECT_TRUE(
+            sched->CommitStep(GreedySample(logits, batch.logits_indices.size()))
+                .ok());
+      }
+
+      for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+    }
+
+    for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+    return all;
+  }
+
+  static model::Qwen2Model* model_;
+  static Status status_;
+};
+
+model::Qwen2Model* PreemptionTest::model_ = nullptr;
+Status PreemptionTest::status_ = OkStatus();
+
+// Recompute preemption really recomputes.
+//
+// The host tests prove the scheduler's bookkeeping: the same tokens go in and
+// the same tokens come out. They cannot prove the part that only exists on a
+// GPU -- that re-prefilling a sequence's own history reconstructs the identical
+// KV, so the tokens it goes on to produce are the ones it would have produced
+// had its cache never been dropped. That is the claim §8.2 rests on, and it is
+// what makes recompute a legitimate answer to a shortage rather than a way of
+// quietly corrupting whoever got evicted.
+//
+// A wrong resumption point does not crash here. It re-reads one token too few
+// or too many and continues generating fluent, plausible, different text.
+TEST_F(PreemptionTest, APreemptedSequenceGeneratesWhatItWouldHaveAnyway) {
+  const std::vector<int32_t> tracked = {kThe, kCapital, kOf, kFrance, kIs};
+
+  SamplingParams params;
+  params.max_tokens = 24;
+
+  // Alone, with the pool to itself: nothing competes and nothing is preempted.
+  std::vector<int32_t> control;
+  {
+    auto sched = MakeScheduler(/*max_running=*/1);
+    ASSERT_TRUE(sched.ok()) << sched.status();
+    ASSERT_TRUE(sched->AddRequest(1, tracked, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    ASSERT_EQ(done[0].reason, FinishReason::kMaxTokens);
+    control = done[0].output_tokens;
+    ASSERT_EQ(control.size(), 24u);
+
+    ASSERT_EQ(sched->preemptions(), 0) << "the control was itself preempted";
+  }
+
+  ASSERT_EQ(model_->kv_pool()->used_blocks(), 0) << "control leaked blocks";
+
+  // Now the same request in a crowd, with ballast long enough to drain the
+  // pool out from under it.
+  std::vector<int32_t> after;
+  int64_t preemptions = 0;
+  {
+    auto sched = MakeScheduler(/*max_running=*/4);
+    ASSERT_TRUE(sched.ok());
+
+    SamplingParams ballast_params;
+    ballast_params.max_tokens = 40;
+
+    // Submitted first, so they are older than the tracked request and the
+    // tracked one -- the newest -- is the victim §8.2 picks.
+    std::vector<int32_t> ballast;
+    for (int i = 0; i < 12; ++i) {
+      for (const int32_t t : {kThe, kCapital, kOf, kFrance}) ballast.push_back(t);
+    }
+
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_TRUE(sched->AddRequest(static_cast<uint64_t>(10 + i), ballast,
+                                    ballast_params)
+                      .ok());
+    }
+
+    // Let the ballast get running and start consuming blocks.
+    for (int i = 0; i < 3; ++i) {
+      ForwardBatch batch;
+      ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+      if (batch.num_tokens() == 0) break;
+
+      std::vector<float> logits;
+      ASSERT_TRUE(model_->Step(batch, &logits).ok());
+      ASSERT_TRUE(
+          sched->CommitStep(GreedySample(logits, batch.logits_indices.size()))
+              .ok());
+    }
+
+    ASSERT_TRUE(sched->AddRequest(1, tracked, params).ok());
+
+    std::vector<Completion> done = Drain(&*sched);
+    preemptions = sched->preemptions();
+
+    for (const Completion& c : done) {
+      if (c.id == 1) {
+        EXPECT_EQ(c.reason, FinishReason::kMaxTokens);
+        after = c.output_tokens;
+      }
+    }
+  }
+
+  ASSERT_GT(preemptions, 0)
+      << "the pool was not tight enough to preempt anything";
+
+  ASSERT_EQ(after.size(), control.size())
+      << "the preempted run generated a different number of tokens";
+
+  EXPECT_EQ(after, control)
+      << "a sequence came back different after " << preemptions
+      << " preemptions -- recompute did not reconstruct its KV";
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+}
+
+// The engine survives a pool it cannot satisfy. Before preemption, a shortage
+// left PrepareStep with an error, and the engine's only answer to that is to
+// fail every request in flight -- so one greedy sequence took the server down
+// with it.
+TEST_F(PreemptionTest, AnOversubscribedPoolStillDrainsEveryRequest) {
+  auto sched = MakeScheduler(/*max_running=*/4);
+  ASSERT_TRUE(sched.ok());
+
+  SamplingParams params;
+  params.max_tokens = 48;
+
+  std::vector<int32_t> prompt;
+  for (int i = 0; i < 10; ++i) {
+    for (const int32_t t : {kThe, kCapital, kOf, kFrance}) prompt.push_back(t);
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(
+        sched->AddRequest(static_cast<uint64_t>(i + 1), prompt, params).ok());
+  }
+
+  const std::vector<Completion> done = Drain(&*sched);
+
+  ASSERT_EQ(done.size(), 4u) << "a request was lost";
+
+  for (const Completion& c : done) {
+    EXPECT_NE(c.reason, FinishReason::kNotFinished) << "request " << c.id;
+    EXPECT_FALSE(c.output_tokens.empty()) << "request " << c.id;
+  }
+
+  std::fprintf(stderr, "[preemption] %ld preemptions to drain 4 requests\n",
+               static_cast<long>(sched->preemptions()));
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
+}
+
+}  // namespace
+
 }  // namespace inferx

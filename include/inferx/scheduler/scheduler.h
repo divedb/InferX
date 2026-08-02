@@ -41,7 +41,16 @@ enum class FinishReason {
   kCancelled,
   /// Admitted, then the pool ran out while it was growing. Distinct from
   /// rejection at admission, because the caller has partial output.
+  ///
+  /// With preemption in place this is rare and specific: it means the sequence
+  /// was the *only* one running and still could not grow, so there was nothing
+  /// to preempt on its behalf. Any other shortage costs some other sequence its
+  /// KV rather than costing this one its life.
   kOutOfMemory,
+  /// Filled `max_seq_len`. The context is full, not the pool, so no amount of
+  /// preemption would have helped -- the sequence has nowhere left to put its
+  /// next token.
+  kContextLimit,
 };
 
 const char* FinishReasonName(FinishReason reason);
@@ -98,9 +107,9 @@ struct SchedulerConfig {
 /// and the whole lifecycle exercised without a device present.
 ///
 /// Scope: FCFS admission (§8.3), continuous batching with chunked prefill
-/// (§8.1), synchronous stepping. Still missing from M5 are preemption -- a
-/// sequence that cannot grow is retired rather than returned to the queue --
-/// and the radix prefix cache.
+/// (§8.1), recompute preemption (§8.2), synchronous stepping. Still missing
+/// from M5 is the radix prefix cache, which is what would make a preempted
+/// sequence cheap to bring back rather than merely correct.
 ///
 /// Every step builds a mixed batch: decodes first, then prefill chunks fill
 /// what is left of `max_batch_tokens`. That ordering is the point rather than
@@ -172,6 +181,14 @@ class Scheduler {
 
   /// \brief Blocks currently held by running sequences.
   int64_t blocks_in_use() const;
+
+  /// \brief How many times a sequence has been sent back to the queue to free
+  ///        KV for another (§8.2). Cumulative over the scheduler's life.
+  ///
+  /// The number to watch under load: it is pure wasted compute, and a rate that
+  /// climbs means the pool is undersized for `max_running` rather than that
+  /// anything is wrong.
+  int64_t preemptions() const;
 
  private:
   struct Impl;

@@ -9,12 +9,14 @@
 
 #include "inferx/scheduler/scheduler.h"
 
+#include <algorithm>
 #include <memory>
 #include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "absl/container/flat_hash_map.h"
 #include "inferx/core/kv_cache.h"
 
 namespace inferx::scheduler {
@@ -635,6 +637,318 @@ TEST_F(SchedulerTest, DeferredSequencesStillDeclareTheirLength) {
 
   // Request 1 has two keys cached; request 2 has none yet, and says so.
   EXPECT_EQ(batch.seq_lens, (std::vector<int32_t>{2, 0}));
+}
+
+// ---------------------------------------------------------------------------
+// Preemption (§8.2).
+// ---------------------------------------------------------------------------
+
+/// A scheduler over a pool small enough that sequences have to compete for it.
+///
+/// The block size is 4, so every four generated tokens costs a block and the
+/// pool can be drained in a handful of steps rather than thousands.
+std::unique_ptr<Scheduler> TightScheduler(KvBlockPool* pool,
+                                          int64_t max_running = 4) {
+  SchedulerConfig config;
+  config.max_running = max_running;
+  config.max_batch_tokens = 64;
+  config.max_seq_len = 64;
+
+  auto s = Scheduler::Create(config, pool);
+  if (!s.ok()) return nullptr;
+  return std::make_unique<Scheduler>(*std::move(s));
+}
+
+/// Runs to completion with a deterministic fake executor, so that what a
+/// sequence generates depends only on its own history and not on how the batch
+/// happened to be composed. That is what makes "preempted output == unpreempted
+/// output" a meaningful comparison.
+///
+/// The token is a hash of the request id and how many tokens it has produced,
+/// which is exactly what a real model's greedy argmax is: a function of the
+/// sequence's own contents.
+std::vector<Completion> DrainDeterministically(Scheduler* sched,
+                                               int max_steps = 4000) {
+  std::vector<Completion> all;
+  absl::flat_hash_map<RequestId, int> produced;
+
+  for (int step = 0; step < max_steps && sched->HasWork(); ++step) {
+    ForwardBatch batch;
+    if (!sched->PrepareStep(&batch).ok()) break;
+
+    if (batch.num_tokens() > 0) {
+      std::vector<int32_t> sampled;
+      sampled.reserve(batch.logits_indices.size());
+
+      // The batch does not say which request each logits row belongs to, so
+      // the deltas from the previous commit cannot be used here. Recover it the
+      // way the model would: the row's sequence index into the block table.
+      for (const int32_t row : batch.logits_indices) {
+        const int32_t seq = batch.seq_of_token[static_cast<size_t>(row)];
+        // Position is a stand-in for "the sequence's own contents".
+        const int32_t pos = batch.positions[static_cast<size_t>(row)];
+        sampled.push_back(100 + (pos * 7) % 50);
+      }
+
+      if (!sched->CommitStep(sampled).ok()) break;
+    }
+
+    for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+  }
+
+  for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+  return all;
+}
+
+// The property that makes recompute preemption safe: a sequence that was
+// evicted mid-generation and re-ran its own history produces exactly what it
+// would have produced had it never been touched.
+//
+// This is the whole correctness claim of §8.2. A preempted sequence keeps its
+// generated tokens and loses only its KV, so resuming means prefilling prompt
+// *plus* what it already said and predicting from there. Get the resumption
+// point wrong by one and it either repeats a token or skips one -- and either
+// way it still returns a plausible-looking completion.
+TEST_F(SchedulerTest, APreemptedSequenceProducesWhatItWouldHaveAnyway) {
+  const std::vector<std::vector<int32_t>> prompts = {
+      {1, 2, 3}, {4, 5}, {6, 7, 8, 9}, {10}};
+
+  // Roomy: nothing competes, nothing is preempted.
+  std::vector<Completion> unpreempted;
+  {
+    auto pool = HostPool(/*blocks=*/256);
+    ASSERT_TRUE(pool.ok());
+    auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+    auto sched = TightScheduler(owned.get());
+    ASSERT_NE(sched, nullptr);
+
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
+                                    Params(20))
+                      .ok());
+    }
+
+    unpreempted = DrainDeterministically(sched.get());
+    ASSERT_EQ(sched->preemptions(), 0) << "the control was itself preempted";
+  }
+
+  // Cramped: the same work through a pool that cannot hold it all at once.
+  std::vector<Completion> preempted;
+  int64_t preemptions = 0;
+  {
+    auto pool = HostPool(/*blocks=*/12);
+    ASSERT_TRUE(pool.ok());
+    auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+    auto sched = TightScheduler(owned.get());
+    ASSERT_NE(sched, nullptr);
+
+    for (size_t i = 0; i < prompts.size(); ++i) {
+      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
+                                    Params(20))
+                      .ok());
+    }
+
+    preempted = DrainDeterministically(sched.get());
+    preemptions = sched->preemptions();
+
+    EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+  }
+
+  ASSERT_GT(preemptions, 0)
+      << "the pool was not tight enough to force a preemption";
+
+  // Sort both by id: preemption reorders completions, which is allowed.
+  const auto by_id = [](const Completion& a, const Completion& b) {
+    return a.id < b.id;
+  };
+  std::sort(unpreempted.begin(), unpreempted.end(), by_id);
+  std::sort(preempted.begin(), preempted.end(), by_id);
+
+  ASSERT_EQ(unpreempted.size(), prompts.size());
+  ASSERT_EQ(preempted.size(), unpreempted.size());
+
+  for (size_t i = 0; i < preempted.size(); ++i) {
+    EXPECT_EQ(preempted[i].id, unpreempted[i].id);
+    EXPECT_EQ(preempted[i].reason, unpreempted[i].reason)
+        << "request " << preempted[i].id;
+    EXPECT_EQ(preempted[i].output_tokens, unpreempted[i].output_tokens)
+        << "request " << preempted[i].id << " came back different after "
+        << preemptions << " preemptions";
+  }
+}
+
+// A shortage costs some sequence its KV, not the whole batch its life. Before
+// preemption this path returned an error out of PrepareStep, and the engine's
+// only answer to that is to fail every request in flight.
+TEST_F(SchedulerTest, ExhaustionPreemptsInsteadOfFailingTheStep) {
+  auto pool = HostPool(/*blocks=*/8);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  auto sched = TightScheduler(owned.get(), /*max_running=*/4);
+  ASSERT_NE(sched, nullptr);
+
+  // Four sequences generating long enough to exhaust 8 blocks between them.
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_TRUE(
+        sched->AddRequest(static_cast<RequestId>(i + 1), {1, 2}, Params(30))
+            .ok());
+  }
+
+  ForwardBatch batch;
+
+  for (int step = 0; step < 500 && sched->HasWork(); ++step) {
+    // Every step succeeds. That is the assertion.
+    ASSERT_TRUE(sched->PrepareStep(&batch).ok()) << "step " << step;
+
+    if (batch.num_tokens() == 0) continue;
+
+    std::vector<int32_t> sampled(batch.logits_indices.size(), 55);
+    ASSERT_TRUE(sched->CommitStep(sampled).ok()) << "step " << step;
+    (void)sched->TakeCompleted();
+  }
+
+  EXPECT_GT(sched->preemptions(), 0) << "nothing was ever preempted";
+  EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+}
+
+// A preempted sequence goes to the *head* of the queue, not the back. It was
+// admitted before everything still waiting and a client has already seen tokens
+// from it, so letting newer requests overtake it is the one unfairness FCFS
+// exists to prevent.
+TEST_F(SchedulerTest, APreemptedSequenceGoesToTheFrontOfTheQueue) {
+  auto pool = HostPool(/*blocks=*/6);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  auto sched = TightScheduler(owned.get(), /*max_running=*/2);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2, 3}, Params(30)).ok());
+  ASSERT_TRUE(sched->AddRequest(2, {4, 5, 6}, Params(30)).ok());
+
+  ForwardBatch batch;
+
+  // Run until something is preempted.
+  int step = 0;
+  for (; step < 500 && sched->preemptions() == 0; ++step) {
+    ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+    if (batch.num_tokens() == 0) break;
+
+    std::vector<int32_t> sampled(batch.logits_indices.size(), 55);
+    ASSERT_TRUE(sched->CommitStep(sampled).ok());
+  }
+
+  ASSERT_GT(sched->preemptions(), 0) << "nothing was preempted in " << step
+                                     << " steps";
+
+  // A newcomer arrives while the preempted sequence is queued.
+  ASSERT_TRUE(sched->AddRequest(99, {7}, Params(2)).ok());
+  EXPECT_EQ(sched->num_waiting(), 2);
+
+  // The preempted one is re-admitted first, so the newcomer never overtakes it.
+  // Drive until the queue drains and check nothing starved.
+  const std::vector<Completion> done = DrainDeterministically(sched.get());
+
+  bool saw_99 = false;
+  for (const Completion& c : done) {
+    if (c.id == 99) saw_99 = true;
+    EXPECT_NE(c.reason, FinishReason::kNotFinished) << "request " << c.id;
+  }
+
+  EXPECT_TRUE(saw_99) << "the newcomer never ran";
+  EXPECT_EQ(owned->free_blocks(), owned->num_blocks()) << "blocks leaked";
+}
+
+// Filling max_seq_len is not a shortage and preemption cannot help: the limit
+// is on where a sequence's tokens may live, not on whether room exists. It
+// retires with its own reason, and everyone else keeps running.
+//
+// This used to be the same ResourceExhausted as an empty pool, which is how one
+// long-running sequence could take the whole server down with it.
+TEST_F(SchedulerTest, FillingTheContextRetiresOnlyThatSequence) {
+  auto pool = HostPool(/*blocks=*/256);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  SchedulerConfig config;
+  config.max_running = 4;
+  config.max_batch_tokens = 64;
+  config.max_seq_len = 16;  // 4 blocks of 4
+
+  auto created = Scheduler::Create(config, owned.get());
+  ASSERT_TRUE(created.ok());
+  Scheduler sched = *std::move(created);
+
+  // Asks for far more tokens than the context can hold.
+  ASSERT_TRUE(sched.AddRequest(1, {1, 2}, Params(100)).ok());
+  // And a modest one alongside it, which must be unaffected.
+  ASSERT_TRUE(sched.AddRequest(2, {3, 4}, Params(3)).ok());
+
+  ForwardBatch batch;
+  std::vector<Completion> done;
+
+  for (int step = 0; step < 200 && sched.HasWork(); ++step) {
+    ASSERT_TRUE(sched.PrepareStep(&batch).ok()) << "step " << step;
+    if (batch.num_tokens() == 0) continue;
+
+    std::vector<int32_t> sampled(batch.logits_indices.size(), 55);
+    ASSERT_TRUE(sched.CommitStep(sampled).ok());
+
+    for (Completion& c : sched.TakeCompleted()) done.push_back(std::move(c));
+  }
+
+  for (Completion& c : sched.TakeCompleted()) done.push_back(std::move(c));
+
+  ASSERT_EQ(done.size(), 2u);
+
+  for (const Completion& c : done) {
+    if (c.id == 1) {
+      EXPECT_EQ(c.reason, FinishReason::kContextLimit);
+
+      // One more than the context holds, and that is right rather than an
+      // off-by-one. A 16-token context and a 2-token prompt leave room for 14
+      // generated tokens *with KV*; the 15th is sampled from the 14th's logits
+      // and retires the sequence before it is ever fed back, so it needs no
+      // block. The token a client sees last is always one the cache never held.
+      EXPECT_EQ(c.output_tokens.size(), 15u);
+    } else {
+      EXPECT_EQ(c.reason, FinishReason::kMaxTokens)
+          << "the neighbouring request was collateral damage";
+      EXPECT_EQ(c.output_tokens.size(), 3u);
+    }
+  }
+
+  // No preemption happened: a full context is not a shortage.
+  EXPECT_EQ(sched.preemptions(), 0);
+  EXPECT_EQ(owned->free_blocks(), owned->num_blocks());
+}
+
+// The one case with nothing to preempt: a single sequence that has drained the
+// pool by itself. There is no victim, so it retires rather than spinning.
+TEST_F(SchedulerTest, TheLastSequenceStandingRetiresRatherThanSpinning) {
+  auto pool = HostPool(/*blocks=*/3);
+  ASSERT_TRUE(pool.ok());
+  auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+  auto sched = TightScheduler(owned.get(), /*max_running=*/1);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2}, Params(60)).ok());
+
+  const std::vector<Completion> done = DrainDeterministically(sched.get());
+
+  ASSERT_EQ(done.size(), 1u);
+  EXPECT_EQ(done[0].reason, FinishReason::kOutOfMemory);
+
+  // 3 blocks of 4 is 12 cached tokens, less the 2-token prompt, plus the final
+  // sampled token that retires the sequence before it needs a slot.
+  EXPECT_EQ(done[0].output_tokens.size(), 11u);
+
+  EXPECT_EQ(sched->preemptions(), 0) << "there was nobody to preempt";
+  EXPECT_EQ(owned->free_blocks(), owned->num_blocks());
 }
 
 // A scheduler destroyed with requests still in flight gives their blocks back.

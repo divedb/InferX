@@ -60,6 +60,7 @@ const char* FinishReasonName(FinishReason reason) {
     case FinishReason::kMaxTokens:   return "max_tokens";
     case FinishReason::kCancelled:   return "cancelled";
     case FinishReason::kOutOfMemory: return "out_of_memory";
+    case FinishReason::kContextLimit: return "context_limit";
   }
   return "?";
 }
@@ -83,6 +84,9 @@ struct Scheduler::Impl {
 
   int64_t max_blocks_per_seq = 0;
 
+  /// Cumulative count of §8.2 preemptions, for `Scheduler::preemptions()`.
+  int64_t preemptions = 0;
+
   /// Gives back everything still held.
   ///
   /// `BlockTable` carries no pointer to the pool it drew from, so it cannot
@@ -105,19 +109,70 @@ struct Scheduler::Impl {
 
   /// Grows a sequence's block table to cover `tokens` tokens.
   ///
-  /// Returns ResourceExhausted rather than throwing, because running out mid
-  /// sequence is a scheduling event (§8.2) and not a fault: at M3 it retires the
-  /// sequence, and at M5 it will preempt one instead.
-  Status Reserve(Sequence* seq, int64_t tokens) {
-    while (seq->table->capacity_tokens() < tokens) {
-      if (seq->table->size() >= max_blocks_per_seq) {
-        return ResourceExhaustedError("sequence would exceed max_seq_len");
-      }
+  /// Reports *which* way it failed rather than returning a Status, because the
+  /// two are not the same event and the caller does opposite things with them.
+  /// A full context is the sequence's own fault and terminal -- no amount of
+  /// freeing helps, because the limit is on where its tokens may live rather
+  /// than on whether room exists. An empty pool is a shortage, which §8.2 says
+  /// to resolve by taking the memory from someone else.
+  ///
+  /// They used to share one ResourceExhausted, which is how a single sequence
+  /// reaching `max_seq_len` could take down every request in flight: the error
+  /// left `PrepareStep`, and the engine's only answer to that is to fail the
+  /// whole batch.
+  enum class Grow {
+    kOk,
+    /// `max_seq_len` reached. Terminal for this sequence.
+    kContextFull,
+    /// The pool has no free block. Someone has to give one up.
+    kPoolEmpty,
+  };
 
-      INFERX_ASSIGN_OR_RETURN(const int32_t block, pool->AllocateBlock());
-      seq->table->Append(block);
+  Grow Reserve(Sequence* seq, int64_t tokens) {
+    while (seq->table->capacity_tokens() < tokens) {
+      if (seq->table->size() >= max_blocks_per_seq) return Grow::kContextFull;
+
+      StatusOr<int32_t> block = pool->AllocateBlock();
+      if (!block.ok()) return Grow::kPoolEmpty;
+
+      seq->table->Append(*block);
     }
-    return OkStatus();
+    return Grow::kOk;
+  }
+
+  /// Sends a running sequence back to the queue and returns its KV to the pool.
+  ///
+  /// **Recompute, not swap** (§8.2). The blocks go back immediately and the
+  /// sequence re-reads its own history later, which costs a prefill it has
+  /// already paid for once and costs nothing on the PCIe bus. Swapping would
+  /// preserve the work at the price of a D2H copy the overlap pipeline would
+  /// then have to hide, and with a prefix cache in front of it (M5's remaining
+  /// item) recompute is nearly always the better trade -- that is the bet §8.2
+  /// makes, and it is worth measuring rather than assuming.
+  ///
+  /// What survives is everything except the KV: `tokens` still holds the prompt
+  /// *and* whatever was generated before the preemption, so the sequence
+  /// resumes by prefilling all of it and predicting the next token. A client
+  /// mid-stream sees a pause, not a restart.
+  void Preempt(size_t index) {
+    Sequence victim = std::move(running[index]);
+    running.erase(running.begin() + static_cast<long>(index));
+
+    if (victim.table != nullptr) {
+      (void)pool->FreeBlocks(victim.table->blocks());
+      victim.table.reset();
+    }
+
+    // Everything it had cached is gone, so it starts again from token zero.
+    victim.cached = 0;
+
+    // The head of the queue, not the back. It was admitted before anything
+    // still waiting and a client has already seen tokens from it; letting newer
+    // requests overtake it would be unfair in the one direction FCFS exists to
+    // prevent, and could starve it indefinitely under sustained load.
+    waiting.push_front(std::move(victim));
+
+    ++preemptions;
   }
 
   void Retire(Sequence* seq, FinishReason reason) {
@@ -134,6 +189,52 @@ struct Scheduler::Impl {
     if (seq->table != nullptr) {
       (void)pool->FreeBlocks(seq->table->blocks());
       seq->table->Clear();
+    }
+  }
+
+  /// Fills `take` with how many tokens each running sequence contributes to the
+  /// next step (§8.1).
+  ///
+  /// Separate from emission because the budget is handed out in a different
+  /// order than the batch is written in: emission has to run in `running` order
+  /// -- the attention plan requires rows grouped by sequence and in ascending
+  /// sequence index -- while the budget goes to decodes first regardless of
+  /// where they sit in that order.
+  void Plan() {
+    const int64_t num_seqs = static_cast<int64_t>(running.size());
+
+    take.assign(static_cast<size_t>(num_seqs), 0);
+    int64_t budget = config.max_batch_tokens;
+
+    // Decodes first. One token each, served ahead of any prompt so that a
+    // decoding sequence's inter-token time does not include some other
+    // request's prefill. Bounding that is the entire reason chunking exists, so
+    // it is the priority rule and not a tuning choice: measured at 10.6x on p99
+    // TBT in bench/tbt_bench.cc.
+    //
+    // A prompt's final chunk has one token pending too, and lands here. That is
+    // right -- it is one token of work either way, and it is the step that
+    // request has been waiting through its whole prefill for.
+    for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
+      if (running[static_cast<size_t>(s)].pending() == 1) {
+        take[static_cast<size_t>(s)] = 1;
+        --budget;
+      }
+    }
+
+    // Then prompts fill what is left, FCFS so the oldest finishes first (§8.3).
+    // A prompt that does not fit is *chunked* rather than deferred: it takes
+    // the rest of the budget now and resumes next step. The alternative --
+    // waiting for a step it fits in whole -- is what made a long prompt able to
+    // stall behind a busy engine indefinitely, and what made a prompt longer
+    // than the budget impossible to serve at all.
+    for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
+      const int64_t pending = running[static_cast<size_t>(s)].pending();
+      if (pending <= 1) continue;
+
+      const int64_t chunk = std::min(pending, budget);
+      take[static_cast<size_t>(s)] = chunk;
+      budget -= chunk;
     }
   }
 
@@ -163,9 +264,16 @@ struct Scheduler::Impl {
 
       // Reserved for the prompt only. Growth for generated tokens happens per
       // step, which is what makes the pool shared rather than partitioned.
-      const Status reserved = Reserve(&seq, needed);
+      //
+      // Deliberately *not* a preemption site. A shortage here means there is
+      // not room for a request that has not started yet, and the answer to that
+      // is to leave it queued -- taking KV from a sequence that is already
+      // producing tokens, to admit one that is not, would trade real progress
+      // for none. §8.2's preemption exists for the other case: a sequence that
+      // is already running and can no longer grow.
+      const Grow reserved = Reserve(&seq, needed);
 
-      if (!reserved.ok()) {
+      if (reserved != Grow::kOk) {
         // Not enough blocks right now. Put back what was taken and leave the
         // request queued -- a running sequence finishing will free room, and
         // FCFS means this one goes first when it does.
@@ -250,6 +358,75 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 
   impl_->Admit();
 
+  // ---- Plan, and make room for the plan ----
+  //
+  // Reserving for the whole batch before emitting any of it is what makes
+  // preemption possible at all. Preempting removes a sequence from `running`,
+  // which renumbers every row after it and changes how the budget divides, so a
+  // half-written batch would have to be unwound. Resolved here, the shortage
+  // costs nothing but a recount: the batch is still only a vector of token
+  // counts.
+  //
+  // Each pass removes at most one sequence from `running` -- retired or
+  // preempted -- so the loop cannot run more times than there were sequences.
+  const size_t initial_running = impl_->running.size();
+
+  for (size_t attempt = 0; attempt <= initial_running; ++attempt) {
+    if (impl_->running.empty()) return OkStatus();
+
+    impl_->Plan();
+
+    bool replan = false;
+
+    for (size_t s = 0; s < impl_->running.size(); ++s) {
+      if (impl_->take[s] == 0) continue;
+
+      Sequence& seq = impl_->running[s];
+
+      const Impl::Grow grew =
+          impl_->Reserve(&seq, seq.cached + impl_->take[s]);
+
+      if (grew == Impl::Grow::kOk) continue;
+
+      if (grew == Impl::Grow::kContextFull) {
+        // Terminal and nobody else's problem. The sequence has filled
+        // max_seq_len, so there is nowhere to put its next token no matter how
+        // much of the pool is free -- preempting on its behalf would free
+        // memory it cannot address.
+        impl_->Retire(&seq, FinishReason::kContextLimit);
+        impl_->running.erase(impl_->running.begin() + static_cast<long>(s));
+      } else {
+        // §8.2. Take the KV from the most recently admitted sequence: it is the
+        // one with the least invested, and preempting from the back is what
+        // keeps FCFS admission from being undone at the other end.
+        size_t victim = impl_->running.size() - 1;
+
+        if (victim == s) {
+          if (impl_->running.size() == 1) {
+            // Nothing to take. It is the only sequence running, so it already
+            // holds every block there is and the pool cannot be relieved.
+            impl_->Retire(&seq, FinishReason::kOutOfMemory);
+            impl_->running.erase(impl_->running.begin() + static_cast<long>(s));
+            replan = true;
+            break;
+          }
+
+          // It is itself the newest, and it is the one that needs the block --
+          // so the next-newest gives it up. Self-preemption would free this
+          // sequence's blocks only to demand all of them back plus one.
+          victim = impl_->running.size() - 2;
+        }
+
+        impl_->Preempt(victim);
+      }
+
+      replan = true;
+      break;
+    }
+
+    if (!replan) break;
+  }
+
   if (impl_->running.empty()) return OkStatus();
 
   const int64_t num_seqs = static_cast<int64_t>(impl_->running.size());
@@ -259,46 +436,6 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
   out_batch->block_table.assign(
       static_cast<size_t>(num_seqs * impl_->max_blocks_per_seq), 0);
   out_batch->seq_lens.assign(static_cast<size_t>(num_seqs), 0);
-
-  // ---- Plan ----
-  //
-  // Decided for the whole batch before anything is emitted, because the token
-  // budget is handed out in a different order than the batch is written in.
-  // Emission has to run in `running` order -- the attention plan requires rows
-  // grouped by sequence and in ascending sequence index -- while the budget
-  // goes to decodes first regardless of where they sit in that order.
-  impl_->take.assign(static_cast<size_t>(num_seqs), 0);
-  int64_t budget = impl_->config.max_batch_tokens;
-
-  // Decodes first (§8.1). One token each, and they are served ahead of any
-  // prompt so that a decoding sequence's inter-token time does not include
-  // some other request's prefill. That bound is the entire reason chunking
-  // exists, so it is the priority rule and not a tuning choice.
-  //
-  // A prompt's final chunk has one token pending too, and lands here. That is
-  // right: it is one token of work either way, and it is the step that request
-  // has been waiting through its whole prefill for.
-  for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
-    if (impl_->running[static_cast<size_t>(s)].pending() == 1) {
-      impl_->take[static_cast<size_t>(s)] = 1;
-      --budget;
-    }
-  }
-
-  // Then prompts fill what is left, FCFS so the oldest finishes first (§8.3).
-  // A prompt that does not fit is *chunked* rather than deferred: it takes the
-  // rest of the budget now and resumes next step. The alternative -- waiting
-  // for a step it fits in whole -- is what made a long prompt able to stall
-  // behind a busy engine indefinitely, and what made a prompt longer than the
-  // budget impossible to serve at all.
-  for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
-    const int64_t pending = impl_->running[static_cast<size_t>(s)].pending();
-    if (pending <= 1) continue;
-
-    const int64_t chunk = std::min(pending, budget);
-    impl_->take[static_cast<size_t>(s)] = chunk;
-    budget -= chunk;
-  }
 
   // ---- Emit ----
   for (size_t s = 0; s < impl_->running.size(); ++s) {
@@ -320,9 +457,11 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
     // whenever the zero happened to name the right block, which is why the
     // symptom was an *alternating* answer rather than a wrong one -- a stack
     // free list hands consecutive requests their blocks in opposite order.
-    if (contributes) {
-      INFERX_RETURN_IF_ERROR(impl_->Reserve(&seq, seq.cached + take));
-    }
+    //
+    // The growth itself now happens in the reserve loop above, before any row
+    // is written, which preserves that ordering for the whole batch at once
+    // rather than per sequence. The invariant is the same one and
+    // SchedulerTest.EveryBatchSlotIsCoveredByTheBatchBlockTable still guards it.
 
     // A sequence's row in the block table, regardless of whether it contributes
     // tokens this step -- the row index is its identity for the whole batch.
@@ -481,5 +620,7 @@ int64_t Scheduler::num_waiting() const {
 int64_t Scheduler::blocks_in_use() const {
   return impl_->pool->used_blocks();
 }
+
+int64_t Scheduler::preemptions() const { return impl_->preemptions; }
 
 }  // namespace inferx::scheduler

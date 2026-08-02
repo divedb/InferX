@@ -371,6 +371,20 @@ When KV allocation fails for a running sequence:
 
 Default to recompute; swap exists behind a flag for long-context workloads where recompute cost dominates. With prefix caching enabled, recompute is nearly always the right call — this is a change from vLLM's original defaults and is worth measuring rather than assuming.
 
+**Delivered, recompute only.** Swap is not built and is not needed until there is a long-context workload to justify the D2H copy.
+
+Three things the implementation had to settle that this section did not say:
+
+- **A full context is not a shortage.** `Reserve` failing because the sequence hit `max_seq_len` and failing because the pool is empty were the same `ResourceExhausted`, and the combined error left `PrepareStep` — where the engine's only available answer is to fail every request in flight. So one sequence reaching its context limit took the whole server down with it. They are now distinct outcomes: a full context retires that sequence alone with `kContextLimit`, and only an empty pool preempts.
+- **The victim is the most recently admitted sequence**, and it goes to the *head* of the waiting queue. Newest-first because it has the least invested; head-of-queue because it was admitted before everything still waiting and a client has already seen tokens from it, so sending it to the back is the one unfairness FCFS exists to prevent. When the sequence that needs the block *is* the newest, the next-newest gives way instead — self-preemption would free that sequence's blocks only to demand all of them back plus one.
+- **Admission is deliberately not a preemption site.** A shortage there means there is no room for a request that has not started; taking KV from a sequence already producing tokens to admit one that is not would trade real progress for none. It still defers, as before.
+
+The one case with no answer is a single running sequence that has drained the pool by itself: there is no victim, so it retires with `kOutOfMemory`. That reason now means specifically "nothing could be taken on its behalf" rather than "memory ran out".
+
+Preemption requires *reserving for the whole batch before emitting any of it*, since removing a sequence renumbers every row after it and changes how the token budget divides. That is the same plan-then-emit split §8.1 already needed, which is why the two land together.
+
+`Scheduler::preemptions()` counts them. It is the number to watch under load: preemption is pure wasted compute, and a rate that climbs means the pool is undersized for `max_running` rather than that anything is wrong.
+
 ### 8.3 Admission and fairness
 
 FCFS with a running-batch cap. Explicitly *not* doing shortest-job-first or priority classes in v1 — they interact badly with prefix caching (reordering destroys cache locality) and the interface should stay simple until we have real traces.
@@ -515,7 +529,7 @@ inferx/
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
-| **M5** | 🚧 **Chunked prefill and decode-first mixed batching delivered** (§8.1), with sequence lengths made explicit in `ForwardBatch` so a skipped sequence no longer forces the reference kernel. Radix prefix cache and preemption still open | Competitive throughput |
+| **M5** | 🚧 **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2). Radix prefix cache still open | Competitive throughput |
 | **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |
