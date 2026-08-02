@@ -343,11 +343,22 @@ Real NCCL perf work is explicitly deferred until multi-GPU hardware exists, and 
 
 ### 8.1 Continuous batching with chunked prefill
 
-Every step builds a **mixed batch**: some decode slots (1 token each) plus prefill chunks capped by a global `max_num_batched_tokens` (default 8192).
+Every step builds a **mixed batch**: some decode slots (1 token each) plus prefill chunks capped by a global token budget, `SchedulerConfig::max_batch_tokens` (default 2048).
 
 Chunking prefill is what keeps p99 TBT flat. Without it, a 32k-token prefill monopolizes a step and every decoding sequence stalls for hundreds of milliseconds. The cost is that a chunked prefill is slightly less GEMM-efficient than a monolithic one, and each chunk re-reads prior KV. We take that trade because G2 (stable TBT) is a stated goal and raw prefill throughput is not.
 
 Priority within a step: **decode first, then prefill fills the remaining token budget.** This bounds TBT by construction.
+
+**Delivered.** `PrepareStep` plans the whole batch before it writes any of it, because the two orders differ: the budget goes to decodes first wherever they sit in the running set, while the batch itself must be emitted in running order — the attention plan requires query rows grouped by sequence and in ascending sequence index. So it is two planning passes over `running` and one emission pass.
+
+Two consequences worth stating, because both were latent bugs before rather than new behaviour:
+
+- **A prompt longer than the budget is now servable at all.** It used to be admitted, then skipped on every step for not fitting, forever.
+- **A prefill can no longer take the budget ahead of a waiting decode.** The old loop walked `running` in arrival order and gave each sequence all or nothing, so a prompt admitted before a decoding sequence pushed that sequence's next token into a later step — the precise TBT hole this section exists to close.
+
+Only the chunk that reaches the end of a prompt asks for logits. The earlier ones compute keys and values and nothing else, so `ForwardBatch::logits_indices` is empty on those steps and `CommitStep` takes no tokens back. That is an ordinary step, not an idle one.
+
+Chunking also forced sequence lengths to become **explicit** in the plan (`ForwardBatch::seq_lens`). The model used to recover each sequence's KV length from the largest query position it owned, which only works while every sequence contributes a query. Under chunking a sequence the budget skipped contributes none, and its history does not stop existing — so the batch states the lengths and the model reads them. Without that, any step containing a skipped sequence fell back to the reference attention kernel, which the measured prefill table below prices at 12.8× slower at 2k.
 
 ### 8.2 Preemption
 
@@ -502,7 +513,7 @@ inferx/
 | **M2** | Safetensors loader + Llama forward, FP16, batch 1, no cache. Logits match HF reference. | Model layer correctness |
 | **M3** | Paged KV + FlashInfer attention + naive scheduler, TP=1, synchronous stepping | The engine exists |
 | **M4** | ✅ **HTTP server, tokenizer, SSE streaming, OpenAI API, temperature/top-p sampling.** Delivered on cpp-httplib, *not* Beast (§9/§5.1), and on our own byte-level BPE, *not* tokenizer FFI (R7) | End-to-end serving — `inferx-serve` answers, honours `temperature`/`top_p`/`seed`, and building it found the paged-attention bug R8 and the graph-capture bug R9 that every single-request test had missed |
-| **M5** | Continuous batching, chunked prefill, radix prefix cache, preemption | Competitive throughput |
+| **M5** | 🚧 **Chunked prefill and decode-first mixed batching delivered** (§8.1), with sequence lengths made explicit in `ForwardBatch` so a skipped sequence no longer forces the reference kernel. Radix prefix cache and preemption still open | Competitive throughput |
 | **M6** | Overlap pipeline (depth 1) + CUDA graphs for decode | G4: CPU off the critical path |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |

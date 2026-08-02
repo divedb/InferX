@@ -30,6 +30,12 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
                                 num_seqs * max_blocks_per_seq);
   }
 
+  if (!seq_lens.empty() &&
+      static_cast<int64_t>(seq_lens.size()) != num_seqs) {
+    return InvalidArgumentError("seq_lens has ", seq_lens.size(),
+                                " entries, expected ", num_seqs);
+  }
+
   for (int64_t i = 0; i < n; ++i) {
     const size_t u = static_cast<size_t>(i);
 
@@ -48,6 +54,18 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
       return InvalidArgumentError("seq_of_token[", i, "] = ", seq_of_token[u],
                                   " is outside [0, ", num_seqs, ")");
     }
+    // A token writes its key at its own position, so the sequence must be
+    // declared long enough to contain it. Catches a chunk whose token count
+    // and declared length disagree -- attention would then read a key the
+    // plan says is not there.
+    if (!seq_lens.empty() &&
+        positions[u] >= seq_lens[static_cast<size_t>(seq_of_token[u])]) {
+      return InvalidArgumentError("positions[", i, "] = ", positions[u],
+                                  " is past the end of sequence ",
+                                  seq_of_token[u], ", declared ",
+                                  seq_lens[static_cast<size_t>(seq_of_token[u])],
+                                  " tokens long");
+    }
     // A slot outside the pool would scatter this token's keys into whatever
     // follows the cache in device memory.
     if (slots[u] < 0 || slots[u] >= total_slots) {
@@ -56,9 +74,12 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
     }
   }
 
-  if (logits_indices.empty()) {
-    return InvalidArgumentError("batch asks for no logits");
-  }
+  // An empty `logits_indices` used to be rejected here as obviously useless
+  // work. Chunked prefill makes it the ordinary shape of a step that carries
+  // several thousand prompt tokens and finishes none of them: the batch is all
+  // keys and values, and there is nothing to sample until a prompt's last
+  // chunk lands. The scheduler is what guarantees a finished prompt gets a
+  // row, and its own tests are where that is checked.
 
   for (size_t i = 0; i < logits_indices.size(); ++i) {
     if (logits_indices[i] < 0 || logits_indices[i] >= n) {

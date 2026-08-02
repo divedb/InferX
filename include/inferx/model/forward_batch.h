@@ -34,6 +34,21 @@ struct ForwardBatch {
   int64_t num_seqs = 0;
   int64_t max_blocks_per_seq = 0;
 
+  /// `[num_seqs]`, each sequence's KV length once this batch has run: how many
+  /// of its tokens have keys in the cache, which is also how many keys its
+  /// queries attend over.
+  ///
+  /// Stated rather than inferred, because chunked prefill (§8.1) breaks the
+  /// inference. The length used to be read back off the query rows -- the
+  /// largest `positions` entry a sequence owns, plus one -- and that only works
+  /// while every sequence contributes a query. A sequence deferred because the
+  /// token budget ran out contributes none, and its history does not stop
+  /// existing just because this step has nothing to add to it.
+  ///
+  /// Empty means "derive it from the query positions", which is what callers
+  /// predating chunked prefill get and what keeps their behaviour unchanged.
+  std::vector<int32_t> seq_lens;
+
   /// When true, `token_ids` is ignored and the device buffer is used as it
   /// stands -- because the previous step's sampler already wrote this step's
   /// tokens into it.
@@ -48,6 +63,10 @@ struct ForwardBatch {
   /// Which token indices need logits. Usually one per sequence -- the last --
   /// because computing the LM head over every prefill token costs a
   /// `[tokens, 151936]` GEMM to throw nearly all of it away.
+  ///
+  /// May be empty. A step that only advances prompts through the middle of
+  /// their prefill has nothing to sample: every chunk but the last computes
+  /// keys and values and no token at all.
   std::vector<int32_t> logits_indices;
 
   /// Per-logits-row sampling parameters, parallel to `logits_indices`.

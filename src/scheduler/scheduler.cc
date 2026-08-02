@@ -27,10 +27,28 @@ struct Sequence {
     return static_cast<int64_t>(tokens.size()) - prompt_len;
   }
 
-  /// Tokens waiting to be run: the prompt on the first step, one token after.
+  /// Tokens waiting to be run: what is left of the prompt while prefilling,
+  /// one token once it is generating.
   int64_t pending() const {
     return static_cast<int64_t>(tokens.size()) - cached;
   }
+};
+
+/// What one sequence contributed to the batch that was just prepared.
+///
+/// `CommitStep` needs both numbers and they are no longer the same. Chunked
+/// prefill separates "how much of this sequence ran" from "did it produce a
+/// token": a middle chunk moves `cached` forward by a thousand tokens and
+/// samples nothing, and the step before a prompt's last chunk lands looks
+/// identical to one that never ran it.
+struct Contribution {
+  /// Index into `running`.
+  int64_t seq = 0;
+  /// Tokens this sequence put in the batch: a chunk while prefilling, 1 while
+  /// decoding.
+  int64_t tokens = 0;
+  /// Whether it has a row in `logits_indices`, and so a token coming back.
+  bool sampled = false;
 };
 
 }  // namespace
@@ -54,11 +72,36 @@ struct Scheduler::Impl {
   std::vector<Sequence> running;
   std::vector<Completion> completed;
 
-  /// Which running index each `logits_indices` entry came from, so `CommitStep`
-  /// can put a sampled token back where it belongs. Rebuilt every step.
-  std::vector<int64_t> batch_seq_index;
+  /// What the last prepared batch asked of each sequence, in the order the
+  /// batch lists them, so `CommitStep` can put the results back where they
+  /// belong. Rebuilt every step.
+  std::vector<Contribution> step;
+
+  /// Tokens each running sequence contributes to the step being planned.
+  /// Scratch, kept across steps only to avoid reallocating it.
+  std::vector<int64_t> take;
 
   int64_t max_blocks_per_seq = 0;
+
+  /// Gives back everything still held.
+  ///
+  /// `BlockTable` carries no pointer to the pool it drew from, so it cannot
+  /// return its own blocks and the scheduler has to do it. Without this a
+  /// scheduler destroyed with requests in flight -- a server shutting down
+  /// mid-stream, a test that stops once it has seen what it came for -- leaves
+  /// those blocks marked used in a pool that outlives it, and nothing ever
+  /// hands them back.
+  ~Impl() {
+    const auto release = [this](Sequence& seq) {
+      if (seq.table != nullptr && !seq.table->blocks().empty()) {
+        (void)pool->FreeBlocks(seq.table->blocks());
+        seq.table->Clear();
+      }
+    };
+
+    for (Sequence& seq : running) release(seq);
+    for (Sequence& seq : waiting) release(seq);
+  }
 
   /// Grows a sequence's block table to cover `tokens` tokens.
   ///
@@ -192,7 +235,7 @@ void Scheduler::Cancel(RequestId id) {
 
 Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
   *out_batch = model::ForwardBatch{};
-  impl_->batch_seq_index.clear();
+  impl_->step.clear();
 
   // Cancellations take effect before admission, so a cancelled running
   // sequence releases its blocks in time for a waiting one to use them.
@@ -209,22 +252,60 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 
   if (impl_->running.empty()) return OkStatus();
 
-  out_batch->num_seqs = static_cast<int64_t>(impl_->running.size());
+  const int64_t num_seqs = static_cast<int64_t>(impl_->running.size());
+
+  out_batch->num_seqs = num_seqs;
   out_batch->max_blocks_per_seq = impl_->max_blocks_per_seq;
   out_batch->block_table.assign(
-      static_cast<size_t>(out_batch->num_seqs * impl_->max_blocks_per_seq), 0);
+      static_cast<size_t>(num_seqs * impl_->max_blocks_per_seq), 0);
+  out_batch->seq_lens.assign(static_cast<size_t>(num_seqs), 0);
 
+  // ---- Plan ----
+  //
+  // Decided for the whole batch before anything is emitted, because the token
+  // budget is handed out in a different order than the batch is written in.
+  // Emission has to run in `running` order -- the attention plan requires rows
+  // grouped by sequence and in ascending sequence index -- while the budget
+  // goes to decodes first regardless of where they sit in that order.
+  impl_->take.assign(static_cast<size_t>(num_seqs), 0);
   int64_t budget = impl_->config.max_batch_tokens;
 
+  // Decodes first (§8.1). One token each, and they are served ahead of any
+  // prompt so that a decoding sequence's inter-token time does not include
+  // some other request's prefill. That bound is the entire reason chunking
+  // exists, so it is the priority rule and not a tuning choice.
+  //
+  // A prompt's final chunk has one token pending too, and lands here. That is
+  // right: it is one token of work either way, and it is the step that request
+  // has been waiting through its whole prefill for.
+  for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
+    if (impl_->running[static_cast<size_t>(s)].pending() == 1) {
+      impl_->take[static_cast<size_t>(s)] = 1;
+      --budget;
+    }
+  }
+
+  // Then prompts fill what is left, FCFS so the oldest finishes first (§8.3).
+  // A prompt that does not fit is *chunked* rather than deferred: it takes the
+  // rest of the budget now and resumes next step. The alternative -- waiting
+  // for a step it fits in whole -- is what made a long prompt able to stall
+  // behind a busy engine indefinitely, and what made a prompt longer than the
+  // budget impossible to serve at all.
+  for (int64_t s = 0; s < num_seqs && budget > 0; ++s) {
+    const int64_t pending = impl_->running[static_cast<size_t>(s)].pending();
+    if (pending <= 1) continue;
+
+    const int64_t chunk = std::min(pending, budget);
+    impl_->take[static_cast<size_t>(s)] = chunk;
+    budget -= chunk;
+  }
+
+  // ---- Emit ----
   for (size_t s = 0; s < impl_->running.size(); ++s) {
     Sequence& seq = impl_->running[s];
 
-    const int64_t pending = seq.pending();
-
-    // No chunking yet (M5): a sequence either fits in what is left of the
-    // budget or waits for the next step. Decodes are one token and always fit,
-    // so this only ever defers a prefill.
-    const bool contributes = pending > 0 && pending <= budget;
+    const int64_t take = impl_->take[s];
+    const bool contributes = take > 0;
 
     // Growth happens *before* the row is written, and that ordering is the
     // whole point. Reserve appends a block whenever this step's tokens run past
@@ -240,8 +321,7 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
     // symptom was an *alternating* answer rather than a wrong one -- a stack
     // free list hands consecutive requests their blocks in opposite order.
     if (contributes) {
-      INFERX_RETURN_IF_ERROR(
-          impl_->Reserve(&seq, static_cast<int64_t>(seq.tokens.size())));
+      INFERX_RETURN_IF_ERROR(impl_->Reserve(&seq, seq.cached + take));
     }
 
     // A sequence's row in the block table, regardless of whether it contributes
@@ -252,11 +332,18 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
           seq.table->blocks()[static_cast<size_t>(b)];
     }
 
+    // What the sequence's KV will hold once this step has run. Stated for every
+    // sequence including the ones contributing nothing, because a deferred
+    // sequence's history is exactly what cannot be read back off the query
+    // rows -- it has none.
+    const int64_t end = seq.cached + take;
+    out_batch->seq_lens[s] = static_cast<int32_t>(end);
+
     if (!contributes) continue;
 
     const int64_t start = seq.cached;
 
-    for (int64_t i = start; i < static_cast<int64_t>(seq.tokens.size()); ++i) {
+    for (int64_t i = start; i < end; ++i) {
       int32_t block = 0;
       int64_t slot = 0;
       if (!seq.table->Locate(i, &block, &slot)) {
@@ -271,25 +358,31 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
           static_cast<int32_t>(block * impl_->pool->block_size() + slot));
     }
 
-    budget -= pending;
+    // Logits come from the last token of a sequence's *own* run, and only once
+    // that run has reached the end of what it has to say. A middle chunk stops
+    // somewhere inside the prompt, so its last token predicts a token the
+    // prompt already supplies -- computing it would cost a [1, 151936] row to
+    // discard, and sampling it would append a token to a prompt still being
+    // read.
+    const bool complete = end == static_cast<int64_t>(seq.tokens.size());
 
-    // Only the last token of each sequence produces logits: the earlier ones
-    // are prompt, and their predictions are discarded.
-    out_batch->logits_indices.push_back(
-        static_cast<int32_t>(out_batch->token_ids.size() - 1));
+    if (complete) {
+      out_batch->logits_indices.push_back(
+          static_cast<int32_t>(out_batch->token_ids.size() - 1));
 
-    // Parallel to logits_indices, so the executor never has to ask which
-    // request a row belongs to -- it just reads the row's parameters.
-    out_batch->temperature.push_back(seq.params.temperature);
-    out_batch->top_p.push_back(seq.params.top_p);
+      // Parallel to logits_indices, so the executor never has to ask which
+      // request a row belongs to -- it just reads the row's parameters.
+      out_batch->temperature.push_back(seq.params.temperature);
+      out_batch->top_p.push_back(seq.params.top_p);
 
-    // Mixed into the position so a request's successive tokens draw
-    // differently while staying reproducible from its seed alone.
-    out_batch->seeds.push_back(seq.params.seed ^
-                               (0x9e3779b97f4a7c15ULL *
-                                static_cast<uint64_t>(seq.tokens.size())));
+      // Mixed into the position so a request's successive tokens draw
+      // differently while staying reproducible from its seed alone.
+      out_batch->seeds.push_back(seq.params.seed ^
+                                 (0x9e3779b97f4a7c15ULL *
+                                  static_cast<uint64_t>(seq.tokens.size())));
+    }
 
-    impl_->batch_seq_index.push_back(static_cast<int64_t>(s));
+    impl_->step.push_back({static_cast<int64_t>(s), take, complete});
   }
 
   // Every sequence was already cached and none is pending. Nothing to run, and
@@ -306,25 +399,37 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
     out_deltas->reserve(sampled.size());
   }
 
-  if (sampled.size() != impl_->batch_seq_index.size()) {
+  size_t expected = 0;
+  for (const Contribution& c : impl_->step) expected += c.sampled ? 1 : 0;
+
+  if (sampled.size() != expected) {
     return InvalidArgumentError("got ", sampled.size(), " sampled tokens but "
-                                "the batch asked for ",
-                                impl_->batch_seq_index.size());
+                                "the batch asked for ", expected);
   }
 
-  for (size_t i = 0; i < sampled.size(); ++i) {
-    Sequence& seq =
-        impl_->running[static_cast<size_t>(impl_->batch_seq_index[i])];
+  size_t next = 0;
 
-    // Everything that went into the batch is now cached, including the tokens
-    // whose logits were discarded.
-    seq.cached = static_cast<int64_t>(seq.tokens.size());
+  for (const Contribution& contribution : impl_->step) {
+    Sequence& seq = impl_->running[static_cast<size_t>(contribution.seq)];
 
-    seq.tokens.push_back(sampled[i]);
+    // Everything that went into the batch is now cached, including a chunk's
+    // worth of prompt whose logits were never computed. Advanced by what ran
+    // rather than set to the sequence's length, which is the same thing only
+    // when the whole remainder ran.
+    seq.cached += contribution.tokens;
+
+    // A middle chunk ends here. It moved the prefill forward and produced no
+    // token, so there is nothing to append, nothing to stop on, and nothing to
+    // stream.
+    if (!contribution.sampled) continue;
+
+    const int32_t token = sampled[next++];
+
+    seq.tokens.push_back(token);
 
     const bool is_stop =
         std::find(seq.params.stop_tokens.begin(), seq.params.stop_tokens.end(),
-                  sampled[i]) != seq.params.stop_tokens.end();
+                  token) != seq.params.stop_tokens.end();
 
     if (is_stop) {
       seq.finish = FinishReason::kStopToken;
@@ -335,11 +440,11 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
     // Emitted after the stop checks, so `finish` is already decided and a
     // streaming caller can close the stream on this same delta.
     if (out_deltas != nullptr) {
-      out_deltas->push_back({seq.id, sampled[i], seq.finish});
+      out_deltas->push_back({seq.id, token, seq.finish});
     }
   }
 
-  impl_->batch_seq_index.clear();
+  impl_->step.clear();
 
   // Retire in one pass afterwards, so indices stay valid while the loop above
   // is using them.

@@ -635,15 +635,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 
 #ifdef INFERX_WITH_FLASHINFER
   // Decode serves one query per sequence; the ragged prefill kernel serves
-  // every other all-contributing shape.  A deferred sequence has no query rows
-  // and no length in ForwardBatch, so a mixed step containing one still uses
-  // the reference kernel until M5 makes sequence lengths explicit in the plan.
+  // every other shape whose sequence lengths the plan can state.
   fi_usable = false;
   fi_prefill_usable = false;
 
   if (flashinfer != nullptr || flashinfer_prefill != nullptr) {
-    // Each sequence's cached length is its query position plus one, which is
-    // also how many keys it will attend over.
     std::vector<int32_t> blocks_used(static_cast<size_t>(batch.num_seqs));
     std::vector<int32_t> last_page(static_cast<size_t>(batch.num_seqs));
 
@@ -652,12 +648,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     std::vector<int32_t> query_counts(static_cast<size_t>(batch.num_seqs));
     std::vector<int32_t> previous_position(static_cast<size_t>(batch.num_seqs),
                                            -1);
+    std::vector<int64_t> derived_len(static_cast<size_t>(batch.num_seqs), 0);
     int64_t previous_seq = -1;
 
     for (int64_t i = 0; i < tokens; ++i) {
       const int64_t seq = batch.seq_of_token[static_cast<size_t>(i)];
-      const int64_t len = batch.positions[static_cast<size_t>(i)] + 1;
-      const int64_t used = (len + block_size - 1) / block_size;
 
       if (seq < previous_seq ||
           (previous_position[static_cast<size_t>(seq)] >= 0 &&
@@ -672,11 +667,39 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
           batch.positions[static_cast<size_t>(i)];
 
       ++query_counts[static_cast<size_t>(seq)];
-      blocks_used[static_cast<size_t>(seq)] = static_cast<int32_t>(used);
+
+      // The fallback when the batch does not state its lengths: a sequence is
+      // as long as its furthest query position. Exact for every sequence that
+      // contributes a query, and silent about the ones that do not, which is
+      // the reason `seq_lens` exists.
+      derived_len[static_cast<size_t>(seq)] =
+          batch.positions[static_cast<size_t>(i)] + 1;
+    }
+
+    // How many keys each sequence attends over. Taken from the batch when it
+    // says, because under chunked prefill the query rows no longer know: a
+    // sequence the token budget skipped has a full history and no position to
+    // read it off.
+    bool lengths_are_known = true;
+
+    for (int64_t seq = 0; seq < batch.num_seqs; ++seq) {
+      const size_t u = static_cast<size_t>(seq);
+
+      const int64_t len = batch.seq_lens.empty()
+                              ? derived_len[u]
+                              : batch.seq_lens[u];
+
+      // A sequence with no keys at all -- admitted this step and skipped by the
+      // budget before it ran a single token. There is no page to point the
+      // planner at, so the batch goes to the reference kernel rather than
+      // handing FlashInfer an empty page range.
+      if (len <= 0) lengths_are_known = false;
+
+      const int64_t used = (len + block_size - 1) / block_size;
+      blocks_used[u] = static_cast<int32_t>(used);
 
       // Never zero: a length that exactly fills its last page uses all of it.
-      const int64_t rem = len - (used - 1) * block_size;
-      last_page[static_cast<size_t>(seq)] = static_cast<int32_t>(rem);
+      last_page[u] = static_cast<int32_t>(len - (used - 1) * block_size);
     }
 
     bool every_sequence_contributes = true;
@@ -692,12 +715,15 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     }
 
     fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
-    // Every contributing request can share the ragged launch. Deferred
-    // requests have no query rows or explicit length in ForwardBatch yet, so a
-    // mixed step containing one stays on the reference path until M5 carries
-    // those lengths directly.
-    fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
-                        every_sequence_contributes;
+
+    // A sequence contributing no query rows used to force the whole batch onto
+    // the reference kernel, because its length was unknowable. With `seq_lens`
+    // stated it is just an empty range in `qo_indptr`, and chunked prefill
+    // produces those constantly -- every step where the budget runs out before
+    // the last sequence is reached.
+    fi_prefill_usable =
+        flashinfer_prefill != nullptr && !fi_usable && lengths_are_known &&
+        (every_sequence_contributes || !batch.seq_lens.empty());
 
     std::vector<int32_t> indices;
     INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(

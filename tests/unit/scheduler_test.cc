@@ -9,6 +9,8 @@
 
 #include "inferx/scheduler/scheduler.h"
 
+#include <memory>
+#include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -365,35 +367,304 @@ TEST_F(SchedulerTest, ExhaustionDefersAdmissionRatherThanLeaking) {
   EXPECT_EQ(batch.token_ids, (std::vector<int32_t>{2, 2, 2, 2}));
 }
 
-// A prefill larger than the per-step token budget waits for a step of its own
-// rather than being truncated. Chunking it is M5's job; silently running part
-// of a prompt would be a correctness bug, not a performance one.
-TEST_F(SchedulerTest, OversizedPrefillDefersRatherThanTruncating) {
+// ---------------------------------------------------------------------------
+// Chunked prefill (§8.1).
+// ---------------------------------------------------------------------------
+
+/// A scheduler with a deliberately tiny token budget, so a handful of tokens
+/// is enough to exercise chunking.
+std::unique_ptr<Scheduler> ChunkingScheduler(KvBlockPool* pool,
+                                             int64_t max_batch_tokens,
+                                             int64_t max_running = 4) {
   SchedulerConfig config;
-  config.max_running = 4;
-  config.max_batch_tokens = 4;
+  config.max_running = max_running;
+  config.max_batch_tokens = max_batch_tokens;
   config.max_seq_len = 64;
 
-  auto s = Scheduler::Create(config, pool_.get());
-  ASSERT_TRUE(s.ok());
-  Scheduler sched = *std::move(s);
+  auto s = Scheduler::Create(config, pool);
+  if (!s.ok()) return nullptr;
+  return std::make_unique<Scheduler>(*std::move(s));
+}
 
-  ASSERT_TRUE(sched.AddRequest(1, {1, 2, 3}, Params(2)).ok());
-  ASSERT_TRUE(sched.AddRequest(2, {4, 5, 6}, Params(2)).ok());
+// The budget is spent rather than left on the table: what does not fit whole is
+// cut to the remainder. This is the test that used to assert the opposite --
+// that a prompt too big for what was left waited for a step of its own -- and
+// inverting it is the point of chunking.
+TEST_F(SchedulerTest, APromptTakesWhatIsLeftOfTheBudgetRatherThanDeferring) {
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/4);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2, 3}, Params(2)).ok());
+  ASSERT_TRUE(sched->AddRequest(2, {4, 5, 6}, Params(2)).ok());
 
   ForwardBatch batch;
-  ASSERT_TRUE(sched.PrepareStep(&batch).ok());
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
 
-  // The first prefill takes 3 of 4; the second needs 3 and does not fit, so it
-  // contributes nothing this step -- but it is not cut short.
-  EXPECT_EQ(batch.token_ids, (std::vector<int32_t>{1, 2, 3}));
+  // Request 1 takes 3 of 4; request 2 takes the remaining 1 as a chunk.
+  EXPECT_EQ(batch.token_ids, (std::vector<int32_t>{1, 2, 3, 4}));
+  EXPECT_EQ(batch.seq_of_token, (std::vector<int32_t>{0, 0, 0, 1}));
+  EXPECT_EQ(batch.positions, (std::vector<int32_t>{0, 1, 2, 0}));
+
+  // Only request 1 finished its prompt, so only it has a logits row.
+  EXPECT_EQ(batch.logits_indices, (std::vector<int32_t>{2}));
+
+  // Both lengths are stated, and request 2's says 1 -- it has one key in the
+  // cache and two prompt tokens still to come.
+  EXPECT_EQ(batch.seq_lens, (std::vector<int32_t>{3, 1}));
+}
+
+// A prompt longer than the whole per-step budget was unservable before
+// chunking: it could never fit a step, so it sat in the queue forever. Now it
+// runs in pieces, and the pieces cover it exactly once.
+TEST_F(SchedulerTest, APromptLongerThanTheBudgetIsServedInChunks) {
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/4);
+  ASSERT_NE(sched, nullptr);
+
+  std::vector<int32_t> prompt(15);
+  for (size_t i = 0; i < prompt.size(); ++i) {
+    prompt[i] = static_cast<int32_t>(100 + i);
+  }
+
+  ASSERT_TRUE(sched->AddRequest(1, prompt, Params(1)).ok());
+
+  ForwardBatch batch;
+  std::vector<int32_t> seen;
+  std::vector<int32_t> seen_positions;
+  int chunks = 0;
+
+  // Run until the prompt produces its first token.
+  while (true) {
+    ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+    ASSERT_FALSE(batch.token_ids.empty());
+    ++chunks;
+    ASSERT_LT(chunks, 20) << "prefill did not converge";
+
+    seen.insert(seen.end(), batch.token_ids.begin(), batch.token_ids.end());
+    seen_positions.insert(seen_positions.end(), batch.positions.begin(),
+                          batch.positions.end());
+
+    EXPECT_LE(batch.num_tokens(), 4) << "chunk overran the budget";
+
+    if (!batch.logits_indices.empty()) break;
+
+    // A middle chunk asks for nothing and takes nothing back.
+    ASSERT_TRUE(sched->CommitStep({}).ok());
+  }
+
+  // 15 tokens at 4 per step is four chunks, the last of them short.
+  EXPECT_EQ(chunks, 4);
+  EXPECT_EQ(seen, prompt) << "the chunks did not reconstruct the prompt";
+
+  // Every position exactly once, in order: no gap, no token run twice.
+  std::vector<int32_t> expected_positions(prompt.size());
+  for (size_t i = 0; i < expected_positions.size(); ++i) {
+    expected_positions[i] = static_cast<int32_t>(i);
+  }
+  EXPECT_EQ(seen_positions, expected_positions);
+
+  // The last chunk is the one that samples, and it samples once.
   EXPECT_EQ(batch.logits_indices.size(), 1u);
+  EXPECT_EQ(batch.logits_indices[0], batch.num_tokens() - 1);
+  EXPECT_EQ(batch.seq_lens, (std::vector<int32_t>{15}));
+}
 
-  ASSERT_TRUE(sched.CommitStep({7}).ok());
+// §8.1's priority rule. A decoding sequence must not wait behind someone
+// else's prompt, because bounding that wait is the reason chunking exists.
+TEST_F(SchedulerTest, DecodesAreServedBeforePrefillChunks) {
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/4);
+  ASSERT_NE(sched, nullptr);
 
-  ASSERT_TRUE(sched.PrepareStep(&batch).ok());
-  // Now the second prefill runs, alongside the first's decode.
-  EXPECT_EQ(batch.token_ids, (std::vector<int32_t>{7, 4, 5, 6}));
+  // Request 1 gets running and starts generating.
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2}, Params(10)).ok());
+
+  ForwardBatch batch;
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+  ASSERT_EQ(batch.num_tokens(), 2);
+  ASSERT_TRUE(sched->CommitStep({50}).ok());
+
+  // Now a long prompt arrives. It is far bigger than the budget, so without
+  // decode-first it would take the whole step and stall request 1.
+  ASSERT_TRUE(sched->AddRequest(2, {7, 7, 7, 7, 7, 7, 7, 7}, Params(1)).ok());
+
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+
+  // Request 1's decode is present, and it is first: rows are grouped by
+  // sequence in ascending sequence order, which the attention plan requires.
+  EXPECT_EQ(batch.seq_of_token, (std::vector<int32_t>{0, 1, 1, 1}));
+  EXPECT_EQ(batch.token_ids, (std::vector<int32_t>{50, 7, 7, 7}));
+
+  // The decode took 1 of the 4 tokens; the prompt was chunked into the other 3
+  // rather than being given the whole budget.
+  EXPECT_EQ(batch.logits_indices, (std::vector<int32_t>{0}));
+  EXPECT_EQ(batch.seq_lens, (std::vector<int32_t>{3, 3}));
+}
+
+// The equivalence that makes chunking safe: splitting a prompt changes how many
+// steps it takes and nothing else. Same tokens, same positions, same slots, so
+// the same keys land in the same places.
+TEST_F(SchedulerTest, ChunkingChangesTheStepsAndNotTheWork) {
+  const std::vector<int32_t> prompt = {5, 6, 7, 8, 9, 10, 11, 12, 13};
+
+  // Collects (token, position, slot) for every prompt token, across however
+  // many steps the budget makes it take.
+  const auto run = [&](int64_t budget) {
+    auto pool = HostPool(64);
+    EXPECT_TRUE(pool.ok());
+    auto owned = std::make_unique<KvBlockPool>(*std::move(pool));
+
+    auto sched = ChunkingScheduler(owned.get(), budget);
+    EXPECT_NE(sched, nullptr);
+    EXPECT_TRUE(sched->AddRequest(1, prompt, Params(1)).ok());
+
+    std::vector<std::tuple<int32_t, int32_t, int32_t>> work;
+    ForwardBatch batch;
+
+    for (int step = 0; step < 20; ++step) {
+      EXPECT_TRUE(sched->PrepareStep(&batch).ok());
+      if (batch.token_ids.empty()) break;
+
+      for (int64_t i = 0; i < batch.num_tokens(); ++i) {
+        work.emplace_back(batch.token_ids[i], batch.positions[i],
+                          batch.slots[i]);
+      }
+
+      if (!batch.logits_indices.empty()) break;
+      EXPECT_TRUE(sched->CommitStep({}).ok());
+    }
+
+    return work;
+  };
+
+  const auto whole = run(/*budget=*/64);
+  const auto chunked = run(/*budget=*/2);
+
+  ASSERT_EQ(whole.size(), prompt.size());
+  EXPECT_EQ(chunked, whole);
+}
+
+// A chunk in the middle of a prompt produces no logits, so it takes no sampled
+// tokens back -- and offering it one is a caller bug worth catching.
+TEST_F(SchedulerTest, CommitRejectsATokenForAChunkThatAskedForNone) {
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/2);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2, 3, 4, 5}, Params(2)).ok());
+
+  ForwardBatch batch;
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+  ASSERT_TRUE(batch.logits_indices.empty()) << "expected a middle chunk";
+
+  EXPECT_EQ(sched->CommitStep({42}).code(), absl::StatusCode::kInvalidArgument);
+}
+
+// A chunked prompt still finishes, still generates the right number of tokens,
+// and still gives its blocks back. The whole lifecycle, with the budget set
+// low enough that every request is chunked.
+TEST_F(SchedulerTest, ChunkedPromptsDrainToCompletion) {
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/3);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1, 2, 3, 4, 5, 6, 7}, Params(4)).ok());
+  ASSERT_TRUE(sched->AddRequest(2, {8, 9, 10, 11, 12}, Params(3)).ok());
+
+  std::vector<Completion> all;
+  int32_t next_token = 70;
+  int steps = 0;
+
+  while (sched->HasWork()) {
+    ASSERT_LT(++steps, 200) << "step loop did not terminate";
+
+    ForwardBatch batch;
+    ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+
+    if (batch.num_tokens() == 0) {
+      for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+      continue;
+    }
+
+    ASSERT_LE(batch.num_tokens(), 3) << "step " << steps << " overran budget";
+    ASSERT_TRUE(batch.Validate(1000, pool_->num_blocks() * pool_->block_size())
+                    .ok())
+        << "step " << steps << ": "
+        << batch.Validate(1000, pool_->num_blocks() * pool_->block_size());
+
+    std::vector<int32_t> sampled(batch.logits_indices.size());
+    for (int32_t& t : sampled) t = next_token++;
+
+    ASSERT_TRUE(sched->CommitStep(sampled).ok());
+
+    for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+  }
+
+  for (Completion& c : sched->TakeCompleted()) all.push_back(std::move(c));
+
+  ASSERT_EQ(all.size(), 2u);
+  for (const Completion& c : all) {
+    EXPECT_EQ(c.reason, FinishReason::kMaxTokens) << "request " << c.id;
+    EXPECT_EQ(c.output_tokens.size(), c.id == 1 ? 4u : 3u)
+        << "request " << c.id << " generated the wrong number of tokens";
+  }
+
+  EXPECT_EQ(pool_->free_blocks(), pool_->num_blocks()) << "blocks leaked";
+}
+
+// Every sequence in the batch has a declared length, including one the budget
+// left out entirely. That sequence has no query row, so its length cannot be
+// recovered from the batch any other way -- which is why ForwardBatch carries
+// it rather than the model deriving it.
+TEST_F(SchedulerTest, DeferredSequencesStillDeclareTheirLength) {
+  // Budget 1, so a single decode consumes it and nothing else gets a token.
+  auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/1);
+  ASSERT_NE(sched, nullptr);
+
+  ASSERT_TRUE(sched->AddRequest(1, {1}, Params(10)).ok());
+
+  ForwardBatch batch;
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+  ASSERT_EQ(batch.num_tokens(), 1);
+  ASSERT_TRUE(sched->CommitStep({50}).ok());
+
+  // Request 2 is admitted but the decode takes the only token of budget.
+  ASSERT_TRUE(sched->AddRequest(2, {9, 9}, Params(1)).ok());
+
+  ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+
+  ASSERT_EQ(batch.num_seqs, 2);
+  EXPECT_EQ(batch.seq_of_token, (std::vector<int32_t>{0}))
+      << "the decode should have taken the budget";
+
+  // Request 1 has two keys cached; request 2 has none yet, and says so.
+  EXPECT_EQ(batch.seq_lens, (std::vector<int32_t>{2, 0}));
+}
+
+// A scheduler destroyed with requests still in flight gives their blocks back.
+//
+// `BlockTable` holds no pointer to the pool it drew from, so it cannot return
+// its own blocks and nothing below the scheduler can either. Until the
+// scheduler's destructor did it, a server shut down mid-stream stranded every
+// in-flight sequence's KV in a pool that outlived it.
+TEST_F(SchedulerTest, DestructionReturnsTheBlocksOfUnfinishedRequests) {
+  const int64_t total = pool_->num_blocks();
+
+  {
+    auto sched = ChunkingScheduler(pool_.get(), /*max_batch_tokens=*/64);
+    ASSERT_NE(sched, nullptr);
+
+    // Enough requests to exceed max_running, so some are still queued when the
+    // scheduler goes away and others are running with blocks held.
+    for (int i = 0; i < 6; ++i) {
+      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1),
+                                    {1, 2, 3, 4, 5}, Params(50))
+                      .ok());
+    }
+
+    ForwardBatch batch;
+    ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+    ASSERT_LT(pool_->free_blocks(), total) << "nothing was allocated to leak";
+  }
+
+  EXPECT_EQ(pool_->free_blocks(), total)
+      << "a scheduler destroyed mid-flight stranded its blocks";
 }
 
 TEST_F(SchedulerTest, CommitRejectsTheWrongNumberOfTokens) {

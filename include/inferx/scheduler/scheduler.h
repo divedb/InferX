@@ -76,8 +76,14 @@ struct Completion {
 struct SchedulerConfig {
   /// Sequences resident at once. Bounds the batch and the block table's width.
   int64_t max_running = 8;
-  /// Tokens per step across the whole batch (§8.1). A prefill longer than this
-  /// is not yet chunked -- that is M5 -- so for now it bounds admission.
+  /// Tokens per step across the whole batch (§8.1), and so also the largest
+  /// prefill chunk. A prompt longer than this is split across steps rather
+  /// than waiting for a step it fits in whole.
+  ///
+  /// This is the TBT/prefill-efficiency dial. Lower bounds how long a decoding
+  /// sequence can be stalled behind someone else's prompt; higher runs prefill
+  /// closer to the throughput a monolithic one gets, since each chunk re-reads
+  /// the prior KV and shorter GEMMs are less efficient.
   int64_t max_batch_tokens = 2048;
   /// Longest sequence, prompt plus generation. Bounds `max_blocks_per_seq`.
   int64_t max_seq_len = 2048;
@@ -91,11 +97,17 @@ struct SchedulerConfig {
 /// it unit-testable on a machine with no GPU -- the pool can be host-allocated
 /// and the whole lifecycle exercised without a device present.
 ///
-/// M3 scope: FCFS admission (§8.3), one prefill per step, synchronous stepping.
-/// No chunked prefill, no preemption, no prefix cache -- those are M5, and the
-/// interface here is the one they extend rather than replace. Notably
-/// `PrepareStep` already returns a batch that can mix a prefill with decodes,
-/// because that is the shape chunked prefill needs.
+/// Scope: FCFS admission (§8.3), continuous batching with chunked prefill
+/// (§8.1), synchronous stepping. Still missing from M5 are preemption -- a
+/// sequence that cannot grow is retired rather than returned to the queue --
+/// and the radix prefix cache.
+///
+/// Every step builds a mixed batch: decodes first, then prefill chunks fill
+/// what is left of `max_batch_tokens`. That ordering is the point rather than
+/// an implementation detail. Prefill is expensive enough to dominate a step --
+/// a 2k prompt is ~16 decode steps' worth of work -- so letting one take the
+/// budget ahead of a waiting decode adds its whole latency to every other
+/// client's inter-token time.
 ///
 /// The step loop is deliberately the depth-0 case of §5.2: prepare, execute,
 /// commit, with nothing in flight across the boundary. T6 keeps this path as
@@ -134,7 +146,11 @@ class Scheduler {
   /// \return           OK, or the reason admission could not proceed at all.
   Status PrepareStep(model::ForwardBatch* out_batch);
 
-  /// \brief Applies one sampled token per sequence in the last prepared batch.
+  /// \brief Applies one sampled token per logits row of the last prepared batch.
+  ///
+  /// Not one per sequence: a sequence part-way through a chunked prefill
+  /// advances its cached length and produces no token, so a step that finishes
+  /// nobody's prompt takes an empty `sampled` and is still a normal step.
   ///
   /// \param sampled     One token per entry of the batch's `logits_indices`, in
   ///                    the same order.

@@ -125,10 +125,11 @@ class EngineTest : public ::testing::Test {
     return all;
   }
 
-  StatusOr<Scheduler> MakeScheduler(int64_t max_running = 4) {
+  StatusOr<Scheduler> MakeScheduler(int64_t max_running = 4,
+                                    int64_t max_batch_tokens = 2048) {
     SchedulerConfig config;
     config.max_running = max_running;
-    config.max_batch_tokens = 2048;
+    config.max_batch_tokens = max_batch_tokens;
     config.max_seq_len = 512;
 
     return Scheduler::Create(config, model_->kv_pool());
@@ -309,6 +310,187 @@ TEST_F(EngineTest, RaggedPrefillCacheIsRepeatableAfterBlockReuse) {
     ASSERT_EQ(first.kv[i], second.kv[i])
         << "first cached K/V difference at flattened element " << i;
   }
+}
+
+// Chunking a prompt changes how many steps it takes and must change nothing
+// else.
+//
+// This is what the whole of §8.1 rests on. A chunk attends over KV that earlier
+// chunks wrote, so the second chunk's queries read keys through the block table
+// rather than from anything in its own batch. If the slot arithmetic, the
+// declared sequence length or the resumption point were off by one position,
+// those reads would land on a neighbouring key and the model would return
+// plausible logits rather than failing -- the same failure mode as R8, which
+// took a GPU, a model and an HTTP server to notice.
+TEST_F(EngineTest, ChunkedPrefillMatchesWholePrefill) {
+  // Long enough for several chunks, and not a multiple of the chunk size, so
+  // the last chunk is short.
+  std::vector<int32_t> prompt;
+  for (int i = 0; i < 6; ++i) {
+    for (const int32_t t : {kThe, kCapital, kOf, kFrance, kIs, kParis}) {
+      prompt.push_back(t);
+    }
+  }
+  ASSERT_EQ(prompt.size(), 36u);
+
+  SamplingParams params;
+  params.max_tokens = 1;
+
+  // Drives the prompt through its prefill, however many steps the budget makes
+  // that take, and returns the logits of its final token.
+  const auto prefill_logits = [&](int64_t budget, int* out_steps) {
+    std::vector<float> logits;
+
+    auto sched = MakeScheduler(/*max_running=*/1, budget);
+    EXPECT_TRUE(sched.ok());
+    EXPECT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    int steps = 0;
+
+    while (steps < 50) {
+      ForwardBatch batch;
+      EXPECT_TRUE(sched->PrepareStep(&batch).ok());
+      EXPECT_GT(batch.num_tokens(), 0);
+      ++steps;
+
+      const Status s = model_->Step(batch, &logits);
+      EXPECT_TRUE(s.ok()) << "step " << steps << ": " << s;
+      if (!s.ok()) break;
+
+      // The last chunk is the one that asks for logits.
+      if (!batch.logits_indices.empty()) break;
+
+      // A middle chunk returns nothing to commit, and committing nothing is
+      // what advances it to the next chunk.
+      EXPECT_TRUE(logits.empty()) << "a middle chunk produced logits";
+      EXPECT_TRUE(sched->CommitStep({}).ok());
+    }
+
+    *out_steps = steps;
+    return logits;
+  };
+
+  int whole_steps = 0;
+  int chunked_steps = 0;
+
+  const std::vector<float> whole = prefill_logits(2048, &whole_steps);
+  const std::vector<float> chunked = prefill_logits(8, &chunked_steps);
+
+  EXPECT_EQ(whole_steps, 1) << "the control was itself chunked";
+  EXPECT_EQ(chunked_steps, 5) << "36 tokens at 8 per step is 4 chunks and a tail";
+
+  ASSERT_FALSE(whole.empty());
+  ASSERT_EQ(whole.size(), chunked.size());
+
+  // What a caller actually sees.
+  EXPECT_EQ(GreedySample(whole, 1), GreedySample(chunked, 1))
+      << "chunking changed the model's prediction";
+
+  // And the logits themselves, to the extent the arithmetic allows. Chunking
+  // reduces over an [8, d] GEMM where the whole prefill reduces over [36, d],
+  // so the two differ in bf16's last bits rather than not at all.
+  double worst = 0.0;
+  double scale = 0.0;
+  for (size_t i = 0; i < whole.size(); ++i) {
+    worst = std::max(worst, std::fabs(static_cast<double>(whole[i]) -
+                                      static_cast<double>(chunked[i])));
+    scale = std::max(scale, std::fabs(static_cast<double>(whole[i])));
+  }
+
+  std::fprintf(stderr, "[chunked prefill] max|diff| = %.6g over range %.6g\n",
+               worst, scale);
+
+  EXPECT_LT(worst, 0.02 * scale)
+      << "chunking moved the logits further than rounding explains";
+}
+
+// The shape chunking exists to produce: a decode and a half-finished prompt in
+// the same batch. The decoding sequence must get exactly the token it would
+// have got had the prompt not been there, which is the isolation property
+// ragged batching already had -- now with one of the sequences contributing
+// query rows that stop in the middle of itself.
+TEST_F(EngineTest, ADecodeIsUnaffectedByAPrefillChunkBesideIt) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+
+  SamplingParams params;
+  params.max_tokens = 4;
+
+  // Alone: no one else in the batch at any point.
+  std::vector<int32_t> alone;
+  {
+    auto sched = MakeScheduler(/*max_running=*/1);
+    ASSERT_TRUE(sched.ok());
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    const std::vector<Completion> done = Drain(&*sched);
+    ASSERT_EQ(done.size(), 1u);
+    alone = done[0].output_tokens;
+  }
+
+  // Beside a long prompt, with a budget small enough that the prompt takes
+  // several steps to get through and is mid-prefill while request 1 decodes.
+  std::vector<int32_t> beside;
+  {
+    auto sched = MakeScheduler(/*max_running=*/4, /*max_batch_tokens=*/8);
+    ASSERT_TRUE(sched.ok());
+
+    ASSERT_TRUE(sched->AddRequest(1, prompt, params).ok());
+
+    std::vector<int32_t> long_prompt;
+    for (int i = 0; i < 8; ++i) {
+      for (const int32_t t : {kThe, kCapital, kOf, kFrance}) {
+        long_prompt.push_back(t);
+      }
+    }
+    ASSERT_TRUE(sched->AddRequest(2, long_prompt, params).ok());
+
+    bool saw_a_mixed_step = false;
+
+    // The loop, inline rather than through Drain, so the mixed shape can be
+    // asserted to have actually occurred -- a test that silently never
+    // produced one would pass for the wrong reason.
+    int steps = 0;
+    std::vector<Completion> done;
+
+    while (sched->HasWork() && steps < 200) {
+      ++steps;
+
+      ForwardBatch batch;
+      ASSERT_TRUE(sched->PrepareStep(&batch).ok());
+
+      if (batch.num_tokens() > 0) {
+        // A step where request 1 decodes one token and request 2 supplies a
+        // chunk of prompt that does not finish it.
+        if (batch.num_seqs == 2 && batch.logits_indices.size() == 1 &&
+            batch.num_tokens() > 1) {
+          saw_a_mixed_step = true;
+        }
+
+        std::vector<float> logits;
+        ASSERT_TRUE(model_->Step(batch, &logits).ok()) << "step " << steps;
+        ASSERT_TRUE(sched->CommitStep(
+                         GreedySample(logits, batch.logits_indices.size()))
+                        .ok());
+      }
+
+      for (Completion& c : sched->TakeCompleted()) done.push_back(std::move(c));
+    }
+
+    for (Completion& c : sched->TakeCompleted()) done.push_back(std::move(c));
+
+    EXPECT_TRUE(saw_a_mixed_step)
+        << "no decode ever shared a step with an unfinished prefill";
+
+    ASSERT_EQ(done.size(), 2u);
+    for (const Completion& c : done) {
+      if (c.id == 1) beside = c.output_tokens;
+    }
+  }
+
+  EXPECT_EQ(alone, beside)
+      << "a prefill chunk in the batch changed a decoding sequence's output";
+
+  EXPECT_EQ(model_->kv_pool()->used_blocks(), 0) << "blocks leaked";
 }
 
 TEST_F(EngineTest, StopTokenEndsGenerationEarly) {
