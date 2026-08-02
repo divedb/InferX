@@ -87,6 +87,23 @@ class PrefixCache {
   ///                always be left to compute.
   Match Acquire(const std::vector<int32_t>& tokens, int64_t limit);
 
+  /// \brief Records that an admission went through, for the hit statistics.
+  ///
+  /// Separate from `Acquire` because a lookup is not an admission. Admission
+  /// can fail after matching -- there may be no room for the *rest* of the
+  /// prompt -- and the scheduler then rolls back and retries on a later step.
+  /// Counting inside `Acquire` charged every one of those retries, so under
+  /// memory pressure, where retries are most frequent, the hit rate collapsed
+  /// towards zero while the cache was in fact working. The metric said the
+  /// opposite of what was happening.
+  ///
+  /// \param hit    Tokens the match supplied.
+  /// \param total  Tokens in the sequence admitted.
+  void RecordAdmission(int64_t hit, int64_t total) {
+    hit_tokens_ += hit;
+    miss_tokens_ += total - hit;
+  }
+
   /// \brief Ends a sequence's relationship with the cache.
   ///
   /// Releases the reference `Acquire` took, then offers the blocks the sequence
@@ -128,6 +145,14 @@ class PrefixCache {
   int64_t hit_tokens() const { return hit_tokens_; }
   int64_t miss_tokens() const { return miss_tokens_; }
 
+  /// \brief Blocks reclaimed from the tree to satisfy an allocation.
+  ///
+  /// Cumulative. Read against `hit_tokens`: eviction rising while hits do not
+  /// is the cache being churned faster than it can be used, which means the
+  /// pool is too small for the working set rather than that caching is the
+  /// wrong idea.
+  int64_t evicted_blocks() const { return evicted_blocks_; }
+
  private:
   /// One run of tokens and the blocks holding it.
   ///
@@ -167,6 +192,7 @@ class PrefixCache {
 
   int64_t hit_tokens_ = 0;
   int64_t miss_tokens_ = 0;
+  int64_t evicted_blocks_ = 0;
 };
 
 }  // namespace inferx::scheduler

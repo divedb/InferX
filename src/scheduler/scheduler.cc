@@ -348,6 +348,12 @@ struct Scheduler::Impl {
         return;
       }
 
+      // Counted here rather than at the lookup: this is the point at which
+      // the match is actually going to be used.
+      if (config.enable_prefix_cache) {
+        cache->RecordAdmission(seq.acquired, needed);
+      }
+
       waiting.pop_front();
       running.push_back(std::move(seq));
     }
@@ -699,6 +705,10 @@ int64_t Scheduler::prefix_hit_tokens() const {
 
 int64_t Scheduler::prefix_miss_tokens() const {
   return impl_->cache->miss_tokens();
+}
+
+int64_t Scheduler::evicted_blocks() const {
+  return impl_->cache->evicted_blocks();
 }
 
 int64_t Scheduler::preemptions() const { return impl_->preemptions; }

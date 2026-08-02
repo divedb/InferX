@@ -274,7 +274,9 @@ struct HttpServer::Impl {
                          ",\"prefix_hit_tokens\":" +
                          std::to_string(stats.prefix_hit_tokens) +
                          ",\"prefix_miss_tokens\":" +
-                         std::to_string(stats.prefix_miss_tokens) + "}";
+                         std::to_string(stats.prefix_miss_tokens) +
+                         ",\"evicted_blocks\":" +
+                         std::to_string(stats.evicted_blocks) + "}";
 
       response.set_content(body, "application/json");
     });

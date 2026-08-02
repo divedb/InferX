@@ -118,9 +118,8 @@ struct SchedulerConfig {
 /// and the whole lifecycle exercised without a device present.
 ///
 /// Scope: FCFS admission (§8.3), continuous batching with chunked prefill
-/// (§8.1), recompute preemption (§8.2), synchronous stepping. Still missing
-/// from M5 is the radix prefix cache, which is what would make a preempted
-/// sequence cheap to bring back rather than merely correct.
+/// (§8.1), recompute preemption (§8.2), a radix prefix cache (§6.3), and
+/// synchronous stepping. That is all of M5.
 ///
 /// Every step builds a mixed batch: decodes first, then prefill chunks fill
 /// what is left of `max_batch_tokens`. That ordering is the point rather than
@@ -205,6 +204,9 @@ class Scheduler {
   /// ratio is what says whether prefix caching is paying for itself here.
   int64_t prefix_hit_tokens() const;
   int64_t prefix_miss_tokens() const;
+
+  /// \brief Blocks reclaimed from the prefix cache to satisfy an allocation.
+  int64_t evicted_blocks() const;
 
   /// \brief How many times a sequence has been sent back to the queue to free
   ///        KV for another (§8.2). Cumulative over the scheduler's life.

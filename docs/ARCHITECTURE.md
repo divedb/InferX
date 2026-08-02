@@ -684,10 +684,88 @@ scheduler's per-step overhead account for. And the reuse arithmetic closes
 exactly: 7168 reused over 7 warm requests is 1024 each, which is the block-
 aligned match of a 1072-token prompt.
 
-Reproducible to ~1% across runs. What is *not* measured here is eviction: the
-pool is deliberately generous, so no row pays for reclaiming anything. What the
-cache costs under memory pressure is a separate question and wants a separate
-harness.
+Reproducible to ~1% across runs.
+
+#### And what it costs when the pool is too small to hold it
+
+`bench/eviction_bench.cc`. The table above gives the cache room to breathe,
+which is the easy half. The hard half is what happens when cached blocks and
+running sequences want the same memory, and there are three ways that could go
+badly: **churn** (blocks evicted before anyone reuses them, so the hit rate
+collapses and the tree walk is pure overhead), **displacement** (the cache holds
+memory a running sequence needed, so the engine preempts where it otherwise
+would not), or a **soft landing** — eviction gives memory back on demand and the
+cache degrades to roughly the uncached case rather than below it.
+
+12 requests sharing a 1024-token preamble, 4 resident at once, 64 generated
+each, submitted as one burst so the pool is genuinely contended. The pool is
+swept downwards; `enable_prefix_cache` is the only thing that differs between
+the two rows at each size.
+
+| blocks | cache | wall ms | mean TTFT | hit % | preempt | evicted | |
+|---|---|---|---|---|---|---|---|
+| 320 | off | 4575 | 2497 | 0 | 0 | 0 | |
+| | on | 3892 | 2220 | 64 | 0 | 0 | 1.18× |
+| 192 | off | 5965 | 2628 | 0 | 0 | 0 | |
+| | on | 3469 | 1431 | 80 | 0 | 0 | 1.72× |
+| 128 | off | 10480 | 4897 | 0 | 0 | 0 | |
+| | on | 3413 | 1546 | 88 | 0 | 11 | **3.07×** |
+| 96 | off | 10662 | 4943 | 0 | 0 | 0 | |
+| | on | 3478 | 1586 | 88 | 0 | 43 | 3.07× |
+| 88 | off | 10526 | 4951 | 0 | 0 | 0 | |
+| | on | 3352 | 1534 | 89 | 2 | 56 | 3.14× |
+| 80 | off | 10547 | 4918 | 0 | 0 | 0 | |
+| | on | 4595 | 1804 | 92 | 11 | 76 | 2.30× |
+
+**The cache is worth more under pressure, not less** — 1.18× with room to spare,
+3.07× at a quarter of the memory. The reason is that the two configurations do
+not have the same working set. Uncached, each resident sequence needs its whole
+1136 tokens: 71 blocks, times four is 284. Cached, all four point at the *same*
+64 blocks of preamble and own only their own tails, so four of them fit in about
+96. Prefix caching is a memory optimization as much as a compute one whenever
+the sharing is between *concurrent* requests, and the uncached column is a step
+function of how many sequences still fit — four, then two, then one.
+
+**The hit rate rises as the pool shrinks**, 64% to 92%, which looks backwards
+until you see what causes a miss here: concurrency. The first four requests are
+admitted together, before any of them has finished and populated the tree, so
+all four miss. Less memory means less concurrency means more requests arriving
+after somebody else has already paid for the preamble.
+
+**No churn.** Evictions climb from 0 to 76 while hits climb too. That is
+tail-trimming doing its job — eviction takes the request-specific end of a node
+and leaves the shared head, so what gets reclaimed is precisely the part nobody
+was going to match.
+
+The knee is at 80 blocks, where the preamble plus four tails no longer fit
+together: preemptions jump to 11 and the win falls to 2.30×. Still well ahead of
+uncached, but this is where the pool is genuinely too small for the workload.
+
+**No displacement either**, on the workload built to expose it — every request a
+different 1072-token prompt, so each cached block is dead weight from the moment
+it is stored:
+
+| blocks | cache | wall ms | hit % | preempt | evicted | |
+|---|---|---|---|---|---|---|
+| 512 | off | 4625 | 0 | 0 | 0 | |
+| | on | 4568 | 0 | 0 | 332 | 1.01× |
+| 256 | off | 5404 | 0 | 0 | 0 | |
+| | on | 5372 | 0 | 0 | 587 | 1.01× |
+| 128 | off | 10506 | 0 | 0 | 0 | |
+| | on | 10506 | 0 | 0 | 713 | 1.00× |
+
+713 blocks stored, evicted, and never once reused, for no measurable cost and no
+extra preemption. Eviction on allocation failure is doing exactly what §6.3 asks
+of it: the cache is as large as it can be right up until the memory is wanted,
+and then it is not in the way.
+
+Reproducible to ~2%. Writing this benchmark also found the hit-rate metric to be
+wrong: `Acquire` counted every lookup, but admission can match and then fail for
+want of room for the *rest* of the prompt, and the scheduler retries on a later
+step. Every retry was charged, so under memory pressure — where retries are most
+frequent and the number matters most — the reported hit rate fell towards zero
+while the cache was working. It reads 88% now where it read 14%. Counting moved
+to `RecordAdmission`, called once the admission commits.
 
 #### The M3-to-M4 progression, re-run
 

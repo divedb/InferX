@@ -413,6 +413,7 @@ struct Engine::Impl {
         stats.cached_blocks = scheduler.cached_blocks();
         stats.prefix_hit_tokens = scheduler.prefix_hit_tokens();
         stats.prefix_miss_tokens = scheduler.prefix_miss_tokens();
+        stats.evicted_blocks = scheduler.evicted_blocks();
       }
     }
 

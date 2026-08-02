@@ -110,10 +110,7 @@ PrefixCache::Match PrefixCache::Acquire(const std::vector<int32_t>& tokens,
   limit = std::min(limit, static_cast<int64_t>(tokens.size()));
   limit = (std::max<int64_t>(limit, 0) / block_size_) * block_size_;
 
-  if (limit == 0) {
-    miss_tokens_ += static_cast<int64_t>(tokens.size());
-    return match;
-  }
+  if (limit == 0) return match;
 
   ++clock_;
 
@@ -123,9 +120,6 @@ PrefixCache::Match PrefixCache::Acquire(const std::vector<int32_t>& tokens,
     match.blocks.insert(match.blocks.end(), node->blocks.begin(),
                         node->blocks.end());
   });
-
-  hit_tokens_ += match.tokens;
-  miss_tokens_ += static_cast<int64_t>(tokens.size()) - match.tokens;
 
   return match;
 }
@@ -281,6 +275,7 @@ int64_t PrefixCache::Evict(int64_t blocks) {
                             static_cast<size_t>(block_size_));
       ++freed;
       --cached_blocks_;
+      ++evicted_blocks_;
     }
 
     if (!victim->blocks.empty()) continue;

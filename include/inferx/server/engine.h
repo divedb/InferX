@@ -183,6 +183,10 @@ class Engine {
     /// whether prefix caching is earning its complexity on this workload.
     int64_t prefix_hit_tokens = 0;
     int64_t prefix_miss_tokens = 0;
+    /// Blocks reclaimed from the cache to satisfy an allocation. Read against
+    /// the hit count: eviction rising while hits do not is the pool being too
+    /// small for the working set, not the cache being the wrong idea.
+    int64_t evicted_blocks = 0;
   };
 
   Stats stats() const;

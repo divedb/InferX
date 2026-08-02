@@ -78,6 +78,9 @@ class PrefixCacheTest : public ::testing::Test {
       blocks.push_back(b);
     }
 
+    // What the scheduler does once admission commits.
+    cache_->RecordAdmission(match.tokens, static_cast<int64_t>(tokens.size()));
+
     cache_->Finish(tokens, static_cast<int64_t>(tokens.size()), blocks,
                    match.tokens);
 
@@ -337,6 +340,36 @@ TEST_F(PrefixCacheTest, SequencesShorterThanABlockAreNeverCached) {
   EXPECT_EQ(RunOnce(tokens), 0);
 
   EXPECT_EQ(pool_->used_blocks(), 0);
+}
+
+// An admission that never happened is not a miss.
+//
+// A lookup is not an admission: matching can succeed and the admission still
+// fail, because there may be no room for the *rest* of the prompt, and the
+// scheduler then rolls back and retries on a later step. Counting inside
+// `Acquire` charged every retry, so under memory pressure -- where retries are
+// most frequent, and where the numbers are most worth trusting -- the reported
+// hit rate fell towards zero while the cache was working perfectly well. A
+// throughput benchmark showed a rising hit rate and a falling one at the same
+// time, which is how this was noticed.
+TEST_F(PrefixCacheTest, ARetriedAdmissionIsCountedOnce) {
+  const std::vector<int32_t> tokens = Seq(16);
+  ASSERT_EQ(RunOnce(tokens), 0);
+
+  const int64_t hits = cache_->hit_tokens();
+  const int64_t misses = cache_->miss_tokens();
+
+  // Three lookups that come to nothing, as a request deferred for three steps
+  // would produce.
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const PrefixCache::Match match = cache_->Acquire(tokens, 15);
+    ASSERT_GT(match.tokens, 0);
+    cache_->Finish(tokens, match.tokens, match.blocks, match.tokens);
+  }
+
+  EXPECT_EQ(cache_->hit_tokens(), hits) << "a failed admission counted as a hit";
+  EXPECT_EQ(cache_->miss_tokens(), misses)
+      << "a failed admission counted as a miss";
 }
 
 // Hit and miss counts are what say whether any of this is paying for itself.
