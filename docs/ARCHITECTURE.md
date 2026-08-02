@@ -358,6 +358,8 @@ Two consequences worth stating, because both were latent bugs before rather than
 
 Only the chunk that reaches the end of a prompt asks for logits. The earlier ones compute keys and values and nothing else, so `ForwardBatch::logits_indices` is empty on those steps and `CommitStep` takes no tokens back. That is an ordinary step, not an idle one.
 
+Measured in `bench/tbt_bench.cc` and tabulated in §14: on this workload chunking is worth **10.6× on p99 TBT** (183 → 17.3 ms) and costs **1.6× on TTFT** (183 → 294 ms). That is the trade this section commits to, now with numbers on both sides of it.
+
 Chunking also forced sequence lengths to become **explicit** in the plan (`ForwardBatch::seq_lens`). The model used to recover each sequence's KV length from the largest query position it owned, which only works while every sequence contributes a query. Under chunking a sequence the budget skipped contributes none, and its history does not stop existing — so the batch states the lengths and the model reads them. Without that, any step containing a skipped sequence fell back to the reference attention kernel, which the measured prefill table below prices at 12.8× slower at 2k.
 
 ### 8.2 Preemption
@@ -562,6 +564,54 @@ instead of exceeding the reference kernel's shared-memory ceiling. Throughput
 holds above 9.2k tok/s across the matrix. Multi-sequence ragged prefill uses the
 same path and is guarded by page-permutation, block-reuse, per-layer K/V, and
 server-lifecycle repeatability tests.
+
+#### Inter-token latency under a mixed workload
+
+The first measurement of what §8.1 is actually about, and the first that drives
+the scheduler rather than a hand-built batch — inter-token time is a property of
+how steps are *composed*, so there is nothing to measure without the component
+that composes them. `bench/tbt_bench.cc`, same box and clocks, CUDA graphs off.
+
+Eight sequences decoding throughout; one 2048-token prompt arrives partway in.
+TBT is the wall-clock gap between one sequence's consecutive tokens — what a
+client experiences — so it is measured on the wall clock rather than with CUDA
+events. TTFT is the arriving prompt's own latency, from submission to its first
+token. With the decoders alone and nothing arriving, p50 TBT is 11.7 ms and p99
+is 12.6 ms: that is the floor, and chunking cannot go below it.
+
+| chunk | p50 TBT | p99 TBT | worst step | TTFT | chunks | prefill tok/s |
+|---|---|---|---|---|---|---|
+| 128 | 12.2 ms | **16.9 ms** | 16.9 ms | 291 ms | 18 | 7047 |
+| 256 | 12.1 ms | 27.5 ms | 27.5 ms | 230 ms | 9 | 8921 |
+| 512 | 12.0 ms | 47.6 ms | 47.6 ms | 200 ms | 5 | 10250 |
+| 1024 | 12.1 ms | 91.4 ms | 91.4 ms | 193 ms | 3 | 10635 |
+| 2048 | 12.0 ms | 167.1 ms | 167.1 ms | 179 ms | 2 | 11423 |
+| 4096 | 12.0 ms | **180.9 ms** | 180.9 ms | 181 ms | 1 | 11320 |
+
+`chunk` is `max_batch_tokens`. The last row exceeds the prompt and runs it whole
+in one step, so it is what chunking replaced: **p99 TBT falls 10.6×, from 181 ms
+to 16.9 ms, while TTFT rises 1.61×, from 181 ms to 291 ms.** Chunking does not
+make the prefill cheaper and is not meant to — it decides who waits for it.
+Reproducible to 1–2% across runs.
+
+Three things worth reading off it beyond the headline:
+
+- **p50 is flat at ~12 ms in every row.** The median never moves, because the
+  median step is a decode either way. A mean would have hidden the entire
+  effect, which is why the tail is what is reported.
+- **The 4096 row's 11320 tok/s cross-checks the prefill table above**, which
+  measures 11628 tok/s for a 2048 prompt in isolation. Interleaving eight
+  decodes into those steps costs ~3%, and the two harnesses agreeing to that
+  margin is the reason to believe either.
+- **The 2048 row takes two chunks, not one.** Decodes are served first and spend
+  8 tokens of the budget before the prompt sees any of it, so a prompt exactly
+  the size of the budget never fits in one step. Not a defect — a consequence of
+  the priority rule, and visible here rather than inferred.
+
+The knob is genuinely two-sided, so `max_batch_tokens` stays at 2048 as a
+default rather than being tuned to the best column: the right value depends on
+whether a deployment is serving chat (TBT dominates) or batch summarization
+(TTFT dominates), and this table is what makes that choice with evidence.
 
 #### The M3-to-M4 progression, re-run
 

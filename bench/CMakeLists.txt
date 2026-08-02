@@ -12,6 +12,7 @@ function(inferx_add_bench name)
     inferx::common
     inferx::model
     inferx::kernels
+    inferx::scheduler
     inferx::flags
   )
   # So that #include "bench/cuda_timer.h" resolves the same way our public
@@ -25,6 +26,11 @@ inferx_add_bench(gemm_bench gemm_bench.cc)
 inferx_add_bench(decode_step_bench decode_step_bench.cc)
 inferx_add_bench(decode_breakdown_bench decode_breakdown_bench.cc)
 inferx_add_bench(prefill_bench prefill_bench.cc)
+
+# The only benchmark that drives the scheduler rather than a hand-built batch:
+# inter-token latency is a property of how steps are composed, so there is
+# nothing to measure without the component that composes them.
+inferx_add_bench(tbt_bench tbt_bench.cc)
 
 # Needs FlashInfer to have something to compare against.
 if(INFERX_HAVE_FLASHINFER)
