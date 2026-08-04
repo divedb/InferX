@@ -169,6 +169,18 @@ class Qwen2Model {
   /// \brief True once `QuantizeWeightsToF8` has run.
   bool weights_are_f8() const;
 
+  /// \brief Switches the KV cache to FP8 e4m3 before it is allocated.
+  ///
+  /// Must be called before `AttachKvCache`, which is when the pool's element
+  /// type is fixed. Per-layer K/V dequant scales are frozen from the first
+  /// warmup forward; the attention path then reads the cache through the FP8
+  /// kernels (`RunFp8`/`PrefillFp8`). Like `QuantizeWeightsToF8` this changes
+  /// the model's output and is opt-in.
+  Status EnableFp8KvCache();
+
+  /// \brief True once `EnableFp8KvCache` has run.
+  bool kv_is_fp8() const;
+
   /// \brief Turns on device-side greedy sampling.
   ///
   /// With it on, a decode step samples its own next token and writes it into

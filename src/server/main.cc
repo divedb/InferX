@@ -35,6 +35,7 @@ void PrintUsage(const char* argv0) {
       "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
       "  --block-size <n>       tokens per block (default 16)\n"
       "  --fp8                  quantize weights to FP8 e4m3\n"
+      "  --fp8-kv               store the KV cache as FP8 e4m3\n"
       "  --no-cuda-graphs       skip decode graph capture at startup\n"
       "\n"
       "Only greedy decoding is implemented: temperature and top_p are\n"
@@ -97,6 +98,8 @@ int main(int argc, char** argv) {
       engine_config.block_size = std::atoll(value.c_str());
     } else if (arg == "--fp8") {
       engine_config.fp8_weights = true;
+    } else if (arg == "--fp8-kv") {
+      engine_config.fp8_kv_cache = true;
     } else if (arg == "--no-cuda-graphs") {
       engine_config.capture_graphs = false;
     } else {

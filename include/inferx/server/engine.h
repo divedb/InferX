@@ -32,6 +32,13 @@ struct EngineConfig {
   /// an explicit choice.
   bool fp8_weights = false;
 
+  /// Store the KV cache as FP8 e4m3 instead of bf16. Halves KV memory (twice the
+  /// concurrency at the same VRAM) at the cost of fp8 quantization error on K/V.
+  /// Per-layer dequant scales are frozen from warmup; prefill folds the K scale
+  /// into the query and decode into sm_scale. Off by default for the same reason
+  /// as `fp8_weights`.
+  bool fp8_kv_cache = false;
+
   /// Capture a CUDA graph per batch size at startup.
   ///
   /// On by default again now that R9 is fixed. The capture probe used to write

@@ -73,6 +73,12 @@ struct LayerWeights {
   float* o_s = nullptr;
   float* gate_up_s = nullptr;
   float* down_s = nullptr;
+
+  // FP8 KV cache dequant scales, frozen from the first warmup forward. Host
+  // values: the attention kernels and AppendBf16AsFp8 take them as scalar args,
+  // so the value baked into a captured decode graph is whatever was frozen here.
+  float k_scale = 1.0f;
+  float v_scale = 1.0f;
 };
 
 /// Uploads several host tensors end to end into one device buffer.
@@ -249,6 +255,18 @@ struct Qwen2Model::Impl {
   DeviceBuffer act_f8;        // quantized activations, reused every GEMM
   DeviceBuffer act_scales;    // one float per GEMM input per layer
 
+  // FP8 KV cache. The cache's element type is fixed at AttachKvCache from this
+  // flag; the per-layer K/V dequant scales are frozen from the first warmup
+  // forward (kv_scales_frozen), so the value baked into a captured decode graph
+  // is stable. kv_scale_dev is scratch the freeze path writes the dynamic
+  // quantize's scale into before reading it back to the host; fp8_scratch is the
+  // throwaway contiguous fp8 buffer that same quantize writes (only its scale is
+  // kept).
+  bool fp8_kv = false;
+  bool kv_scales_frozen = false;
+  DeviceBuffer kv_scale_dev;
+  DeviceBuffer fp8_scratch;
+
   // One instantiated graph per decode shape. Keyed on (tokens, seqs, blocks):
   // a graph records fixed launch dimensions, so a batch of a different shape
   // needs its own. Decode shapes repeat forever, which is what makes this pay.
@@ -373,6 +391,15 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   INFERX_RETURN_IF_ERROR(alloc(&gate, tokens * inter, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&up, tokens * inter, kBf16));
   INFERX_RETURN_IF_ERROR(alloc(&logits, tokens * vocab, kBf16));
+
+  // FP8 KV freeze scratch: the dynamic quantize's throwaway contiguous output,
+  // one token's-worth of K (== V) at a time. Only its scale is kept.
+  if (fp8_kv) {
+    INFERX_ASSIGN_OR_RETURN(
+        fp8_scratch,
+        DeviceBuffer::Allocate(static_cast<size_t>(tokens * kvd),
+                               DeviceId::Cuda(0)));
+  }
 
   INFERX_ASSIGN_OR_RETURN(
       positions, DeviceBuffer::Allocate(
@@ -773,11 +800,21 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     // paths run identical kernels -- so a test that says "graphs do not change
     // the output" is testing dispatch rather than arithmetic.
     if (fi_usable) {
-      INFERX_RETURN_IF_ERROR(flashinfer->Plan(
-          batch.num_seqs, config.num_attention_heads,
-          config.num_key_value_heads, config.head_dim, block_size,
-          absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
-    } else if (fi_prefill_usable) {
+      if (fp8_kv) {
+        INFERX_RETURN_IF_ERROR(flashinfer->PlanFp8(
+            batch.num_seqs, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, block_size,
+            absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+      } else {
+        INFERX_RETURN_IF_ERROR(flashinfer->Plan(
+            batch.num_seqs, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, block_size,
+            absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+      }
+    } else if (fi_prefill_usable && !fp8_kv) {
+      // FP8 prefill is one-shot -- PrefillFp8 plans and runs in one call -- so
+      // the separate bf16 Plan here is skipped on that path; LaunchDecodeBody
+      // calls PrefillFp8 directly.
       INFERX_RETURN_IF_ERROR(flashinfer_prefill->Plan(
           batch.num_seqs, config.num_attention_heads,
           config.num_key_value_heads, config.head_dim, block_size,
@@ -878,7 +915,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
   for (int64_t layer_index = 0;
        layer_index < static_cast<int64_t>(layers.size()); ++layer_index) {
-    const LayerWeights& layer = layers[static_cast<size_t>(layer_index)];
+    LayerWeights& layer = layers[static_cast<size_t>(layer_index)];
 
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
@@ -908,8 +945,39 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_ASSIGN_OR_RETURN(const TensorView v_cache,
                             pool->ValueCache(layer_index));
 
-    INFERX_RETURN_IF_ERROR(
-        kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
+    if (fp8_kv) {
+      auto* k_scale_dev = reinterpret_cast<float*>(kv_scale_dev.data());
+      auto* v_scale_dev = k_scale_dev + 1;
+      if (!kv_scales_frozen) {
+        // Warmup freeze (uncaptured): learn this layer's K/V scale from the
+        // data, then write the cache with it. The readback needs a sync, which
+        // is why the freeze runs only here -- before capture, in warmup -- and
+        // never inside a recorded graph. fp8_scratch is the throwaway contiguous
+        // fp8 the dynamic quantize writes; only the scale it leaves behind is
+        // kept.
+        INFERX_ASSIGN_OR_RETURN(
+            const TensorView k_fp8_tmp,
+            TensorView::Create(fp8_scratch.data(), DataType::kFloat8E4M3FN,
+                               k3.GetShape(), DeviceId::Cuda(0)));
+        INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
+            k3, k_fp8_tmp, k_scale_dev, stream));
+        INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
+            v3, k_fp8_tmp, v_scale_dev, stream));
+        INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+        INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(&layer.k_scale, k_scale_dev,
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost));
+        INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(&layer.v_scale, v_scale_dev,
+                                               sizeof(float),
+                                               cudaMemcpyDeviceToHost));
+      }
+      INFERX_RETURN_IF_ERROR(kernels::AppendBf16AsFp8(
+          k3, v3, k_cache, v_cache, slots_v, layer.k_scale, layer.v_scale,
+          stream));
+    } else {
+      INFERX_RETURN_IF_ERROR(
+          kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
+    }
 
 #ifdef INFERX_WITH_FLASHINFER
     if (use_flashinfer || use_flashinfer_prefill) {
@@ -929,17 +997,31 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                              Shape({num_seqs}), DeviceId::Cuda(0)));
 
       if (use_flashinfer) {
-        INFERX_RETURN_IF_ERROR(flashinfer->Run(
-            q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
-            attn_scale, stream));
+        if (fp8_kv) {
+          INFERX_RETURN_IF_ERROR(flashinfer->RunFp8(
+              q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
+              attn_scale, layer.k_scale, layer.v_scale, stream));
+        } else {
+          INFERX_RETURN_IF_ERROR(flashinfer->Run(
+              q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
+              attn_scale, stream));
+        }
       } else {
         INFERX_ASSIGN_OR_RETURN(
             const TensorView fi_qo_indptr,
             TensorView::Create(fi_qo_indptr_buf.data(), DataType::kInt32,
                                Shape({num_seqs + 1}), DeviceId::Cuda(0)));
-        INFERX_RETURN_IF_ERROR(flashinfer_prefill->Run(
-            q3, k_cache, v_cache, fi_qo_indptr, fi_indices, fi_indptr,
-            fi_last_page, a3, attn_scale, stream));
+        if (fp8_kv) {
+          INFERX_RETURN_IF_ERROR(flashinfer_prefill->PrefillFp8(
+              q3, k_cache, v_cache, fi_qo_indptr,
+              absl::MakeConstSpan(fi_qo_indptr_host), fi_indices, fi_indptr,
+              absl::MakeConstSpan(fi_indptr_host), fi_last_page, a3, attn_scale,
+              layer.k_scale, layer.v_scale, stream));
+        } else {
+          INFERX_RETURN_IF_ERROR(flashinfer_prefill->Run(
+              q3, k_cache, v_cache, fi_qo_indptr, fi_indices, fi_indptr,
+              fi_last_page, a3, attn_scale, stream));
+        }
       }
     } else
 #endif
@@ -972,6 +1054,11 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                                   layer.down_s, x, 3));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
+
+  // The first forward (warmup) freezes every layer's K/V scale inline; once it
+  // returns, the freeze path is retired and subsequent steps -- including any
+  // captured decode graph -- use the frozen scales verbatim.
+  if (fp8_kv) kv_scales_frozen = true;
 
   INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
       x, final_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
@@ -1321,7 +1408,8 @@ Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   layout.entries_per_token = 2;  // K and V; MLA would say 1 (T11)
   layout.kv_heads = impl_->config.num_key_value_heads;
   layout.head_dim = impl_->config.head_dim;
-  layout.dtype = DataType::kBFloat16;
+  layout.dtype =
+      impl_->fp8_kv ? DataType::kFloat8E4M3FN : DataType::kBFloat16;
 
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
@@ -1350,6 +1438,15 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   if (impl_->pool == nullptr) {
     return FailedPreconditionError(
         "CaptureDecodeGraph requires a KV cache; call AttachKvCache first");
+  }
+
+  if (impl_->fp8_kv && !impl_->kv_scales_frozen) {
+    // A captured decode graph bakes layer.k_scale/v_scale into AppendBf16AsFp8
+    // and RunFp8 as constants. They must be frozen first (in warmup, which runs
+    // before capture) -- otherwise the graph records the default 1.0 forever.
+    return FailedPreconditionError(
+        "cannot capture a graph before the FP8 KV scales are frozen; run a "
+        "warmup forward first");
   }
 
   if (num_seqs <= 0 || max_blocks_per_seq <= 0) {
@@ -1574,6 +1671,26 @@ Status Qwen2Model::QuantizeWeightsToF8() {
 }
 
 bool Qwen2Model::weights_are_f8() const { return impl_->weights_f8; }
+
+Status Qwen2Model::EnableFp8KvCache() {
+  // The cache's element type is fixed when the pool is allocated, so this must
+  // precede AttachKvCache; once allocated the type cannot change. The per-layer
+  // scales freeze later, during warmup, which is also before capture.
+  if (impl_->pool != nullptr) {
+    return FailedPreconditionError(
+        "EnableFp8KvCache must be called before AttachKvCache allocates the "
+        "pool (the cache element type is fixed then)");
+  }
+
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->kv_scale_dev,
+      DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0)));
+
+  impl_->fp8_kv = true;
+  return OkStatus();
+}
+
+bool Qwen2Model::kv_is_fp8() const { return impl_->fp8_kv; }
 
 Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
   // Refused after capture, and this one is worth spelling out: a graph records

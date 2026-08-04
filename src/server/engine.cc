@@ -463,6 +463,10 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     INFERX_RETURN_IF_ERROR(model.QuantizeWeightsToF8());
   }
 
+  if (config.fp8_kv_cache) {
+    INFERX_RETURN_IF_ERROR(model.EnableFp8KvCache());
+  }
+
   INFERX_RETURN_IF_ERROR(
       model.AttachKvCache(config.kv_blocks, config.block_size));
 
