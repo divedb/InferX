@@ -12,6 +12,7 @@
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/quantize.h"
+#include "inferx/kernels/w4a16_gemm.h"
 
 namespace inferx {
 namespace {
@@ -408,6 +409,115 @@ TEST_F(Int4QuantTest, Bf16RoundTripStaysWithinHalfAStep) {
     const float tol = step + 1e-3f;
     for (int64_t j = 0; j < k; ++j) {
       EXPECT_NEAR(__bfloat162float(got[i * k + j]), wf[i * k + j], tol)
+          << "at (" << i << ", " << j << ")";
+    }
+  }
+}
+
+// The fused W4A16 GEMM must match the unfused baseline (dequant int4 -> bf16,
+// then the stock bf16 GEMM) -- both fp32-accumulate the same dequanted weights,
+// so the gap is bf16 output rounding, not int4 quantization error. That keeps
+// this a test of the fused dequant+GEMM pipeline rather than of int4 accuracy,
+// which the round-trip tests own.
+TEST_F(Int4QuantTest, FusedW4A16MatchesExactDequantReference) {
+  constexpr int64_t m = 2, n = 256, k = 512, group = 128;
+
+  std::vector<float> xf(m * k), wf(n * k);
+  for (int64_t i = 0; i < m; ++i)
+    for (int64_t p = 0; p < k; ++p) xf[i * k + p] = Fill(i, p, 0.0f);
+  for (int64_t j = 0; j < n; ++j)
+    for (int64_t p = 0; p < k; ++p) wf[j * k + p] = Fill(j, p, 1.7f);
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView x = UploadBf16(keep, xf, m, k);
+  const TensorView w = UploadBf16(keep, wf, n, k);
+
+  auto qb = DeviceBuffer::Allocate(n * k / 2, DeviceId::Cuda(0));
+  auto sb = DeviceBuffer::Allocate(n * (k / group) * sizeof(__nv_bfloat16),
+                                   DeviceId::Cuda(0));
+  ASSERT_TRUE(qb.ok() && sb.ok());
+  auto q = TensorView::Create(qb->data(), DataType::kInt4, Shape({n, k}),
+                              DeviceId::Cuda(0));
+  auto s = TensorView::Create(sb->data(), DataType::kBFloat16,
+                              Shape({n, k / group}), DeviceId::Cuda(0));
+  ASSERT_TRUE(q.ok() && s.ok());
+
+  ASSERT_TRUE(kernels::QuantizeBf16ToInt4(w, *q, *s).ok());
+
+  // Unfused reference: dequant to bf16, then the stock bf16 GEMM.
+  auto wbat =
+      DeviceBuffer::Allocate(n * k * sizeof(__nv_bfloat16), DeviceId::Cuda(0));
+  ASSERT_TRUE(wbat.ok());
+  auto w_hat = TensorView::Create(wbat->data(), DataType::kBFloat16,
+                                  Shape({n, k}), DeviceId::Cuda(0));
+  ASSERT_TRUE(w_hat.ok());
+  ASSERT_TRUE(kernels::DequantizeInt4ToBf16(*q, *s, *w_hat).ok());
+
+  auto yrefb =
+      DeviceBuffer::Allocate(m * n * sizeof(__nv_bfloat16), DeviceId::Cuda(0));
+  auto ygotb =
+      DeviceBuffer::Allocate(m * n * sizeof(__nv_bfloat16), DeviceId::Cuda(0));
+  ASSERT_TRUE(yrefb.ok() && ygotb.ok());
+  auto yref = TensorView::Create(yrefb->data(), DataType::kBFloat16,
+                                 Shape({m, n}), DeviceId::Cuda(0));
+  auto ygot = TensorView::Create(ygotb->data(), DataType::kBFloat16,
+                                 Shape({m, n}), DeviceId::Cuda(0));
+  ASSERT_TRUE(yref.ok() && ygot.ok());
+
+  auto gemm = kernels::CublasLtGemm::Create();
+  ASSERT_TRUE(gemm.ok()) << gemm.status();
+  ASSERT_TRUE(gemm->LinearBF16(x, *w_hat, *yref).ok());
+
+  ASSERT_TRUE(kernels::W4A16Gemm(x, *q, *s, *ygot, group).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  // The fused kernel keeps q*scale in fp32 (it never materializes a bf16
+  // weight), so it is MORE accurate than the unfused bf16-weight path above and
+  // will not match it to sub-ulp. The right gate is the exact dequant in double:
+  // read back x, the packed int4, and the scales and compute y = x . (q*scale).
+  std::vector<__nv_bfloat16> xh(m * k);
+  std::vector<uint8_t> qh(n * k / 2);
+  std::vector<__nv_bfloat16> sh(n * (k / group));
+  std::vector<__nv_bfloat16> got(m * n);
+  ASSERT_EQ(cudaMemcpy(xh.data(), x.Data(),
+                        xh.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(
+      cudaMemcpy(qh.data(), qb->data(), qh.size(), cudaMemcpyDeviceToHost),
+      cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(sh.data(), sb->data(),
+                        sh.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(got.data(), ygotb->data(),
+                        got.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+  const auto dequant = [&](int64_t j, int64_t kk) -> double {
+    const uint8_t byte = qh[static_cast<size_t>(j) * (k / 2) + kk / 2];
+    int qi = (kk & 1) ? (byte >> 4) : (byte & 0xF);
+    if (qi >= 8) qi -= 16;
+    return qi * static_cast<double>(
+                    __bfloat162float(sh[static_cast<size_t>(j) * (k / group) +
+                                       kk / group]));
+  };
+
+  for (int64_t i = 0; i < m; ++i) {
+    for (int64_t j = 0; j < n; ++j) {
+      double acc = 0.0;
+      for (int64_t kk = 0; kk < k; ++kk) {
+        acc += static_cast<double>(__bfloat162float(xh[i * k + kk])) *
+               dequant(j, kk);
+      }
+      // The output is bf16, so the gate is ~one bf16 output ulp at the value's
+      // magnitude plus a small relative term for the fused kernel's fp32
+      // accumulate against the double reference.
+      const float tol =
+          0.13f + 0.02f * std::fabs(static_cast<float>(acc));
+      EXPECT_NEAR(__bfloat162float(got[i * n + j]),
+                  static_cast<float>(acc), tol)
           << "at (" << i << ", " << j << ")";
     }
   }

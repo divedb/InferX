@@ -10,6 +10,7 @@ add_library(inferx_kernels
   layers.cu
   quantize.cu
   smoke.cu
+  w4a16_gemm.cu
 )
 add_library(inferx::kernels ALIAS inferx_kernels)
 
