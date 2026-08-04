@@ -144,4 +144,17 @@ Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
                            const TensorView& dst,
                            cudaStream_t stream = nullptr);
 
+/// \brief `QuantizeF16ToInt4` for bf16 weights -- the model's native dtype.
+///
+/// W4A16 serving dequantizes bf16 weights to bf16 and runs the stock bf16 GEMM,
+/// so the quantize needs to read bf16 too (no bf16<->f16 cast at every linear).
+Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
+                          const TensorView& scales,
+                          cudaStream_t stream = nullptr);
+
+/// \brief `DequantizeInt4ToF16` for bf16 output.
+Status DequantizeInt4ToBf16(const TensorView& src, const TensorView& scales,
+                            const TensorView& dst,
+                            cudaStream_t stream = nullptr);
+
 }  // namespace inferx::kernels

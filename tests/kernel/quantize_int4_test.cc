@@ -1,6 +1,7 @@
 #include <cmath>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -41,6 +42,33 @@ TensorView UploadF16(std::vector<DeviceBuffer>& keep,
   keep.push_back(*std::move(buf));
 
   auto v = TensorView::Create(keep.back().data(), DataType::kFloat16,
+                              Shape({rows, cols}), DeviceId::Cuda(0));
+  EXPECT_TRUE(v.ok()) << v.status();
+
+  return *v;
+}
+
+// The bf16 analogue, for the W4A16-in-the-model path: the model's weights and
+// activations are bf16, so the bf16 int4 kernels avoid a bf16<->f16 cast at
+// every linear.
+TensorView UploadBf16(std::vector<DeviceBuffer>& keep,
+                      const std::vector<float>& host, int64_t rows,
+                      int64_t cols) {
+  std::vector<__nv_bfloat16> h(host.size());
+  for (size_t i = 0; i < host.size(); ++i) h[i] = __float2bfloat16(host[i]);
+
+  auto buf = DeviceBuffer::Allocate(h.size() * sizeof(__nv_bfloat16),
+                                    DeviceId::Cuda(0));
+  EXPECT_TRUE(buf.ok()) << buf.status();
+
+  EXPECT_EQ(cudaMemcpy(buf->data(), h.data(),
+                        h.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyHostToDevice),
+            cudaSuccess);
+
+  keep.push_back(*std::move(buf));
+
+  auto v = TensorView::Create(keep.back().data(), DataType::kBFloat16,
                               Shape({rows, cols}), DeviceId::Cuda(0));
   EXPECT_TRUE(v.ok()) << v.status();
 
@@ -330,6 +358,57 @@ TEST_F(Int4QuantTest, PerGroupScaleIsCorrectForNonPowerOfTwoGroupSize) {
       // ~0.001 instead of ~0.714, missing by ~700x.
       EXPECT_NEAR(got, expected, expected * 1e-2f)
           << "row " << i << " group " << g << " got " << got;
+    }
+  }
+}
+
+// The bf16 round trip: bf16 -> int4 -> bf16 must stay within half a step, the
+// same gate the f16 round-trip test uses. Guards the W4A16-in-model path, which
+// quantizes bf16 weights at load and dequantizes to bf16 each step.
+TEST_F(Int4QuantTest, Bf16RoundTripStaysWithinHalfAStep) {
+  constexpr int64_t n = 32, k = 128;  // one group per row
+
+  std::vector<float> wf(n * k);
+  for (int64_t i = 0; i < n; ++i)
+    for (int64_t j = 0; j < k; ++j) wf[i * k + j] = Fill(i, j, 0.0f);
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView w = UploadBf16(keep, wf, n, k);
+
+  auto qb = DeviceBuffer::Allocate(n * k / 2, DeviceId::Cuda(0));
+  auto sb =
+      DeviceBuffer::Allocate(n * 1 * sizeof(__nv_bfloat16), DeviceId::Cuda(0));
+  auto hatb =
+      DeviceBuffer::Allocate(n * k * sizeof(__nv_bfloat16), DeviceId::Cuda(0));
+  ASSERT_TRUE(qb.ok() && sb.ok() && hatb.ok());
+
+  auto q = TensorView::Create(qb->data(), DataType::kInt4, Shape({n, k}),
+                              DeviceId::Cuda(0));
+  auto s = TensorView::Create(sb->data(), DataType::kBFloat16,
+                              Shape({n, 1}), DeviceId::Cuda(0));
+  auto hat = TensorView::Create(hatb->data(), DataType::kBFloat16,
+                                Shape({n, k}), DeviceId::Cuda(0));
+  ASSERT_TRUE(q.ok() && s.ok() && hat.ok());
+
+  ASSERT_TRUE(kernels::QuantizeBf16ToInt4(w, *q, *s).ok());
+  ASSERT_TRUE(kernels::DequantizeInt4ToBf16(*q, *s, *hat).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  std::vector<__nv_bfloat16> got(n * k);
+  ASSERT_EQ(cudaMemcpy(got.data(), hatb->data(),
+                        got.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+  for (int64_t i = 0; i < n; ++i) {
+    float amax = 0.0f;
+    for (int64_t j = 0; j < k; ++j)
+      amax = std::max(amax, std::abs(wf[i * k + j]));
+    const float step = amax > 0.0f ? (2.0f * amax) / 15.0f : 0.0f;
+    const float tol = step + 1e-3f;
+    for (int64_t j = 0; j < k; ++j) {
+      EXPECT_NEAR(__bfloat162float(got[i * k + j]), wf[i * k + j], tol)
+          << "at (" << i << ", " << j << ")";
     }
   }
 }
