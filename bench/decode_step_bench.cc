@@ -83,14 +83,17 @@ int Main(int argc, char** argv) {
   int warmup = 5;
   int iters = 30;
   bool fp8 = false;
+  bool fp8_kv = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
     else if (arg == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
     else if (arg == "--fp8") fp8 = true;
+    else if (arg == "--fp8-kv") fp8_kv = true;
     else {
-      std::fprintf(stderr, "usage: %s [--warmup N] [--iters N]\n", argv[0]);
+      std::fprintf(stderr, "usage: %s [--warmup N] [--iters N] [--fp8] [--fp8-kv]\n",
+                   argv[0]);
       return 2;
     }
   }
@@ -111,6 +114,16 @@ int Main(int argc, char** argv) {
 
   const int64_t block_size = 16;
   const int64_t max_blocks_per_seq = 64;
+
+  // EnableFp8KvCache must precede AttachKvCache: the pool's element type is
+  // fixed when it is allocated. Scales freeze later, in the first warmup Step
+  // before any capture.
+  if (fp8_kv) {
+    if (const Status s = model.EnableFp8KvCache(); !s.ok()) {
+      std::fprintf(stderr, "cannot enable fp8 KV: %s\n", s.ToString().c_str());
+      return 1;
+    }
+  }
 
   if (const Status s = model.AttachKvCache(2048, block_size); !s.ok()) {
     std::fprintf(stderr, "cannot attach KV cache: %s\n",
@@ -153,6 +166,11 @@ int Main(int argc, char** argv) {
   std::printf("%s\n", model.config().ToString().c_str());
   std::printf("weights: %s, %.2f GB\n", fp8 ? "fp8 e4m3" : "bf16",
               model.WeightBytes() / 1e9);
+  std::printf("kv cache: %s, %.2f GB (%.0fM tokens at this pool size)\n",
+              fp8_kv ? "fp8 e4m3" : "bf16",
+              model.kv_pool()->bytes() / 1e9,
+              static_cast<double>(model.kv_pool()->num_blocks() *
+                                  model.kv_pool()->block_size()) / 1e6);
   std::printf("decode step, context %ld, one token per sequence\n\n",
               static_cast<long>(kContext));
 

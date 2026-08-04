@@ -4,7 +4,7 @@ A high-performance LLM inference server in C++20, aiming at throughput and
 latency comparable to vLLM and SGLang — without Python or libtorch in the
 serving path.
 
-**Status: M5 done.** `inferx-serve` answers OpenAI-compatible completions over
+**Status: M6 done.** `inferx-serve` answers OpenAI-compatible completions over
 HTTP with SSE streaming, running Qwen2.5-3B-Instruct on a paged KV cache with
 FlashInfer attention, CUDA graphs, and on-device temperature/top-p sampling —
 at 89.7 tok/s bf16 and 118.4 tok/s FP8, batch 1. The scheduler does continuous
@@ -105,6 +105,14 @@ prompt arrives beside eight decoding sequences, at the cost of 1.6× on that
 prompt's own time-to-first-token. The prefix cache cuts **warm TTFT 5.9×**
 (97 → 16 ms) behind a shared system prompt, and holds multi-turn chat flat at
 ~15 ms where recomputing the conversation each turn climbs past 50 ms.
+
+M8's FP8 KV cache halves KV memory: the same 2048-block pool is **1.21 GB in
+bf16, 0.60 GB in fp8 e4m3**, so twice the concurrency (or twice the context per
+sequence) fits in the same VRAM. Decode tok/s is unchanged by it — at context
+256 the step is weight-bandwidth-bound, not KV-bound, so the cache format does
+not move batch-1 latency (11.02 ms bf16 vs 11.13 ms fp8 per token, within run
+noise). Per-layer K/V scales freeze from warmup and the fp8 decode path is
+captured into the same CUDA graphs. (`bench/decode_step_bench --fp8-kv`.)
 
 Numbers, method, and the re-measurement of every historical claim are in
 ARCHITECTURE.md §14.
