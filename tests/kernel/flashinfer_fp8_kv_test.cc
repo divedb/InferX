@@ -524,5 +524,87 @@ TEST_F(Fp8KvTest, GraphCapturedRunFp8ReplaysTheDirectRun) {
   EXPECT_LT(worst, 1e-4) << "captured RunFp8 diverged from direct by " << worst;
 }
 
+// The fused fp8 KV write must land, at each scattered slot, the same fp8 bytes a
+// contiguous dynamic quantize produces for that token -- same data, same scale,
+// same saturating cvt -- and leave every slot it did not touch at zero. That
+// checks both the scatter (token -> slot) and the quantize (bf16 -> fp8) in one
+// pass, which is the whole point of fusing them.
+TEST_F(Fp8KvTest, AppendBf16AsFp8MatchesContiguousDynamicAtWrittenSlots) {
+  constexpr int64_t tokens = 5, kv_heads = 2, head_dim = 128;
+  constexpr int64_t blocks = 4, block_size = 16;
+  Dev dev;
+  const Shape kv_shape({tokens, kv_heads, head_dim});
+  const Shape cache_shape({blocks, block_size, kv_heads, head_dim});
+
+  const std::vector<float> kh =
+      Ramp(static_cast<size_t>(tokens * kv_heads * head_dim), 0.4f);
+  const std::vector<float> vh =
+      Ramp(static_cast<size_t>(tokens * kv_heads * head_dim), 1.9f);
+  const TensorView k = dev.Bf16(kh, kv_shape);
+  const TensorView v = dev.Bf16(vh, kv_shape);
+
+  // Contiguous dynamic quantize of k/v gives both the per-tensor scale and the
+  // byte-for-byte reference the fused scatter must reproduce at its slots.
+  const TensorView k_ref = dev.Fp8(kv_shape);
+  const TensorView v_ref = dev.Fp8(kv_shape);
+  DeviceScalar kscale_dev, vscale_dev;
+  ASSERT_TRUE(kernels::QuantizeToF8E4M3Dynamic(
+                  k, k_ref, reinterpret_cast<float*>(kscale_dev.buf.data()))
+                  .ok());
+  ASSERT_TRUE(kernels::QuantizeToF8E4M3Dynamic(
+                  v, v_ref, reinterpret_cast<float*>(vscale_dev.buf.data()))
+                  .ok());
+  const float k_scale = kscale_dev.Read();
+  const float v_scale = vscale_dev.Read();
+  ASSERT_GT(k_scale, 0.0f);
+  ASSERT_GT(v_scale, 0.0f);
+
+  // Scattered, non-contiguous slots (each < blocks*block_size = 64). Slot 0 is
+  // deliberately unused, to check the write does not touch its neighbours.
+  const std::vector<int32_t> slots = {1, 17, 33, 50, 8};
+  const TensorView k_cache = dev.Fp8(cache_shape);  // zero-initialized
+  const TensorView v_cache = dev.Fp8(cache_shape);
+  ASSERT_TRUE(kernels::AppendBf16AsFp8(
+                  k, v, k_cache, v_cache,
+                  dev.I32(slots, Shape({tokens})), k_scale, v_scale)
+                  .ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  const int64_t per_token = kv_heads * head_dim;
+  std::vector<uint8_t> kc(blocks * block_size * per_token), vc(blocks * block_size * per_token);
+  std::vector<uint8_t> kref(tokens * per_token), vref(tokens * per_token);
+  ASSERT_EQ(cudaMemcpy(kc.data(), k_cache.Data(), kc.size(),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(vc.data(), v_cache.Data(), vc.size(),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(kref.data(), k_ref.Data(), kref.size(),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(vref.data(), v_ref.Data(), vref.size(),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+  // Each written slot must match the contiguous reference for that token.
+  int mismatches = 0;
+  for (int64_t t = 0; t < tokens; ++t) {
+    const int64_t slot = slots[static_cast<size_t>(t)];
+    for (int64_t e = 0; e < per_token; ++e) {
+      if (kc[slot * per_token + e] != kref[t * per_token + e]) ++mismatches;
+      if (vc[slot * per_token + e] != vref[t * per_token + e]) ++mismatches;
+    }
+  }
+  EXPECT_EQ(mismatches, 0)
+      << "fused fp8 write diverged from contiguous dynamic quantize";
+
+  // Slot 0 was never written: every byte must still read back as fp8 zero
+  // (0x00), which is what the zero-initialized cache held before the launch.
+  for (int64_t e = 0; e < per_token; ++e) {
+    EXPECT_EQ(kc[e], 0) << "K slot 0 corrupted at element " << e;
+    EXPECT_EQ(vc[e], 0) << "V slot 0 corrupted at element " << e;
+  }
+}
+
 }  // namespace
 }  // namespace inferx

@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "inferx/core/cuda_utils.h"
@@ -216,6 +217,36 @@ __global__ void AppendKvKernel(const bf16* __restrict__ k,
   for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
     k_cache[dst + d] = k[src + d];
     v_cache[dst + d] = v[src + d];
+  }
+}
+
+// Same scatter structure as AppendKvKernel -- one block per (token, kv_head),
+// slot precomputed host-side -- but it quantizes bf16 -> fp8 e4m3 against a
+// frozen per-layer scale as it writes. Fused rather than quantize-then-scatter
+// so the fp8 KV write stays one pass over K/V: the decode step is bandwidth-
+// bound, and a separate fp8 scratch the scatter would then read back doubles
+// the K/V traffic for nothing. The scale is fixed at warmup, so baking it into
+// the kernel argument pins a stable value for any captured decode graph.
+__global__ void AppendBf16AsFp8Kernel(
+    const bf16* __restrict__ k, const bf16* __restrict__ v,
+    __nv_fp8_storage_t* __restrict__ k_cache,
+    __nv_fp8_storage_t* __restrict__ v_cache,
+    const int32_t* __restrict__ slots, int64_t kv_heads, int64_t head_dim,
+    int64_t total_slots, float inv_k_scale, float inv_v_scale) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t slot = slots[token];
+
+  if (slot < 0 || slot >= total_slots) return;
+
+  const int64_t src = (token * kv_heads + head) * head_dim;
+  const int64_t dst = (slot * kv_heads + head) * head_dim;
+
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    k_cache[dst + d] = __nv_cvt_float_to_fp8(
+        __bfloat162float(k[src + d]) * inv_k_scale, __NV_SATFINITE, __NV_E4M3);
+    v_cache[dst + d] = __nv_cvt_float_to_fp8(
+        __bfloat162float(v[src + d]) * inv_v_scale, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
@@ -676,6 +707,59 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
       static_cast<bf16*>(k_cache.Data()), static_cast<bf16*>(v_cache.Data()),
       static_cast<const int32_t*>(slots.Data()), kv_heads, head_dim,
       total_slots);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
+                       const TensorView& k_cache, const TensorView& v_cache,
+                       const TensorView& slots, float k_scale, float v_scale,
+                       cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(k_cache, DataType::kFloat8E4M3FN, 4, "k_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(v_cache, DataType::kFloat8E4M3FN, 4, "v_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(slots, DataType::kInt32, 1, "slots"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k, v, "k", "v"));
+  INFERX_RETURN_IF_ERROR(
+      CheckSameShape(k_cache, v_cache, "k_cache", "v_cache"));
+
+  if (k_scale <= 0.0f || v_scale <= 0.0f) {
+    return InvalidArgumentError("AppendBf16AsFp8: scales must be positive, got "
+                                "k_scale=",
+                                k_scale, " v_scale=", v_scale);
+  }
+
+  const int64_t tokens = k.Dim(0);
+  const int64_t kv_heads = k.Dim(1);
+  const int64_t head_dim = k.Dim(2);
+
+  if (slots.Dim(0) != tokens) {
+    return InvalidArgumentError("slots has ", slots.Dim(0),
+                                " entries but there are ", tokens, " tokens");
+  }
+  if (k_cache.Dim(2) != kv_heads || k_cache.Dim(3) != head_dim) {
+    return InvalidArgumentError("cache is [.., .., ", k_cache.Dim(2), ", ",
+                                k_cache.Dim(3), "] but k is [.., ", kv_heads,
+                                ", ", head_dim, "]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const int64_t total_slots = k_cache.Dim(0) * k_cache.Dim(1);
+  const int block = BlockFor(head_dim);
+
+  AppendBf16AsFp8Kernel<<<dim3(static_cast<unsigned>(tokens),
+                               static_cast<unsigned>(kv_heads)),
+                          block, 0, stream>>>(
+      static_cast<const bf16*>(k.Data()), static_cast<const bf16*>(v.Data()),
+      static_cast<__nv_fp8_storage_t*>(k_cache.Data()),
+      static_cast<__nv_fp8_storage_t*>(v_cache.Data()),
+      static_cast<const int32_t*>(slots.Data()), kv_heads, head_dim,
+      total_slots, 1.0f / k_scale, 1.0f / v_scale);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

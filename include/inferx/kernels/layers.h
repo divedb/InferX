@@ -110,6 +110,30 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
                        const TensorView& k_cache, const TensorView& v_cache,
                        const TensorView& slots, cudaStream_t stream = nullptr);
 
+/// \brief Scatters new bf16 K/V into an **fp8 e4m3** paged cache, quantizing
+/// in flight against fixed per-layer scales.
+///
+/// The fp8-KV counterpart of `AppendToKvCache`: same paged scatter, but each
+/// bf16 element is scaled by `1/k_scale` (K) or `1/v_scale` (V) and converted
+/// to e4m3 as it is written. Fused into one pass so the write does not pay a
+/// second K/V trip through an fp8 scratch -- the decode step is bandwidth-bound
+/// and that round trip would double the cost for nothing. The scales are the
+/// same dequant factors the attention kernel takes (`RunFp8`/`PrefillFp8`),
+/// frozen per layer at warmup so the value baked into this captured kernel is
+/// stable.
+///
+/// \param k       `[tokens, kv_heads, head_dim]` bf16, new keys.
+/// \param v       Same shape, new values.
+/// \param k_cache `[blocks, block_size, kv_heads, head_dim]` f8e4m3.
+/// \param v_cache Same shape.
+/// \param slots   `[tokens]` int32, destination slot per token.
+/// \param k_scale Per-layer K dequant scale (amax / 448).
+/// \param v_scale Per-layer V dequant scale.
+Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
+                       const TensorView& k_cache, const TensorView& v_cache,
+                       const TensorView& slots, float k_scale, float v_scale,
+                       cudaStream_t stream = nullptr);
+
 /// \brief Causal attention over a paged KV cache.
 ///
 /// The M3 replacement for `Attention`: keys and values are read through a block
