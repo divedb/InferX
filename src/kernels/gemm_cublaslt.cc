@@ -1,11 +1,13 @@
 #include <cublasLt.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "inferx/core/cuda_utils.h"
+#include "inferx/core/shape.h"
 #include "inferx/kernels/gemm.h"
 
 namespace inferx::kernels {
@@ -98,6 +100,14 @@ struct Plan {
   cublasLtMatrixLayout_t c = nullptr;  // output,      col-major [n, m]
   cublasLtMatmulAlgo_t algo{};
 
+  // The heuristic returns a ranked list, and its top rank is not uniformly the
+  // fastest by wall-clock: R3b measured gate_up at m=8 at 0.88x on the top-1
+  // algo. We keep the first kMaxAlgos candidates and let Tune() time them on
+  // the FP8 decode path, keeping whichever the device actually runs fastest.
+  static constexpr int kMaxAlgos = 8;
+  cublasLtMatmulHeuristicResult_t candidates[kMaxAlgos]{};
+  int num_candidates = 0;
+
   ~Plan() {
     // Destruction order does not matter to cuBLASLt, and each destroy tolerates
     // a null handle, so a partially-built plan cleans up correctly.
@@ -112,6 +122,40 @@ struct Plan {
   Plan& operator=(const Plan&) = delete;
 };
 
+// RAII for the two CUDA events Tune() times candidates with, so its several
+// abandon-on-failure paths cannot leak them. Local to this file because the
+// engine owns the only other event pairs and this is the kernel layer's single
+// timed path.
+struct EventPair {
+  cudaEvent_t a = nullptr;
+  cudaEvent_t b = nullptr;
+  bool created = false;
+
+  Status Init() {
+    if (cudaEventCreate(&a) != cudaSuccess) {
+      return InternalError("cudaEventCreate failed in GEMM tuning");
+    }
+    if (cudaEventCreate(&b) != cudaSuccess) {
+      cudaEventDestroy(a);
+      a = nullptr;
+      return InternalError("cudaEventCreate failed in GEMM tuning");
+    }
+    created = true;
+    return OkStatus();
+  }
+
+  ~EventPair() {
+    if (created) {
+      cudaEventDestroy(a);
+      cudaEventDestroy(b);
+    }
+  }
+
+  EventPair() = default;
+  EventPair(const EventPair&) = delete;
+  EventPair& operator=(const EventPair&) = delete;
+};
+
 }  // namespace
 
 struct CublasLtGemm::Impl {
@@ -123,6 +167,9 @@ struct CublasLtGemm::Impl {
   // real pointers are bound per call, since they belong to the tensors rather
   // than to the plan.
   DeviceBuffer unit_scales;
+  // When false, Tune is skipped and plans keep the heuristic's top-1 -- the
+  // reference path for differential testing, and a faster cold start.
+  bool autotune = true;
   absl::flat_hash_map<ShapeKey, std::unique_ptr<Plan>> plans;
 
   ~Impl() {
@@ -132,6 +179,14 @@ struct CublasLtGemm::Impl {
   }
 
   StatusOr<const Plan*> GetOrBuild(int64_t m, int64_t n, int64_t k, Path path);
+
+  // Times the heuristic's candidate algorithms for one plan and keeps the
+  // fastest, retiring R3b (the top-1 algo is not uniformly the fastest on the
+  // FP8 decode path). Scoped to the FP8 path and to memory-bound shapes, where
+  // the heuristic is the thing that is wrong and the scratch cost of timing is
+  // small. Best-effort: any internal failure abandons tuning and leaves the
+  // heuristic's top-1 in place, so it can never make a shape fail.
+  Status Tune(Plan& plan, int64_t m, int64_t n, int64_t k, Path path);
 };
 
 StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
@@ -227,13 +282,18 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
       pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_bytes,
       sizeof(ws_bytes));
 
-  cublasLtMatmulHeuristicResult_t heuristic{};
-  int returned = 0;
+  // Ask for several candidates rather than one. The heuristic ranks them, but
+  // its top rank is not uniformly the fastest by wall-clock -- R3b measured
+  // gate_up at m=8 at 0.88x on the top-1 algo, an algorithm-selection issue
+  // rather than a bandwidth one. Tune() times them and keeps the fastest on
+  // the FP8 path. Every candidate is already workspace-filtered by the
+  // preference above, so all of them fit the buffer handed to cublasLtMatmul.
   const cublasStatus_t heur_status =
       pref_status == CUBLAS_STATUS_SUCCESS
           ? cublasLtMatmulAlgoGetHeuristic(lt, plan->desc, plan->a, plan->b,
-                                           plan->c, plan->c, pref, 1,
-                                           &heuristic, &returned)
+                                           plan->c, plan->c, pref,
+                                           Plan::kMaxAlgos, plan->candidates,
+                                           &plan->num_candidates)
           : pref_status;
 
   // Destroyed before the error checks below so that neither early return leaks
@@ -245,7 +305,7 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
                                __FILE__, __LINE__);
   }
 
-  if (returned == 0) {
+  if (plan->num_candidates == 0) {
     return UnimplementedError(
         "cuBLASLt has no algorithm for m=", m, " n=", n, " k=", k, " (",
         (path == Path::kF8E4M3 || path == Path::kF8E4M3BF16Out) ? "f8e4m3"
@@ -253,7 +313,14 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
         " in, f32 accumulate, workspace ", ws_bytes, " B)");
   }
 
-  plan->algo = heuristic.algo;
+  // Default to the heuristic's top rank; Tune may overwrite this for FP8.
+  plan->algo = plan->candidates[0].algo;
+
+  // Best-effort and never propagated: the heuristic's top-1 is today's
+  // behavior, so abandoning tuning leaves a correct -- if sometimes 0.88x --
+  // plan rather than a failed one. Skipped entirely when autotune is off, which
+  // is the differential-testing reference and a faster cold start.
+  if (autotune) (void)Tune(*plan, m, n, k, path);
 
   const Plan* raw = plan.get();
   plans.emplace(key, std::move(plan));
@@ -261,8 +328,173 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   return raw;
 }
 
-StatusOr<CublasLtGemm> CublasLtGemm::Create(size_t workspace_bytes) {
+Status CublasLtGemm::Impl::Tune(Plan& plan, int64_t m, int64_t n, int64_t k,
+                                Path path) {
+  // R3b is an FP8-path issue; the f16/bf16 heuristic has no known inversion,
+  // and timing it would burn warmup for nothing.
+  if (path != Path::kF8E4M3 && path != Path::kF8E4M3BF16Out) return OkStatus();
+
+  // Nothing to choose between. Most decode shapes return several candidates;
+  // a shape that returns one has already been answered optimally by definition.
+  if (plan.num_candidates < 2) return OkStatus();
+
+  // Scope tuning to the memory-bound regime, which is where R3b lives and
+  // where the algorithm swings the result. The FP8 roofline on this card
+  // crosses around m ~ 80 (2*m FLOP/byte against a ~160 FLOP:s-:Byte peak
+  // ratio), so 64 sits safely inside the decode range. Prefill m is
+  // compute-bound, the heuristic is reliable there, and timing it would
+  // allocate a y buffer of hundreds of MB for no return.
+  constexpr int64_t kTuneMaxTokens = 64;
+  if (m > kTuneMaxTokens) return OkStatus();
+
+  const DataType out_dt = (path == Path::kF8E4M3BF16Out) ? DataType::kBFloat16
+                                                          : DataType::kFloat16;
+
+  // Operand scratch. Values do not affect FP8-GEMM timing -- the tensor cores
+  // have no data-dependent path, and the scale folds into a fixed epilogue --
+  // so zeroed buffers time identically to real ones and avoid a quantize pass
+  // per candidate. The descriptor already carries the unit scales bound in
+  // GetOrBuild, which is all timing needs.
+  auto xb = DeviceBuffer::Allocate(static_cast<size_t>(m * k), DeviceId::Cuda(0));
+  auto wb = DeviceBuffer::Allocate(static_cast<size_t>(n * k), DeviceId::Cuda(0));
+  auto yb =
+      DeviceBuffer::Allocate(static_cast<size_t>(m * n) * 2, DeviceId::Cuda(0));
+  if (!xb.ok() || !wb.ok() || !yb.ok()) return OkStatus();
+
+  if (cudaMemsetAsync(xb->data(), 0, xb->size()) != cudaSuccess ||
+      cudaMemsetAsync(wb->data(), 0, wb->size()) != cudaSuccess ||
+      cudaMemsetAsync(yb->data(), 0, yb->size()) != cudaSuccess) {
+    return OkStatus();
+  }
+
+  auto x = TensorView::Create(xb->data(), DataType::kFloat8E4M3FN,
+                              Shape({m, k}), DeviceId::Cuda(0));
+  auto w = TensorView::Create(wb->data(), DataType::kFloat8E4M3FN,
+                              Shape({n, k}), DeviceId::Cuda(0));
+  auto y = TensorView::Create(yb->data(), out_dt, Shape({m, n}),
+                              DeviceId::Cuda(0));
+  if (!x.ok() || !w.ok() || !y.ok()) return OkStatus();
+
+  EventPair events;
+  if (!events.Init().ok()) return OkStatus();
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  auto launch = [&](const cublasLtMatmulAlgo_t& algo) -> cublasStatus_t {
+    return cublasLtMatmul(lt, plan.desc, &alpha, w->Data(), plan.a, x->Data(),
+                          plan.b, &beta, y->Data(), plan.c, y->Data(), plan.c,
+                          &algo, workspace.data(), workspace.size(), nullptr);
+  };
+
+  // Ramp the device before timing. Only the SM clock is locked (-lgc); the
+  // memory clock floats, and on a consumer Ada part its response to a workload
+  // is sluggish and state-dependent -- a bandwidth-bound decode GEMM measured
+  // before it has settled can read at half the achievable bandwidth, ranking
+  // candidates wrong. Running candidate 0 back-to-back is the same ramp the
+  // bench's own warmup performs, and reaches a steady state more often than a
+  // cold start does. It does not fully eliminate cross-run variance: that is a
+  // property of the unlocked memory clock (R3b), and locking it is the only
+  // complete fix. The tuner is still a strict improvement on the heuristic --
+  // its top-1 lands in the slow cluster even when a faster algo is reachable.
+  constexpr int kRampLaunches = 128;
+  for (int i = 0; i < kRampLaunches; ++i) {
+    if (launch(plan.candidates[0].algo) != CUBLAS_STATUS_SUCCESS) {
+      return OkStatus();
+    }
+  }
+  if (cudaDeviceSynchronize() != cudaSuccess) return OkStatus();
+
+  // Size the batch from a pilot on candidate 0 -- now that the clock has
+  // settled -- so every candidate is measured over the same launch count.
+  // Clamped because m=1 shapes would otherwise ask for thousands of launches,
+  // and a millisecond of device time is all the resolution the comparison needs.
+  constexpr int kWarmup = 5;
+  constexpr double kTargetSampleMs = 1.0;
+  int batch = 1;
+
+  if (cudaEventRecord(events.a) == cudaSuccess &&
+      launch(plan.candidates[0].algo) == CUBLAS_STATUS_SUCCESS &&
+      cudaEventRecord(events.b) == cudaSuccess &&
+      cudaEventSynchronize(events.b) == cudaSuccess) {
+    float pilot_ms = 0.0f;
+    if (cudaEventElapsedTime(&pilot_ms, events.a, events.b) == cudaSuccess &&
+        pilot_ms > 0.0f) {
+      const double want = kTargetSampleMs / static_cast<double>(pilot_ms);
+      batch = static_cast<int>(
+          want < 1.0 ? 1.0 : (want > 256.0 ? 256.0 : want));
+    }
+  }
+
+  // Time each candidate over several samples and keep the one with the best
+  // minimum. Min, not median, for one reason only: the bench reports min-of-
+  // samples too, so Tune and the bench agree on what "fastest algorithm" means
+  // and a plan that looks fast to Tune looks fast to the bench. Within a run
+  // the two are within ~1% for these shapes anyway -- a bandwidth-bound GEMM is
+  // launch-bound and its per-sample spread is small once the device has settled
+  // -- so the choice between them does not move the pick. What does move it is
+  // the device's DVFS state, which shifts every candidate together across runs
+  // and is addressed by the ramp above and by locking the memory clock, not by
+  // the summary statistic.
+  constexpr int kSamples = 20;
+  double sample_ms[kSamples];
+
+  double best_min = -1.0;
+  int best_idx = 0;
+
+  for (int ci = 0; ci < plan.num_candidates; ++ci) {
+    if (plan.candidates[ci].state != CUBLAS_STATUS_SUCCESS) continue;
+
+    bool good = true;
+    for (int i = 0; i < kWarmup && good; ++i) {
+      good = (launch(plan.candidates[ci].algo) == CUBLAS_STATUS_SUCCESS);
+    }
+    if (!good || cudaDeviceSynchronize() != cudaSuccess) continue;
+
+    int got = 0;
+    for (int s = 0; s < kSamples; ++s) {
+      // Drained between samples, not between launches: samples stay
+      // independent while the device never idles long enough mid-sample to
+      // drop clocks. The sync sits outside the event pair so it is not timed.
+      if (cudaDeviceSynchronize() != cudaSuccess) break;
+      if (cudaEventRecord(events.a) != cudaSuccess) break;
+
+      int done = 0;
+      for (int i = 0; i < batch; ++i) {
+        if (launch(plan.candidates[ci].algo) != CUBLAS_STATUS_SUCCESS) break;
+        ++done;
+      }
+      if (done != batch || cudaEventRecord(events.b) != cudaSuccess ||
+          cudaEventSynchronize(events.b) != cudaSuccess) {
+        break;
+      }
+
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, events.a, events.b) != cudaSuccess) break;
+      sample_ms[got++] = static_cast<double>(ms) / batch;
+    }
+
+    // A candidate that could not be timed cleanly is out of the running; it is
+    // not an error for the plan, which keeps the heuristic's choice otherwise.
+    if (got != kSamples) continue;
+
+    double cmin = sample_ms[0];
+    for (int s = 1; s < kSamples; ++s) cmin = std::min(cmin, sample_ms[s]);
+
+    if (best_min < 0.0 || cmin < best_min) {
+      best_min = cmin;
+      best_idx = ci;
+    }
+  }
+
+  if (best_min >= 0.0) plan.algo = plan.candidates[best_idx].algo;
+  return OkStatus();
+}
+
+StatusOr<CublasLtGemm> CublasLtGemm::Create(size_t workspace_bytes,
+                                            bool autotune) {
   auto impl = std::make_unique<Impl>();
+  impl->autotune = autotune;
 
   INFERX_CUBLAS_RETURN_IF_ERROR(cublasLtCreate(&impl->lt));
 

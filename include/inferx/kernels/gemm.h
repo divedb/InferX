@@ -31,9 +31,16 @@ class CublasLtGemm {
   /// \brief Creates a context on the current CUDA device.
   ///
   /// \param workspace_bytes Size of the algorithm workspace.
+  /// \param autotune        When true (the default), the FP8 path times the
+  ///                        heuristic's candidate algorithms at plan-build time
+  ///                        and keeps the fastest, retiring R3b. Pass false to
+  ///                        leave the heuristic's top-1 in place -- the
+  ///                        differential-testing reference for the tuned path,
+  ///                        and a faster cold start where peak FP8 throughput
+  ///                        is not the point. f16/bf16 are never tuned.
   /// \return                The context, or the cuBLAS/CUDA error.
   static StatusOr<CublasLtGemm> Create(
-      size_t workspace_bytes = kDefaultWorkspaceBytes);
+      size_t workspace_bytes = kDefaultWorkspaceBytes, bool autotune = true);
 
   ~CublasLtGemm();
 

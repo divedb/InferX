@@ -214,6 +214,78 @@ TEST_F(Fp8GemmTest, PlansAreSeparateFromTheF16Path) {
   EXPECT_EQ(gemm->PlanCacheSize(), 2u);
 }
 
+// The autotune kill-switch (Create(..., /*autotune=*/false)) leaves the
+// heuristic's top-1 algorithm in place -- the differential-testing reference
+// for Tune. The algorithm choice is speed, not math, so the autotune-on and
+// autotune-off results must agree within FP8 + accumulation rounding.
+TEST_F(Fp8GemmTest, AutotuneOffAgreesWithAutotuneOn) {
+  constexpr int64_t m = 8, n = 64, k = 128;
+
+  std::vector<float> xf(m * k), wf(n * k);
+  for (int64_t i = 0; i < m * k; ++i) xf[i] = Fill(i / k, i % k, 0.0f);
+  for (int64_t j = 0; j < n * k; ++j) wf[j] = Fill(j / k, j % k, 1.7f);
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView x16 = UploadF16(keep, xf, m, k);
+  const TensorView w16 = UploadF16(keep, wf, n, k);
+
+  auto xq_buf = DeviceBuffer::Allocate(m * k, DeviceId::Cuda(0));
+  auto wq_buf = DeviceBuffer::Allocate(n * k, DeviceId::Cuda(0));
+  auto y_on = DeviceBuffer::Allocate(m * n * sizeof(__half), DeviceId::Cuda(0));
+  auto y_off = DeviceBuffer::Allocate(m * n * sizeof(__half), DeviceId::Cuda(0));
+  auto scales = DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0));
+  ASSERT_TRUE(xq_buf.ok() && wq_buf.ok() && y_on.ok() && y_off.ok() &&
+              scales.ok());
+
+  auto xq = TensorView::Create(xq_buf->data(), DataType::kFloat8E4M3FN,
+                               Shape({m, k}), DeviceId::Cuda(0));
+  auto wq = TensorView::Create(wq_buf->data(), DataType::kFloat8E4M3FN,
+                               Shape({n, k}), DeviceId::Cuda(0));
+  auto on = TensorView::Create(y_on->data(), DataType::kFloat16,
+                               Shape({m, n}), DeviceId::Cuda(0));
+  auto off = TensorView::Create(y_off->data(), DataType::kFloat16,
+                                Shape({m, n}), DeviceId::Cuda(0));
+  ASSERT_TRUE(xq.ok() && wq.ok() && on.ok() && off.ok());
+
+  float* const s = reinterpret_cast<float*>(scales->data());
+  ASSERT_TRUE(kernels::ComputeF8Scale(x16, s).ok());
+  ASSERT_TRUE(kernels::ComputeF8Scale(w16, s + 1).ok());
+  ASSERT_TRUE(kernels::QuantizeF16ToF8E4M3(x16, *xq, s).ok());
+  ASSERT_TRUE(kernels::QuantizeF16ToF8E4M3(w16, *wq, s + 1).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  auto gemm_on = kernels::CublasLtGemm::Create();
+  auto gemm_off = kernels::CublasLtGemm::Create(kernels::CublasLtGemm::kDefaultWorkspaceBytes,
+                                                /*autotune=*/false);
+  ASSERT_TRUE(gemm_on.ok() && gemm_off.ok());
+
+  ASSERT_TRUE(gemm_on->LinearF8E4M3(*xq, *wq, *on, s, s + 1).ok());
+  ASSERT_TRUE(gemm_off->LinearF8E4M3(*xq, *wq, *off, s, s + 1).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  std::vector<__half> got_on(m * n), got_off(m * n);
+  ASSERT_EQ(cudaMemcpy(got_on.data(), y_on->data(), got_on.size() * sizeof(__half),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(got_off.data(), y_off->data(),
+                       got_off.size() * sizeof(__half), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+
+  // Both ran the same FP8 matmul; only the algorithm differed. Different
+  // cuBLASLt algorithms accumulate in a different order, so the gap is small
+  // rounding relative to the output's own magnitude -- not the FP8
+  // quantization error, which is correlated (same quantized inputs) and cancels.
+  double max_mag = 0.0;
+  for (size_t i = 0; i < got_on.size(); ++i) {
+    max_mag = std::max(max_mag, std::fabs(static_cast<double>(__half2float(got_on[i]))));
+  }
+  for (size_t i = 0; i < got_on.size(); ++i) {
+    EXPECT_NEAR(__half2float(got_on[i]), __half2float(got_off[i]),
+                max_mag * 1e-2 + 1e-3)
+        << "autotune on/off disagree at " << i;
+  }
+}
+
 // k not a multiple of 16 is refused with a diagnostic that says so, rather than
 // reaching cuBLASLt and coming back as "no algorithm".
 TEST_F(Fp8GemmTest, UnalignedKIsRejectedClearly) {
