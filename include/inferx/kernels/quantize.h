@@ -73,4 +73,75 @@ Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
                                float* scale_dev,
                                cudaStream_t stream = nullptr);
 
+// ---------------------------------------------------------------------------
+// W4A16: per-group symmetric int4 weights.
+//
+// This is M8's weight format, and the reason it exists is bandwidth, not
+// arithmetic: int4 weights are a quarter the bytes of fp16, which on a
+// decode step (m small, weight-read-bound) is the only thing that moves the
+// needle. The format is symmetric per-group: each weight w[n, k] becomes an
+// int4 in [-7, 7] scaled by a per-group fp16 factor, with the group running
+// along k -- the contraction dim, matching how linear-layer weights are laid
+// out [n, k]. Group size 128 is the AWQ/GPTQ default and what `scales.Dim(1)
+// == k/128` implies; the kernels derive the group from the shapes rather than
+// taking it as a parameter so the two cannot disagree.
+//
+// Two int4 are packed per byte, low nibble first (element 2*i is the low
+// nibble of byte i), in two's complement. The packing is the project's own --
+// `DataType::kInt4` already addresses sub-byte rows this way -- so a
+// checkpoint loader that produces this layout feeds these kernels directly.
+//
+// What is here is the dequant-then-GEMM path, deliberately: CUTLASS 4.6.1 has
+// no turnkey fused W4A16 kernel for sm_89 (mixed-input is Hopper-only; the
+// SM80 framework's int4 warp-fragment shuffle is unimplemented -- see
+// ARCHITECTURE.md R3/M8). Dequantizing to fp16 and running the stock fp16
+// GEMM is correct and is the lower bound a future fused kernel has to beat;
+// it pays double bandwidth (read int4, write fp16, read fp16 again), which is
+// exactly the cost fusing removes and the reason to measure it.
+// ---------------------------------------------------------------------------
+
+/// The symmetric int4 range. Scales are chosen to map a group's peak magnitude
+/// onto 7, so values land in [-7, 7] and q and -q are both representable. The
+/// -8 code point is unused.
+inline constexpr float kInt4SymmetricMax = 7.0f;
+
+/// \brief Quantizes an f16 weight tensor to per-group symmetric int4.
+///
+/// Computes one fp16 scale per group (group amax / 7) and writes the packed
+/// int4 weights. `src` is `[n, k]` f16; `dst` is `[n, k]` int4 (packed
+/// 2-per-byte, so its buffer is `n*k/2` bytes and `k` must be even); `scales`
+/// is `[n, k/group]` f16. The group size is `k / scales.Dim(1)` and is
+/// required to divide `k` evenly.
+///
+/// Done in two launches -- a per-group amax reduction, then the quantize+pack
+/// -- because weights are quantized once at load, not per step, so the launch
+/// count is free and the two passes stay simple and independently testable.
+///
+/// \param src     `[n, k]` f16 on a CUDA device.
+/// \param dst     `[n, k]` int4, same device.
+/// \param scales  `[n, k/group]` f16, same device. Overwritten.
+/// \param stream  Stream to launch on. Does not synchronize.
+/// \return        OK, InvalidArgument for shapes this cannot serve, or the
+///                CUDA error.
+Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
+                         const TensorView& scales,
+                         cudaStream_t stream = nullptr);
+
+/// \brief Dequantizes per-group int4 weights back to f16.
+///
+/// The inverse of `QuantizeF16ToInt4`: unpacks each int4, multiplies by its
+/// group's scale, and writes fp16. `src` is `[n, k]` int4, `scales` is
+/// `[n, k/group]` f16, `dst` is `[n, k]` f16. The materialized f16 is then
+/// fed to a stock `LinearF16` -- this is the unfused baseline, not a W4A16
+/// kernel.
+///
+/// \param src     `[n, k]` int4 on a CUDA device.
+/// \param scales  `[n, k/group]` f16, same device.
+/// \param dst     `[n, k]` f16, same device. Overwritten.
+/// \param stream  Stream to launch on. Does not synchronize.
+/// \return        OK, InvalidArgument, or the CUDA error.
+Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
+                           const TensorView& dst,
+                           cudaStream_t stream = nullptr);
+
 }  // namespace inferx::kernels

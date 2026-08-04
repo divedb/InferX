@@ -234,4 +234,231 @@ Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
   return OkStatus();
 }
 
+// ===========================================================================
+// W4A16: per-group symmetric int4. See quantize.h for the format rationale.
+// ===========================================================================
+
+namespace {
+
+// One block per (row, group). Block-reduces the amax over the group's elements
+// and writes the fp16 scale. A block per group rather than a grid-stride
+// reduction because there are n*num_groups of them and each is small (group is
+// typically 128) -- one block owns one group's reduction end to end.
+__global__ void Int4GroupScaleKernel(const __half* __restrict__ w, int64_t n,
+                                     int64_t k, int group, int groups_per_row,
+                                     __half* __restrict__ scales) {
+  const int row = blockIdx.x / groups_per_row;
+  const int g = blockIdx.x % groups_per_row;
+  if (row >= n) return;
+
+  const int64_t base = static_cast<int64_t>(row) * k +
+                       static_cast<int64_t>(g) * group;
+
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < group; i += blockDim.x) {
+    local = fmaxf(local, fabsf(__half2float(w[base + i])));
+  }
+
+  __shared__ float tile[256];
+  tile[threadIdx.x] = local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      tile[threadIdx.x] = fmaxf(tile[threadIdx.x], tile[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    const float amax = tile[0];
+    // An all-zero group gets scale 1 so the dequant multiplies by something;
+    // its outputs are zero regardless, so the value does not matter beyond
+    // avoiding a divide-by-zero in the quantize kernel.
+    const float scale = amax > 0.0f ? amax / kInt4SymmetricMax : 1.0f;
+    scales[static_cast<int64_t>(row) * groups_per_row + g] =
+        __float2half(scale);
+  }
+}
+
+// Quantizes and packs. Each thread owns one byte = two consecutive elements
+// (indices 2*b and 2*b+1), so the two nibbles of a byte never race. k is even
+// (checked by the caller), so a pair never straddles a row boundary and the
+// two elements always share a group.
+__global__ void QuantizeF16ToInt4Kernel(const __half* __restrict__ w,
+                                        int64_t n, int64_t k, int group,
+                                        int groups_per_row,
+                                        const __half* __restrict__ scales,
+                                        uint8_t* __restrict__ q) {
+  const int64_t nbytes = n * (k / 2);
+  for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       b < nbytes;
+       b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int64_t e0 = 2 * b;
+    const int64_t row = e0 / k;
+    const int col0 = static_cast<int>(e0 % k);
+
+    const float s0 =
+        __half2float(scales[static_cast<int64_t>(row) * groups_per_row +
+                            (col0 / group)]);
+    const float s1 =
+        __half2float(scales[static_cast<int64_t>(row) * groups_per_row +
+                            ((col0 + 1) / group)]);
+
+    // Round to nearest even, then clamp to the symmetric range. __float2int_rn
+    // rounds ties to even, which is what keeps a uniform tensor quantizing
+    // symmetrically rather than biasing up.
+    int q0 = __float2int_rn(__half2float(w[e0]) / s0);
+    int q1 = __float2int_rn(__half2float(w[e0 + 1]) / s1);
+    q0 = q0 < -7 ? -7 : (q0 > 7 ? 7 : q0);
+    q1 = q1 < -7 ? -7 : (q1 > 7 ? 7 : q1);
+
+    // Two's-complement 4-bit: for v in [-8,7], (v & 0xF) is exactly the nibble.
+    q[b] = static_cast<uint8_t>((q0 & 0xF) | ((q1 & 0xF) << 4));
+  }
+}
+
+// The inverse: one byte in, two fp16 out, each scaled by its own group.
+__global__ void DequantizeInt4ToF16Kernel(
+    const uint8_t* __restrict__ q, int64_t n, int64_t k, int group,
+    int groups_per_row, const __half* __restrict__ scales,
+    __half* __restrict__ dst) {
+  const int64_t nbytes = n * (k / 2);
+  for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       b < nbytes;
+       b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const uint8_t byte = q[b];
+    int q0 = byte & 0xF;       // sign-extend the nibble:
+    if (q0 >= 8) q0 -= 16;     // 0x8..0xF map to -8..-1.
+    int q1 = byte >> 4;
+    if (q1 >= 8) q1 -= 16;
+
+    const int64_t e0 = 2 * b;
+    const int64_t row = e0 / k;
+    const int col0 = static_cast<int>(e0 % k);
+
+    const float s0 =
+        __half2float(scales[static_cast<int64_t>(row) * groups_per_row +
+                            (col0 / group)]);
+    const float s1 =
+        __half2float(scales[static_cast<int64_t>(row) * groups_per_row +
+                            ((col0 + 1) / group)]);
+
+    dst[e0] = __float2half(q0 * s0);
+    dst[e0 + 1] = __float2half(q1 * s1);
+  }
+}
+
+}  // namespace
+
+Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
+                         const TensorView& scales, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kFloat16, "src"));
+  INFERX_RETURN_IF_ERROR(CheckDeviceTensor(dst, DataType::kInt4, "dst"));
+  INFERX_RETURN_IF_ERROR(
+      CheckDeviceTensor(scales, DataType::kFloat16, "scales"));
+
+  if (src.Rank() != 2 || dst.Rank() != 2 || scales.Rank() != 2) {
+    return InvalidArgumentError(
+        "QuantizeF16ToInt4: src/dst/scales must be rank 2");
+  }
+
+  const int64_t n = src.Dim(0);
+  const int64_t k = src.Dim(1);
+
+  if (dst.Dim(0) != n || dst.Dim(1) != k) {
+    return InvalidArgumentError("QuantizeF16ToInt4: dst is [", dst.Dim(0), ", ",
+                                dst.Dim(1), "], expected [", n, ", ", k, "]");
+  }
+  if (scales.Dim(0) != n) {
+    return InvalidArgumentError("QuantizeF16ToInt4: scales has ",
+                                scales.Dim(0), " rows, expected ", n);
+  }
+  if (k % 2 != 0) {
+    return InvalidArgumentError(
+        "QuantizeF16ToInt4: k must be even (two int4 pack into one byte), got ",
+        k);
+  }
+
+  const int groups_per_row = static_cast<int>(scales.Dim(1));
+  if (groups_per_row <= 0 || k % groups_per_row != 0) {
+    return InvalidArgumentError(
+        "QuantizeF16ToInt4: scales has ", groups_per_row,
+        " groups per row, which must divide k=", k);
+  }
+  const int group = static_cast<int>(k / groups_per_row);
+
+  if (n == 0 || k == 0) return OkStatus();
+
+  // One block per group for the reduction. blockDim covers a group with
+  // stride; group=128 lands one thread per element, larger groups stride. The
+  // halving reduction inside the kernel only combines every lane when blockDim
+  // is a power of two, so round the group up to the next power of two (floor 32,
+  // ceiling 256 to fit the shared-memory tile); threads past the group load
+  // nothing and contribute 0 to the max.
+  int block = 32;
+  while (block < group && block < 256) block <<= 1;
+  Int4GroupScaleKernel<<<static_cast<int>(n) * groups_per_row, block, 0,
+                         stream>>>(static_cast<const __half*>(src.Data()), n, k,
+                                   group, groups_per_row,
+                                   static_cast<__half*>(scales.Data()));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
+  QuantizeF16ToInt4Kernel<<<GridFor(n * (k / 2)), kBlock, 0, stream>>>(
+      static_cast<const __half*>(src.Data()), n, k, group, groups_per_row,
+      static_cast<const __half*>(scales.Data()),
+      static_cast<uint8_t*>(dst.Data()));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
+  return OkStatus();
+}
+
+Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
+                           const TensorView& dst, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kInt4, "src"));
+  INFERX_RETURN_IF_ERROR(
+      CheckDeviceTensor(scales, DataType::kFloat16, "scales"));
+  INFERX_RETURN_IF_ERROR(CheckDeviceTensor(dst, DataType::kFloat16, "dst"));
+
+  if (src.Rank() != 2 || dst.Rank() != 2 || scales.Rank() != 2) {
+    return InvalidArgumentError(
+        "DequantizeInt4ToF16: src/dst/scales must be rank 2");
+  }
+
+  const int64_t n = src.Dim(0);
+  const int64_t k = src.Dim(1);
+
+  if (dst.Dim(0) != n || dst.Dim(1) != k) {
+    return InvalidArgumentError("DequantizeInt4ToF16: dst is [", dst.Dim(0),
+                                ", ", dst.Dim(1), "], expected [", n, ", ", k,
+                                "]");
+  }
+  if (scales.Dim(0) != n) {
+    return InvalidArgumentError("DequantizeInt4ToF16: scales has ",
+                                scales.Dim(0), " rows, expected ", n);
+  }
+  if (k % 2 != 0) {
+    return InvalidArgumentError(
+        "DequantizeInt4ToF16: k must be even, got ", k);
+  }
+
+  const int groups_per_row = static_cast<int>(scales.Dim(1));
+  if (groups_per_row <= 0 || k % groups_per_row != 0) {
+    return InvalidArgumentError(
+        "DequantizeInt4ToF16: scales has ", groups_per_row,
+        " groups per row, which must divide k=", k);
+  }
+  const int group = static_cast<int>(k / groups_per_row);
+
+  if (n == 0 || k == 0) return OkStatus();
+
+  DequantizeInt4ToF16Kernel<<<GridFor(n * (k / 2)), kBlock, 0, stream>>>(
+      static_cast<const uint8_t*>(src.Data()), n, k, group, groups_per_row,
+      static_cast<const __half*>(scales.Data()),
+      static_cast<__half*>(dst.Data()));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
+  return OkStatus();
+}
+
 }  // namespace inferx::kernels

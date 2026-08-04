@@ -96,6 +96,53 @@ class FlashInferDecode {
                 const TensorView& last_page_len, const TensorView& out,
                 float scale, cudaStream_t stream = nullptr);
 
+  /// \brief One decode step against an **FP8 e4m3** paged KV cache.
+  ///
+  /// Same shape contract as `Decode`, but the cache holds K/V as fp8 e4m3
+  /// rather than bf16 -- half the KV memory (§6.4), which is the capacity win.
+  /// Q and O stay bf16; FlashInfer's fa2 decode upcasts fp8 to fp32 in
+  /// registers on load, so this uses no fp8 tensor cores and runs on sm_89,
+  /// unlike the Hopper-only mixed-input GEMM.
+  ///
+  /// FP8 is a scaled format, so two per-tensor dequant scalars are required,
+  /// and where they go is fixed by the attention math rather than chosen:
+  /// `k_scale` is folded into `scale` (attention is invariant to a rescaling
+  /// of K -- it falls out of the normalizing softmax), and `v_scale` is
+  /// applied to `out` after the kernel returns. That is exactly what
+  /// FlashInfer's own Python wrapper does, and the TODO there to fuse `v_scale`
+  /// into the kernel is still open, so neither happens inside the template.
+  ///
+  /// This is the one-shot (non-graph) entry point: it plans and launches in one
+  /// call, like `Decode`. A graph-capturable FP8 path (Plan/Run analogues) is
+  /// left for serving-path integration.
+  Status DecodeFp8(const TensorView& q, const TensorView& k_cache,
+                   const TensorView& v_cache, const TensorView& kv_indices,
+                   const TensorView& kv_indptr,
+                   absl::Span<const int32_t> kv_indptr_host,
+                   const TensorView& last_page_len, const TensorView& out,
+                   float scale, float k_scale, float v_scale,
+                   cudaStream_t stream = nullptr);
+
+  /// \name Graph-capturable FP8 KV decode
+  ///
+  /// The Plan/Run split for the FP8 KV path, mirroring the bf16 `Plan`/`Run`.
+  /// `PlanFp8` does the host-side work (reads `kv_indptr_host`, branches on it)
+  /// and must stay outside a captured region; `RunFp8` is pure device work and
+  /// can be recorded. The scales are fixed at capture time, which is consistent
+  /// with a per-layer fixed KV scale -- the serving strategy M8 will use.
+  ///@{
+  Status PlanFp8(int64_t batch, int64_t q_heads, int64_t kv_heads,
+                 int64_t head_dim, int64_t page_size,
+                 absl::Span<const int32_t> kv_indptr_host, bool graph_safe,
+                 cudaStream_t stream = nullptr);
+
+  Status RunFp8(const TensorView& q, const TensorView& k_cache,
+                const TensorView& v_cache, const TensorView& kv_indices,
+                const TensorView& kv_indptr, const TensorView& last_page_len,
+                const TensorView& out, float scale, float k_scale,
+                float v_scale, cudaStream_t stream = nullptr);
+  ///@}
+
   /// \brief Plans a step without launching it. Host-side; **not capturable**.
   ///
   /// The split that lets FlashInfer live inside a CUDA graph. Planning reads
