@@ -3,7 +3,7 @@
 A plan for making `inferx-serve` run `openai/gpt-oss-20b`, the MoE checkpoint
 already cached on this box, and for what that buys.
 
-**Status: Phases 0–1 done, Phase 2 under way. Phases 3–4 proposed.** The oracle exists, the MXFP4 bit
+**Status: Phases 0–2 done. Phases 3–4 proposed.** The oracle exists, the MXFP4 bit
 layout is settled against HuggingFace's own decoder, and every definition this
 document originally marked "recalled, verify later" has been read out of the
 reference implementation. §8 records what changed. The rest exists to be argued
@@ -387,20 +387,40 @@ more than the headline:
 from a comment to an assertion, which is what entitles the other tests to
 demand equality instead of a tolerance.
 
-### Phase 2 — a deliberately slow, correct forward *(in progress)*
+### Phase 2 — a deliberately slow, correct forward ✅ *done*
 
-Build the gpt-oss stack with **MXFP4 dequantized to bf16 one layer at a time**
-(~423 MB per layer — fits trivially), reusing `MoeFfn`. No serving, no
-performance, no CUDA graphs. This is M2's playbook: the implementation whose
-logits get compared, written to be checkable rather than fast.
+`model::GptOssModel` runs the whole stack and its logits match HuggingFace's.
+**M9's central caveat is retired**: the MoE layer is no longer tested only
+against its own definition.
 
-Needs R-B, R-D, R-E to be *correct* but not *fast* — a reference attention with
-sinks and a host-computed YaRN table are fine here.
+The memory strategy is the load-bearing part. Expert weights stay **packed on
+the host** and one layer is uploaded and dequantized into a reusable bf16
+scratch as it is reached — peak ~5.5 GB on device, ~10 GB over PCIe per call,
+about 24 seconds per forward. (The plan previously said 423 MB per layer; that
+is the *packed* size. Dequantized it is **1.59 GB**, which is what the scratch
+holds and why the peak is what it is.) That is not a serving path and is not
+trying to be — Phase 4's mainloop replaces it, and this class stays as the
+thing that says the fast path is right.
 
-- **Exit:** greedy logits match the Phase 0 oracle to bf16 tolerance, argmax
-  agreeing at every position on a fixed prompt. **This is the milestone that
-  retires M9's central caveat**, and it is reachable without a fast kernel,
-  without the tokenizer, and without touching the scheduler.
+Reuses `MoeFfn` unchanged except for two additions gpt-oss forced, both of
+which any biased MoE would have needed: expert and router **biases**, and an
+**activation selector** for the clamped form.
+
+**Exit met**, on two prompts:
+
+| | |
+|---|---|
+| 5-token prompt | argmax agrees at **every** position; top-5 sets overlap 5/5 |
+| 225-token prompt | 13 of 225 positions differ — see below; exercises the 128-token window on 12 of 24 layers |
+
+The bug it caught is the one worth recording. The first run picked the wrong
+token at *every* position, and the cause was that **`gate_up`'s bias must be
+de-interleaved exactly as its weight was**. R-E had established that gpt-oss
+interleaves gate and up, and the weight de-interleave went into the MXFP4
+decode where it belongs — but the bias is indexed by the same axis and was
+uploaded in checkpoint order, so every gate's bias landed on an `up` and vice
+versa. It produced a model that ran, and generated fluent text, and was wrong.
+No unit test would have caught it; only the end-to-end comparison did.
 
 ### Phase 3 — the tokenizer and the server path *(medium)*
 
@@ -436,7 +456,10 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
 
 ## 7. Recommendation
 
-Phases 0 and 1 are done. Do Phase 2, then reassess.
+Phases 0–2 are done. Phase 2's exit criterion is met: gpt-oss-20b runs
+end to end and its logits match HuggingFace's. Phases 3 (tokenizer and
+serving) and 4 (make it fast) are the remaining work, and §9 revises what they
+look like now that the model runs.
 
 That subset is where nearly all the value sits: it retires M9's caveat, it
 proves MXFP4, and it produces a checkpoint-validated MoE forward pass — while
@@ -480,3 +503,65 @@ window nobody would guess.
 (FlashInfer and attention sinks) is still the risk most likely to force an
 unpleasant choice, and Phase 0 said nothing about it either way — it is a
 Phase 2 discovery by construction.
+
+---
+
+## 9. What Phase 2 changed, and the one finding that outlives it
+
+### MoE routing is a discontinuity, and gpt-oss's router is *close*
+
+The 225-token prompt disagrees with HuggingFace at 13 of 225 positions, and
+chasing that down produced the most useful thing in this document.
+
+It is not an implementation error. gpt-oss routes each token to 4 of 32
+experts, and the router's margin between the **4th and 5th ranked expert** is
+tiny: over that prompt the median is **0.07**, and **28 of 225 positions sit
+below 0.01**. bf16 carries about three decimal digits. So any difference in
+accumulation order — ours against HuggingFace's, or HuggingFace's against
+itself on other hardware — can reorder that boundary, and when it does the
+token runs through a *different expert* and its output changes by far more than
+the perturbation that caused it.
+
+The measurements that establish this, in order:
+
+1. Divergence begins at **layer 0** (5% relative), so it is not accumulation.
+2. Within layer 0, the **attention output** agrees to ~2 bf16 ulps — and a
+   from-scratch fp32 numpy reimplementation of that attention disagrees with
+   HuggingFace by the *same* amount, so the kernel matches the definition and
+   the residue is bf16 rounding.
+3. The **MoE output** at layer 0 agrees on average (mean |Δ| 0.007 against a
+   mean magnitude of 0.30) but is badly wrong at **10 of 225 positions** — the
+   signature of different expert selection, not of wrong arithmetic.
+4. Router margins, measured: median 0.07, 12% of positions under 0.01.
+5. The disagreement count **moves between 6 and 13 for changes as small as
+   swapping `__sincosf` for `sincosf`** — which is the clearest possible
+   demonstration that these are coin-flips being re-flipped rather than errors
+   being fixed.
+
+This is the same class of fact as §6.3's "a cache hit can change a greedy
+answer", and it deserves the same treatment: state it, bound it, and do not
+pretend the bound is tighter than the arithmetic allows. The test bounds
+disagreement at 10% and says why; a structural bug is nowhere near that line,
+as the bias bug demonstrated by missing at 100%.
+
+**It has consequences beyond this test, and they are for Phase 3 and 4 to
+absorb rather than rediscover.** Any change to accumulation order in the router
+path — batching a request differently, a grouped GEMM, chunked prefill,
+serving a prefix from cache — can change which experts a token visits and hence
+what it generates. §6.3 already accepts that prefix caching costs bitwise
+determinism; MoE routing raises the price, because the perturbation needed is
+smaller and the consequence larger. A `--deterministic-routing` mode, if it is
+ever wanted, would have to fix the router's arithmetic and not merely its
+inputs.
+
+### Smaller corrections to this document
+
+- Per-layer dequantized experts are **1.59 GB**, not the 423 MB stated in
+  Phase 2's original sketch — that figure was the packed size. The strategy is
+  unaffected; the peak is ~5.5 GB rather than ~2 GB.
+- `sincosf` replaced `__sincosf` in the YaRN kernel. At position 224 the angle
+  reaches 224 radians, where the fast intrinsic's argument reduction is
+  visibly worse. It is not the cause of anything above, and it is free here.
+- The existing `RotaryEmbedding` in `layers.cu` still uses `__sincosf`, and
+  Qwen's reference test only ever runs 5 tokens. That is an untested corner
+  rather than a known bug, and it is worth a look independently of this work.

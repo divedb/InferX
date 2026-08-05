@@ -40,6 +40,16 @@ struct MoeWeights {
   TensorView shared_down;
   /// `[1, hidden]` — the shared expert's own scalar gate, pre-sigmoid.
   TensorView shared_gate;
+
+  // Biases. Undefined means the architecture has none, which is Qwen2-MoE and
+  // Mixtral; gpt-oss biases all three.
+
+  /// `[num_experts]`, added to the router's logits before the top-k.
+  TensorView router_bias;
+  /// `[num_experts, 2 · moe_intermediate]`.
+  TensorView gate_up_bias;
+  /// `[num_experts, hidden]`.
+  TensorView down_bias;
 };
 
 /// \brief A mixture-of-experts FFN: route, group, one GEMM per expert, combine.
@@ -71,6 +81,15 @@ struct MoeWeights {
 /// rather than fused into it.
 class MoeFfn {
  public:
+  /// \brief Which gated activation the experts use.
+  enum class Activation {
+    /// `silu(gate) · up`, what Mixtral and Qwen2-MoE use.
+    kSiluMul,
+    /// gpt-oss's `(up+1) · gate · σ(α·gate)` with an asymmetric clamp.
+    /// \see kernels/gpt_oss.h for why every part of that differs.
+    kGptOssClamped,
+  };
+
   struct Config {
     int64_t hidden = 0;
     int64_t num_experts = 0;
@@ -78,6 +97,11 @@ class MoeFfn {
     int64_t moe_intermediate = 0;
     int64_t shared_intermediate = 0;  // 0 when there is no shared expert
     bool norm_topk_prob = true;
+
+    Activation activation = Activation::kSiluMul;
+    /// Only read for `kGptOssClamped`.
+    float swiglu_limit = 7.0f;
+    float swiglu_alpha = 1.702f;
   };
 
   /// \brief Builds the layer and sizes its scratch for `max_tokens`.

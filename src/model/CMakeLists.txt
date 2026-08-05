@@ -23,6 +23,6 @@ target_link_libraries(inferx_model
 )
 
 if(INFERX_CUDA_MEETS_FLOOR)
-  target_sources(inferx_model PRIVATE qwen2.cc moe_ffn.cc mla.cc)
+  target_sources(inferx_model PRIVATE qwen2.cc moe_ffn.cc mla.cc gpt_oss.cc)
   target_link_libraries(inferx_model PUBLIC inferx::kernels)
 endif()

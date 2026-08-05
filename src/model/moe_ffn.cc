@@ -8,6 +8,7 @@
 
 #include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
+#include "inferx/kernels/gpt_oss.h"
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/moe.h"
 
@@ -181,6 +182,13 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       const TensorView experts_v,
       impl_->experts.View(DataType::kInt32, Shape({tokens, k})));
 
+  // The router's bias, when the architecture has one. Added before the top-k,
+  // because it shifts which experts win and not merely by how much.
+  if (weights.router_bias.IsDefined()) {
+    INFERX_RETURN_IF_ERROR(
+        kernels::AddBiasInPlace(logits_v, weights.router_bias, stream));
+  }
+
   INFERX_RETURN_IF_ERROR(kernels::MoeRouteTopK(
       logits_v, weights_v, experts_v, c.norm_topk_prob, stream));
 
@@ -268,8 +276,34 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
                             down_w_3d.Reshape(Shape({c.hidden, inter})));
 
     INFERX_RETURN_IF_ERROR(gemm->LinearBF16(xe, gu_w, gu_e, stream));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu_e, act_e, stream));
+
+    if (weights.gate_up_bias.IsDefined()) {
+      INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
+                              weights.gate_up_bias.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(const TensorView b,
+                              b2d.Reshape(Shape({2 * inter})));
+      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(gu_e, b, stream));
+    }
+
+    switch (c.activation) {
+      case Activation::kSiluMul:
+        INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu_e, act_e, stream));
+        break;
+      case Activation::kGptOssClamped:
+        INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(
+            gu_e, act_e, c.swiglu_limit, c.swiglu_alpha, stream));
+        break;
+    }
+
     INFERX_RETURN_IF_ERROR(gemm->LinearBF16(act_e, down_w, ye, stream));
+
+    if (weights.down_bias.IsDefined()) {
+      INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
+                              weights.down_bias.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(const TensorView b,
+                              b2d.Reshape(Shape({c.hidden})));
+      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(ye, b, stream));
+    }
   }
 
   // --- 4. Combine, then the shared expert -----------------------------------

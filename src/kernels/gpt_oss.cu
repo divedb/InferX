@@ -47,6 +47,103 @@ __global__ void ApplySinksKernel(bf16* __restrict__ out,
   }
 }
 
+// One block per (query, head). Two passes over the visible keys: the maximum
+// score, then the denominator and the weighted V together. Same shape as the
+// other reference attentions here, and for the same reason -- it is the thing
+// the fast path gets checked against.
+__global__ void AttentionRefKernel(const bf16* __restrict__ q,
+                                   const bf16* __restrict__ k,
+                                   const bf16* __restrict__ v,
+                                   bf16* __restrict__ out,
+                                   float* __restrict__ lse, int64_t q_heads,
+                                   int64_t kv_heads, int64_t head_dim,
+                                   int64_t window, float scale) {
+  const int64_t query = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t kv_head = head / (q_heads / kv_heads);
+
+  // Causal, and windowed when asked. `first` is the oldest visible key: a
+  // window of w lets query i see (i-w, i], which is w keys including itself.
+  const int64_t last = query;
+  const int64_t first =
+      window > 0 ? (query - window + 1 > 0 ? query - window + 1 : 0) : 0;
+
+  const bf16* qrow = q + (query * q_heads + head) * head_dim;
+
+  __shared__ float reduce[kBlock];
+  extern __shared__ float acc[];  // head_dim floats
+
+  // Pass 1: the row maximum.
+  float local_max = -INFINITY;
+  for (int64_t j = first + threadIdx.x; j <= last; j += blockDim.x) {
+    float dot = 0.0f;
+    const bf16* krow = k + (j * kv_heads + kv_head) * head_dim;
+    for (int64_t d = 0; d < head_dim; ++d) dot += ToF32(qrow[d]) * ToF32(krow[d]);
+    local_max = fmaxf(local_max, dot * scale);
+  }
+
+  reduce[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+  __syncthreads();
+
+  // Pass 2: denominator and weighted V.
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) acc[d] = 0.0f;
+  __syncthreads();
+
+  float local_sum = 0.0f;
+
+  for (int64_t j = first; j <= last; ++j) {
+    float dot = 0.0f;
+    const bf16* krow = k + (j * kv_heads + kv_head) * head_dim;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+      dot += ToF32(qrow[d]) * ToF32(krow[d]);
+    }
+
+    reduce[threadIdx.x] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+      __syncthreads();
+    }
+
+    const float weight = __expf(reduce[0] * scale - row_max);
+    __syncthreads();
+
+    if (threadIdx.x == 0) local_sum += weight;
+
+    const bf16* vrow = v + (j * kv_heads + kv_head) * head_dim;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+      acc[d] += weight * ToF32(vrow[d]);
+    }
+    __syncthreads();
+  }
+
+  __shared__ float denom;
+  if (threadIdx.x == 0) denom = local_sum;
+  __syncthreads();
+
+  const float inv = 1.0f / denom;
+  bf16* dst = out + (query * q_heads + head) * head_dim;
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    dst[d] = ToBf16(acc[d] * inv);
+  }
+
+  // FlashInfer's convention: m + log2(d), with m already in log2 space. Ours
+  // is natural, so both terms convert. Writing it in *their* units is what
+  // lets ApplyAttentionSinks be indifferent to which kernel produced it.
+  if (threadIdx.x == 0) {
+    lse[query * q_heads + head] =
+        row_max * 1.4426950408889634f + __log2f(denom);
+  }
+}
+
 __global__ void SwiGluKernel(const bf16* __restrict__ gate_up,
                              bf16* __restrict__ out, int64_t inter, float limit,
                              float alpha) {
@@ -80,7 +177,7 @@ __global__ void RopeTableKernel(bf16* __restrict__ q, bf16* __restrict__ k,
     const float angle = pos * inv_freq[j];
 
     float s, c;
-    __sincosf(angle, &s, &c);
+    sincosf(angle, &s, &c);
 
     // YaRN's temperature. 1.0 collapses this to the ordinary rotation, which
     // is why the same kernel serves both.
@@ -158,6 +255,62 @@ Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
       static_cast<bf16*>(out.Data()), static_cast<const float*>(lse.Data()),
       static_cast<const bf16*>(sinks.Data()), heads, head_dim,
       lse_is_log2 ? kLn2 : 1.0f);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
+                          const TensorView& v, const TensorView& out,
+                          const TensorView& lse, int64_t window, float scale,
+                          cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(lse, DataType::kFloat, 2, "lse"));
+
+  const int64_t tokens = q.Dim(0);
+  const int64_t q_heads = q.Dim(1);
+  const int64_t head_dim = q.Dim(2);
+  const int64_t kv_heads = k.Dim(1);
+
+  if (k.Dim(0) != tokens || v.Dim(0) != tokens || k.Dim(2) != head_dim ||
+      v.Dim(2) != head_dim || v.Dim(1) != kv_heads) {
+    return InvalidArgumentError("k ", k.GetShape().ToString(), " and v ",
+                                v.GetShape().ToString(), " do not match q ",
+                                q.GetShape().ToString());
+  }
+
+  if (kv_heads <= 0 || q_heads % kv_heads != 0) {
+    return InvalidArgumentError("q_heads ", q_heads,
+                                " is not a multiple of kv_heads ", kv_heads);
+  }
+
+  if (out.Dim(0) != tokens || out.Dim(1) != q_heads || out.Dim(2) != head_dim) {
+    return InvalidArgumentError("out is ", out.GetShape().ToString(),
+                                " but q is ", q.GetShape().ToString());
+  }
+
+  if (lse.Dim(0) != tokens || lse.Dim(1) != q_heads) {
+    return InvalidArgumentError("lse must be [", tokens, ", ", q_heads,
+                                "], got ", lse.GetShape().ToString());
+  }
+
+  if (window < 0) {
+    return InvalidArgumentError("window must be non-negative, got ", window);
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(q_heads));
+  const size_t shared = static_cast<size_t>(head_dim) * sizeof(float);
+
+  AttentionRefKernel<<<grid, kBlock, shared, stream>>>(
+      static_cast<const bf16*>(q.Data()), static_cast<const bf16*>(k.Data()),
+      static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()),
+      static_cast<float*>(lse.Data()), q_heads, kv_heads, head_dim, window,
+      scale);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "inferx/core/dtype.h"
 #include "inferx/core/status.h"
@@ -23,6 +24,11 @@ enum class Architecture {
   /// expert FFNs of which `num_experts_per_tok` run per token, and a shared
   /// expert that runs for every token. Attention is bit-for-bit the Qwen2 path.
   kQwen2Moe,
+  /// gpt-oss: MoE, plus four things nothing else here does — per-head learned
+  /// attention **sinks**, **sliding-window** attention on alternating layers,
+  /// **YaRN** position scaling, and a clamped `(up+1)·gate·σ(αgate)` activation.
+  /// Its expert weights are MXFP4 (\see kernels/mxfp4.h).
+  kGptOss,
 };
 
 const char* ArchitectureName(Architecture arch);
@@ -108,6 +114,50 @@ struct ModelConfig {
 
   /// \brief Whether attention is MLA rather than GQA.
   bool is_mla() const { return kv_lora_rank > 0; }
+
+  // --- gpt-oss (§14, M11). All default to "off", which is every other model.
+
+  /// Per-head learned logits in the softmax denominator with no value behind
+  /// them. True when the checkpoint carries `self_attn.sinks`.
+  bool attention_sinks = false;
+
+  /// Width of the sliding attention window, 0 when every layer is full.
+  int64_t sliding_window = 0;
+
+  /// One entry per layer: true where attention only sees the last
+  /// `sliding_window` tokens. Empty means every layer is full attention.
+  ///
+  /// A vector rather than a stride because "every other layer" is a property
+  /// of this checkpoint rather than of the idea, and a model that alternated
+  /// differently would otherwise be silently mis-run.
+  std::vector<bool> layer_is_sliding;
+
+  /// The clamp in gpt-oss's gated activation. 0 means the ordinary SwiGLU.
+  double swiglu_limit = 0.0;
+
+  /// `x·σ(αx)` rather than `x·σ(x)`; 1.702 makes it approximate GELU.
+  double swiglu_alpha = 1.702;
+
+  // --- YaRN position scaling. `yarn_factor` 0 means no scaling.
+
+  double yarn_factor = 0.0;
+  double yarn_beta_fast = 32.0;
+  double yarn_beta_slow = 1.0;
+  int64_t yarn_original_max_position = 0;
+  bool yarn_truncate = true;
+
+  /// \brief Whether positions are YaRN-scaled.
+  bool is_yarn() const { return yarn_factor > 0.0; }
+
+  /// \brief Whether layer `i` attends only within the sliding window.
+  bool IsSlidingLayer(int64_t layer) const {
+    if (sliding_window <= 0) return false;
+    if (layer_is_sliding.empty()) return false;
+    if (layer < 0 || layer >= static_cast<int64_t>(layer_is_sliding.size())) {
+      return false;
+    }
+    return layer_is_sliding[static_cast<size_t>(layer)];
+  }
 
   /// \brief Bytes one token occupies in one layer's KV cache.
   ///

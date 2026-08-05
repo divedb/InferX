@@ -41,13 +41,15 @@ StatusOr<Architecture> ParseArchitecture(std::string_view name) {
   if (name == "Qwen2ForCausalLM") return Architecture::kQwen2;
   if (name == "LlamaForCausalLM") return Architecture::kLlama;
   if (name == "Qwen2MoeForCausalLM") return Architecture::kQwen2Moe;
+  if (name == "GptOssForCausalLM") return Architecture::kGptOss;
 
   // Rejected rather than defaulted. Running an unread architecture through the
   // Llama path produces output that looks like text and is wrong, which is the
   // most expensive kind of failure to notice.
   return UnimplementedError(
       "unsupported architecture '", name,
-      "'; known: Qwen2ForCausalLM, LlamaForCausalLM, Qwen2MoeForCausalLM");
+      "'; known: Qwen2ForCausalLM, LlamaForCausalLM, "
+      "Qwen2MoeForCausalLM, GptOssForCausalLM");
 }
 
 StatusOr<DataType> ParseTorchDtype(std::string_view name) {
@@ -65,6 +67,7 @@ const char* ArchitectureName(Architecture arch) {
     case Architecture::kQwen2: return "Qwen2ForCausalLM";
     case Architecture::kLlama: return "LlamaForCausalLM";
     case Architecture::kQwen2Moe: return "Qwen2MoeForCausalLM";
+    case Architecture::kGptOss: return "GptOssForCausalLM";
   }
   return "?";
 }
@@ -140,6 +143,19 @@ Status ModelConfig::Validate() const {
   } else if (num_experts_per_tok > 0) {
     return InvalidArgumentError("num_experts_per_tok is ", num_experts_per_tok,
                                 " but the model declares no experts");
+  }
+
+  if (architecture == Architecture::kGptOss) {
+    if (!is_moe()) {
+      return InvalidArgumentError(
+          "architecture is GptOssForCausalLM but num_local_experts is 0");
+    }
+    if (!layer_is_sliding.empty() &&
+        static_cast<int64_t>(layer_is_sliding.size()) != num_hidden_layers) {
+      return InvalidArgumentError(
+          "layer_types lists ", layer_is_sliding.size(),
+          " layers but the model has ", num_hidden_layers);
+    }
   }
 
   if (architecture == Architecture::kQwen2Moe && !is_moe()) {
@@ -295,6 +311,77 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
   INFERX_ASSIGN_OR_RETURN(
       c.shared_expert_intermediate_size,
       root.OptionalInt("shared_expert_intermediate_size", 0));
+
+  // gpt-oss. `num_local_experts` is its spelling of `num_experts`, and the
+  // rest describe things no other architecture here has.
+  if (c.num_experts == 0) {
+    INFERX_ASSIGN_OR_RETURN(c.num_experts,
+                            root.OptionalInt("num_local_experts", 0));
+    if (c.num_experts > 0 && c.moe_intermediate_size == c.intermediate_size) {
+      // gpt-oss gives every expert the model's `intermediate_size` and has no
+      // separate `moe_intermediate_size`, which the fallback above already
+      // produced. Nothing to do -- but the case is worth naming, because a
+      // silent fallback to the *dense* width is exactly the sort of thing that
+      // would make each expert 4x too wide on a checkpoint that did differ.
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(c.sliding_window,
+                          root.OptionalInt("sliding_window", 0));
+
+  const JsonValue* swiglu_limit = root.Find("swiglu_limit");
+  if (swiglu_limit != nullptr && !swiglu_limit->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(c.swiglu_limit, swiglu_limit->AsDouble());
+  }
+
+  // Per-layer attention types. Read as a list rather than as "every other one"
+  // because the alternation is this checkpoint's, not the architecture's.
+  if (const JsonValue* types = root.Find("layer_types");
+      types != nullptr && !types->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const auto* list, types->AsArray());
+
+    for (const JsonValue& entry : *list) {
+      INFERX_ASSIGN_OR_RETURN(const std::string_view name, entry.AsString());
+
+      if (name == "sliding_attention") {
+        c.layer_is_sliding.push_back(true);
+      } else if (name == "full_attention") {
+        c.layer_is_sliding.push_back(false);
+      } else {
+        return UnimplementedError("unknown layer_type '", name, "'");
+      }
+    }
+  }
+
+  // YaRN. Only the `yarn` rope_type is implemented; the others (linear,
+  // dynamic, longrope, llama3) each change the frequencies differently, and
+  // running one as another produces a model with no long-range coherence.
+  if (const JsonValue* rope = root.Find("rope_scaling");
+      rope != nullptr && !rope->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const std::string_view rope_type,
+                            rope->RequiredString("rope_type"));
+
+    if (rope_type != "yarn") {
+      return UnimplementedError("rope_scaling.rope_type '", rope_type,
+                                "' is not implemented; only 'yarn' is");
+    }
+
+    INFERX_ASSIGN_OR_RETURN(const double factor, rope->RequiredDouble("factor"));
+    c.yarn_factor = factor;
+
+    if (const JsonValue* v = rope->Find("beta_fast"); v != nullptr) {
+      INFERX_ASSIGN_OR_RETURN(c.yarn_beta_fast, v->AsDouble());
+    }
+    if (const JsonValue* v = rope->Find("beta_slow"); v != nullptr) {
+      INFERX_ASSIGN_OR_RETURN(c.yarn_beta_slow, v->AsDouble());
+    }
+    INFERX_ASSIGN_OR_RETURN(
+        c.yarn_original_max_position,
+        rope->OptionalInt("original_max_position_embeddings",
+                          c.max_position_embeddings));
+    INFERX_ASSIGN_OR_RETURN(c.yarn_truncate,
+                            rope->OptionalBool("truncate", true));
+  }
 
   // MLA, read the same way and for the same reason: absent keys mean GQA.
   INFERX_ASSIGN_OR_RETURN(c.kv_lora_rank, root.OptionalInt("kv_lora_rank", 0));

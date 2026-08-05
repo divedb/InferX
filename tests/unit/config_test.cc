@@ -244,6 +244,115 @@ TEST(ModelConfig, RejectsALatentNarrowerThanTheHeadsItReconstructs) {
   EXPECT_FALSE(c.ok());
 }
 
+TEST(ModelConfig, ParsesGptOss) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["GptOssForCausalLM"],
+      "hidden_size": 2880, "intermediate_size": 2880,
+      "num_hidden_layers": 4, "num_attention_heads": 64,
+      "num_key_value_heads": 8, "head_dim": 64, "vocab_size": 201088,
+      "num_local_experts": 32, "num_experts_per_tok": 4,
+      "swiglu_limit": 7.0, "sliding_window": 128, "rope_theta": 150000,
+      "rms_norm_eps": 1e-5, "attention_bias": true,
+      "layer_types": ["sliding_attention", "full_attention",
+                      "sliding_attention", "full_attention"],
+      "rope_scaling": {"rope_type": "yarn", "factor": 32.0,
+                       "beta_fast": 32.0, "beta_slow": 1.0,
+                       "original_max_position_embeddings": 4096,
+                       "truncate": false}
+  })");
+  ASSERT_TRUE(c.ok()) << c.status();
+
+  EXPECT_EQ(c->architecture, Architecture::kGptOss);
+  EXPECT_TRUE(c->is_moe());
+
+  // num_local_experts is gpt-oss's spelling; nothing else uses it.
+  EXPECT_EQ(c->num_experts, 32);
+  EXPECT_EQ(c->num_experts_per_tok, 4);
+
+  // No moe_intermediate_size in this config, so an expert is as wide as the
+  // model's intermediate_size. That fallback is load-bearing here.
+  EXPECT_EQ(c->moe_intermediate_size, 2880);
+
+  EXPECT_DOUBLE_EQ(c->swiglu_limit, 7.0);
+  EXPECT_EQ(c->sliding_window, 128);
+
+  // Decoupled head_dim: 64 heads x 64 = 4096 against a hidden size of 2880.
+  EXPECT_EQ(c->q_dim(), 4096);
+  EXPECT_EQ(c->kv_dim(), 512);
+
+  // The alternation is read, not assumed.
+  ASSERT_EQ(c->layer_is_sliding.size(), 4u);
+  EXPECT_TRUE(c->IsSlidingLayer(0));
+  EXPECT_FALSE(c->IsSlidingLayer(1));
+  EXPECT_TRUE(c->IsSlidingLayer(2));
+  EXPECT_FALSE(c->IsSlidingLayer(3));
+
+  EXPECT_TRUE(c->is_yarn());
+  EXPECT_DOUBLE_EQ(c->yarn_factor, 32.0);
+  EXPECT_EQ(c->yarn_original_max_position, 4096);
+  EXPECT_FALSE(c->yarn_truncate);
+}
+
+TEST(ModelConfig, RejectsLayerTypesThatDoNotCoverTheModel) {
+  // A truncated list would silently run the missing layers as full attention,
+  // which is a plausible-looking model with the wrong receptive field.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["GptOssForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 64, "num_hidden_layers": 4,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "num_local_experts": 4, "num_experts_per_tok": 2,
+      "sliding_window": 8,
+      "layer_types": ["sliding_attention", "full_attention"]
+  })");
+
+  EXPECT_FALSE(c.ok());
+}
+
+TEST(ModelConfig, RejectsRopeScalingWeHaveNotImplemented) {
+  // linear/dynamic/longrope each change the frequencies differently. Running
+  // one as another gives a model with no long-range coherence and no error.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 64, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "rope_scaling": {"rope_type": "linear", "factor": 4.0}
+  })");
+
+  EXPECT_FALSE(c.ok());
+  EXPECT_EQ(c.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(ModelConfig, ReadsTheRealGptOssCheckpointDirectory) {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) GTEST_SKIP() << "no HOME";
+
+  std::string dir;
+  if (const char* env = std::getenv("INFERX_TEST_GPTOSS_CHECKPOINT")) {
+    dir = env;
+  } else {
+    dir = std::string(home) +
+          "/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/"
+          "6cee5e81ee83917806bbde320786a8fb61efebee";
+  }
+
+  auto c = ModelConfig::FromDirectory(dir);
+  if (!c.ok()) GTEST_SKIP() << "no gpt-oss checkpoint at " << dir;
+
+  EXPECT_EQ(c->architecture, Architecture::kGptOss);
+  EXPECT_EQ(c->num_hidden_layers, 24);
+  EXPECT_EQ(c->num_experts, 32);
+  EXPECT_EQ(c->num_experts_per_tok, 4);
+  EXPECT_EQ(c->hidden_size, 2880);
+  EXPECT_EQ(c->q_dim(), 4096);
+  EXPECT_EQ(c->sliding_window, 128);
+  EXPECT_TRUE(c->is_yarn());
+  EXPECT_FALSE(c->tie_word_embeddings);
+
+  ASSERT_EQ(c->layer_is_sliding.size(), 24u);
+  EXPECT_TRUE(c->IsSlidingLayer(0));
+  EXPECT_FALSE(c->IsSlidingLayer(23));
+}
+
 TEST(ModelConfig, ReadsTheRealCheckpointDirectory) {
   const char* home = std::getenv("HOME");
   if (home == nullptr) GTEST_SKIP() << "no HOME";

@@ -55,6 +55,36 @@ Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
                            const TensorView& sinks, bool lse_is_log2 = true,
                            cudaStream_t stream = nullptr);
 
+/// \brief Causal GQA attention that also reports its log-sum-exp.
+///
+/// The reference path for M11's Phase 2: no paging, no cache, full recompute
+/// over `tokens` positions, one block per (query, head). It exists to be
+/// checkable rather than fast — `PagedAttention` and FlashInfer are what serve.
+///
+/// Two things it does that the existing reference attention does not:
+///
+///   * **It writes the log-sum-exp**, which is what makes attention sinks a
+///     post-pass (\see ApplyAttentionSinks) rather than a kernel change. The
+///     lse is written in FlashInfer's base-2 convention so that the same
+///     `ApplyAttentionSinks` call works against either producer, and so that
+///     swapping this kernel for FlashInfer later changes nothing downstream.
+///   * **It supports a sliding window.** Query `i` sees key `j` only when
+///     `i - j < window`. gpt-oss alternates windowed and full layers, and a
+///     window applied to the wrong layers is a model with the wrong receptive
+///     field and no error message.
+///
+/// \param q       `[tokens, q_heads, head_dim]` bf16, post-RoPE.
+/// \param k       `[tokens, kv_heads, head_dim]` bf16, post-RoPE.
+/// \param v       `[tokens, kv_heads, head_dim]` bf16.
+/// \param out     `[tokens, q_heads, head_dim]` bf16.
+/// \param lse     `[tokens, q_heads]` fp32, `m + log2(d)`.
+/// \param window  Keys visible behind each query, 0 for unlimited.
+/// \param scale   Softmax scale, normally `1/sqrt(head_dim)`.
+Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
+                          const TensorView& v, const TensorView& out,
+                          const TensorView& lse, int64_t window, float scale,
+                          cudaStream_t stream = nullptr);
+
 /// \brief gpt-oss's gated activation: clamped, alpha-scaled, and offset.
 ///
 /// Four differences from the `silu(gate) · up` every other model here uses, and
