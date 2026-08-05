@@ -175,9 +175,11 @@ struct HttpServer::Impl {
     response->set_header("Cache-Control", "no-cache");
     response->set_header("X-Accel-Buffering", "no");
 
+    const bool include_usage = sampling.include_usage;
+
     response->set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, chat, sampled](
+        [this, stream, id, created, model, chat, sampled, include_usage](
             size_t /*offset*/, httplib::DataSink& sink) {
           // The first chunk announces the role and carries no content, which is
           // what OpenAI's protocol specifies and what clients key on to open
@@ -205,6 +207,20 @@ struct HttpServer::Impl {
                                                       &reason, created, sampled)
                        : api::CompletionChunkJson(id, model, "", &reason,
                                                   created, sampled));
+
+              // The accounting chunk goes between the finish reason and
+              // [DONE], which is where OpenAI puts it: a client that stops
+              // reading at the finish reason loses only the counts, and one
+              // that reads to [DONE] gets them without a second request.
+              if (include_usage) {
+                Usage usage;
+                usage.prompt_tokens = stream->prompt_tokens();
+                usage.completion_tokens = event.generated;
+
+                frame += api::SseFrame(api::UsageChunkJson(
+                    id, model, usage, created, chat, sampled));
+              }
+
               frame += api::SseFrame("[DONE]");
 
               sink.write(frame.data(), frame.size());
@@ -367,6 +383,16 @@ StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
 
   impl->server.set_payload_max_length(config.max_request_bytes);
   impl->server.set_read_timeout(config.read_timeout_seconds, 0);
+
+  // Nagle's algorithm and an SSE stream are a bad pair, and cpp-httplib leaves
+  // TCP_NODELAY off by default. Each token is one small write; Nagle holds it
+  // in the kernel until the previous small segment is acknowledged, and the
+  // peer's delayed ACK does not fire for ~40 ms. M10 measured exactly that: a
+  // TTFT floor of ~43 ms that did not move between a 6-token prompt and a
+  // 455-token one, because it was never prefill -- it was the socket. The
+  // engine's job is to put a token on the wire as soon as it exists, so the
+  // batching heuristic that helps bulk transfers is precisely wrong here.
+  impl->server.set_tcp_nodelay(true);
 
   // Generation can take much longer than a default socket timeout, and a
   // non-streaming request holds the connection open for all of it.

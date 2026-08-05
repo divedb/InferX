@@ -24,6 +24,22 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
 
   INFERX_ASSIGN_OR_RETURN(out->stream, root.OptionalBool("stream", false));
 
+  // `stream_options` is an object, and clients send it whether or not they are
+  // streaming. Reject a non-object outright -- a client that sent a bare
+  // `true` here is confused about the field and should hear so -- but treat a
+  // missing `include_usage` as false rather than an error, since OpenAI has
+  // added keys to this object before and will again.
+  if (const JsonValue* opts = root.Find("stream_options");
+      opts != nullptr && !opts->IsNull()) {
+    if (!opts->IsObject()) {
+      return InvalidArgumentError("stream_options must be an object, got ",
+                                  opts->KindName());
+    }
+
+    INFERX_ASSIGN_OR_RETURN(out->include_usage,
+                            opts->OptionalBool("include_usage", false));
+  }
+
   if (const JsonValue* t = root.Find("temperature");
       t != nullptr && !t->IsNull()) {
     INFERX_ASSIGN_OR_RETURN(const double value, t->AsDouble());
@@ -306,6 +322,30 @@ std::string CompletionChunkJson(std::string_view id, std::string_view model,
   }
 
   out += "}]}";
+
+  return out;
+}
+
+std::string UsageChunkJson(std::string_view id, std::string_view model,
+                           const Usage& usage, int64_t created, bool chat,
+                           bool sampled) {
+  std::string out = "{";
+
+  AppendField("id", id, &out);
+  out += chat ? ",\"object\":\"chat.completion.chunk\",\"created\":"
+              : ",\"object\":\"text_completion\",\"created\":";
+  out += std::to_string(created);
+  out += ',';
+  AppendField("model", model, &out);
+  out += ",\"system_fingerprint\":";
+  AppendJsonString(sampled ? "sampled" : "greedy", &out);
+  out += ",\"choices\":[],\"usage\":{\"prompt_tokens\":";
+  out += std::to_string(usage.prompt_tokens);
+  out += ",\"completion_tokens\":";
+  out += std::to_string(usage.completion_tokens);
+  out += ",\"total_tokens\":";
+  out += std::to_string(usage.prompt_tokens + usage.completion_tokens);
+  out += "}}";
 
   return out;
 }

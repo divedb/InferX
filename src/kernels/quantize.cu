@@ -14,6 +14,11 @@ using bf16 = __nv_bfloat16;
 
 constexpr int kBlock = 256;
 
+// Widens either half format to fp32, so one copy of each kernel below serves
+// both -- the W4A16 bench is f16, the model's activations are bf16.
+__device__ inline float Widen(__half x) { return __half2float(x); }
+__device__ inline float Widen(__nv_bfloat16 x) { return __bfloat162float(x); }
+
 // Grid-stride amax with a block reduction, finished with one atomic per block.
 //
 // atomicMax on the *bit pattern* rather than on the float: IEEE-754 orders
@@ -21,7 +26,8 @@ constexpr int kBlock = 256;
 // ever feed this fabsf() output, so the integer maximum is the float maximum.
 // CUDA has no atomicMax for float, and doing this with a CAS loop would be
 // slower for no gain.
-__global__ void AbsMaxKernel(const __half* __restrict__ src, int64_t n,
+template <typename Src>
+__global__ void AbsMaxKernel(const Src* __restrict__ src, int64_t n,
                              float* __restrict__ out) {
   __shared__ float tile[kBlock];
 
@@ -29,7 +35,7 @@ __global__ void AbsMaxKernel(const __half* __restrict__ src, int64_t n,
 
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    local = fmaxf(local, fabsf(__half2float(src[i])));
+    local = fmaxf(local, fabsf(Widen(src[i])));
   }
 
   tile[threadIdx.x] = local;
@@ -56,7 +62,8 @@ __global__ void FinalizeScaleKernel(float* __restrict__ scale) {
   *scale = amax > 0.0f ? amax / kFloat8E4M3Max : 1.0f;
 }
 
-__global__ void QuantizeKernel(const __half* __restrict__ src,
+template <typename Src>
+__global__ void QuantizeKernel(const Src* __restrict__ src,
                                __nv_fp8_storage_t* __restrict__ dst, int64_t n,
                                const float* __restrict__ scale) {
   // Read once per thread rather than per element: it is the same value for the
@@ -67,7 +74,7 @@ __global__ void QuantizeKernel(const __half* __restrict__ src,
        i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     // __NV_SATFINITE clamps to ±448 instead of producing inf/NaN, so a scale
     // that turns out too small costs accuracy rather than correctness.
-    dst[i] = __nv_cvt_float_to_fp8(__half2float(src[i]) * inv, __NV_SATFINITE,
+    dst[i] = __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE,
                                    __NV_E4M3);
   }
 }
@@ -96,15 +103,15 @@ Status CheckDeviceTensor(const TensorView& t, DataType expected,
   return OkStatus();
 }
 
-// Widens either half format to fp32, so the dynamic kernel below serves both
-// without a second copy of it.
-__device__ inline float Widen(__half x) { return __half2float(x); }
-__device__ inline float Widen(__nv_bfloat16 x) { return __bfloat162float(x); }
-
 // One block, two passes, no global synchronization: find the maximum magnitude
 // across the whole tensor, reduce it within the block, then quantize. Reading
 // the input twice is cheaper than the three extra launches the split version
-// costs, because at these sizes everything is in L2 by the second pass.
+// costs, because at decode sizes everything is in L2 by the second pass.
+//
+// One block also means one SM. That is the right trade for a decode
+// activation -- a few thousand elements, where launch count dominates -- and
+// the wrong one by an order of magnitude for a prefill activation, so
+// QuantizeToF8E4M3Dynamic dispatches to the split path above that size.
 template <typename Src>
 __global__ void QuantizeDynamicKernel(const Src* __restrict__ src,
                                       __nv_fp8_storage_t* __restrict__ dst,
@@ -215,22 +222,73 @@ Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
   const int64_t n = src.Numel();
   if (n == 0) return OkStatus();
 
-  constexpr int kBlock = 1024;
-
-  if (src.GetDataType() == DataType::kBFloat16) {
-    QuantizeDynamicKernel<__nv_bfloat16><<<1, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(src.Data()),
-        static_cast<__nv_fp8_storage_t*>(dst.Data()), n, scale_dev);
-  } else if (src.GetDataType() == DataType::kFloat16) {
-    QuantizeDynamicKernel<__half><<<1, kBlock, 0, stream>>>(
-        static_cast<const __half*>(src.Data()),
-        static_cast<__nv_fp8_storage_t*>(dst.Data()), n, scale_dev);
-  } else {
+  if (src.GetDataType() != DataType::kBFloat16 &&
+      src.GetDataType() != DataType::kFloat16) {
     return InvalidArgumentError("src is ", DataTypeName(src.GetDataType()),
                                 ", expected f16 or bf16");
   }
 
+  const bool bf16_src = src.GetDataType() == DataType::kBFloat16;
+  auto* out = static_cast<__nv_fp8_storage_t*>(dst.Data());
+
+  // Where the two strategies cross. Below it, the single-block kernel wins on
+  // launch count: one launch instead of four, against a tensor small enough
+  // that one SM reads it in microseconds. Above it, one SM is the bottleneck
+  // and the extra launches disappear into the work -- 128k elements is a
+  // 2048-token prefill activation at hidden 64, so every real prefill lands on
+  // the split path and every decode activation lands on the single-block one.
+  //
+  // M10 is why this dispatch exists: serving with --fp8 measured 3.7k prefill
+  // tok/s against bf16's 8.9k, and the GEMM microbenchmark could not see it
+  // because it times the matmul on operands somebody else quantized. A whole
+  // prefill's activations were going through one SM.
+  constexpr int64_t kSplitPathElements = 128 * 1024;
+
+  if (n < kSplitPathElements) {
+    constexpr int kDynamicBlock = 1024;
+
+    if (bf16_src) {
+      QuantizeDynamicKernel<bf16><<<1, kDynamicBlock, 0, stream>>>(
+          static_cast<const bf16*>(src.Data()), out, n, scale_dev);
+    } else {
+      QuantizeDynamicKernel<__half><<<1, kDynamicBlock, 0, stream>>>(
+          static_cast<const __half*>(src.Data()), out, n, scale_dev);
+    }
+
+    INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+    return OkStatus();
+  }
+
+  // The split path: amax across the grid, then the scale, then the quantize.
+  // Every step is stream-ordered and graph-capturable, including the memset --
+  // AbsMaxKernel only ever raises the value, so a stale maximum from the
+  // previous call would silently survive without it.
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaMemsetAsync(scale_dev, 0, sizeof(float), stream));
+
+  const int grid = GridFor(n);
+
+  if (bf16_src) {
+    AbsMaxKernel<bf16><<<grid, kBlock, 0, stream>>>(
+        static_cast<const bf16*>(src.Data()), n, scale_dev);
+  } else {
+    AbsMaxKernel<__half><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __half*>(src.Data()), n, scale_dev);
+  }
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
+  FinalizeScaleKernel<<<1, 1, 0, stream>>>(scale_dev);
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
+  if (bf16_src) {
+    QuantizeKernel<bf16><<<grid, kBlock, 0, stream>>>(
+        static_cast<const bf16*>(src.Data()), out, n, scale_dev);
+  } else {
+    QuantizeKernel<__half><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __half*>(src.Data()), out, n, scale_dev);
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+
   return OkStatus();
 }
 

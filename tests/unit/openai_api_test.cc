@@ -53,6 +53,24 @@ std::string_view StringAt(const JsonValue& root,
   return value.ok() ? *value : std::string_view{};
 }
 
+// The same walk, for the numeric fields. Returns -1 when the path is absent,
+// which no real count can be, so a missing field fails loudly rather than
+// reading as a zero the response never contained.
+int64_t IntAt(const JsonValue& root,
+              std::initializer_list<std::string_view> path) {
+  const JsonValue* node = &root;
+
+  for (const std::string_view key : path) {
+    if (node == nullptr) return -1;
+    node = node->Find(key);
+  }
+
+  if (node == nullptr) return -1;
+
+  const StatusOr<int64_t> value = node->AsInt();
+  return value.ok() ? *value : -1;
+}
+
 // --- Request parsing ---------------------------------------------------------
 
 TEST(ParseChatCompletion, ReadsAWellFormedRequest) {
@@ -160,6 +178,39 @@ TEST(ParseCompletion, ReadsASinglePrompt) {
   EXPECT_EQ(request->sampling.max_tokens, 8);
 }
 
+TEST(ParseCompletion, DefaultsIncludeUsageToOff) {
+  const auto request = ParseCompletionRequest(R"({"prompt":"x","stream":true})");
+
+  ASSERT_TRUE(request.ok()) << request.status().ToString();
+  EXPECT_FALSE(request->sampling.include_usage);
+}
+
+TEST(ParseCompletion, ReadsStreamOptionsIncludeUsage) {
+  const auto request = ParseCompletionRequest(
+      R"({"prompt":"x","stream":true,"stream_options":{"include_usage":true}})");
+
+  ASSERT_TRUE(request.ok()) << request.status().ToString();
+  EXPECT_TRUE(request->sampling.include_usage);
+}
+
+TEST(ParseCompletion, IgnoresUnknownStreamOptions) {
+  // OpenAI has grown this object before; a key we do not implement is not a
+  // reason to fail a request we can otherwise serve.
+  const auto request = ParseCompletionRequest(
+      R"({"prompt":"x","stream_options":{"continuous_usage_stats":true}})");
+
+  ASSERT_TRUE(request.ok()) << request.status().ToString();
+  EXPECT_FALSE(request->sampling.include_usage);
+}
+
+TEST(ParseCompletion, RejectsAScalarStreamOptions) {
+  const auto request =
+      ParseCompletionRequest(R"({"prompt":"x","stream_options":true})");
+
+  EXPECT_FALSE(request.ok());
+  EXPECT_EQ(request.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 // --- Response building -------------------------------------------------------
 
 TEST(ChatCompletionJson, HasTheShapeClientsExpect) {
@@ -256,6 +307,34 @@ TEST(ChatCompletionChunk, FinalChunkHasAReasonAndNoContentKey) {
   ASSERT_NE(delta, nullptr);
   EXPECT_EQ(delta->Find("content"), nullptr)
       << "the terminal chunk emitted a content key";
+}
+
+TEST(UsageChunk, CarriesCountsAndNoChoices) {
+  Usage usage;
+  usage.prompt_tokens = 7;
+  usage.completion_tokens = 128;
+
+  const JsonValue root = Parse(UsageChunkJson("id", "m", usage, 0, false));
+
+  EXPECT_EQ(StringAt(root, {"object"}), "text_completion");
+  EXPECT_EQ(IntAt(root, {"usage", "prompt_tokens"}), 7);
+  EXPECT_EQ(IntAt(root, {"usage", "completion_tokens"}), 128);
+  EXPECT_EQ(IntAt(root, {"usage", "total_tokens"}), 135);
+
+  // The empty array is the signal: a client iterating choices must see nothing
+  // to render, not an empty-text delta it would append.
+  const StatusOr<const std::vector<JsonValue>*> choices =
+      root.Find("choices")->AsArray();
+  ASSERT_TRUE(choices.ok());
+  EXPECT_TRUE((*choices)->empty());
+}
+
+TEST(UsageChunk, UsesTheChatObjectDiscriminatorForChatStreams) {
+  Usage usage;
+
+  const JsonValue root = Parse(UsageChunkJson("id", "m", usage, 0, true));
+
+  EXPECT_EQ(StringAt(root, {"object"}), "chat.completion.chunk");
 }
 
 TEST(ErrorJson, IsParseableAndCarriesTheMessage) {

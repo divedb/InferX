@@ -28,6 +28,13 @@ struct SamplingRequest {
   int32_t max_tokens = 128;
   bool stream = false;
 
+  /// `stream_options.include_usage`. When set, the stream ends with one extra
+  /// chunk that carries token counts and no choices, immediately before
+  /// `[DONE]`. Without it a streaming client has no way to learn how many
+  /// tokens it was billed for except by counting chunks, which is wrong
+  /// whenever a token decodes to no complete character.
+  bool include_usage = false;
+
   /// Softmax temperature. OpenAI's default is 1.0 and most clients send it
   /// whether or not the user asked, so this defaults to 0 -- greedy -- and is
   /// only honoured when the request says so explicitly. That is the opposite
@@ -125,6 +132,20 @@ std::string CompletionChunkJson(std::string_view id, std::string_view model,
                                 std::string_view text,
                                 const FinishReason* reason, int64_t created,
                                 bool sampled = false);
+
+/// \brief Builds the trailing usage-only chunk of a stream.
+///
+/// Emitted last, after the chunk carrying the finish reason and before
+/// `[DONE]`, and only when the request asked for `stream_options.include_usage`.
+/// Its `choices` array is empty, which is what tells a client this chunk is
+/// accounting rather than content.
+///
+/// \param chat Selects the `object` discriminator, since a client dispatches
+///             on it and a `text_completion` chunk in a chat stream would be
+///             a protocol error rather than a cosmetic one.
+std::string UsageChunkJson(std::string_view id, std::string_view model,
+                           const Usage& usage, int64_t created, bool chat,
+                           bool sampled = false);
 
 /// \brief Builds a `GET /v1/models` listing with a single entry.
 std::string ModelsJson(std::string_view model, int64_t created);

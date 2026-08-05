@@ -516,6 +516,106 @@ TEST_F(ServerTest, StreamingDeltasConcatenateToTheBlockingAnswer) {
   EXPECT_EQ(assembled, *expected);
 }
 
+TEST_F(ServerTest, StreamingUsageChunkMatchesTheBlockingCounts) {
+  // A streaming client's only other way to learn its token counts is to count
+  // chunks, and that is wrong whenever a token decodes to no complete
+  // character -- the server skips those chunks. So the counts reported here
+  // have to be the engine's, and the blocking endpoint is what says what the
+  // engine's are. M10's benchmark divides by these numbers.
+  httplib::Client client = Client();
+
+  constexpr const char* kPrompt =
+      R"("prompt":"The capital of France is","max_tokens":24)";
+
+  const httplib::Result blocking = client.Post(
+      "/v1/completions", std::string("{") + kPrompt + "}", "application/json");
+  ASSERT_TRUE(blocking);
+  ASSERT_EQ(blocking->status, 200) << blocking->body;
+
+  const JsonValue expected = ParseBody(blocking->body);
+  const JsonValue* expected_usage = expected.Find("usage");
+  ASSERT_NE(expected_usage, nullptr);
+
+  const StatusOr<int64_t> expected_prompt =
+      expected_usage->RequiredInt("prompt_tokens");
+  const StatusOr<int64_t> expected_completion =
+      expected_usage->RequiredInt("completion_tokens");
+  ASSERT_TRUE(expected_prompt.ok());
+  ASSERT_TRUE(expected_completion.ok());
+
+  const httplib::Result streamed = client.Post(
+      "/v1/completions",
+      std::string("{") + kPrompt +
+          R"(,"stream":true,"stream_options":{"include_usage":true}})",
+      "application/json");
+  ASSERT_TRUE(streamed);
+  ASSERT_EQ(streamed->status, 200);
+
+  // Walk to the last chunk before [DONE], which is where the usage chunk has
+  // to be: a client that reads only up to the finish reason must still get a
+  // well-formed stream, so the counts cannot come any earlier.
+  const std::string& raw = streamed->body;
+  int usage_chunks = 0;
+  int64_t prompt_tokens = -1;
+  int64_t completion_tokens = -1;
+  bool usage_was_last = false;
+
+  size_t at = 0;
+  while ((at = raw.find("data: ", at)) != std::string::npos) {
+    at += 6;
+
+    const size_t end = raw.find('\n', at);
+    const std::string payload =
+        raw.substr(at, end == std::string::npos ? end : end - at);
+
+    if (payload == "[DONE]") break;
+
+    const JsonValue chunk = ParseBody(payload);
+    const StatusOr<const std::vector<JsonValue>*> choices =
+        chunk.Find("choices")->AsArray();
+    ASSERT_TRUE(choices.ok());
+
+    if (!(*choices)->empty()) {
+      usage_was_last = false;
+      continue;
+    }
+
+    ++usage_chunks;
+    usage_was_last = true;
+
+    const JsonValue* usage = chunk.Find("usage");
+    ASSERT_NE(usage, nullptr) << "a choice-less chunk carried no usage";
+
+    const StatusOr<int64_t> p = usage->RequiredInt("prompt_tokens");
+    const StatusOr<int64_t> c = usage->RequiredInt("completion_tokens");
+    ASSERT_TRUE(p.ok());
+    ASSERT_TRUE(c.ok());
+    prompt_tokens = *p;
+    completion_tokens = *c;
+  }
+
+  EXPECT_EQ(usage_chunks, 1) << "expected exactly one usage chunk";
+  EXPECT_TRUE(usage_was_last) << "the usage chunk was not the last before [DONE]";
+  EXPECT_EQ(prompt_tokens, *expected_prompt);
+  EXPECT_EQ(completion_tokens, *expected_completion);
+}
+
+TEST_F(ServerTest, StreamingOmitsUsageUnlessAsked) {
+  // The extra chunk is opt-in: a client that never sent stream_options must
+  // see the stream it saw before this feature existed.
+  httplib::Client client = Client();
+
+  const httplib::Result streamed = client.Post(
+      "/v1/completions",
+      R"({"prompt":"The capital of France is","max_tokens":8,"stream":true})",
+      "application/json");
+  ASSERT_TRUE(streamed);
+  ASSERT_EQ(streamed->status, 200);
+
+  EXPECT_EQ(streamed->body.find("\"usage\""), std::string::npos)
+      << "an unasked-for usage chunk appeared in the stream";
+}
+
 TEST_F(ServerTest, StopStringIsRemovedFromTheOutput) {
   httplib::Client client = Client();
 

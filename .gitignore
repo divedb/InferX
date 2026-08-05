@@ -27,3 +27,10 @@ models/
 *.bin
 testdata/
 .venv-ref/
+
+# The reference engines M10 measures against, and the runs it produces. Both
+# are reproducible from scripts/, and a results directory is a record of one
+# machine on one day rather than something to review.
+.venv-vllm/
+bench-results/
+__pycache__/

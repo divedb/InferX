@@ -505,9 +505,9 @@ Each entry is a decision we should be able to revisit deliberately.
 |---|---|---|---|
 | R1 | **CUDA 12.0 is too old.** CUTLASS 4.x (FP8 + grouped GEMM) and the FlashInfer MLA wrapper both need a current toolkit, and 12.0–12.3 cannot compile against libstdc++ 13 at all. | High | **Resolved in M0:** toolkit floor set to CUDA 13.0, enforced at configure time. `scripts/install-cuda.sh` performs the upgrade. |
 | R2 | TP is designed but untestable for performance here | High | §7.4 — `HostSimComm`, shard-reconstruction tests, numerical differential tests. Accept that perf tuning is deferred. |
-| R3 | Torch-free quantized GEMM (FP8, W4A16, MoE grouped) is the largest single unknown | ~~High~~ **Retired for FP8; Medium for W4A16** | **FP8 e4m3 W8A8 lands at ~2× FP16**, measured with the SM clock locked at 2400 MHz (`nvidia-smi -lgc 2400`) and reproducible to two decimals across independent runs: 1.92–2.05× for every shape at m ≥ 128, and 183.9 vs 92.5 TFLOP/s at m=8192 — the 2× the FP8 tensor cores promise. Mean 2.34× over 28 shapes. Two exceptions matter more than the mean, both below. Torch-free quantized GEMM is demonstrated; W4A16 remains open and is the part that still needs CUTLASS. |
+| R3 | Torch-free quantized GEMM (FP8, W4A16, MoE grouped) is the largest single unknown | ~~High~~ **Retired for FP8; Medium for W4A16** | **FP8 e4m3 W8A8 lands at ~2× FP16**, measured with the SM clock locked at 2400 MHz (`nvidia-smi -lgc 2400`) and reproducible to two decimals across independent runs: 1.92–2.05× for every shape at m ≥ 128, and 183.9 vs 92.5 TFLOP/s at m=8192 — the 2× the FP8 tensor cores promise. Mean 2.34× over 28 shapes. Two exceptions matter more than the mean, both below. Torch-free quantized GEMM is demonstrated. **W4A16 de-risked at M8:** CUTLASS 4.6.1 has *no turnkey* int4×fp16 path for sm_89 (mixed-input `CollectiveBuilder` is Hopper/TMA-only; the SM80 `MmaMixedInputTensorOp` framework lacks the ratio-4 int4 warp-fragment shuffle and produces wrong results — see `mma_mixed_input_tensor_op.h`), so a true fused W4A16 needs a custom kernel (in-mainloop dequant, or a third-party kernel like Marlin). The foundation landed regardless: `QuantizeF16ToInt4`/`DequantizeInt4ToF16` (per-group symmetric int4, group 128, packed 2-per-byte) and a dequant+cuBLASLt path that is correct and is the **lower bound** a fused kernel has to beat. Measured on the decode shapes it is 0.22–0.75× of fp16 (the double-touch penalty: read int4, write fp16, read fp16 again); a fused kernel reading int4 once would approach 4× fp16, so the headroom is roughly an order of magnitude. |
 | R3a | **Quantization can cross the L2 residency threshold, and that is worth more than the arithmetic.** `down_proj` at m=8 runs **6.2×**, not 2×, reproducibly across every run. Its f16 weights are 135.8 MB against a 64 MB L2; the FP8 copy is 67.9 MB and becomes nearly resident, measuring 957 GB/s — above this card's ~736 GB/s HBM peak — where f16 manages 307. | — | Not a risk but a design input: the decode-path win from quantization is a step function at each cache threshold, not a smooth 2×. It strengthens the case for W4A16 (§15 Q2), which would push more shapes across the same line, and it means KV-cache and weight sizing should be reasoned about against L2 as well as HBM. |
-| R3b | **cuBLASLt's FP8 heuristic is not uniformly better.** `gate_up` at m=8 measures **0.88×** — FP8 *slower* than FP16 — reproducibly in two of three locked runs. Its weights exceed L2 in both formats, so this is algorithm selection rather than bandwidth. | Low | Pin an algorithm per shape rather than trusting the heuristic on the decode path, or fall back to FP16 for shapes where FP8 measures slower. `Warm()` is already the place this would live. Revisit when the decode path is real (M6). |
+| R3b | **cuBLASLt's FP8 heuristic is not uniformly better.** `gate_up` at m=8 measured **0.88×** — FP8 *slower* than FP16 — in two of three locked runs. | Low | **Mitigated in M6.** `GetOrBuild` now asks the heuristic for up to 8 candidates and `Tune()` times them on zeroed FP8 scratch at plan-build time, keeping the fastest (FP8 path only, memory-bound shapes `m ≤ 64`; the heuristic stays untouched for f16/bf16 and for compute-bound prefill). The investigation refined the root cause: the heuristic's top-1 sits in a ~0.45 ms / half-bandwidth cluster even when ~0.21 ms / full-bandwidth algorithms are reachable, and the tuner selects the fast one whenever the device is in that state — a strict improvement, since in the state where no algorithm is fast they are all ~0.45 ms and the pick ties top-1. Tuning runs once per FP8 plan at warmup and costs **~2.25 s across the 12 decode shapes** (m ≤ 64; measured), one-time at engine startup; `CublasLtGemm::Create(., /*autotune=*/false)` skips it for differential testing or a faster cold start. The residual cross-run variance (the original "2 of 3 runs") is the **unlocked memory clock**, not algorithm selection: only `-lgc` (SM clock) is locked, `-lmc` (mem clock) floats, and a bandwidth-bound GEMM reads at half bandwidth when DVFS has not settled — `nvidia-smi` even reads 11501 MHz in both states, so the reading cannot be trusted to reflect per-launch effective bandwidth. The tuner's ramp reaches the fast state more often than a cold start does. Locking the mem clock would be the only complete fix, **but it is not available on this setup**: under WSL (where the bench runs) `nvidia-smi -lmc` hangs — the WSL driver does not support clock control at all, and the existing 2400 MHz SM lock is applied from an elevated Windows process and inherited read-only — and native Windows `nvidia-smi -lmc` reports "no permission" without elevation, with consumer Ada (RTX 4080 SUPER) further restricting mem-clock locking and `SUPPORTED_CLOCKS` exposing only a single mem-clock value. The variance is therefore inherent to the hardware/environment and must be tolerated — take the best of several cold runs, or validate on the serving path at M8 where sustained decode load holds the mem clock up. Re-measure there, where FP8 decode first runs. |
 | R4 | 16 GB constrains what can be validated end-to-end | Medium | Target 7B-class at W4A16 for the main loop; MoE/MLA validated for correctness at toy sizes |
 | R5 | FlashInfer pinned-commit drift | Medium | Pin, wrap behind our own interface, and write attention conformance tests against a naive reference kernel |
 | R6 | Folly build weight slows iteration | Low | Narrow target build; moodycamel fallback |
@@ -565,9 +565,9 @@ inferx/
 | **M5** | ✅ **Chunked prefill and decode-first mixed batching** (§8.1, 10.6× on p99 TBT), with sequence lengths made explicit in `ForwardBatch`; **recompute preemption** (§8.2); **radix prefix cache** (§6.3, 5.9× on warm TTFT behind a shared preamble), which costs bitwise determinism across cache states | Competitive throughput |
 | **M6** | ✅ **CUDA graphs for decode** (delivered at M3/M4, 1.06–1.12×). **Overlap pipeline measured and not built**: with graphs on, the host is 1.6–2.1% of a step and the scheduler 0.2%, so there is nothing left to hide (§5.2a) | G4: CPU off the critical path — **met**, 1.9% against a 30% target |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
-| **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB |
+| **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB. **Weight foundation in:** per-group symmetric int4 quant/dequant (`QuantizeF16ToInt4`/`DequantizeInt4ToF16`) + a dequant+cuBLASLt W4A16 path validated vs fp16; the unfused baseline measures 0.22–0.75× of fp16 (the double-touch penalty), quantifying what a fused int4 GEMM must beat. **KV foundation in:** `FlashInferDecode::{DecodeFp8,PlanFp8,RunFp8}` — a complete fp8 e4m3 paged KV decode path on sm_89 (fa2 upcasts fp8 on load, no tensor cores, not Hopper-gated), in both one-shot and graph-capturable Plan/Run forms (the split the engine's captured decode needs); K's scale folds into `sm_scale`, V's applies post-kernel. Validated against the bf16 KV path within fp8 error, and the captured `RunFp8` replays the direct run. An fp8 **prefill** path (`PrefillFp8`) is sketched but blocked by a bug in FlashInfer's fa2 fp8 V fragment (`prefill.cuh:988-1031`, the `ldmatrix_m8n8x4_trans_{left,right}_half` + `frag_layout_swizzle_16b_to_8b_trans` sequence) — output is uniformly ~0.82x bf16, sm_89-specific, and internal to the pinned submodule (decode fp8 avoids it via fp8→fp32). Not ours to patch (R5); the serving workaround is to dequant fp8 KV → bf16 for prefill only, keeping the fast fp8 decode. `KvBlockPool` already takes a dtype, so half-capacity KV storage is one config away. **Open:** (1) a fused int4 GEMM — CUTLASS has no turnkey one for sm_89 (R3), a custom-kernel decision; (2) serving-path wiring — fp8 KV `kv_cache_dtype` config, quantize-on-write with a per-layer fixed scale, the engine dispatch to the fp8 path; (3) fix `PrefillFp8`'s V scale before prefill can carry fp8 KV |
 | **M9** | MoE (TP-over-experts) and MLA layers | G6 |
-| **M10** | Benchmark harness; head-to-head vs vLLM/SGLang on this box | G1 |
+| **M10** | ✅ **Serving benchmark harness and the head-to-head vs vLLM 0.26** (`bench/serve_bench.py`, `scripts/bench_serve.sh`): TTFT/ITL/decode at batch 1, an output-throughput sweep over concurrency, and prefill tok/s, measured through one client so a row differs only by the engine under it. **bf16 lands within a few percent of vLLM on decode** (0.97x batch 1, 0.93x at concurrency 8), ahead on TTFT, 0.86x on prefill; **fp8 leads vLLM by 1.37x on decode and 1.17x on throughput**. Found and fixed two defects no microbenchmark could see: `TCP_NODELAY` off (a flat ~43 ms TTFT floor) and single-block FP8 activation quantization (prefill 3727 → 14691 tok/s). Also closed an API gap it needed — `stream_options.include_usage`. SGLang still unmeasured | G1 — **met for bf16 parity, exceeded for fp8** |
 
 ### Measured decode performance
 
@@ -820,6 +820,112 @@ Note that `35e42aa` is the commit where graphs made things *worse* — 0.73x,
 because a captured graph there fell back to the reference attention kernel.
 That is what `ba3f060` fixed, and it is why the graph column is not
 monotonic.
+
+#### M10 — head to head against vLLM
+
+`bench/serve_bench.py` driven by `scripts/bench_serve.sh`. The same client
+measures every engine over HTTP; each engine is started, measured and stopped
+before the next one starts, because both size their KV cache to fill the card
+and two live servers would be measuring each other's memory pressure.
+
+Qwen2.5-3B-Instruct, RTX 4080 SUPER, SM clocks locked at 2400 MHz, vLLM 0.26.0.
+Both engines: bf16 weights (except the fp8 row), bf16 KV, chunked prefill and
+prefix caching on, `max_num_seqs`/`--max-running` 8, 4096-token context. Greedy
+everywhere, so both generate the same text and stop in the same place. Prompts
+carry a unique random tag *in front*, so neither engine's prefix cache can
+answer a request the other had to compute.
+
+| batch 1, 128 tokens out | TTFT | ITL p50 | ITL p99 | decode tok/s |
+|---|---|---|---|---|
+| inferx bf16 | **16.6 ms** | 10.81 ms | 11.88 ms | 92.5 |
+| **inferx fp8** | **16.5 ms** | **7.53 ms** | **8.57 ms** | **131.2** |
+| vLLM bf16 | 17.8 ms | 10.44 ms | 11.58 ms | 95.5 |
+
+Output tokens per second with N requests in flight:
+
+| concurrency | inferx bf16 | inferx fp8 | vLLM bf16 |
+|---|---|---|---|
+| 1 | 93.8 | 128.9 | 95.7 |
+| 2 | 177.0 | 249.5 | 181.5 |
+| 4 | 345.1 | 465.0 | 365.4 |
+| 8 | 670.1 | **842.6** | 719.8 |
+
+Prefill, from a long prompt with `max_tokens=1`:
+
+| prompt | inferx bf16 | inferx fp8 | vLLM bf16 |
+|---|---|---|---|
+| 515 tok | 8944 tok/s | 10574 tok/s | 10191 tok/s |
+| 2054 tok | 10509 tok/s | **13973 tok/s** | 12254 tok/s |
+
+**bf16 against bf16, the two engines are within a few percent of each other on
+decode** — 0.97x at batch 1, 0.93x at concurrency 8 — and inferx is ahead on
+TTFT (16.6 vs 17.8 ms) and behind on prefill throughput (0.86x at 2k). Decode
+tok/s moves ~6% between runs on this box for *both* engines (vLLM measured 90.0
+and 95.5 on two runs an hour apart; inferx bf16, 91.7 to 94.0), which is the
+unlocked memory clock of R3b and is larger than the gap between them. So the
+honest reading of the bf16 rows is a tie on decode, a small real loss on
+prefill. That is the result G1 asked for: a torch-free C++ engine reaches a
+mature Python one on the same hardware and the same model. It is not a win over
+vLLM and is not claimed as one.
+
+**The win is quantization, which is the thing this hardware needed.** FP8
+weights are worth 1.42x on batch-1 decode and 1.26x on concurrency-8 throughput
+against inferx's own bf16, and 1.37x / 1.17x against vLLM — and 1.33x on
+prefill, where FP8 is compute-bound rather than bandwidth-bound. vLLM can serve
+FP8 too, and this does not claim otherwise; the point is that the 16 GB
+envelope §1 is built around is reachable without leaving C++.
+
+Two defects this benchmark found, both invisible to every microbenchmark in
+this repo because both live between components rather than inside one:
+
+- **TCP_NODELAY was off**, so cpp-httplib handed each SSE frame to a kernel that
+  held it until the peer's delayed ACK fired. A prompt-length sweep of 6 / 20 /
+  62 / 231 / 455 tokens measured 47.3 / 43.9 / 43.8 / 43.8 / 48.1 ms — a floor
+  that did not move with prefill work, which is what gave it away. With
+  `set_tcp_nodelay(true)` the same sweep reads 13.0 / 13.1 / 16.2 / 28.4 /
+  48.0 ms, and batch-1 TTFT went from 25 ms behind vLLM to 1 ms ahead of it.
+  Nothing about the engine changed.
+- **FP8 activation quantization ran in a single CUDA block.** One block is the
+  right call for a decode activation — one launch instead of four, over a few
+  thousand elements — and an order of magnitude wrong for a prefill one, where
+  a whole step's activations went through one SM. Serving with `--fp8` alone —
+  weights quantized, KV cache left bf16, so the fp8 KV path is not implicated —
+  measured **3727 tok/s of prefill against bf16's 8925**: quantization made the
+  compute-bound path 2.4x *slower*. `gemm_bench` could not see it: it times the
+  matmul on operands somebody else quantized, and reports FP8 at 1.9–2.0x fp16
+  for exactly these shapes. `QuantizeToF8E4M3Dynamic` now dispatches to the
+  existing multi-block amax/quantize kernels above 128k elements, leaving the
+  decode path byte-identical — prefill goes 3727 → 14691 tok/s (3.9x) and
+  concurrency-8 throughput 818 → 871 tok/s.
+
+Both are one-line-scale fixes for defects that had been shipping since M4 and
+M8 respectively, and neither was reachable without an end-to-end serving
+benchmark and a second engine to disagree with. That is the argument for M10
+existing at all, independent of the numbers it produced.
+
+Method notes, since a comparison is only as good as its fairness:
+
+- Token counts come from each server's own `usage`, never from counting SSE
+  chunks — a chunking difference would otherwise read as a throughput
+  difference. Getting this required implementing `stream_options.include_usage`
+  in inferx-serve, which had been an OpenAI-compatibility gap.
+- ITL percentiles are measured from chunk *arrival* times, which is what a
+  streaming client experiences, while token counts come from `usage`.
+- Each engine gets a keep-alive connection per concurrent worker, so no
+  measured request pays TCP setup.
+- The prompt for the prefill scenario is sized by asking the server what it
+  tokenized, not by a client-side estimate, so both engines are handed the same
+  token count rather than the same string.
+- vLLM needs two environment overrides on this box, both documented in
+  `scripts/run_vllm.sh`: `VLLM_WSL2_ENABLE_PIN_MEMORY=1` (its 0.26 model runner
+  allocates UVA buffers, which need pinned memory, which vLLM disables under
+  WSL2) and `VLLM_USE_FLASHINFER_SAMPLER=0` (FlashInfer's JIT sampler does not
+  build against CUDA 13's CCCL — `sampling.cuh` calls
+  `cub::BlockAdjacentDifference::FlagHeads`, removed in CCCL 3.x). Neither
+  touches the paths being measured at temperature 0.
+
+SGLang is not measured. It is the same client and one more row in
+`bench_serve.sh` whenever its install lands.
 
 M1 before M2 is deliberate: the quantized GEMM story is the largest risk in a torch-free design, and discovering it is intractable *after* building the model layer would be expensive.
 

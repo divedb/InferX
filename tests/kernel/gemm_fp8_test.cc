@@ -1,7 +1,10 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
@@ -357,6 +360,75 @@ TEST_F(Fp8GemmTest, ScaleMapsAmaxOntoTheFormatMaximum) {
             cudaSuccess);
 
   EXPECT_NEAR(got, 3.5f / kernels::kFloat8E4M3Max, 1e-6f);
+}
+
+// QuantizeToF8E4M3Dynamic picks between a one-block kernel and a split
+// multi-block one at 128k elements, because one SM is right for a decode
+// activation and an order of magnitude wrong for a prefill one (§14, M10). The
+// dispatch is a performance decision, so what has to be asserted is that it is
+// *only* a performance decision: the same input either side of the threshold
+// must produce the same scale and the same bytes.
+TEST_F(Fp8GemmTest, BothDynamicQuantizePathsAgree) {
+  constexpr int64_t kThreshold = 128 * 1024;
+
+  // Straddles the threshold, and the amax sits in the tail so the split path's
+  // cross-block atomic has to carry it rather than block 0 alone.
+  for (const int64_t n : {kThreshold - 1, kThreshold + 1}) {
+    std::vector<float> host(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      host[static_cast<size_t>(i)] = Fill(i, i % 13, 0.3f);
+    }
+    host[static_cast<size_t>(n - 3)] = 7.25f;  // the amax, near the end
+
+    std::vector<DeviceBuffer> keep;
+    const TensorView src = UploadF16(keep, host, 1, n);
+
+    auto dst_buf = DeviceBuffer::Allocate(static_cast<size_t>(n),
+                                          DeviceId::Cuda(0));
+    auto scale_buf = DeviceBuffer::Allocate(sizeof(float), DeviceId::Cuda(0));
+    ASSERT_TRUE(dst_buf.ok() && scale_buf.ok());
+
+    auto dst = TensorView::Create(dst_buf->data(), DataType::kFloat8E4M3FN,
+                                  Shape({1, n}), DeviceId::Cuda(0));
+    ASSERT_TRUE(dst.ok());
+
+    float* const scale = reinterpret_cast<float*>(scale_buf->data());
+
+    ASSERT_TRUE(kernels::QuantizeToF8E4M3Dynamic(src, *dst, scale).ok());
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    float got_scale = 0.0f;
+    ASSERT_EQ(cudaMemcpy(&got_scale, scale, sizeof(float),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+
+    // The scale is the amax mapped onto the format maximum, whichever path ran.
+    EXPECT_NEAR(got_scale, 7.25f / kernels::kFloat8E4M3Max, 1e-6f)
+        << "n = " << n;
+
+    // And the quantized bytes round-trip to the input within one fp8 step.
+    std::vector<uint8_t> quantized(static_cast<size_t>(n));
+    ASSERT_EQ(cudaMemcpy(quantized.data(), dst_buf->data(),
+                         quantized.size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+
+    double worst = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+      const float want = __half2float(
+          __float2half(host[static_cast<size_t>(i)]));
+      const float back =
+          static_cast<float>(
+              *reinterpret_cast<const __nv_fp8_e4m3*>(
+                  &quantized[static_cast<size_t>(i)])) *
+          got_scale;
+      worst = std::max<double>(worst, std::abs(back - want));
+    }
+
+    // e4m3 keeps 3 mantissa bits, so the step at 7.25 is 0.5; half of that is
+    // the most a correct round can be off by, and anything larger means the
+    // scale or the indexing is wrong rather than that fp8 is coarse.
+    EXPECT_LT(worst, 0.25) << "n = " << n;
+  }
 }
 
 // bf16 output, which is what the model needs: an FP8 GEMM has to drop into a
