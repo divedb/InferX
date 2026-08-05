@@ -11,6 +11,7 @@
 #include "inferx/kernels/gpt_oss.h"
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/moe.h"
+#include "inferx/kernels/mxfp4_gemm.h"
 
 namespace inferx::model {
 namespace {
@@ -262,20 +263,58 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     INFERX_ASSIGN_OR_RETURN(const TensorView ye,
                             expert_out_all.Slice(begin, end));
 
-    // The stacked weights, viewed one expert at a time. Slice takes dimension
-    // 0, which is the expert axis, and the result is [1, ...] -- reshaped down
-    // to the 2-D operand the GEMM wants.
-    INFERX_ASSIGN_OR_RETURN(const TensorView gu_w_3d,
-                            weights.gate_up.Slice(e, e + 1));
-    INFERX_ASSIGN_OR_RETURN(const TensorView gu_w,
-                            gu_w_3d.Reshape(Shape({2 * inter, c.hidden})));
+    // The fused MXFP4 path: read 4-bit expert weights directly in the GEMM
+    // mainloop, skipping the dequant-to-bf16 scratch entirely. Branch is
+    // uniform across the loop (gpt-oss always sets these, everyone else never
+    // does), so the cost is one device-side predictable per layer.
+    const bool mxfp4 = weights.gate_up_blocks.IsDefined();
 
-    INFERX_ASSIGN_OR_RETURN(const TensorView down_w_3d,
-                            weights.down.Slice(e, e + 1));
-    INFERX_ASSIGN_OR_RETURN(const TensorView down_w,
-                            down_w_3d.Reshape(Shape({c.hidden, inter})));
+    TensorView gu_w, down_w;
+    TensorView gu_blocks, gu_scales, dn_blocks, dn_scales;
 
-    INFERX_RETURN_IF_ERROR(gemm->LinearBF16(xe, gu_w, gu_e, stream));
+    if (mxfp4) {
+      // MXFP4 weight slices: [2*inter, hidden/2] blocks + [2*inter, hidden/32]
+      // scales, one expert's worth.
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView gb3,
+          weights.gate_up_blocks.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(gu_blocks,
+                              gb3.Reshape(Shape({2 * inter, c.hidden / 2})));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView gs3,
+          weights.gate_up_scales.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(gu_scales,
+                              gs3.Reshape(Shape({2 * inter, c.hidden / 32})));
+
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView db3,
+          weights.down_blocks.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(dn_blocks,
+                              db3.Reshape(Shape({inter, c.hidden / 2})));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView ds3,
+          weights.down_scales.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(dn_scales,
+                              ds3.Reshape(Shape({inter, c.hidden / 32})));
+    } else {
+      // The stacked bf16 weights, viewed one expert at a time.
+      INFERX_ASSIGN_OR_RETURN(const TensorView gu_w_3d,
+                              weights.gate_up.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(gu_w,
+                              gu_w_3d.Reshape(Shape({2 * inter, c.hidden})));
+      INFERX_ASSIGN_OR_RETURN(const TensorView down_w_3d,
+                              weights.down.Slice(e, e + 1));
+      INFERX_ASSIGN_OR_RETURN(down_w,
+                              down_w_3d.Reshape(Shape({c.hidden, inter})));
+    }
+
+    if (mxfp4) {
+      INFERX_RETURN_IF_ERROR(
+          kernels::Mxfp4Gemm(xe, gu_blocks, gu_scales, gu_e,
+                             /*deinterleave=*/true, stream));
+    } else {
+      INFERX_RETURN_IF_ERROR(gemm->LinearBF16(xe, gu_w, gu_e, stream));
+    }
 
     if (weights.gate_up_bias.IsDefined()) {
       INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
@@ -295,7 +334,13 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
         break;
     }
 
-    INFERX_RETURN_IF_ERROR(gemm->LinearBF16(act_e, down_w, ye, stream));
+    if (mxfp4) {
+      INFERX_RETURN_IF_ERROR(
+          kernels::Mxfp4Gemm(act_e, dn_blocks, dn_scales, ye,
+                             /*deinterleave=*/false, stream));
+    } else {
+      INFERX_RETURN_IF_ERROR(gemm->LinearBF16(act_e, down_w, ye, stream));
+    }
 
     if (weights.down_bias.IsDefined()) {
       INFERX_ASSIGN_OR_RETURN(const TensorView b2d,

@@ -603,11 +603,13 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     mw.router = w.router_w;
     mw.router_bias = w.router_b;
 
-    INFERX_RETURN_IF_ERROR(
-        m.DequantizeLayerExperts(w, &mw.gate_up, &mw.down));
-
-    // Resident biases -- same change as Forward(). No per-call upload, no
-    // bias_keep free, no per-layer sync.
+    // Fused MXFP4 path: pass the device-resident 4-bit weights directly. The
+    // GEMM reads them in the mainloop and dequantizes in registers, so the
+    // 1.59 GB/layer bf16 scratch is gone -- no DequantizeLayerExperts call.
+    mw.gate_up_blocks = w.gate_up_blocks_dev;
+    mw.gate_up_scales = w.gate_up_scales_dev;
+    mw.down_blocks = w.down_blocks_dev;
+    mw.down_scales = w.down_scales_dev;
     mw.gate_up_bias = w.gate_up_bias_dev;
     mw.down_bias = w.down_bias_dev;
 
@@ -955,15 +957,13 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     mw.router = w.router_w;
     mw.router_bias = w.router_b;
 
-    INFERX_RETURN_IF_ERROR(
-        m.DequantizeLayerExperts(w, &mw.gate_up, &mw.down));
-    if (profiling) prof.tick(prof.dequant);
-
-    // The biases are device-resident (uploaded once at Load, de-interleaved
-    // for gate_up so it lines up with the split weight). No per-call upload,
-    // no bias_keep free, and therefore no per-layer cudaDeviceSynchronize --
-    // that sync existed only to keep bias_keep alive until the kernels
-    // finished, and with bias_keep gone it is just serialization cost.
+    // Fused MXFP4 path: pass the device-resident 4-bit weights directly. The
+    // dequant-to-bf16 scratch and its profile bucket are gone -- the GEMM
+    // reads MXFP4 in the mainloop and dequantizes in registers.
+    mw.gate_up_blocks = w.gate_up_blocks_dev;
+    mw.gate_up_scales = w.gate_up_scales_dev;
+    mw.down_blocks = w.down_blocks_dev;
+    mw.down_scales = w.down_scales_dev;
     mw.gate_up_bias = w.gate_up_bias_dev;
     mw.down_bias = w.down_bias_dev;
 

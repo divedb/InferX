@@ -11,6 +11,7 @@ add_library(inferx_kernels
   layers.cu
   mla.cu
   mxfp4.cu
+  mxfp4_gemm.cu
   moe.cu
   quantize.cu
   smoke.cu
