@@ -7,6 +7,7 @@
 
 add_library(inferx_kernels
   gemm_cublaslt.cc
+  gpt_oss.cu
   layers.cu
   mla.cu
   mxfp4.cu

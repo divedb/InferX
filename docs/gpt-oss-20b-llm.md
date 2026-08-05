@@ -3,7 +3,7 @@
 A plan for making `inferx-serve` run `openai/gpt-oss-20b`, the MoE checkpoint
 already cached on this box, and for what that buys.
 
-**Status: Phases 0–1 done. Phases 2–4 proposed.** The oracle exists, the MXFP4 bit
+**Status: Phases 0–1 done, Phase 2 under way. Phases 3–4 proposed.** The oracle exists, the MXFP4 bit
 layout is settled against HuggingFace's own decoder, and every definition this
 document originally marked "recalled, verify later" has been read out of the
 reference implementation. §8 records what changed. The rest exists to be argued
@@ -164,12 +164,34 @@ So the denominator gains `exp(sink_h − max)` and the numerator gains nothing �
 a head can attend "nowhere" and emit near-zero. Mechanically trivial; the
 problem is entirely where it has to live.
 
-Cheap to state, awkward to place: it has to happen inside whatever computes the
-softmax, which is FlashInfer's kernel for both the paged decode and the prefill
-path. Whether the pinned submodule supports sinks needs checking; if it does
-not, this is either a patch we do not own (R5 says do not) or a fallback to our
-own `PagedAttention`, which would cost the FlashInfer speedup on this model.
-**This is the risk most likely to force an unpleasant architectural choice.**
+**Resolved in Phase 2, and it needs no FlashInfer change at all.**
+
+The spike first: `prefill.cuh` *does* have a hook — it calls
+`variant.update_m_d(...)`, which an `AttentionVariant` can override. `decode.cuh`
+does **not**; it maintains `st.m` / `st.d` inline with no variant call. So the
+paged decode kernel we actually run cannot express a sink, and X1 looked real.
+
+It is not, because the sink factors out of the softmax exactly. With
+`D = Σ_j e^{s_j}` over the real keys:
+
+    out_sink = (Σ_j e^{s_j} v_j) / (D + e^{sink})
+             = out_plain · D / (D + e^{sink})
+             = out_plain · σ(lse − sink)
+
+`lse` is the log-sum-exp the kernel already computes and `BatchDecodeParams`
+already has a field for — we pass `nullptr` today purely because nothing wanted
+it. So a sink is **a scalar rescale per (token, head) after an ordinary
+attention**, and the kernel underneath stays untouched, unpatched and fast.
+
+Verified to 2e-16 against the concatenate-and-drop form for sinks from −5 to
++20, then implemented as `ApplyAttentionSinks` and tested against the same
+definition on device.
+
+One trap worth recording: `state_t::get_lse()` returns `m + log2(d)` — **base
+two**, because the kernels fold `log2(e)` into the softmax scale so they can use
+`exp2`. Using it as a natural log puts a factor of `ln 2` inside a sigmoid,
+which is wrong by a plausible-looking amount rather than an obvious one. The
+kernel takes the convention as an explicit argument for that reason.
 
 ### R-C. Sliding-window attention — the sneaky one
 
@@ -365,7 +387,7 @@ more than the headline:
 from a comment to an assertion, which is what entitles the other tests to
 demand equality instead of a tolerance.
 
-### Phase 2 — a deliberately slow, correct forward *(medium-large)*
+### Phase 2 — a deliberately slow, correct forward *(in progress)*
 
 Build the gpt-oss stack with **MXFP4 dequantized to bf16 one layer at a time**
 (~423 MB per layer — fits trivially), reusing `MoeFfn`. No serving, no
@@ -404,7 +426,7 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
 
 | | risk | severity |
 |---|---|---|
-| X1 | FlashInfer's pinned version may not support attention sinks, forcing our own slower kernel or a submodule patch R5 says is not ours | **High** — no clean workaround |
+| X1 | ~~FlashInfer's pinned version may not support attention sinks~~ | **Retired in Phase 2.** It does not, in the decode path — and it does not need to. The sink factors out of the softmax as `out · σ(lse − sink)`, so it is a post-pass rescale using the lse the kernel already computes. No patch, no fallback, no lost speedup |
 | X2 | 2 GB of headroom after weights; the 201088-wide logits buffer can eat most of it in one prefill | Medium — mitigable, `lm_head` to FP8 buys 1.16 GB |
 | X3 | Phase 4 rests on a fused 4-bit GEMM that today loses to bf16; the MoE win could evaporate into kernel work | **High** — Phase 2 delivers value regardless, which is why it is sequenced first |
 | X4 | Sliding-window KV touches the prefix cache and block manager, the two components with the most invariants | Medium — contained if treated as a scheduler change |
