@@ -33,9 +33,10 @@ namespace {
 struct ForwardProfile {
   using Clock = std::chrono::steady_clock;
   Clock::time_point last = Clock::now();
-  double dequant = 0;      // DequantizeLayerExperts (now: dequantize kernel only)
-  double moe_forward = 0;  // MoeFfn::Forward
-  double attn = 0;         // the full attention block
+  double dequant = 0;        // DequantizeLayerExperts (now: dequantize kernel only)
+  double moe_forward = 0;    // MoeFfn::Forward
+  double attn_proj = 0;      // QKV+o GEMMs, RoPE, norms, d2d copies around attention
+  double attn_kernel = 0;    // the attention kernel + sink rescale only
   int64_t layers = 0;
 
   void tick(double& bucket) {
@@ -45,16 +46,17 @@ struct ForwardProfile {
   }
 
   void report(int64_t tokens) const {
-    const double total = dequant + moe_forward + attn;
+    const double total = dequant + moe_forward + attn_proj + attn_kernel;
     std::fprintf(stderr,
         "[gpt-oss profile] %lld tokens, %lld layers, total %.0f ms\n"
-        "  dequant (device-resident MXFP4 -> bf16): %8.1f ms  (%4.1f%%)\n"
-        "  moe_forward:                             %8.1f ms  (%4.1f%%)\n"
-        "  attention (rmsn+qkv+rope+att             %8.1f ms  (%4.1f%%)\n"
-        "  +sink+oproj+residual):\n",
+        "  dequant (MXFP4 -> bf16):          %8.1f ms  (%4.1f%%)\n"
+        "  moe_forward:                      %8.1f ms  (%4.1f%%)\n"
+        "  attn_proj (qkv+o GEMMs, rope):    %8.1f ms  (%4.1f%%)\n"
+        "  attn_kernel (attend + sink):      %8.1f ms  (%4.1f%%)\n",
         static_cast<long long>(tokens), static_cast<long long>(layers), total,
         dequant, 100 * dequant / total, moe_forward,
-        100 * moe_forward / total, attn, 100 * attn / total);
+        100 * moe_forward / total, attn_proj, 100 * attn_proj / total,
+        attn_kernel, 100 * attn_kernel / total);
   }
 };
 
@@ -92,6 +94,44 @@ StatusOr<TensorView> Upload(std::vector<DeviceBuffer>* keep,
 
   return TensorView::Create(keep->back().data(), host.dtype(),
                             host.shape(), DeviceId::Cuda(0));
+}
+
+// Uploads several same-width 2-D host tensors end-to-end as one device buffer,
+// concatenating along dim 0. Mirrors qwen2.cc's helper of the same name: the
+// QKV projections are stored as three separate tensors in the checkpoint but
+// are cheapest as one fused GEMM, so they are concatenated once at load.
+StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
+                                        std::vector<DeviceBuffer>* keep) {
+  int64_t rows = 0;
+  int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
+  size_t bytes = 0;
+
+  for (const Tensor& t : parts) {
+    rows += t.dim(0);
+    bytes += static_cast<size_t>(t.nbytes());
+    if (t.rank() == 2 && t.dim(1) != cols) {
+      return InvalidArgumentError("cannot concatenate: widths ", cols, " and ",
+                                  t.dim(1), " differ");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
+                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+
+  size_t offset = 0;
+  for (const Tensor& t : parts) {
+    INFERX_CUDA_RETURN_IF_ERROR(
+        cudaMemcpy(buf.data() + offset, t.data(),
+                   static_cast<size_t>(t.nbytes()), cudaMemcpyHostToDevice));
+    offset += static_cast<size_t>(t.nbytes());
+  }
+
+  keep->push_back(std::move(buf));
+
+  const Shape shape =
+      parts.front().rank() == 2 ? Shape({rows, cols}) : Shape({rows});
+  return TensorView::Create(keep->back().data(), parts.front().dtype(), shape,
+                            DeviceId::Cuda(0));
 }
 
 // Uploads a `[experts, 2·inter]` bias with its last axis de-interleaved, so it
@@ -142,6 +182,12 @@ struct LayerWeights {
   TensorView q_w, q_b;
   TensorView k_w, k_b;
   TensorView v_w, v_b;
+  // Fused QKV: q/k/v weights concatenated along dim 0 into one
+  // [q_dim + 2*kv_dim, hidden] tensor, and likewise the biases, so the three
+  // projections become one GEMM at run time. The split back into q/k/v is a
+  // cheap kernel that runs against the fused output. The separate q_w/k_w/v_w
+  // stay for the load path's convenience; the forward reads qkv_w only.
+  TensorView qkv_w, qkv_b;
   TensorView o_w, o_b;
   TensorView sinks;
 
@@ -198,6 +244,10 @@ struct GptOssModel::Impl {
   Scratch ids, positions;
   Scratch hidden, residual, normed;
   Scratch qkv_q, qkv_k, qkv_v, attn_out, lse;
+  // The fused QKV output: [tokens, q_dim + 2*kv_dim], produced by one GEMM
+  // and split into qkv_q/qkv_k/qkv_v by SplitQkvWithBias. Replaces three
+  // separate projection GEMMs with one.
+  Scratch qkv_fused;
   Scratch proj, moe_out, logits;
 
   // The MXFP4 staging scratch is gone: experts are device-resident now and
@@ -255,6 +305,8 @@ Status GptOssModel::Impl::EnsureCapacity(int64_t tokens) {
   INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * config.q_dim()));
   INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * config.kv_dim()));
   INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * config.kv_dim()));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_fused,
+                               sz * tokens * (config.q_dim() + 2 * config.kv_dim())));
   INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * heads * hd));
   INFERX_RETURN_IF_ERROR(Grow(&lse, sizeof(float) * tokens * heads));
   INFERX_RETURN_IF_ERROR(Grow(&proj, sz * tokens * h));
@@ -480,6 +532,9 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
                           v.Reshape(Shape({tokens, c.kv_dim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView attn2,
                           attn.Reshape(Shape({tokens, heads * hd})));
+  INFERX_ASSIGN_OR_RETURN(
+      const TensorView qkv_v,
+      m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
 
   INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x));
 
@@ -496,12 +551,10 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.input_norm, normed,
                                             static_cast<float>(c.rms_norm_eps)));
 
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.q_w, q2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(q2, w.q_b));
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.k_w, k2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(k2, w.k_b));
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.v_w, v2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(v2, w.v_b));
+    // One fused QKV GEMM instead of three, then split + bias in one pass.
+    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2));
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
         q, k, pos_v, inv_freq, m.attn_factor));
@@ -628,12 +681,29 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
     INFERX_RETURN_IF_ERROR(up("input_layernorm.weight", &w.input_norm));
     INFERX_RETURN_IF_ERROR(up("post_attention_layernorm.weight", &w.post_norm));
 
-    INFERX_RETURN_IF_ERROR(up("self_attn.q_proj.weight", &w.q_w));
-    INFERX_RETURN_IF_ERROR(up("self_attn.q_proj.bias", &w.q_b));
-    INFERX_RETURN_IF_ERROR(up("self_attn.k_proj.weight", &w.k_w));
-    INFERX_RETURN_IF_ERROR(up("self_attn.k_proj.bias", &w.k_b));
-    INFERX_RETURN_IF_ERROR(up("self_attn.v_proj.weight", &w.v_w));
-    INFERX_RETURN_IF_ERROR(up("self_attn.v_proj.bias", &w.v_b));
+    // Q/K/V are loaded as one fused weight + bias (one GEMM at run time rather
+    // than three). The host tensors are fetched, concatenated, and uploaded
+    // once; the separate per-projection weights are never uploaded, which
+    // matters now that resident experts make device memory tight -- keeping
+    // both would roughly double the attention weight footprint and push
+    // cuBLASLt off its workspace, which measured as a 10x slowdown everywhere.
+    {
+      std::vector<Tensor> qkv_w_parts;
+      std::vector<Tensor> qkv_b_parts;
+      for (const std::string_view name :
+           {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}) {
+        INFERX_ASSIGN_OR_RETURN(
+            Tensor wt, get(absl::StrCat(p, name, ".weight")));
+        INFERX_ASSIGN_OR_RETURN(
+            Tensor bs, get(absl::StrCat(p, name, ".bias")));
+        qkv_w_parts.push_back(std::move(wt));
+        qkv_b_parts.push_back(std::move(bs));
+      }
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_w, UploadConcatenated(qkv_w_parts, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_b, UploadConcatenated(qkv_b_parts, &impl->weight_buffers));
+    }
     INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.weight", &w.o_w));
     INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.bias", &w.o_b));
     INFERX_RETURN_IF_ERROR(up("self_attn.sinks", &w.sinks));
@@ -801,6 +871,9 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
                           v.Reshape(Shape({tokens, c.kv_dim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView attn2,
                           attn.Reshape(Shape({tokens, heads * hd})));
+  INFERX_ASSIGN_OR_RETURN(
+      const TensorView qkv_v,
+      m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
 
   INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x));
 
@@ -839,17 +912,14 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.input_norm, normed,
                                             static_cast<float>(c.rms_norm_eps)));
 
-    // Three separate projections rather than a fused QKV: the checkpoint
-    // stores them apart, and this path is not chasing launches.
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.q_w, q2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(q2, w.q_b));
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.k_w, k2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(k2, w.k_b));
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.v_w, v2));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(v2, w.v_b));
+    // One fused QKV GEMM instead of three, then split + bias in one pass.
+    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2));
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
         q, k, pos_v, inv_freq, m.attn_factor));
+    if (profiling) prof.tick(prof.attn_proj);
 
     const int64_t window = c.IsSlidingLayer(layer) ? c.sliding_window : 0;
 
@@ -861,6 +931,7 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     // inside the softmax.
     INFERX_RETURN_IF_ERROR(
         kernels::ApplyAttentionSinks(attn, lse_v, w.sinks, /*lse_is_log2=*/true));
+    if (profiling) prof.tick(prof.attn_kernel);
 
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
     INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b));
@@ -870,7 +941,7 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
         cudaMemcpy(x.Data(), proj.Data(),
                    DataTypeByteSize(kBf16, tokens * h),
                    cudaMemcpyDeviceToDevice));
-    if (profiling) prof.tick(prof.attn);
+    if (profiling) prof.tick(prof.attn_proj);
 
     // --- MoE ---------------------------------------------------------------
     INFERX_CUDA_RETURN_IF_ERROR(
