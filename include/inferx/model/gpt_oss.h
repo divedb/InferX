@@ -5,8 +5,10 @@
 #include <string_view>
 #include <vector>
 
+#include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
 #include "inferx/model/config.h"
+#include "inferx/model/forward_batch.h"
 #include "inferx/model/safetensors.h"
 
 namespace inferx::model {
@@ -61,6 +63,52 @@ class GptOssModel {
   ///                   even though the stack ran in bf16.
   Status Forward(const std::vector<int32_t>& token_ids,
                  std::vector<float>* out_logits);
+
+  /// \brief Allocates the paged KV cache. Required before `Step`.
+  ///
+  /// The Phase 3 slow path (Forward) keeps no cache and recomputes every
+  /// position; the paged path (Step) writes each layer's K/V into this pool
+  /// and reads it back, which is what lets the scheduler batch multiple
+  /// sequences and what amortises the MXFP4 expert upload across a batch. The
+  /// 12 sliding-attention layers are served as full-attention for now (they
+  /// cache every token rather than 128) -- a memory cost, not a correctness
+  /// one, deferred until R-C's per-layer-lifetime scheduler change.
+  Status AttachKvCache(int64_t num_blocks, int64_t block_size = 16);
+
+  /// \brief The pool, for the scheduler to allocate blocks from. See Qwen2Model.
+  KvBlockPool* kv_pool();
+
+  /// \brief Runs one batched step, reading and writing the paged KV cache.
+  ///
+  /// The continuous-batching counterpart of `Forward`: `batch` may hold a
+  /// prefill, a set of decode steps, or both, across multiple sequences. The
+  /// expert dequantize-and-forward path is unchanged from `Forward` -- it
+  /// already processes whatever tokens it is handed -- so a batch of N tokens
+  /// pays one ~10 GB PCIe expert upload rather than N, which is the whole reason
+  /// batching helps gpt-oss before Phase 4's fused GEMM lands.
+  ///
+  /// Attention runs through our own `PagedAttentionWithLse` (the reference
+  /// kernel, with the lse output and per-layer sliding window gpt-oss needs)
+  /// rather than FlashInfer, because the sink rescale needs the lse and the
+  /// FlashInfer wrapper does not expose it yet. Slower per launch; attention is
+  /// not the bottleneck.
+  ///
+  /// Synchronizes before returning and argmaxes on the host, so this is the
+  /// synchronous sibling of Qwen2Model::Step -- no device sampling, no CUDA
+  /// graphs. Those stack on later.
+  ///
+  /// \param batch      What to run. \see ForwardBatch.
+  /// \param out_logits Receives `[logits_indices.size() × vocab]` fp32,
+  ///                   row-major, in the order `logits_indices` lists.
+  Status Step(const ForwardBatch& batch, std::vector<float>* out_logits);
+
+  /// \brief Sizes the activation scratch for a batch of `max_tokens`.
+  ///
+  /// Same correctness contract as Qwen2Model::ReserveActivations: the scratch
+  /// only grows, so reserving the largest expected batch up front keeps every
+  /// later growth a no-op. Required before any `Step` larger than what
+  /// `Forward` already sized.
+  Status ReserveActivations(int64_t max_tokens);
 
  private:
   struct Impl;

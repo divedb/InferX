@@ -178,6 +178,36 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       int64_t max_context = 0,
                       cudaStream_t stream = nullptr);
 
+/// \brief Paged attention that also writes the per-(token, head) log-sum-exp
+///        and honours a sliding window.
+///
+/// The same kernel as `PagedAttention` with two additions gpt-oss needs and no
+/// other served model here does:
+///
+///   * **`lse` output.** The softmax denominator's log is the ingredient that
+///     makes an attention sink a post-pass rescale (\see kernels/gpt_oss.h,
+///     `ApplyAttentionSinks`) rather than a change inside the kernel. The plain
+///     `PagedAttention` computes it internally and discards it; this entry
+///     writes it. The convention is **natural log** (`max + ln sum`), so callers
+///     that pair it with `ApplyAttentionSinks` must pass `lse_is_log2=false`.
+///   * **`window`.** When non-zero, a query at position `p` attends to keys
+///     `max(0, p - window + 1) .. p` rather than `0 .. p`. gpt-oss alternates
+///     full and sliding (128) layers; a wrong layer mask is a model with the
+///     wrong receptive field and no error message. `max_context` should be sized
+///     from `window` on a sliding layer so the shared-memory tile is not.
+///
+/// `lse` may be an empty `TensorView` when the caller does not need it, in
+/// which case nothing is written; that keeps a graph capture or a path that
+/// only wants the window from having to allocate a sink-scratch it never reads.
+Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
+                             const TensorView& v_cache,
+                             const TensorView& block_table,
+                             const TensorView& seq_of_token,
+                             const TensorView& q_pos, const TensorView& out,
+                             const TensorView& lse, float scale,
+                             int64_t window, int64_t max_context = 0,
+                             cudaStream_t stream = nullptr);
+
 /// \brief Greedy sampling: the argmax of each logits row, on the device.
 ///
 /// §4 step 7 in its simplest form. Sampling on the GPU is what makes the

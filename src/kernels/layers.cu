@@ -317,6 +317,94 @@ __global__ void PagedAttentionKernel(
   }
 }
 
+// PagedAttentionKernel with two gpt-oss additions: a per-(token, head)
+// log-sum-exp output (the ingredient that makes a sink a post-pass rescale
+// rather than a kernel change) and a sliding window (gpt-oss alternates full
+// and 128-token layers). Otherwise identical arithmetic, kept separate from the
+// plain kernel so the Qwen2 serving path -- which wants neither -- runs exactly
+// the launch it always did.
+//
+// `lse` is written in the natural-log convention (`max + ln(sum)`); pair with
+// `ApplyAttentionSinks(..., /*lse_is_log2=*/false)`.
+__global__ void PagedAttentionWithLseKernel(
+    const bf16* __restrict__ q, const bf16* __restrict__ k_cache,
+    const bf16* __restrict__ v_cache, const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ seq_of_token, const int32_t* __restrict__ q_pos,
+    bf16* __restrict__ out, float* __restrict__ lse, int64_t q_heads,
+    int64_t kv_heads, int64_t head_dim, int64_t block_size, int64_t max_blocks,
+    float scale, int64_t window, int64_t max_keys) {
+  extern __shared__ float smem[];
+  float* tile = smem;
+  float* scores = smem + blockDim.x;
+
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t seq = seq_of_token[token];
+  const int64_t group = q_heads / kv_heads;
+  const int64_t kv_head = head / group;
+
+  // A query at absolute position p sees keys [start_key, p]. With no window that
+  // is 0..p (the plain causal mask); with a window of W it is max(0, p-W+1)..p,
+  // so the oldest keys fall out of view rather than out of memory -- the cache
+  // still holds them, this kernel just stops reading them.
+  const int64_t pos = static_cast<int64_t>(q_pos[token]);
+  const int64_t back = (window > 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  const int64_t start_key = back;
+  const int64_t n_keys = pos + 1 - start_key;
+  if (n_keys <= 0 || n_keys > max_keys) return;
+
+  const bf16* qr = q + (token * q_heads + head) * head_dim;
+  const int32_t* table = block_table + seq * max_blocks;
+
+  float running_max = -INFINITY;
+
+  for (int64_t j = 0; j < n_keys; ++j) {
+    const int64_t key = start_key + j;
+    const int32_t block = table[key / block_size];
+    const int64_t slot = block * block_size + (key % block_size);
+    const bf16* kr = k_cache + (slot * kv_heads + kv_head) * head_dim;
+
+    float dot = 0.0f;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+      dot += ToF32(qr[d]) * ToF32(kr[d]);
+    }
+    dot = BlockReduce(dot, tile, SumOp{}, 0.0f);
+
+    if (threadIdx.x == 0) scores[j] = dot * scale;
+    __syncthreads();
+
+    running_max = fmaxf(running_max, scores[j]);
+  }
+
+  float sum = 0.0f;
+  for (int64_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
+    const float e = __expf(scores[j] - running_max);
+    scores[j] = e;
+    sum += e;
+  }
+  sum = BlockReduce(sum, tile, SumOp{}, 0.0f);
+
+  const float inv_sum = 1.0f / sum;
+
+  // lse = max + ln(sum). Written once per (token, head); `sum` is broadcast by
+  // BlockReduce so the value is identical across threads, but the write is
+  // thread 0 to avoid a race.
+  if (lse != nullptr && threadIdx.x == 0) {
+    lse[token * q_heads + head] = running_max + logf(sum);
+  }
+
+  for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t j = 0; j < n_keys; ++j) {
+      const int64_t key = start_key + j;
+      const int32_t block = table[key / block_size];
+      const int64_t slot = block * block_size + (key % block_size);
+      acc += scores[j] * ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
+    }
+    out[(token * q_heads + head) * head_dim + d] = ToBf16(acc * inv_sum);
+  }
+}
+
 // One block per row. Each thread scans a strided slice of the vocabulary and
 // the block reduces to a single (value, index) pair. Ties go to the lower index
 // so the result is deterministic, which matters because two runs of the same
@@ -845,6 +933,99 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
   return OkStatus();
 }
 
+Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
+                             const TensorView& v_cache,
+                             const TensorView& block_table,
+                             const TensorView& seq_of_token,
+                             const TensorView& q_pos, const TensorView& out,
+                             const TensorView& lse, float scale,
+                             int64_t window, int64_t max_context,
+                             cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
+                                      "k_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
+                                      "v_cache"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(block_table, DataType::kInt32, 2,
+                                      "block_table"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(seq_of_token, DataType::kInt32, 1,
+                                      "seq_of_token"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_pos, DataType::kInt32, 1, "q_pos"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(q, out, "q", "out"));
+  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
+                                         "v_cache"));
+
+  // lse is optional: an empty TensorView means "do not write it", which keeps a
+  // caller that only wants the window from allocating a scratch it never reads.
+  float* lse_ptr = nullptr;
+  if (lse.IsDefined()) {
+    INFERX_RETURN_IF_ERROR(CheckTensor(lse, DataType::kFloat, 2, "lse"));
+    if (lse.Dim(0) != q.Dim(0) || lse.Dim(1) != q.Dim(1)) {
+      return InvalidArgumentError(
+          "lse is [", lse.Dim(0), ", ", lse.Dim(1),
+          "] but expected [", q.Dim(0), ", ", q.Dim(1), "]");
+    }
+    lse_ptr = static_cast<float*>(lse.Data());
+  }
+
+  const int64_t tokens = q.Dim(0);
+  const int64_t q_heads = q.Dim(1);
+  const int64_t head_dim = q.Dim(2);
+  const int64_t block_size = k_cache.Dim(1);
+  const int64_t kv_heads = k_cache.Dim(2);
+  const int64_t max_blocks = block_table.Dim(1);
+
+  if (k_cache.Dim(3) != head_dim) {
+    return InvalidArgumentError("q head_dim is ", head_dim, " but the cache's "
+                                "is ", k_cache.Dim(3));
+  }
+  if (kv_heads == 0 || q_heads % kv_heads != 0) {
+    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
+                                "kv_heads (", kv_heads, ")");
+  }
+  if (seq_of_token.Dim(0) != tokens || q_pos.Dim(0) != tokens) {
+    return InvalidArgumentError("seq_of_token/q_pos have ",
+                                seq_of_token.Dim(0), "/", q_pos.Dim(0),
+                                " entries but there are ", tokens, " tokens");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  // The tile holds one float per visible key. On a sliding layer the visible
+  // key count is bounded by `window`, so sizing `max_context` from it (which
+  // the caller does) keeps the shared-memory demand at `window` floats rather
+  // than the full context.
+  const int64_t table_keys = max_blocks * block_size;
+  const int64_t max_keys =
+      max_context > 0 ? std::min(max_context, table_keys) : table_keys;
+  const int block = BlockFor(head_dim);
+
+  const size_t smem =
+      (static_cast<size_t>(block) + static_cast<size_t>(max_keys)) *
+      sizeof(float);
+
+  if (smem > 48u * 1024u) {
+    return ResourceExhaustedError(
+        "paged attention (lse) needs ", smem, " B of shared memory for ",
+        max_keys, " keys, over the 48 KB limit");
+  }
+
+  PagedAttentionWithLseKernel<<<dim3(static_cast<unsigned>(tokens),
+                                      static_cast<unsigned>(q_heads)),
+                                 block, smem, stream>>>(
+      static_cast<const bf16*>(q.Data()),
+      static_cast<const bf16*>(k_cache.Data()),
+      static_cast<const bf16*>(v_cache.Data()),
+      static_cast<const int32_t*>(block_table.Data()),
+      static_cast<const int32_t*>(seq_of_token.Data()),
+      static_cast<const int32_t*>(q_pos.Data()),
+      static_cast<bf16*>(out.Data()), lse_ptr, q_heads, kv_heads, head_dim,
+      block_size, max_blocks, scale, window, max_keys);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
 
 // Temperature + nucleus sampling for one row, in one block.
 //

@@ -35,6 +35,11 @@ inferx_add_bench(prefix_cache_bench prefix_cache_bench.cc)
 inferx_add_bench(eviction_bench eviction_bench.cc)
 inferx_add_bench(overlap_bench overlap_bench.cc)
 
+# One-shot Forward profiler: loads the checkpoint, runs one forward over the
+# reference prompt, prints a per-phase breakdown to stderr. Not a benchmark --
+# it answers "where does the 24s go" once, not "did it regress".
+inferx_add_bench(gpt_oss_profile gpt_oss_profile.cc)
+
 # Needs FlashInfer to have something to compare against.
 if(INFERX_HAVE_FLASHINFER)
   inferx_add_bench(attention_bench attention_bench.cc)
