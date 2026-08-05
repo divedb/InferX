@@ -3,7 +3,7 @@
 A plan for making `inferx-serve` run `openai/gpt-oss-20b`, the MoE checkpoint
 already cached on this box, and for what that buys.
 
-**Status: Phase 0 done. Phases 1–4 proposed.** The oracle exists, the MXFP4 bit
+**Status: Phases 0–1 done. Phases 2–4 proposed.** The oracle exists, the MXFP4 bit
 layout is settled against HuggingFace's own decoder, and every definition this
 document originally marked "recalled, verify later" has been read out of the
 reference implementation. §8 records what changed. The rest exists to be argued
@@ -336,19 +336,34 @@ cache entry. transformers got there first and one oracle is enough; vLLM
 remains available as a second opinion if Phase 2 finds a disagreement it cannot
 explain.
 
-### Phase 1 — MXFP4 decode, in isolation *(medium — now smaller than estimated)*
+### Phase 1 — MXFP4 decode, in isolation ✅ *done*
 
-Phase 0 did the risky half. What remains is mechanical:
+Phase 0 had done the risky half; what remained was mechanical, and was.
 
-- `DequantizeMxfp4ToBf16` kernel, written against the format as recorded in R-A.
-- A C++ reader for `testdata/gptoss_mxfp4_golden.bin` and a test asserting the
-  device decode equals the golden bytes **exactly** — no tolerance, because
-  both sides look up 16 representable values and scale by a power of two, so
-  there is nothing for a tolerance to absorb.
-- Loader support for `_blocks` / `_scales` / `_bias` triples, with **no
-  transpose** (R-A), and the de-interleave of the `2·inter` axis (R-E) folded
-  into the same load-time pass.
-- **Exit:** all three golden cases decode bit-exactly on device.
+- `kernels/mxfp4.{h,cu}`: `DequantizeMxfp4ToBf16`, plus
+  `DequantizeMxfp4GateUpToBf16` which folds R-E's de-interleave into the same
+  pass — the kernel picks a destination row regardless, so picking a permuted
+  one is free.
+- `tests/kernel/mxfp4_test.cc` reads the golden container and asserts **exact**
+  equality. All three cases decode bit-for-bit.
+- **Loader support needed nothing.** `safetensors.cc` already maps `U8` and is
+  rank-agnostic, so the `_blocks` / `_scales` / `_bias` triples read as they
+  are. Confirmed by loading them rather than by reading the code.
+
+**Exit met, and then some.** The suite is six tests, and two of them are worth
+more than the headline:
+
+- `LoadsAndDecodesStraightFromTheCheckpoint` runs the whole chain — checkpoint
+  on disk, our reader, our kernel — and compares against the golden bytes,
+  which were produced without our reader ever being involved. A mis-strided
+  rank-4 u8 tensor fails here while the isolated decode passes.
+- The nibble order was checked for *teeth*: swapping it deliberately fails
+  **83,388 of 92,160 values**, so the test cannot pass by accident. A test
+  pinning a convention is worth only what it costs to violate.
+
+`EveryDecodedValueSurvivesBf16Exactly` also promotes mxfp4.h's exactness claim
+from a comment to an assertion, which is what entitles the other tests to
+demand equality instead of a tolerance.
 
 ### Phase 2 — a deliberately slow, correct forward *(medium-large)*
 
@@ -399,7 +414,7 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
 
 ## 7. Recommendation
 
-Phase 0 is done. Do Phases 1–2, then reassess.
+Phases 0 and 1 are done. Do Phase 2, then reassess.
 
 That subset is where nearly all the value sits: it retires M9's caveat, it
 proves MXFP4, and it produces a checkpoint-validated MoE forward pass — while
