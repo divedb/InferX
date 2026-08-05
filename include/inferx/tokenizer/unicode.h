@@ -57,6 +57,21 @@ bool IsLetter(uint32_t cp);
 /// \brief Whether `cp` is in general category N* (`\p{N}`).
 bool IsNumber(uint32_t cp);
 
+/// \brief Whether `cp` is `\p{Lu}` or `\p{Lt}` (uppercase or titlecase).
+///
+/// The o200k pre-tokenizer splits on case rather than on "is a letter", so it
+/// needs to tell upper-case letters apart from lower-case ones. `\p{Lu}` and
+/// `\p{Lt}` are the case-bearing upper letters; `\p{Lm}` and `\p{Lo}` are not
+/// cased and the pattern treats them as both upper and lower, which C++ derives
+/// as `IsLetter && !IsUpperLetter && !IsLowerLetter`.
+bool IsUpperLetter(uint32_t cp);
+
+/// \brief Whether `cp` is `\p{Ll}` (lowercase).
+bool IsLowerLetter(uint32_t cp);
+
+/// \brief Whether `cp` is in general category M* (`\p{M}`), the combining marks.
+bool IsMark(uint32_t cp);
+
 /// \brief Whether `cp` is whitespace as Rust's regex crate defines `\s`.
 ///
 /// This is `\p{White_Space}`, which is wider than C's `isspace` -- it includes

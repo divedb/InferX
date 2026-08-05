@@ -125,10 +125,30 @@ def composition_exclusions():
     return out
 
 
+def specific_category_ranges(categories):
+    """Ranges of codepoints whose general category is in `categories`.
+
+    `category_ranges` is startswith-based and therefore emits unions of the L*,
+    N* etc. subclasses; the o200k pre-tokenizer needs the *specific* subclasses
+    Lu, Lt, Ll and M, because it splits on case rather than on "is a letter".
+    """
+    return ranges(lambda cp: unicodedata.category(chr(cp)) in categories)
+
+
 def main():
     letters = category_ranges("L")
     numbers = category_ranges("N")
     combining = combining_ranges()
+
+    # The o200k pre-tokenizer's CamelCase alternatives are written with
+    # \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M} and \p{Ll}\p{Lm}\p{Lo}\p{M}. \p{Lm} and
+    # \p{Lo} appear in both sets, so a single membership test for "is an
+    # uncased letter" is enough for them -- and that is exactly `IsLetter &&
+    # !IsUpperLetter && !IsLowerLetter`. Only the case-bearing letters and the
+    # marks need their own tables.
+    upper_letters = specific_category_ranges({"Lu", "Lt"})
+    lower_letters = specific_category_ranges({"Ll"})
+    marks = category_ranges("M")
 
     excluded = composition_exclusions()
 
@@ -188,6 +208,9 @@ def main():
 
     emit_ranges("Letter", letters)
     emit_ranges("Number", numbers)
+    emit_ranges("UpperLetter", upper_letters)
+    emit_ranges("LowerLetter", lower_letters)
+    emit_ranges("Mark", marks)
 
     w("/// A run of codepoints sharing one non-zero canonical combining class.\n")
     w("struct CombiningRange {\n")

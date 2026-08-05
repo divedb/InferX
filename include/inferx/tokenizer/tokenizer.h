@@ -12,6 +12,18 @@
 
 namespace inferx::tokenizer {
 
+/// \brief Which split pattern a tokenizer.json declared.
+///
+/// The alternatives are hand-written to match the file exactly rather than run
+/// through a regex engine, so loading records which one a file carries and the
+/// pre-tokenizer dispatches on it. `kQwen2` is the GPT-2-style pattern Qwen2's
+/// tokenizer.json ships; `kO200k` is the CamelCase-aware pattern gpt-oss's
+/// tokenizer.json ships.
+enum class Pattern {
+  kQwen2,
+  kO200k,
+};
+
 /// \brief A byte-level BPE tokenizer, loaded from a HuggingFace
 ///        `tokenizer.json`.
 ///
@@ -29,20 +41,21 @@ namespace inferx::tokenizer {
 /// fix, the FFI is the fallback, and this class's interface is small enough on
 /// purpose that swapping the implementation underneath it is contained.
 ///
-/// What is implemented is the pipeline Qwen2's `tokenizer.json` actually
-/// declares, and nothing else:
+/// What is implemented is the BPE pipeline Qwen2's and gpt-oss's
+/// `tokenizer.json` files actually declare, and nothing else:
 ///
 ///   * added-token extraction, leftmost-longest, ahead of everything;
 ///   * NFC normalization;
 ///   * a GPT-2 style pre-tokenizer split, hand-written because the pattern
-///     needs `\p{L}`, `\p{N}` and a lookahead;
+///     needs `\p{L}`, `\p{N}`, `\p{Lu}`, `\p{Ll}`, `\p{M}` and a lookahead;
 ///   * byte-level mapping of each piece to the 256-character alphabet;
 ///   * BPE by merge rank;
 ///   * a byte-level decoder.
 ///
-/// Loading a different model's tokenizer is checked, not assumed: `Load` fails
-/// if the file declares a normalizer, pre-tokenizer or decoder this does not
-/// implement, rather than silently tokenizing it wrongly.
+/// Two split patterns are recognised: Qwen2's plain `\p{L}+` pattern and
+/// gpt-oss's o200k CamelCase-aware pattern. The alternatives are written out
+/// by hand, so a tokenizer.json carrying any other pattern is rejected at load
+/// rather than tokenized wrongly.
 ///
 /// Thread-safety: `const` methods are safe to call concurrently.  There is no
 /// memoization of BPE words for that reason -- prompt encoding is far from the
@@ -129,6 +142,17 @@ class Tokenizer {
 
   std::vector<AddedToken> added_;
   std::unordered_map<int32_t, bool> added_special_;
+
+  // Which split pattern this tokenizer was loaded with. Set once at load from
+  // the pattern in tokenizer.json; the BPE pipeline reads it per call to
+  // dispatch PreTokenize, so the run-time cost is a branch on a stable member.
+  Pattern pre_tokenizer_pattern_ = Pattern::kQwen2;
+
+  // Whether the pipeline NFC-normalizes input before pre-tokenizing. Qwen2's
+  // tokenizer.json declares an NFC normalizer; gpt-oss's declares none, and
+  // running one anyway reorders combining marks and merges precomposed forms
+  // the reference leaves intact -- which changes token ids.
+  bool normalize_nfc_ = true;
 
   int32_t eos_id_ = -1;
 

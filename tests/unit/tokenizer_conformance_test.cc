@@ -33,6 +33,11 @@ namespace {
 // Kept in sync with scripts/gen_tokenizer_corpus.py, which writes the corpus.
 constexpr std::string_view kCorpusPath = "testdata/tokenizer_corpus.txt";
 
+// The o200k corpus, generated the same way from gpt-oss's tokenizer.json.
+// Separate file so one corpus can be regenerated without touching the other.
+constexpr std::string_view kO200kCorpusPath =
+    "testdata/tokenizer_corpus_o200k.txt";
+
 std::string Base64Decode(std::string_view text) {
   static constexpr std::string_view kAlphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -77,8 +82,8 @@ std::string RepoPath(std::string_view relative) {
   return std::string(relative);
 }
 
-std::vector<Record> LoadCorpus() {
-  std::ifstream in(RepoPath(kCorpusPath));
+std::vector<Record> LoadCorpusAt(const std::string& path) {
+  std::ifstream in(path);
 
   std::vector<Record> records;
   std::string line;
@@ -107,17 +112,46 @@ std::vector<Record> LoadCorpus() {
   return records;
 }
 
-// The checkpoint the corpus was generated from. Absent on a machine that has
-// not downloaded it, in which case the suite skips rather than fails -- the
-// corpus is checked in, but the vocabulary it refers to is 7 MB of model.
-std::string CheckpointDir() {
+std::vector<Record> LoadCorpus() {
+  return LoadCorpusAt(RepoPath(kCorpusPath));
+}
+
+// The Qwen2 conformance suite is parametric over (checkpoint, corpus) so the
+// o200k suite below can share the loader. Each (checkpoint, corpus) pair is
+// its own fixture: the vocabularies differ, so a single tokenizer_ cannot
+// serve both.
+std::string Qwen2CheckpointDir() {
   const char* home = std::getenv("HOME");
   if (home == nullptr) return {};
 
   const std::string base = std::string(home) +
       "/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots";
 
-  // One snapshot directory, named by revision hash.
+  if (std::FILE* pipe = popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
+      pipe != nullptr) {
+    char buffer[4096] = {};
+    std::string path;
+
+    if (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+      path = buffer;
+      if (!path.empty() && path.back() == '\n') path.pop_back();
+      if (!path.empty() && path.back() == '/') path.pop_back();
+    }
+
+    pclose(pipe);
+    return path;
+  }
+
+  return {};
+}
+
+std::string O200kCheckpointDir() {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return {};
+
+  const std::string base = std::string(home) +
+      "/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots";
+
   if (std::FILE* pipe = popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
       pipe != nullptr) {
     char buffer[4096] = {};
@@ -139,7 +173,7 @@ std::string CheckpointDir() {
 class TokenizerConformance : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
-    const std::string dir = CheckpointDir();
+    const std::string dir = Qwen2CheckpointDir();
 
     if (dir.empty()) return;
 
@@ -338,6 +372,104 @@ TEST_F(TokenizerConformance, LongWhitespaceRunIsNotQuadratic) {
       << "encoding a long whitespace run took "
       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
       << " ms, which suggests the merge loop is quadratic";
+}
+
+// --- o200k (gpt-oss) -------------------------------------------------------
+//
+// The o200k pattern is the second split this tokenizer implements, and its
+// conformance bar is the same as Qwen2's: exact id equality on every corpus
+// entry, because "almost right" is a different prompt. The corpus is generated
+// from gpt-oss's own tokenizer.json by the same script, and is skipped rather
+// than failed when the checkpoint is absent.
+
+class O200kConformance : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    const std::string dir = O200kCheckpointDir();
+    if (dir.empty()) return;
+
+    StatusOr<std::unique_ptr<Tokenizer>> loaded =
+        Tokenizer::LoadFromDirectory(dir);
+
+    ASSERT_TRUE(loaded.ok())
+        << "gpt-oss checkpoint is present but its tokenizer would not load: "
+        << loaded.status().ToString();
+
+    tokenizer_ = loaded->release();
+  }
+
+  static void TearDownTestSuite() {
+    delete tokenizer_;
+    tokenizer_ = nullptr;
+  }
+
+  void SetUp() override {
+    if (tokenizer_ == nullptr) {
+      GTEST_SKIP() << "gpt-oss-20b checkpoint not present";
+    }
+  }
+
+  static Tokenizer* tokenizer_;
+};
+
+Tokenizer* O200kConformance::tokenizer_ = nullptr;
+
+TEST_F(O200kConformance, LoadsAndPicksTheO200kPattern) {
+  // A sanity check the Qwen2 suite has implicitly via its corpus: the loaded
+  // tokenizer must actually be running the o200k pattern, not silently falling
+  // back to Qwen2's. The distinguishing case is CamelCase, which the corpus
+  // tests below cover -- but a separate assertion here names the failure mode.
+  const std::vector<int32_t> hello_world = tokenizer_->Encode("HelloWorld");
+  ASSERT_GT(hello_world.size(), 1u)
+      << "'HelloWorld' encoded as a single token, which means the o200k "
+         "CamelCase splitter is not running";
+}
+
+TEST_F(O200kConformance, CorpusIsPresentAndNonTrivial) {
+  const std::vector<Record> records =
+      LoadCorpusAt(RepoPath(kO200kCorpusPath));
+
+  ASSERT_GE(records.size(), 100u)
+      << "o200k corpus has " << records.size()
+      << " records; regenerate with scripts/gen_tokenizer_corpus.py pointed "
+         "at the gpt-oss checkpoint";
+}
+
+TEST_F(O200kConformance, MatchesHuggingFaceOnEveryCorpusEntry) {
+  const std::vector<Record> records =
+      LoadCorpusAt(RepoPath(kO200kCorpusPath));
+  ASSERT_FALSE(records.empty());
+
+  int mismatches = 0;
+
+  for (const Record& record : records) {
+    const std::vector<int32_t> actual = tokenizer_->Encode(record.text);
+
+    if (actual == record.ids) continue;
+
+    ++mismatches;
+
+    if (mismatches <= 20) {
+      std::ostringstream expected;
+      std::ostringstream got;
+
+      for (const int32_t id : record.ids) {
+        expected << id << "(" << tokenizer_->IdToToken(id) << ") ";
+      }
+      for (const int32_t id : actual) {
+        got << id << "(" << tokenizer_->IdToToken(id) << ") ";
+      }
+
+      ADD_FAILURE() << "o200k corpus line " << record.line << "\n"
+                    << "  input    : " << ::testing::PrintToString(record.text)
+                    << "\n  expected : " << expected.str()
+                    << "\n  actual   : " << got.str();
+    }
+  }
+
+  EXPECT_EQ(mismatches, 0) << mismatches << " of " << records.size()
+                           << " o200k corpus entries tokenize differently "
+                              "from HuggingFace";
 }
 
 }  // namespace

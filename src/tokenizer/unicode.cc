@@ -283,6 +283,16 @@ bool IsLetter(uint32_t cp) { return InRanges(kLetter, kLetterCount, cp); }
 
 bool IsNumber(uint32_t cp) { return InRanges(kNumber, kNumberCount, cp); }
 
+bool IsUpperLetter(uint32_t cp) {
+  return InRanges(kUpperLetter, kUpperLetterCount, cp);
+}
+
+bool IsLowerLetter(uint32_t cp) {
+  return InRanges(kLowerLetter, kLowerLetterCount, cp);
+}
+
+bool IsMark(uint32_t cp) { return InRanges(kMark, kMarkCount, cp); }
+
 bool IsWhitespace(uint32_t cp) {
   // \p{White_Space}.  Small and stable enough to inline rather than generate.
   switch (cp) {

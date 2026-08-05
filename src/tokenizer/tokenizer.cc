@@ -22,6 +22,21 @@ namespace {
 constexpr std::string_view kExpectedSplitPattern =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
+// gpt-oss's o200k split pattern, verbatim from its tokenizer.json. The two
+// leading alternatives are a CamelCase-aware word matcher that o200k uses
+// instead of Qwen2's plain `\p{L}+`: it keeps "Hello" and "hello" as one
+// pre-token but splits "HelloWorld" into "Hello" + "World", which is the
+// behaviour every GPT-4-class tokenizer has and Qwen2 deliberately does not.
+// Digits cap at three (`\p{N}{1,3}`) and the punctuation trailing run accepts
+// `[\r\n/]*` rather than `[\r\n]*`.
+constexpr std::string_view kO200kSplitPattern =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+
+// Which split pattern a loaded tokenizer uses, set from tokenizer.json. The
+// alternatives are hand-written to match the file exactly, so the kind is fixed
+// at load and the matcher never branches on a string at run time.
+// (Pattern itself lives in the header so the Tokenizer class can hold one.)
+
 // GPT-2's byte-to-unicode alphabet: every byte gets a distinct printable
 // codepoint, so that arbitrary binary survives a text-only BPE unchanged.  The
 // 188 bytes that are already printable map to themselves; the other 68 are
@@ -153,8 +168,96 @@ size_t MatchWord(const std::vector<uint32_t>& cps, size_t p) {
   return 0;
 }
 
-//  ?[^\s\p{L}\p{N}]+[\r\n]*
-size_t MatchPunctuation(const std::vector<uint32_t>& cps, size_t p) {
+// --- o200k character classes ----------------------------------------------
+//
+// The o200k pattern uses [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and
+// [\p{Ll}\p{Lm}\p{Lo}\p{M}]. \p{Lm} and \p{Lo} appear in both, which makes
+// them "uncased letters" -- CJK and modifier letters attend into either an
+// upper run or a lower run. The two membership tests below encode that
+// directly: upper-class is "cased upper or uncased letter or mark", and
+// lower-class is "cased lower or uncased letter or mark".
+
+bool IsUncasedLetter(uint32_t cp) {
+  return unicode::IsLetter(cp) && !unicode::IsUpperLetter(cp) &&
+         !unicode::IsLowerLetter(cp);
+}
+
+bool IsO200kUpperClass(uint32_t cp) {
+  return unicode::IsUpperLetter(cp) || IsUncasedLetter(cp) ||
+         unicode::IsMark(cp);
+}
+
+bool IsO200kLowerClass(uint32_t cp) {
+  return unicode::IsLowerLetter(cp) || IsUncasedLetter(cp) ||
+         unicode::IsMark(cp);
+}
+
+bool IsPrefixChar(uint32_t cp) {
+  // [^\r\n\p{L}\p{N}]: the optional leading char that attaches to a word.
+  return !IsCrLf(cp) && !unicode::IsLetter(cp) && !unicode::IsNumber(cp);
+}
+
+// One of o200k's two CamelCase alternatives, with the optional prefix and the
+// optional contraction suffix folded in. `needs_lower` selects between them:
+//   A1: [prefix]?[upper]*[lower]+[contract]?    -- the trailing lower run
+//                                                  must be non-empty
+//   A2: [prefix]?[upper]+[lower]*[contract]?    -- the leading upper run
+//                                                  must be non-empty
+//
+// A1 has the subtle backtracking case: [upper]* and [lower]+ overlap on uncased
+// letters, so [upper]* grabs as many as it can and then yields one at a time
+// until [lower]+ finds a lower-class char to start on. A2 needs no backtracking
+// -- both halves are greedy and the trailing run may be empty.
+size_t MatchO200kWordAlternative(const std::vector<uint32_t>& cps, size_t p,
+                                 bool needs_lower) {
+  for (int prefix = 1; prefix >= 0; --prefix) {
+    if (prefix == 1) {
+      if (!IsPrefixChar(cps[p])) continue;
+      if (p + 1 >= cps.size()) continue;
+    }
+
+    const size_t body = p + prefix;
+
+    if (needs_lower) {
+      const size_t max_upper =
+          RunLength(cps, body, IsO200kUpperClass);
+
+      // Walk [upper]* back from its greedy maximum one codepoint at a time
+      // until [lower]+ can match at least one. The first hit wins, which is
+      // what a backtracking engine settles on; an uncased letter at the
+      // boundary is in both classes, so backing onto it lets [lower]+ start.
+      for (size_t u = max_upper + 1; u-- > 0;) {
+        const size_t lower = RunLength(cps, body + u, IsO200kLowerClass);
+        if (lower >= 1) {
+          const size_t end = body + u + lower;
+          return prefix + u + lower + MatchContraction(cps, end);
+        }
+      }
+    } else {
+      const size_t upper = RunLength(cps, body, IsO200kUpperClass);
+      if (upper < 1) continue;
+      const size_t lower = RunLength(cps, body + upper, IsO200kLowerClass);
+      const size_t end = body + upper + lower;
+      return prefix + upper + lower + MatchContraction(cps, end);
+    }
+  }
+
+  return 0;
+}
+
+// o200k's first two alternatives, tried in the order the regex lists them: the
+// "needs a lower tail" form before the "upper-only" form, so "Hello" matches as
+// one word and "HELLO" falls through to A2.
+size_t MatchO200kWord(const std::vector<uint32_t>& cps, size_t p) {
+  const size_t a1 = MatchO200kWordAlternative(cps, p, /*needs_lower=*/true);
+  if (a1 != 0) return a1;
+  return MatchO200kWordAlternative(cps, p, /*needs_lower=*/false);
+}
+
+//  ?[^\s\p{L}\p{N}]+[\r\n]*   (Qwen2)
+//  ?[^\s\p{L}\p{N}]+[\r\n/]*  (o200k -- includes slashes in the trailing run)
+size_t MatchPunctuation(const std::vector<uint32_t>& cps, size_t p,
+                        bool trailing_slash) {
   for (int space = 1; space >= 0; --space) {
     if (space == 1 && cps[p] != ' ') continue;
 
@@ -167,8 +270,12 @@ size_t MatchPunctuation(const std::vector<uint32_t>& cps, size_t p) {
 
     if (run == 0) continue;
 
-    const size_t newlines = RunLength(cps, q + run, IsCrLf);
-    return space + run + newlines;
+    const auto is_trail = [trailing_slash](uint32_t c) {
+      return IsCrLf(c) || (trailing_slash && c == '/');
+    };
+
+    const size_t trailing = RunLength(cps, q + run, is_trail);
+    return space + run + trailing;
   }
 
   return 0;
@@ -212,16 +319,38 @@ size_t MatchWhitespace(const std::vector<uint32_t>& cps, size_t p) {
 
 // Splits into the pieces BPE is applied to, as [begin, end) codepoint ranges.
 std::vector<std::pair<size_t, size_t>> PreTokenize(
-    const std::vector<uint32_t>& cps) {
+    const std::vector<uint32_t>& cps, Pattern pattern) {
   std::vector<std::pair<size_t, size_t>> pieces;
   size_t p = 0;
 
   while (p < cps.size()) {
-    size_t len = MatchContraction(cps, p);
+    size_t len = 0;
 
-    if (len == 0) len = MatchWord(cps, p);
-    if (len == 0) len = unicode::IsNumber(cps[p]) ? 1 : 0;
-    if (len == 0) len = MatchPunctuation(cps, p);
+    if (pattern == Pattern::kQwen2) {
+      // Qwen2's first alternative is a standalone contraction: it matches "'s"
+      // at a position where nothing else can use the apostrophe, which is why
+      // "'s" alone is one token rather than "'" + "s". o200k folds the
+      // contraction into each word alternative as an optional suffix, so it is
+      // not tried separately there.
+      len = MatchContraction(cps, p);
+      if (len == 0) len = MatchWord(cps, p);
+      if (len == 0) len = unicode::IsNumber(cps[p]) ? 1 : 0;
+    } else {
+      // o200k's word alternatives come before the digit alternative, and the
+      // contraction is their suffix rather than a leading alternative.
+      len = MatchO200kWord(cps, p);
+      if (len == 0) {
+        // \p{N}{1,3}: one to three digits, greedy. The next alternative cannot
+        // extend a digit run, so there is no backtracking -- the maximum is
+        // also the match.
+        if (unicode::IsNumber(cps[p])) {
+          len = std::min<size_t>(3, RunLength(cps, p, unicode::IsNumber));
+        }
+      }
+    }
+
+    const bool trailing_slash = pattern == Pattern::kO200k;
+    if (len == 0) len = MatchPunctuation(cps, p, trailing_slash);
     if (len == 0) len = MatchNewlineRun(cps, p);
     if (len == 0) len = MatchTrailingWhitespace(cps, p);
     if (len == 0) len = MatchWhitespace(cps, p);
@@ -292,9 +421,16 @@ StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFromFile(
   // declaring something else gets a clear error at load, which is enormously
   // cheaper than tokenizing subtly wrongly and debugging it from bad output.
 
+  // NFC is applied only when the file declares it. gpt-oss's tokenizer.json
+  // has `"normalizer": null`, and running NFC anyway reorders combining marks
+  // the reference leaves in input order -- which changes token ids on text
+  // with multiple diacritics. `normalize_nfc_` carries the decision into
+  // EncodeSpan.
+  tokenizer->normalize_nfc_ = false;
   if (const JsonValue* normalizer = root.Find("normalizer");
       normalizer != nullptr && !normalizer->IsNull()) {
     INFERX_RETURN_IF_ERROR(ExpectType(normalizer, "NFC", "normalizer"));
+    tokenizer->normalize_nfc_ = true;
   }
 
   INFERX_RETURN_IF_ERROR(
@@ -329,11 +465,20 @@ StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFromFile(
     INFERX_ASSIGN_OR_RETURN(const std::string_view regex,
                             pattern->RequiredString("Regex"));
 
-    if (regex != kExpectedSplitPattern) {
+    // Two patterns are implemented, hand-written to match the file exactly.
+    // Anything else is rejected: a pattern this class has not read is one it
+    // would silently get wrong, and the difference shows up as wrong token ids
+    // rather than as a crash.
+    if (regex == kExpectedSplitPattern) {
+      tokenizer->pre_tokenizer_pattern_ = Pattern::kQwen2;
+    } else if (regex == kO200kSplitPattern) {
+      tokenizer->pre_tokenizer_pattern_ = Pattern::kO200k;
+    } else {
       return UnimplementedError(
-          "the Split pre-tokenizer's pattern is not the one this tokenizer "
-          "implements; it splits text differently and would produce different "
-          "token ids");
+          "the Split pre-tokenizer's pattern is not one this tokenizer "
+          "implements (only Qwen2's GPT-2-style pattern and gpt-oss's o200k "
+          "pattern are supported); it splits text differently and would "
+          "produce different token ids");
     }
 
     INFERX_ASSIGN_OR_RETURN(const std::string_view behavior,
@@ -622,7 +767,11 @@ void Tokenizer::EncodeSpan(std::string_view text,
                            std::vector<int32_t>* out) const {
   if (text.empty()) return;
 
-  const std::string normalized = unicode::NormalizeNfc(text);
+  // NFC is the normalizer Qwen2 declares; gpt-oss declares none, and applying
+  // it would reorder marks the reference left alone. The input is decoded
+  // either way, since the rest of the pipeline works in codepoints.
+  const std::string& normalized =
+      normalize_nfc_ ? unicode::NormalizeNfc(text) : std::string(text);
   const std::vector<uint32_t> cps = unicode::Utf8Decode(normalized);
 
   const std::array<std::string, 256>& byte_chars = ByteToChars();
@@ -630,7 +779,7 @@ void Tokenizer::EncodeSpan(std::string_view text,
   std::string word;
   std::string utf8;
 
-  for (const auto& [begin, end] : PreTokenize(cps)) {
+  for (const auto& [begin, end] : PreTokenize(cps, pre_tokenizer_pattern_)) {
     word.clear();
 
     // Byte level: encode the piece to UTF-8, then replace each *byte* with its
