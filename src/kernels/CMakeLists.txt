@@ -8,6 +8,8 @@
 add_library(inferx_kernels
   gemm_cublaslt.cc
   layers.cu
+  mla.cu
+  moe.cu
   quantize.cu
   smoke.cu
   w4a16_gemm.cu

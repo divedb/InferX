@@ -12,9 +12,12 @@ matches it on decode** (92.5 vs 95.5 tok/s at batch 1, within this box's
 run-to-run spread) and **FP8 beats it by 1.37x** (131.2 tok/s). The scheduler
 does continuous batching with chunked prefill, recompute preemption, and a
 radix prefix cache. The CPU is already off the critical path — 1.9% of a step —
-so M6's overlap pipeline was measured and deliberately not built. Still open:
-tensor parallelism (M7), a fused W4A16 GEMM that beats bf16 (M8), MoE and MLA
-(M9).
+so M6's overlap pipeline was measured and deliberately not built.
+
+M9's MoE and MLA layers exist and are tested against host references, but
+neither is wired into a served model and neither has a checkpoint on this box
+to validate against. Still open: tensor parallelism (M7), a fused W4A16 GEMM
+that beats bf16 (M8), and loading a real MoE or MLA checkpoint (M9).
 
 ## Why another engine
 
@@ -72,7 +75,7 @@ conventions, and troubleshooting.
 | M6 | Overlap pipeline + CUDA graphs for decode | **done** (graphs; overlap measured, not built) |
 | M7 | Tensor parallelism | |
 | M8 | W4A16 weights + FP8 KV cache | next |
-| M9 | MoE and MLA | |
+| M9 | MoE and MLA | **layers done** (TP=1, no checkpoint yet) |
 | M10 | Benchmarks vs vLLM/SGLang | **done** (vLLM; SGLang unmeasured) |
 
 M1 deliberately preceded the model layer: torch-free quantized GEMM was the

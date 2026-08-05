@@ -355,10 +355,18 @@ Two all-reduces per transformer layer. Comms go through a `Communicator` interfa
 
 v1 implements **TP-over-experts** (fits the existing comm pattern, no all-to-all). The `FfnLayer` interface is designed so EP can be added as a second implementation without touching the attention path or scheduler. On 16 GB, MoE is only reachable at int4 for small models — it will be built and correctness-tested here, throughput-tuned elsewhere.
 
+**Built at M9** as `model::MoeFfn` (`include/inferx/model/moe_ffn.h`), at TP=1. The shape follows the decision above: routing, grouping and the GEMM loop are separate calls, so TP-over-experts is this same code with a narrower `moe_intermediate` and one all-reduce appended, while EP replaces the grouping and combine without touching the router. Two properties were treated as requirements rather than nice-to-haves, and both cost implementation choices. **Determinism** (§6.3, R8): no kernel uses an atomic to place or accumulate a value, because a float sum whose order depends on thread scheduling breaks the identical-requests-identical-tokens contract — so the grouping is a stable block-per-expert compaction rather than an atomic cursor, and the combine sums each token's `k` contributions in slot order from one block. **Graph-capturability**: the dispatch writes its counts into the offsets buffer and scans them in place, so it needs no scratch and no synchronize. The GEMM loop then spoils that anyway — a GEMM's `m` is a host argument, so the offsets have to come back to the host once per layer per step. That round-trip is the strongest argument for a grouped GEMM, over and above the `E` launches.
+
 **MLA (DeepSeek-V2/V3)** — the important one for the KV abstraction. MLA caches a *compressed latent* per token per layer (plus a small decoupled RoPE key), not per-head K and V. Two consequences that must be baked in now:
 
 1. The KV pool layout `[k|v][heads][head_dim]` **does not apply**. The KV manager must be parameterized by a `KvLayout` describing bytes-per-token-per-layer, with the per-head split being one instantiation and the MLA latent another. Getting this wrong means rewriting the block allocator later.
 2. **The MLA latent is replicated across TP ranks, not sharded.** KV memory therefore does *not* shrink with TP for MLA. Any capacity-planning code that assumes `kv_bytes / tp_size` is wrong for MLA. This must be a property queried from the model, never computed by the scheduler.
+
+**Built at M9** as `model::MlaAttentionLayer` (`include/inferx/model/mla.h`), at TP=1. Both consequences landed as stated: the pool takes `MlaAttentionLayer::LayoutFor(config)` — `entries_per_token = 1`, `kv_heads = 1`, `head_dim = kv_lora_rank + qk_rope_head_dim` — and `KvBlockPool::ValueCache()` *fails* for that layout rather than returning half a latent, which a test pins; and the per-token cost is `ModelConfig::KvElementsPerTokenPerLayer()`, a model property, so nothing downstream is in a position to divide it by `tp_size`. For DeepSeek-V2's numbers that is 576 elements per token per layer against GQA's 8192.
+
+What is built is the **unabsorbed** form: each step gathers the sequence's latents, runs one `kv_b` GEMM to reconstruct every cached token's K and V, then attends. It is correct and it is what the tests compare against a host reference, but it hands back most of MLA's decode advantage — the reconstruction is O(context) work every step, where the absorbed form folds `kv_b` into the query once and attends against the latent directly. Absorption changes no interface here and is the obvious next move.
+
+One honesty note that matters more than it looks. **The RoPE convention is a choice, not a verified match.** MLA rotates the trailing `qk_rope_head_dim` of each Q head and the one shared key; this implements the half-split ("NeoX") form, the same rotation `RotaryEmbedding` applies, and the tests assert that the two agree with each other. HF's DeepSeek implementation reaches the same mathematics through an interleaving of its own, and with no DeepSeek checkpoint on this box there is no way to assert the two produce identical numbers. A loader will have to settle that against real weights before any MLA output can be called correct rather than self-consistent.
 
 ### 7.4 Making blind TP honest
 
@@ -566,7 +574,7 @@ inferx/
 | **M6** | ✅ **CUDA graphs for decode** (delivered at M3/M4, 1.06–1.12×). **Overlap pipeline measured and not built**: with graphs on, the host is 1.6–2.1% of a step and the scheduler 0.2%, so there is nothing left to hide (§5.2a) | G4: CPU off the critical path — **met**, 1.9% against a 30% target |
 | **M7** | `Communicator` + TP sharding, validated via `HostSimComm` + reconstruction tests | G5 as far as this hardware allows |
 | **M8** | W4A16 + FP8 KV quant in the serving path | Fits real models in 16 GB. **Weight foundation in:** per-group symmetric int4 quant/dequant (`QuantizeF16ToInt4`/`DequantizeInt4ToF16`) + a dequant+cuBLASLt W4A16 path validated vs fp16; the unfused baseline measures 0.22–0.75× of fp16 (the double-touch penalty), quantifying what a fused int4 GEMM must beat. **KV foundation in:** `FlashInferDecode::{DecodeFp8,PlanFp8,RunFp8}` — a complete fp8 e4m3 paged KV decode path on sm_89 (fa2 upcasts fp8 on load, no tensor cores, not Hopper-gated), in both one-shot and graph-capturable Plan/Run forms (the split the engine's captured decode needs); K's scale folds into `sm_scale`, V's applies post-kernel. Validated against the bf16 KV path within fp8 error, and the captured `RunFp8` replays the direct run. An fp8 **prefill** path (`PrefillFp8`) is sketched but blocked by a bug in FlashInfer's fa2 fp8 V fragment (`prefill.cuh:988-1031`, the `ldmatrix_m8n8x4_trans_{left,right}_half` + `frag_layout_swizzle_16b_to_8b_trans` sequence) — output is uniformly ~0.82x bf16, sm_89-specific, and internal to the pinned submodule (decode fp8 avoids it via fp8→fp32). Not ours to patch (R5); the serving workaround is to dequant fp8 KV → bf16 for prefill only, keeping the fast fp8 decode. `KvBlockPool` already takes a dtype, so half-capacity KV storage is one config away. **Open:** (1) a fused int4 GEMM — CUTLASS has no turnkey one for sm_89 (R3), a custom-kernel decision; (2) serving-path wiring — fp8 KV `kv_cache_dtype` config, quantize-on-write with a per-layer fixed scale, the engine dispatch to the fp8 path; (3) fix `PrefillFp8`'s V scale before prefill can carry fp8 KV |
-| **M9** | MoE (TP-over-experts) and MLA layers | G6 |
+| **M9** | ✅ **MoE and MLA layers, at TP=1, validated against host references.** **MoE:** a deterministic router (softmax + top-k, ties to the lower index), a stable atomic-free grouping of the `tokens·k` assignments by expert, gather/combine permutation kernels, and `MoeFfn` running one GEMM per expert plus Qwen2-MoE's shared expert. **MLA:** `MlaAttentionLayer` over a paged *latent* cache — `KvLayout{entries=1, heads=1, head_dim=kv_lora_rank+qk_rope_head_dim}`, the instantiation §7.3 required the pool to admit — with the decoupled RoPE key shared across heads, and `KvElementsPerTokenPerLayer()` as a model property so no scheduler ever divides it by `tp_size`. Config parsing and validation for both. **Open, and deliberately so:** (1) neither is wired into a `Model` and neither has a checkpoint on this box, so correctness is against the definition rather than against HF logits — in particular *the RoPE convention is unverified against DeepSeek's*; (2) the per-expert GEMM loop is `E` cuBLASLt calls where a CUTLASS grouped GEMM belongs, and its host round-trip for the offsets makes the MoE FFN uncapturable as a graph; (3) MLA is the **unabsorbed** form, reconstructing K/V for the whole context every step — absorption is what makes MLA decode cheap and is the next thing to build; (4) TP itself is M7 | G6 — layers exist and are tested; no throughput claim |
 | **M10** | ✅ **Serving benchmark harness and the head-to-head vs vLLM 0.26** (`bench/serve_bench.py`, `scripts/bench_serve.sh`): TTFT/ITL/decode at batch 1, an output-throughput sweep over concurrency, and prefill tok/s, measured through one client so a row differs only by the engine under it. **bf16 lands within a few percent of vLLM on decode** (0.97x batch 1, 0.93x at concurrency 8), ahead on TTFT, 0.86x on prefill; **fp8 leads vLLM by 1.37x on decode and 1.17x on throughput**. Found and fixed two defects no microbenchmark could see: `TCP_NODELAY` off (a flat ~43 ms TTFT floor) and single-block FP8 activation quantization (prefill 3727 → 14691 tok/s). Also closed an API gap it needed — `stream_options.include_usage`. SGLang still unmeasured | G1 — **met for bf16 parity, exceeded for fp8** |
 
 ### Measured decode performance
@@ -820,6 +828,47 @@ Note that `35e42aa` is the commit where graphs made things *worse* — 0.73x,
 because a captured graph there fell back to the reference attention kernel.
 That is what `ba3f060` fixed, and it is why the graph column is not
 monotonic.
+
+#### M9 — what "correct" means without a checkpoint
+
+Neither an MoE nor an MLA checkpoint is on this box, and downloading one would
+not help much: Qwen2-MoE-A2.7B and DeepSeek-V2-Lite are both larger than the
+16 GB envelope leaves after a KV pool, and the one MoE checkpoint that *is*
+cached (gpt-oss-20b) is MXFP4, which is a quantization format this engine does
+not implement. So M9 could not be validated the way M2 validated the dense
+path — against HF's own logits — and pretending otherwise would be the
+expensive kind of dishonesty.
+
+What it is validated against instead is **the definition**, computed on the
+host, exhaustively, at a shape small enough to make that affordable:
+
+| property | what is asserted |
+|---|---|
+| MoE router | softmax + top-k matches a host softmax + top-k, weights to 1e-5; renormalized weights sum to 1; un-renormalized ones do not |
+| MoE routing determinism | all-equal logits route to experts 0 and 1 — ties break to the lower index, so routing is a function of the logits and not of scan order |
+| MoE dispatch | every assignment appears exactly once, inside its own expert's range; `rows` and `dest` are exact inverses; an expert nobody chose gets an empty range, not garbage; within an expert, rows come out in ascending assignment order |
+| MoE layer | the routed mixture equals a host reference that applies **every** expert to **every** token and mixes by gate weight — 2% of the largest output, against bf16 through two GEMMs and a mixture |
+| MoE determinism | four identical `Forward` calls produce bitwise identical output |
+| MoE shared expert | turning it on changes **every** row, which is what "shared" means and what a shared expert wired into the top-k by mistake would not do |
+| MLA layout | `entries_per_token == 1`, `ValueCache()` fails, and the per-token cost equals `KvElementsPerTokenPerLayer()` |
+| MLA layer | the full layer matches a host reference of the MLA definition to 3% of the largest output |
+| **MLA cache** | **decoding 9 tokens one at a time equals prefilling all 9 at once**, to 2% |
+| MLA RoPE | only the trailing `rope_dim` moves; position 0 is the identity |
+| MLA paging | append-then-gather round-trips exactly through a **deliberately out-of-order** block table |
+
+The last MLA row is the one worth the most. A slot mapping, a block-table walk
+or a causal bound that is off by one produces two paths that each look
+plausible on their own and disagree with each other, and nothing but running
+both catches it. It is the same property `qwen2_paged_test` asserts for the GQA
+path, for the same reason.
+
+Two things this deliberately does **not** claim. There is no throughput number
+for either layer: MoE's per-expert GEMM loop and MLA's unabsorbed
+reconstruction are both known-slow shapes, and benchmarking them would measure
+a decision already documented as temporary. And neither layer is wired into a
+`Model`, so "MoE works" means the FFN computes the mixture, not that
+`inferx-serve` can load Qwen2-MoE — the loader, the expert-weight stacking from
+a real checkpoint, and the dispatch from `Qwen2Model` are all still to do.
 
 #### M10 — head to head against vLLM
 

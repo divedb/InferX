@@ -134,6 +134,116 @@ TEST(ModelConfig, RejectsMissingRequiredFields) {
   EXPECT_FALSE(ModelConfig::FromJson("not json").ok());
 }
 
+// --- MoE and MLA (M9) --------------------------------------------------------
+
+TEST(ModelConfig, DenseCheckpointsAreNeitherMoeNorMla) {
+  // The fields are read unconditionally, so the thing to check is that a
+  // checkpoint that mentions none of them is still dense rather than a MoE
+  // model with zero experts.
+  auto c = ModelConfig::FromJson(kQwen3B);
+  ASSERT_TRUE(c.ok()) << c.status();
+
+  EXPECT_FALSE(c->is_moe());
+  EXPECT_FALSE(c->is_mla());
+  EXPECT_EQ(c->num_experts, 0);
+  EXPECT_EQ(c->KvElementsPerTokenPerLayer(), 2 * 2 * 128);
+}
+
+TEST(ModelConfig, ParsesAQwen2MoeCheckpoint) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["Qwen2MoeForCausalLM"],
+      "hidden_size": 2048, "intermediate_size": 5632,
+      "num_hidden_layers": 24, "num_attention_heads": 16,
+      "num_key_value_heads": 16, "vocab_size": 151936,
+      "num_experts": 60, "num_experts_per_tok": 4,
+      "moe_intermediate_size": 1408, "norm_topk_prob": false,
+      "shared_expert_intermediate_size": 5632
+  })");
+  ASSERT_TRUE(c.ok()) << c.status();
+
+  EXPECT_EQ(c->architecture, Architecture::kQwen2Moe);
+  EXPECT_TRUE(c->is_moe());
+  EXPECT_EQ(c->num_experts, 60);
+  EXPECT_EQ(c->num_experts_per_tok, 4);
+  EXPECT_EQ(c->moe_intermediate_size, 1408);
+  EXPECT_EQ(c->shared_expert_intermediate_size, 5632);
+
+  // Read, not assumed: this checkpoint turns renormalization off.
+  EXPECT_FALSE(c->norm_topk_prob);
+
+  // The expert width is the narrow one; the dense intermediate_size still
+  // describes the shared expert and must not be overwritten by it.
+  EXPECT_EQ(c->intermediate_size, 5632);
+}
+
+TEST(ModelConfig, RejectsRoutingToMoreExpertsThanExist) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["Qwen2MoeForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "num_experts": 4, "num_experts_per_tok": 8, "moe_intermediate_size": 32
+  })");
+
+  EXPECT_FALSE(c.ok());
+  EXPECT_EQ(c.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ModelConfig, RejectsExpertsNobodyRoutesTo) {
+  // num_experts without num_experts_per_tok would run as a dense model while
+  // the checkpoint carries expert weights -- plausible output, silently wrong.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["Qwen2MoeForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100, "num_experts": 8
+  })");
+
+  EXPECT_FALSE(c.ok());
+}
+
+TEST(ModelConfig, ParsesMlaHeadDimensions) {
+  // DeepSeek-V2-Lite's shape.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 2048, "intermediate_size": 10944,
+      "num_hidden_layers": 27, "num_attention_heads": 16,
+      "num_key_value_heads": 16, "vocab_size": 102400,
+      "kv_lora_rank": 512, "q_lora_rank": 0,
+      "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128
+  })");
+  ASSERT_TRUE(c.ok()) << c.status();
+
+  EXPECT_TRUE(c->is_mla());
+  EXPECT_EQ(c->kv_lora_rank, 512);
+  EXPECT_EQ(c->qk_rope_head_dim, 64);
+
+  // The point of MLA, in one number: 576 elements per token per layer instead
+  // of the 4096 the same head count would cost as GQA.
+  EXPECT_EQ(c->KvElementsPerTokenPerLayer(), 576);
+}
+
+TEST(ModelConfig, RejectsMlaHeadDimensionsWithoutALatent) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16
+  })");
+
+  EXPECT_FALSE(c.ok());
+}
+
+TEST(ModelConfig, RejectsALatentNarrowerThanTheHeadsItReconstructs) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "kv_lora_rank": 8,
+      "qk_nope_head_dim": 16, "qk_rope_head_dim": 8, "v_head_dim": 16
+  })");
+
+  EXPECT_FALSE(c.ok());
+}
+
 TEST(ModelConfig, ReadsTheRealCheckpointDirectory) {
   const char* home = std::getenv("HOME");
   if (home == nullptr) GTEST_SKIP() << "no HOME";

@@ -40,12 +40,14 @@ StatusOr<std::string> ReadFile(const std::string& path) {
 StatusOr<Architecture> ParseArchitecture(std::string_view name) {
   if (name == "Qwen2ForCausalLM") return Architecture::kQwen2;
   if (name == "LlamaForCausalLM") return Architecture::kLlama;
+  if (name == "Qwen2MoeForCausalLM") return Architecture::kQwen2Moe;
 
   // Rejected rather than defaulted. Running an unread architecture through the
   // Llama path produces output that looks like text and is wrong, which is the
   // most expensive kind of failure to notice.
-  return UnimplementedError("unsupported architecture '", name,
-                            "'; known: Qwen2ForCausalLM, LlamaForCausalLM");
+  return UnimplementedError(
+      "unsupported architecture '", name,
+      "'; known: Qwen2ForCausalLM, LlamaForCausalLM, Qwen2MoeForCausalLM");
 }
 
 StatusOr<DataType> ParseTorchDtype(std::string_view name) {
@@ -62,6 +64,7 @@ const char* ArchitectureName(Architecture arch) {
   switch (arch) {
     case Architecture::kQwen2: return "Qwen2ForCausalLM";
     case Architecture::kLlama: return "LlamaForCausalLM";
+    case Architecture::kQwen2Moe: return "Qwen2MoeForCausalLM";
   }
   return "?";
 }
@@ -111,10 +114,82 @@ Status ModelConfig::Validate() const {
                                 head_dim);
   }
 
+  if (num_experts < 0 || num_experts_per_tok < 0) {
+    return InvalidArgumentError("negative expert counts: num_experts=",
+                                num_experts, " num_experts_per_tok=",
+                                num_experts_per_tok);
+  }
+
+  // A router that has to pick more experts than exist cannot; and a model
+  // declaring experts nobody routes to would silently run as dense, which is
+  // the failure that produces plausible nonsense rather than an error.
+  if (num_experts > 0) {
+    if (num_experts_per_tok <= 0) {
+      return InvalidArgumentError("num_experts is ", num_experts,
+                                  " but num_experts_per_tok is ",
+                                  num_experts_per_tok);
+    }
+    if (num_experts_per_tok > num_experts) {
+      return InvalidArgumentError("num_experts_per_tok (", num_experts_per_tok,
+                                  ") exceeds num_experts (", num_experts, ")");
+    }
+    if (moe_intermediate_size <= 0) {
+      return InvalidArgumentError("moe_intermediate_size must be positive for "
+                                  "a MoE model, got ", moe_intermediate_size);
+    }
+  } else if (num_experts_per_tok > 0) {
+    return InvalidArgumentError("num_experts_per_tok is ", num_experts_per_tok,
+                                " but the model declares no experts");
+  }
+
+  if (architecture == Architecture::kQwen2Moe && !is_moe()) {
+    return InvalidArgumentError(
+        "architecture is Qwen2MoeForCausalLM but num_experts is 0");
+  }
+
+  if (is_mla()) {
+    if (qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 || v_head_dim <= 0) {
+      return InvalidArgumentError(
+          "MLA needs positive qk_nope_head_dim, qk_rope_head_dim and "
+          "v_head_dim; got ", qk_nope_head_dim, ", ", qk_rope_head_dim, ", ",
+          v_head_dim);
+    }
+
+    // The decoupled RoPE key is rotated in half-split pairs like any other.
+    if (qk_rope_head_dim % 2 != 0) {
+      return InvalidArgumentError("qk_rope_head_dim must be even for RoPE, got ",
+                                  qk_rope_head_dim);
+    }
+
+    // MLA reconstructs K and V from the latent, so a latent narrower than one
+    // head's worth of either would be lossy by construction rather than by
+    // design. Every published MLA config has it far wider than both.
+    if (kv_lora_rank < qk_nope_head_dim || kv_lora_rank < v_head_dim) {
+      return InvalidArgumentError("kv_lora_rank (", kv_lora_rank,
+                                  ") is narrower than a single reconstructed "
+                                  "head (nope ", qk_nope_head_dim, ", v ",
+                                  v_head_dim, ")");
+    }
+  } else if (qk_nope_head_dim > 0 || qk_rope_head_dim > 0 || v_head_dim > 0) {
+    return InvalidArgumentError(
+        "MLA head dimensions are set but kv_lora_rank is 0, so there is no "
+        "latent to reconstruct them from");
+  }
+
   return OkStatus();
 }
 
 std::string ModelConfig::ToString() const {
+  std::string moe;
+  if (is_moe()) {
+    moe = absl::StrCat(" experts=", num_experts, "/", num_experts_per_tok,
+                       " moe_inter=", moe_intermediate_size,
+                       shared_expert_intermediate_size > 0
+                           ? absl::StrCat(" shared=",
+                                          shared_expert_intermediate_size)
+                           : "");
+  }
+
   return absl::StrCat(
       ArchitectureName(architecture), "{hidden=", hidden_size,
       " inter=", intermediate_size, " layers=", num_hidden_layers,
@@ -123,7 +198,7 @@ std::string ModelConfig::ToString() const {
       " rope_theta=", rope_theta, " eps=", rms_norm_eps,
       " tied=", tie_word_embeddings ? "yes" : "no",
       " attn_bias=", attention_bias ? "yes" : "no",
-      " dtype=", DataTypeName(weight_dtype), "}");
+      " dtype=", DataTypeName(weight_dtype), moe, "}");
 }
 
 StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
@@ -204,6 +279,31 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
                             dtype->AsString());
     INFERX_ASSIGN_OR_RETURN(c.weight_dtype, ParseTorchDtype(dtype_name));
   }
+
+  // MoE. Read for every architecture rather than only the MoE ones: a dense
+  // checkpoint simply has none of these keys and `num_experts` stays 0, which
+  // is the dense case. Reading them unconditionally means a new MoE
+  // architecture needs a line in ParseArchitecture and nothing here.
+  INFERX_ASSIGN_OR_RETURN(c.num_experts, root.OptionalInt("num_experts", 0));
+  INFERX_ASSIGN_OR_RETURN(c.num_experts_per_tok,
+                          root.OptionalInt("num_experts_per_tok", 0));
+  INFERX_ASSIGN_OR_RETURN(
+      c.moe_intermediate_size,
+      root.OptionalInt("moe_intermediate_size", c.intermediate_size));
+  INFERX_ASSIGN_OR_RETURN(c.norm_topk_prob,
+                          root.OptionalBool("norm_topk_prob", true));
+  INFERX_ASSIGN_OR_RETURN(
+      c.shared_expert_intermediate_size,
+      root.OptionalInt("shared_expert_intermediate_size", 0));
+
+  // MLA, read the same way and for the same reason: absent keys mean GQA.
+  INFERX_ASSIGN_OR_RETURN(c.kv_lora_rank, root.OptionalInt("kv_lora_rank", 0));
+  INFERX_ASSIGN_OR_RETURN(c.q_lora_rank, root.OptionalInt("q_lora_rank", 0));
+  INFERX_ASSIGN_OR_RETURN(c.qk_nope_head_dim,
+                          root.OptionalInt("qk_nope_head_dim", 0));
+  INFERX_ASSIGN_OR_RETURN(c.qk_rope_head_dim,
+                          root.OptionalInt("qk_rope_head_dim", 0));
+  INFERX_ASSIGN_OR_RETURN(c.v_head_dim, root.OptionalInt("v_head_dim", 0));
 
   INFERX_RETURN_IF_ERROR(c.Validate());
 

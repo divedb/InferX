@@ -19,6 +19,10 @@ namespace inferx::model {
 enum class Architecture {
   kQwen2,
   kLlama,
+  /// Qwen2 attention with a mixture-of-experts FFN: a router, `num_experts`
+  /// expert FFNs of which `num_experts_per_tok` run per token, and a shared
+  /// expert that runs for every token. Attention is bit-for-bit the Qwen2 path.
+  kQwen2Moe,
 };
 
 const char* ArchitectureName(Architecture arch);
@@ -53,6 +57,69 @@ struct ModelConfig {
 
   /// The dtype the checkpoint stores, from `torch_dtype`. Usually BF16.
   DataType weight_dtype = DataType::kBFloat16;
+
+  // --- Mixture of experts (§7.3). Zero experts means a dense FFN, which is
+  // what every field below degenerates to and why they need no separate flag.
+
+  /// Routed experts per layer. 0 for a dense model.
+  int64_t num_experts = 0;
+
+  /// Experts each token is routed to. The router picks this many of
+  /// `num_experts` by gate score; the rest cost nothing for that token.
+  int64_t num_experts_per_tok = 0;
+
+  /// The FFN width *of one routed expert*, which is far narrower than a dense
+  /// model's `intermediate_size` -- that is what makes a wide expert count
+  /// affordable. Falls back to `intermediate_size` when a checkpoint omits it.
+  int64_t moe_intermediate_size = 0;
+
+  /// Rescale the top-k gate weights to sum to 1. Qwen2-MoE and Mixtral do;
+  /// some architectures deliberately do not, so it is read rather than assumed.
+  bool norm_topk_prob = true;
+
+  /// Width of the always-on shared expert, which every token passes through in
+  /// addition to its routed ones, gated by its own sigmoid. 0 means none.
+  int64_t shared_expert_intermediate_size = 0;
+
+  /// \brief Whether the FFN is a mixture of experts.
+  bool is_moe() const { return num_experts > 0; }
+
+  // --- Multi-head latent attention (§7.3). Zero `kv_lora_rank` means ordinary
+  // GQA, which is what every field below degenerates to.
+
+  /// Width of the compressed KV latent — the thing MLA caches *instead of*
+  /// per-head K and V. 0 for a GQA model.
+  int64_t kv_lora_rank = 0;
+
+  /// Width of the Q down-projection. 0 means Q is projected from the hidden
+  /// state in one step, which is DeepSeek-V2-Lite's shape.
+  int64_t q_lora_rank = 0;
+
+  /// The part of each Q/K head that carries no position information and is
+  /// reconstructed from the latent.
+  int64_t qk_nope_head_dim = 0;
+
+  /// The part that carries RoPE. Decoupled: it is cached once per token rather
+  /// than once per head, which is what keeps the latent small.
+  int64_t qk_rope_head_dim = 0;
+
+  /// Width of each V head, which MLA lets differ from the Q/K head width.
+  int64_t v_head_dim = 0;
+
+  /// \brief Whether attention is MLA rather than GQA.
+  bool is_mla() const { return kv_lora_rank > 0; }
+
+  /// \brief Bytes one token occupies in one layer's KV cache.
+  ///
+  /// A property of the model, never a formula the scheduler applies (§7.3, T11).
+  /// For GQA it is `2 · kv_heads · head_dim`; for MLA it is the latent plus the
+  /// one shared RoPE key, with no factor of two and no head count — and, the
+  /// part that catches people, **it does not shrink under tensor parallelism**,
+  /// because the latent is replicated across ranks rather than sharded.
+  int64_t KvElementsPerTokenPerLayer() const {
+    if (is_mla()) return kv_lora_rank + qk_rope_head_dim;
+    return 2 * num_key_value_heads * head_dim;
+  }
 
   /// \brief Q heads per KV head. 1 means MHA.
   int64_t gqa_group_size() const {
