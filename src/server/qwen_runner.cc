@@ -1,6 +1,7 @@
 #include "qwen_runner.h"
 
 #include <condition_variable>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <memory>
@@ -88,6 +89,19 @@ class RankWorker {
     std::unique_lock lock(mu_);
     cv_.wait(lock, [this] { return done_ || stopping_; });
     return result_;
+  }
+
+  bool WaitFor(std::chrono::seconds timeout, Status* result) {
+    std::unique_lock lock(mu_);
+    if (!cv_.wait_for(lock, timeout, [this] { return done_ || stopping_; })) {
+      return false;
+    }
+    *result = result_;
+    return true;
+  }
+
+  Status AbortCommunication() {
+    return model_ == nullptr ? OkStatus() : model_->AbortCommunicator();
   }
 
   KvBlockPool* kv_pool() const { return pool_; }
@@ -253,8 +267,16 @@ class NcclQwenRunner final : public QwenRunner {
     }
     Status first = OkStatus();
     for (auto& worker : workers_) {
-      const Status status = worker->Wait();
+      Status status;
+      if (!worker->WaitFor(std::chrono::seconds(30), &status)) {
+        for (auto& peer : workers_) (void)peer->AbortCommunication();
+        return InternalError(
+            "tensor-parallel rank timed out; all communicators were aborted");
+      }
       if (first.ok() && !status.ok()) first = status;
+    }
+    if (!first.ok()) {
+      for (auto& worker : workers_) (void)worker->AbortCommunication();
     }
     return first;
   }

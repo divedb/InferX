@@ -42,6 +42,9 @@ class Communicator {
   /// CUDA/NCCL). Host tensors ignore it.
   virtual Status AllReduceSum(const TensorView& tensor,
                               void* stream = nullptr) = 0;
+
+  /// Breaks outstanding backend work during fatal rank failure. Idempotent.
+  virtual Status Abort() = 0;
 };
 
 /// The production default at TP=1. The collective validates its input and is
@@ -58,6 +61,7 @@ class SingleRankComm final : public Communicator {
     return {.cuda_graph_capture = true, .device_collectives = true};
   }
   Status AllReduceSum(const TensorView& tensor, void* stream = nullptr) override;
+  Status Abort() override { return OkStatus(); }
 
  private:
   DeviceId device_;

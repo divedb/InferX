@@ -82,6 +82,12 @@ class NcclComm final : public Communicator {
         "ncclAllReduce");
   }
 
+  Status Abort() override {
+    if (comm_ == nullptr) return OkStatus();
+    ncclComm_t comm = std::exchange(comm_, nullptr);
+    return NcclStatus(ncclCommAbort(comm), "ncclCommAbort");
+  }
+
  private:
   int rank_;
   int size_;

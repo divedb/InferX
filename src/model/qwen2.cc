@@ -1446,6 +1446,7 @@ Qwen2Model& Qwen2Model::operator=(Qwen2Model&&) noexcept = default;
 const ModelConfig& Qwen2Model::config() const { return impl_->config; }
 int Qwen2Model::tensor_parallel_rank() const { return impl_->comm->rank(); }
 int Qwen2Model::tensor_parallel_size() const { return impl_->comm->size(); }
+Status Qwen2Model::AbortCommunicator() { return impl_->comm->Abort(); }
 size_t Qwen2Model::WeightBytes() const { return impl_->weight_bytes; }
 
 namespace {

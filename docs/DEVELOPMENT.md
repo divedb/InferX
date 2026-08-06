@@ -9,6 +9,23 @@
 | C++ compiler | GCC 13+ or Clang 18+ | C++20. GCC 13 lacks `std::expected`, hence `absl::StatusOr`. |
 | CMake | 3.28+ | 3.31+ recommended with CUDA 13.x. |
 | GPU | sm_75+ | CUDA 13 dropped Maxwell/Pascal/Volta. Primary target is sm_89 (Ada). |
+| NCCL | optional | Required for `--tensor-parallel-size 2`; TP=1 and HostSim build without it. |
+
+For the first production TP runtime, install NCCL's development package so
+both `nccl.h` and `libnccl.so` are discoverable at configure time. CMake prints
+`NCCL backend : ON` when it is enabled. A two-GPU launch is:
+
+```bash
+./build-cuda/src/server/inferx-serve \
+  --model /path/to/checkpoint \
+  --tensor-parallel-size 2 \
+  --devices 0,1 \
+  --comm-backend nccl
+```
+
+Both GPUs must be in the same machine and visible to the process. Record
+`nvidia-smi topo -m` and verify CUDA P2P access before interpreting TP
+performance.
 
 ### Why CUDA 13.x
 

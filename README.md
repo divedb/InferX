@@ -17,8 +17,9 @@ so M6's overlap pipeline was measured and deliberately not built.
 M9's MoE path is now checkpoint-validated and serves gpt-oss-20b directly from
 MXFP4 weights. Its grouped MoE projections consume device-resident dispatch
 offsets, removing the per-layer host synchronization; fixed decode shapes now
-replay as CUDA graphs. Tensor parallel arithmetic is validated through HostSim;
-NCCL deployment awaits multi-GPU hardware. Still open: a W4A16 GEMM that beats
+replay as CUDA graphs. Tensor-parallel arithmetic is validated through HostSim;
+the optional two-GPU NCCL runtime is implemented and awaits rented-hardware
+validation. Still open: a W4A16 GEMM that beats
 bf16 (M8), and wiring MLA into a served checkpoint (M9).
 
 ## Why another engine
@@ -75,7 +76,7 @@ conventions, and troubleshooting.
 | M4 | HTTP server, tokenizer, OpenAI-compatible streaming | **done** |
 | M5 | Continuous batching, chunked prefill, prefix cache, preemption | **done** |
 | M6 | Overlap pipeline + CUDA graphs for decode | **done** (graphs; overlap measured, not built) |
-| M7 | Tensor parallelism | **done** (HostSim; NCCL deferred) |
+| M7 | Tensor parallelism | **NCCL runtime done; two-GPU validation pending** |
 | M8 | W4A16 weights + FP8 KV cache | **serving paths done; W4 tuning open** |
 | M9 | MoE and MLA | **layers done** (TP=1, no checkpoint yet) |
 | M10 | Benchmarks vs vLLM/SGLang | **done** (vLLM; SGLang unmeasured) |

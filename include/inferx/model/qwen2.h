@@ -246,6 +246,9 @@ class Qwen2Model {
   int tensor_parallel_rank() const;
   int tensor_parallel_size() const;
 
+  /// Aborts the communication backend after an unrecoverable rank failure.
+  Status AbortCommunicator();
+
   /// \brief Device bytes held by the weights.
   size_t WeightBytes() const;
 

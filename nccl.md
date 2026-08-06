@@ -2,7 +2,10 @@
 
 ## Status
 
-Design proposal. This document is the gate before implementation.
+Implemented through the optional NCCL backend, device-aware Qwen2 placement,
+two-rank serving workers, CLI configuration, and concurrent graph dispatch.
+Physical two-GPU correctness, failure injection, and performance validation are
+pending suitable hardware.
 
 The first production tensor-parallel target is one Linux process on one host
 with exactly two CUDA GPUs. NCCL is the initial communication backend. The

@@ -18,6 +18,9 @@
 namespace inferx::comm {
 namespace {
 
+uint16_t Bf16(float value);
+float Float(uint16_t value);
+
 TEST(NcclCommTest, MissingBackendFailsClearly) {
   if (NcclBackendAvailable()) GTEST_SKIP() << "NCCL backend is installed";
   EXPECT_EQ(CreateNcclUniqueId().status().code(),
@@ -25,6 +28,82 @@ TEST(NcclCommTest, MissingBackendFailsClearly) {
   EXPECT_EQ(CreateNcclCommunicator({}).status().code(),
             absl::StatusCode::kUnimplemented);
 }
+
+#if defined(INFERX_WITH_CUDA)
+TEST(NcclCommTest, TwoGpuBf16AllReduceUsesTheSuppliedStreams) {
+  if (!NcclBackendAvailable() || CudaDeviceCount() < 2) {
+    GTEST_SKIP() << "needs an NCCL build and two CUDA devices";
+  }
+
+  auto id = CreateNcclUniqueId();
+  ASSERT_TRUE(id.ok()) << id.status();
+  std::vector<Status> statuses(2);
+  std::vector<uint16_t> outputs(2, 0);
+  std::vector<std::thread> ranks;
+
+  for (int rank = 0; rank < 2; ++rank) {
+    ranks.emplace_back([&, rank] {
+      NcclCommConfig config;
+      config.rank = rank;
+      config.world_size = 2;
+      config.local_device = rank;
+      config.unique_id = *id;
+      auto communicator = CreateNcclCommunicator(config);
+      if (!communicator.ok()) {
+        statuses[static_cast<size_t>(rank)] = communicator.status();
+        return;
+      }
+
+      cudaStream_t stream = nullptr;
+      cudaError_t error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+      if (error != cudaSuccess) {
+        statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
+            error, "cudaStreamCreateWithFlags", __FILE__, __LINE__);
+        return;
+      }
+
+      const DeviceId device = DeviceId::Cuda(static_cast<int8_t>(rank));
+      auto buffer = DeviceBuffer::Allocate(sizeof(uint16_t), device);
+      if (!buffer.ok()) {
+        statuses[static_cast<size_t>(rank)] = buffer.status();
+        cudaStreamDestroy(stream);
+        return;
+      }
+      const uint16_t input = Bf16(static_cast<float>(rank + 1));
+      error = cudaMemcpyAsync(buffer->data(), &input, sizeof(input),
+                              cudaMemcpyHostToDevice, stream);
+      if (error == cudaSuccess) {
+        auto view = TensorView::Create(buffer->data(), DataType::kBFloat16,
+                                       Shape({1}), device);
+        statuses[static_cast<size_t>(rank)] =
+            view.ok() ? (*communicator)->AllReduceSum(*view, stream)
+                      : view.status();
+      } else {
+        statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
+            error, "cudaMemcpyAsync", __FILE__, __LINE__);
+      }
+      if (statuses[static_cast<size_t>(rank)].ok()) {
+        error = cudaMemcpyAsync(&outputs[static_cast<size_t>(rank)],
+                                buffer->data(), sizeof(uint16_t),
+                                cudaMemcpyDeviceToHost, stream);
+        if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+        if (error != cudaSuccess) {
+          statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
+              error, "NCCL test synchronization", __FILE__, __LINE__);
+        }
+      }
+      cudaStreamDestroy(stream);
+    });
+  }
+  for (auto& rank : ranks) rank.join();
+
+  for (int rank = 0; rank < 2; ++rank) {
+    ASSERT_TRUE(statuses[static_cast<size_t>(rank)].ok())
+        << "rank " << rank << ": " << statuses[static_cast<size_t>(rank)];
+    EXPECT_FLOAT_EQ(Float(outputs[static_cast<size_t>(rank)]), 3.0f);
+  }
+}
+#endif
 
 TensorView CpuView(void* data, DataType dtype, int64_t count) {
   auto view = TensorView::Create(data, dtype, Shape({count}), DeviceId::Cpu());

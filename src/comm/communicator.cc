@@ -222,6 +222,7 @@ class HostSimComm final : public Communicator {
   Status AllReduceSum(const TensorView& tensor, void* stream) override {
     return state_->AllReduce(rank_, tensor, stream);
   }
+  Status Abort() override { return OkStatus(); }
 
  private:
   int rank_;
