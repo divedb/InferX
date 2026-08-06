@@ -1,5 +1,6 @@
 add_library(inferx_comm
   communicator.cc
+  tensor_parallel.cc
 )
 add_library(inferx::comm ALIAS inferx_comm)
 

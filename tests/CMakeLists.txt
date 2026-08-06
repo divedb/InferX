@@ -60,6 +60,8 @@ inferx_add_test(caching_allocator_test unit/caching_allocator_test.cc)
 inferx_add_test(device_buffer_test     unit/device_buffer_test.cc)
 inferx_add_test(communicator_test      unit/communicator_test.cc)
 target_link_libraries(communicator_test PRIVATE inferx::comm)
+inferx_add_test(tensor_parallel_test   unit/tensor_parallel_test.cc)
+target_link_libraries(tensor_parallel_test PRIVATE inferx::comm)
 
 if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(kernel_smoke_test kernel/smoke_test.cc)
