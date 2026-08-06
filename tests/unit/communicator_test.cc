@@ -1,4 +1,5 @@
 #include "inferx/comm/communicator.h"
+#include "inferx/comm/nccl_communicator.h"
 
 #include <gtest/gtest.h>
 
@@ -16,6 +17,14 @@
 
 namespace inferx::comm {
 namespace {
+
+TEST(NcclCommTest, MissingBackendFailsClearly) {
+  if (NcclBackendAvailable()) GTEST_SKIP() << "NCCL backend is installed";
+  EXPECT_EQ(CreateNcclUniqueId().status().code(),
+            absl::StatusCode::kUnimplemented);
+  EXPECT_EQ(CreateNcclCommunicator({}).status().code(),
+            absl::StatusCode::kUnimplemented);
+}
 
 TensorView CpuView(void* data, DataType dtype, int64_t count) {
   auto view = TensorView::Create(data, dtype, Shape({count}), DeviceId::Cpu());
@@ -35,6 +44,10 @@ float Float(uint16_t value) {
 
 TEST(SingleRankCommTest, IsAValidatedNoOp) {
   SingleRankComm comm;
+  EXPECT_EQ(comm.backend(), CommBackend::kSingleRank);
+  EXPECT_EQ(comm.device(), DeviceId::Cuda(0));
+  EXPECT_TRUE(comm.capabilities().cuda_graph_capture);
+  EXPECT_TRUE(comm.capabilities().device_collectives);
   std::vector<float> values = {1.0f, -2.0f, 3.5f};
   EXPECT_EQ(comm.rank(), 0);
   EXPECT_EQ(comm.size(), 1);

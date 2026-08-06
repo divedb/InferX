@@ -210,6 +210,15 @@ class HostSimComm final : public Communicator {
 
   int rank() const override { return rank_; }
   int size() const override { return state_->size; }
+  DeviceId device() const override {
+#if defined(INFERX_WITH_CUDA)
+    return DeviceId::Cuda(0);
+#else
+    return DeviceId::Cpu();
+#endif
+  }
+  CommBackend backend() const override { return CommBackend::kHostSim; }
+  CommCapabilities capabilities() const override { return {}; }
   Status AllReduceSum(const TensorView& tensor, void* stream) override {
     return state_->AllReduce(rank_, tensor, stream);
   }

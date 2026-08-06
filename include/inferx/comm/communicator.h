@@ -4,10 +4,23 @@
 #include <memory>
 #include <vector>
 
+#include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::comm {
+
+enum class CommBackend : uint8_t {
+  kSingleRank,
+  kHostSim,
+  kNccl,
+  kMscclpp,
+};
+
+struct CommCapabilities {
+  bool cuda_graph_capture = false;
+  bool device_collectives = false;
+};
 
 /// Collective communication used by tensor-parallel model layers.
 ///
@@ -19,6 +32,9 @@ class Communicator {
 
   virtual int rank() const = 0;
   virtual int size() const = 0;
+  virtual DeviceId device() const = 0;
+  virtual CommBackend backend() const = 0;
+  virtual CommCapabilities capabilities() const = 0;
 
   /// Sums corresponding elements across ranks and writes the result in-place
   /// on every rank. All ranks must provide the same dtype and element count.
@@ -32,9 +48,19 @@ class Communicator {
 /// otherwise a no-op, so model code always exercises the communicator call.
 class SingleRankComm final : public Communicator {
  public:
+  explicit SingleRankComm(DeviceId device = DeviceId::Cuda(0))
+      : device_(device) {}
   int rank() const override { return 0; }
   int size() const override { return 1; }
+  DeviceId device() const override { return device_; }
+  CommBackend backend() const override { return CommBackend::kSingleRank; }
+  CommCapabilities capabilities() const override {
+    return {.cuda_graph_capture = true, .device_collectives = true};
+  }
   Status AllReduceSum(const TensorView& tensor, void* stream = nullptr) override;
+
+ private:
+  DeviceId device_;
 };
 
 /// Creates one host-simulated communicator per rank, sharing one rendezvous.
