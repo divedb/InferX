@@ -44,6 +44,8 @@ endfunction()
 
 inferx_add_test(dtype_test             unit/dtype_test.cc)
 inferx_add_test(json_test              unit/json_test.cc)
+inferx_add_test(metrics_test           unit/metrics_test.cc)
+target_link_libraries(metrics_test PRIVATE inferx::observe)
 inferx_add_test(safetensors_test       unit/safetensors_test.cc)
 inferx_add_test(config_test            unit/config_test.cc)
 inferx_add_test(scheduler_test         unit/scheduler_test.cc)

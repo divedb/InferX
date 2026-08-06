@@ -17,6 +17,7 @@ target_link_libraries(inferx_server
     inferx::common
     inferx::api
     inferx::model
+    inferx::observe
     inferx::scheduler
     inferx::tokenizer
     inferx::flags

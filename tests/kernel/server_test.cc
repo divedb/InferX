@@ -699,17 +699,28 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   const httplib::Result response = client.Get("/metrics");
   ASSERT_TRUE(response);
   ASSERT_EQ(response->status, 200);
-
-  const JsonValue root = ParseBody(response->body);
-
-  for (const char* field : {"running", "waiting", "blocks_in_use",
-                            "blocks_total", "steps", "tokens_generated"}) {
-    EXPECT_TRUE(root.RequiredInt(field).ok())
-        << "/metrics is missing \"" << field << "\": " << response->body;
+  EXPECT_NE(response->get_header_value("Content-Type").find("text/plain"),
+            std::string::npos);
+  for (const char* metric : {"inferx_requests_running ",
+                             "inferx_requests_waiting ",
+                             "inferx_kv_blocks{state=\"used\"} ",
+                             "inferx_steps_total ",
+                             "inferx_generation_tokens_total "}) {
+    EXPECT_NE(response->body.find(metric), std::string::npos)
+        << "/metrics is missing \"" << metric << "\": " << response->body;
   }
+  auto sample = [](std::string_view body, std::string_view metric) {
+    const size_t start = body.find(std::string(metric) + " ");
+    if (start == std::string_view::npos) return int64_t{-1};
+    return static_cast<int64_t>(
+        std::stoll(std::string(body.substr(start + metric.size() + 1))));
+  };
+  const int64_t before = sample(response->body, "inferx_steps_total");
+  ASSERT_GE(before, 0);
 
-  const StatusOr<int64_t> before = root.RequiredInt("steps");
-  ASSERT_TRUE(before.ok());
+  const httplib::Result stats = client.Get("/stats");
+  ASSERT_TRUE(stats);
+  EXPECT_TRUE(ParseBody(stats->body).RequiredInt("steps").ok());
 
   // Generate something *here* rather than relying on earlier tests: ctest runs
   // each test in its own process, so a counter that looks warm when the whole
@@ -724,11 +735,9 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   const httplib::Result after_response = client.Get("/metrics");
   ASSERT_TRUE(after_response);
 
-  const StatusOr<int64_t> after =
-      ParseBody(after_response->body).RequiredInt("steps");
-  ASSERT_TRUE(after.ok());
-
-  EXPECT_GT(*after, *before) << "the step counter did not advance";
+  const int64_t after = sample(after_response->body, "inferx_steps_total");
+  ASSERT_GE(after, 0);
+  EXPECT_GT(after, before) << "the step counter did not advance";
 }
 
 }  // namespace

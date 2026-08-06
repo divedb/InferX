@@ -1,6 +1,8 @@
 # InferX observability design
 
-Status: implementation plan for M7 tensor parallelism. This document is the design gate before metrics code is added.
+Status: implementation plan for M7 tensor parallelism. Milestone 1 (the internal
+registry and Prometheus `/metrics` endpoint) is implemented; serving lifecycle
+instrumentation begins in milestone 2.
 
 ## Scope and reviewed implementations
 

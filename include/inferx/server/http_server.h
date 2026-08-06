@@ -46,7 +46,8 @@ struct HttpServerConfig {
 ///   POST /v1/completions        blocking and SSE
 ///   GET  /v1/models
 ///   GET  /health
-///   GET  /metrics               engine counters, not Prometheus format
+///   GET  /metrics               Prometheus text exposition
+///   GET  /stats                 legacy engine-statistics JSON
 class HttpServer {
  public:
   /// \param engine Borrowed; must outlive the server.

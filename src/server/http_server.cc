@@ -6,6 +6,7 @@
 
 #include "httplib.h"
 #include "inferx/api/openai.h"
+#include "inferx/observe/metrics.h"
 #include "inferx/tokenizer/chat_template.h"
 
 namespace inferx::server {
@@ -86,6 +87,68 @@ int StatusToHttp(const Status& status) {
     default:
       return 500;
   }
+}
+
+std::string RenderMetrics(const Engine::Stats& stats) {
+  observe::Registry registry;
+  auto gauge = [&](std::string name, std::string help, double value,
+                   observe::Labels labels = {}) {
+    registry.AddGauge(std::move(name), std::move(help), std::move(labels))
+        ->Set(value);
+  };
+  auto counter = [&](std::string name, std::string help, uint64_t value) {
+    registry.AddCounter(std::move(name), std::move(help))->Increment(value);
+  };
+
+  gauge("inferx_requests_running", "Requests currently executing.",
+        stats.running);
+  gauge("inferx_requests_waiting", "Requests waiting for admission.",
+        stats.waiting);
+  gauge("inferx_kv_blocks", "KV-cache blocks by state.", stats.blocks_in_use,
+        {{"state", "used"}});
+  gauge("inferx_kv_blocks", "KV-cache blocks by state.", stats.blocks_total,
+        {{"state", "total"}});
+  gauge("inferx_kv_blocks", "KV-cache blocks by state.", stats.cached_blocks,
+        {{"state", "cached"}});
+  const uint64_t free_blocks = stats.blocks_total > stats.blocks_in_use
+                                   ? stats.blocks_total - stats.blocks_in_use
+                                   : 0;
+  gauge("inferx_kv_blocks", "KV-cache blocks by state.", free_blocks,
+        {{"state", "free"}});
+  gauge("inferx_kv_cache_usage_ratio", "Fraction of KV-cache blocks in use.",
+        stats.blocks_total == 0
+            ? 0.0
+            : static_cast<double>(stats.blocks_in_use) / stats.blocks_total);
+  gauge("inferx_engine_last_step_seconds",
+        "Device duration of the most recently completed engine step.",
+        stats.last_step_ms / 1000.0);
+  counter("inferx_steps_total", "Completed engine steps.", stats.steps);
+  counter("inferx_generation_tokens_total", "Generated output tokens.",
+          stats.tokens_generated);
+  counter("inferx_preemptions_total", "Scheduler preemptions.",
+          stats.preemptions);
+  counter("inferx_prefix_cache_hits_total", "Prompt tokens served from cache.",
+          stats.prefix_hit_tokens);
+  counter("inferx_prefix_cache_misses_total",
+          "Prompt tokens not served from cache.", stats.prefix_miss_tokens);
+  counter("inferx_prefix_cache_evictions_total", "Evicted prefix-cache blocks.",
+          stats.evicted_blocks);
+  return registry.Render();
+}
+
+std::string RenderStatsJson(const Engine::Stats& stats) {
+  return "{\"running\":" + std::to_string(stats.running) +
+         ",\"waiting\":" + std::to_string(stats.waiting) +
+         ",\"blocks_in_use\":" + std::to_string(stats.blocks_in_use) +
+         ",\"blocks_total\":" + std::to_string(stats.blocks_total) +
+         ",\"steps\":" + std::to_string(stats.steps) +
+         ",\"tokens_generated\":" + std::to_string(stats.tokens_generated) +
+         ",\"last_step_ms\":" + std::to_string(stats.last_step_ms) +
+         ",\"preemptions\":" + std::to_string(stats.preemptions) +
+         ",\"cached_blocks\":" + std::to_string(stats.cached_blocks) +
+         ",\"prefix_hit_tokens\":" + std::to_string(stats.prefix_hit_tokens) +
+         ",\"prefix_miss_tokens\":" + std::to_string(stats.prefix_miss_tokens) +
+         ",\"evicted_blocks\":" + std::to_string(stats.evicted_blocks) + "}";
 }
 
 }  // namespace
@@ -270,31 +333,14 @@ struct HttpServer::Impl {
 
     server.Get("/metrics", [this](const httplib::Request&,
                                   httplib::Response& response) {
-      const Engine::Stats stats = engine->stats();
+      response.set_content(RenderMetrics(engine->stats()),
+                           "text/plain; version=0.0.4; charset=utf-8");
+    });
 
-      std::string body = "{\"running\":" + std::to_string(stats.running) +
-                         ",\"waiting\":" + std::to_string(stats.waiting) +
-                         ",\"blocks_in_use\":" +
-                         std::to_string(stats.blocks_in_use) +
-                         ",\"blocks_total\":" +
-                         std::to_string(stats.blocks_total) +
-                         ",\"steps\":" + std::to_string(stats.steps) +
-                         ",\"tokens_generated\":" +
-                         std::to_string(stats.tokens_generated) +
-                         ",\"last_step_ms\":" +
-                         std::to_string(stats.last_step_ms) +
-                         ",\"preemptions\":" +
-                         std::to_string(stats.preemptions) +
-                         ",\"cached_blocks\":" +
-                         std::to_string(stats.cached_blocks) +
-                         ",\"prefix_hit_tokens\":" +
-                         std::to_string(stats.prefix_hit_tokens) +
-                         ",\"prefix_miss_tokens\":" +
-                         std::to_string(stats.prefix_miss_tokens) +
-                         ",\"evicted_blocks\":" +
-                         std::to_string(stats.evicted_blocks) + "}";
-
-      response.set_content(body, "application/json");
+    server.Get("/stats", [this](const httplib::Request&,
+                                httplib::Response& response) {
+      response.set_content(RenderStatsJson(engine->stats()),
+                           "application/json");
     });
 
     server.Post("/v1/chat/completions", [this](const httplib::Request& request,

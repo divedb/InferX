@@ -23,6 +23,7 @@ include(InferXCuda)
 include(InferXDependencies)
 
 add_subdirectory(src/common)
+add_subdirectory(src/observe)
 add_subdirectory(src/core)
 add_subdirectory(src/comm)
 add_subdirectory(src/tokenizer)
