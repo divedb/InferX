@@ -182,6 +182,98 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
   return OkStatus();
 }
 
+// The W4A16 unfused baseline: weights live as packed int4 with per-group fp16
+// scales, and each step dequantizes them to fp16 and runs the stock fp16 GEMM.
+// This is the path the M8 foundation ships -- correct, and the lower bound a
+// fused int4 GEMM has to beat. The dequant is inside the timed region on
+// purpose: that double touch of the weights (read int4, write fp16, read fp16
+// again) is precisely the bandwidth a fused kernel removes, so timing it shows
+// the size of the prize rather than hiding it.
+Status RunW4A16(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
+                int warmup, int iters, double* out_tflops) {
+  const int64_t n = shape.n;
+  const int64_t k = shape.k;
+  const int64_t groups = k / 128;  // AWQ/GPTQ group size
+
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer xb, DeviceBuffer::Allocate(m * k * sizeof(__half),
+                                              DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer wb, DeviceBuffer::Allocate(n * k * sizeof(__half),
+                                              DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer yb, DeviceBuffer::Allocate(m * n * sizeof(__half),
+                                              DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer qb, DeviceBuffer::Allocate(n * k / 2, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer sb,
+      DeviceBuffer::Allocate(n * groups * sizeof(__half), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer hatb, DeviceBuffer::Allocate(n * k * sizeof(__half),
+                                                DeviceId::Cuda(0)));
+
+  INFERX_RETURN_IF_ERROR(FillDevice(xb, m * k, 0.0f));
+  INFERX_RETURN_IF_ERROR(FillDevice(wb, n * k, 1.7f));
+
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView x, TensorView::Create(xb.data(), DataType::kFloat16,
+                                       Shape({m, k}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView w, TensorView::Create(wb.data(), DataType::kFloat16,
+                                       Shape({n, k}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView y, TensorView::Create(yb.data(), DataType::kFloat16,
+                                       Shape({m, n}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView q, TensorView::Create(qb.data(), DataType::kInt4,
+                                       Shape({n, k}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView s, TensorView::Create(sb.data(), DataType::kFloat16,
+                                       Shape({n, groups}), DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(
+      TensorView hat, TensorView::Create(hatb.data(), DataType::kFloat16,
+                                          Shape({n, k}), DeviceId::Cuda(0)));
+
+  // Quantize once, out of the timed region: weights are quantized at load.
+  INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToInt4(w, q, s));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+
+  // The fp16 plan for (m,n,k); the dequant has no plan cache.
+  INFERX_RETURN_IF_ERROR(gemm.Warm(m, n, k, /*fp8=*/false));
+
+  INFERX_ASSIGN_OR_RETURN(
+      Timing t,
+      TimeLaunch(
+          [&] {
+            INFERX_RETURN_IF_ERROR(kernels::DequantizeInt4ToF16(q, s, hat));
+            return gemm.LinearF16(x, hat, y);
+          },
+          warmup, iters));
+
+  const double flop = 2.0 * static_cast<double>(m) * n * k;
+
+  // Bytes moved per step: the int4 weight read, the fp16 weight write (dequant
+  // output) AND read (GEMM input) -- the double touch -- plus x and y. That
+  // double touch is what makes the unfused path slower than plain fp16 and is
+  // what fusing removes.
+  const double bytes =
+      0.5 * static_cast<double>(n) * k +   // int4 weights, read once
+      4.0 * static_cast<double>(n) * k +   // fp16 weights: written then read
+      2.0 * static_cast<double>(m) * k +   // activations
+      2.0 * static_cast<double>(m) * n;    // output
+
+  const char* bound = flop / bytes < 160.0 ? "memory" : "compute";
+
+  if (out_tflops != nullptr) *out_tflops = t.tflops(flop);
+
+  std::printf("%-10s %-5s %6ld %6ld %6ld %9.4f %7.1f %8.1f %8.1f  %s\n",
+              shape.name, "w4a16", static_cast<long>(m), static_cast<long>(n),
+              static_cast<long>(k), t.min_ms, t.noise() * 100.0, t.tflops(flop),
+              t.gbytes_per_s(bytes), bound);
+  return OkStatus();
+}
+
 // Drives the GPU hard for `seconds` before any measurement starts.
 //
 // OFF BY DEFAULT, and measured to be harmful on this card without a clock lock.
@@ -342,6 +434,22 @@ int Main(int argc, char** argv) {
                     "  ->", static_cast<long>(m), "", "", "", "", "", speedup);
         total_speedup += speedup;
         ++speedup_count;
+      }
+
+      // The W4A16 unfused baseline: dequant int4 -> fp16, then the stock fp16
+      // GEMM, in the timed region. Reported vs fp16 rather than vs fp8: the
+      // point is to show the double-touch penalty (ratio < 1) and therefore the
+      // headroom a fused int4 GEMM would recover, not to compare formats.
+      double w4_tflops = 0.0;
+      const Status ws = RunW4A16(*gemm, shape, m, warmup, iters, &w4_tflops);
+      if (!ws.ok()) {
+        std::fprintf(stderr, "%-10s w4a16 m=%ld FAILED: %s\n", shape.name,
+                     static_cast<long>(m), ws.ToString().c_str());
+        ++failures;
+      } else if (f16_tflops > 0.0) {
+        const double ratio = w4_tflops / f16_tflops;
+        std::printf("%-10s %-5s %6ld %6s %6s %9s %7s %8s %7.2fx\n", "",
+                    " w4vs16", static_cast<long>(m), "", "", "", "", "", ratio);
       }
     }
     std::printf("\n");
