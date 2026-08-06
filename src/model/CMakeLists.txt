@@ -19,6 +19,7 @@ target_link_libraries(inferx_model
   PUBLIC
     inferx::core
     inferx::common
+    inferx::comm
     inferx::flags
 )
 

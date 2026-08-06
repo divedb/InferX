@@ -74,7 +74,7 @@ conventions, and troubleshooting.
 | M4 | HTTP server, tokenizer, OpenAI-compatible streaming | **done** |
 | M5 | Continuous batching, chunked prefill, prefix cache, preemption | **done** |
 | M6 | Overlap pipeline + CUDA graphs for decode | **done** (graphs; overlap measured, not built) |
-| M7 | Tensor parallelism | **in progress** (communicator foundation) |
+| M7 | Tensor parallelism | **in progress** (dense Qwen2 TP=2 validated) |
 | M8 | W4A16 weights + FP8 KV cache | next |
 | M9 | MoE and MLA | **layers done** (TP=1, no checkpoint yet) |
 | M10 | Benchmarks vs vLLM/SGLang | **done** (vLLM; SGLang unmeasured) |

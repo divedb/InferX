@@ -11,6 +11,8 @@
 
 #include "absl/strings/str_cat.h"
 #include "inferx/core/cuda_utils.h"
+#include "inferx/comm/communicator.h"
+#include "inferx/comm/tensor_parallel.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
@@ -136,6 +138,7 @@ struct Scratch {
 
 struct Qwen2Model::Impl {
   ModelConfig config;
+  std::unique_ptr<comm::Communicator> comm;
 
   std::vector<DeviceBuffer> weight_buffers;
   std::vector<LayerWeights> layers;
@@ -159,7 +162,21 @@ struct Qwen2Model::Impl {
 
   size_t weight_bytes = 0;
 
-  explicit Impl(kernels::CublasLtGemm g) : gemm(std::move(g)) {}
+  explicit Impl(kernels::CublasLtGemm g,
+                std::unique_ptr<comm::Communicator> communicator)
+      : comm(std::move(communicator)), gemm(std::move(g)) {}
+
+  int64_t LocalHeads() const {
+    return config.num_attention_heads / comm->size();
+  }
+  int64_t LocalKvHeads() const {
+    return config.num_key_value_heads / comm->size();
+  }
+  int64_t LocalQDim() const { return LocalHeads() * config.head_dim; }
+  int64_t LocalKvDim() const { return LocalKvHeads() * config.head_dim; }
+  int64_t LocalIntermediate() const {
+    return config.intermediate_size / comm->size();
+  }
 
   // M3: the paged cache and the per-step index buffers that address it.
   std::unique_ptr<KvBlockPool> pool;
@@ -326,9 +343,9 @@ struct Qwen2Model::Impl {
   Status EnsureActivationF8(int64_t tokens) {
     if (!weights_f8 || tokens <= 0) return OkStatus();
 
-    const int64_t widest = std::max({config.hidden_size,
-                                     config.q_dim() + 2 * config.kv_dim(),
-                                     config.intermediate_size});
+    const int64_t widest =
+        std::max({config.hidden_size, LocalQDim() + 2 * LocalKvDim(),
+                  LocalIntermediate()});
     const size_t need = static_cast<size_t>(tokens * widest);
 
     if (need <= act_f8.size()) return OkStatus();
@@ -365,9 +382,9 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   if (tokens <= capacity_tokens) return OkStatus();
 
   const int64_t h = config.hidden_size;
-  const int64_t qd = config.q_dim();
-  const int64_t kvd = config.kv_dim();
-  const int64_t inter = config.intermediate_size;
+  const int64_t qd = LocalQDim();
+  const int64_t kvd = LocalKvDim();
+  const int64_t inter = LocalIntermediate();
   const int64_t vocab = config.vocab_size;
 
   const auto alloc = [&](Scratch* s, int64_t elems, size_t elem_size) -> Status {
@@ -432,10 +449,10 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                     int64_t* out_tokens) {
   const int64_t tokens = static_cast<int64_t>(ids.size());
   const int64_t h = config.hidden_size;
-  const int64_t heads = config.num_attention_heads;
-  const int64_t kv_heads = config.num_key_value_heads;
+  const int64_t heads = LocalHeads();
+  const int64_t kv_heads = LocalKvHeads();
   const int64_t hd = config.head_dim;
-  const int64_t inter = config.intermediate_size;
+  const int64_t inter = LocalIntermediate();
 
   INFERX_RETURN_IF_ERROR(EnsureCapacity(tokens));
 
@@ -472,16 +489,16 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qv,
-      q.View(DataType::kBFloat16, Shape({tokens, config.q_dim()})));
+      q.View(DataType::kBFloat16, Shape({tokens, LocalQDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView kv_,
-      k.View(DataType::kBFloat16, Shape({tokens, config.kv_dim()})));
+      k.View(DataType::kBFloat16, Shape({tokens, LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView vv,
-      v.View(DataType::kBFloat16, Shape({tokens, config.kv_dim()})));
+      v.View(DataType::kBFloat16, Shape({tokens, LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView av,
-      attn_out.View(DataType::kBFloat16, Shape({tokens, config.q_dim()})));
+      attn_out.View(DataType::kBFloat16, Shape({tokens, LocalQDim()})));
 
   // The same buffers seen as [tokens, heads, head_dim] for the attention
   // kernels. Same bytes, different shape -- the projections produce a flat
@@ -505,7 +522,7 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qkv_v,
       qkv_fused.View(DataType::kBFloat16,
-                     Shape({tokens, config.q_dim() + 2 * config.kv_dim()})));
+                     Shape({tokens, LocalQDim() + 2 * LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView gate_up_v,
       gate_up_fused.View(DataType::kBFloat16, Shape({tokens, 2 * inter})));
@@ -536,6 +553,7 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(kernels::Attention(q3, k3, v3, a3, attn_scale));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x));
+    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
 
     // --- feed-forward block ----------------------------------------------
@@ -550,6 +568,7 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
     INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v));
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x));
+    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
   }
 
@@ -802,13 +821,13 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     if (fi_usable) {
       if (fp8_kv) {
         INFERX_RETURN_IF_ERROR(flashinfer->PlanFp8(
-            batch.num_seqs, config.num_attention_heads,
-            config.num_key_value_heads, config.head_dim, block_size,
+            batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
+            block_size,
             absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
       } else {
         INFERX_RETURN_IF_ERROR(flashinfer->Plan(
-            batch.num_seqs, config.num_attention_heads,
-            config.num_key_value_heads, config.head_dim, block_size,
+            batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
+            block_size,
             absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
       }
     } else if (fi_prefill_usable && !fp8_kv) {
@@ -816,8 +835,8 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
       // the separate bf16 Plan here is skipped on that path; LaunchDecodeBody
       // calls PrefillFp8 directly.
       INFERX_RETURN_IF_ERROR(flashinfer_prefill->Plan(
-          batch.num_seqs, config.num_attention_heads,
-          config.num_key_value_heads, config.head_dim, block_size,
+          batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
+          block_size,
           absl::MakeConstSpan(fi_qo_indptr_host),
           absl::MakeConstSpan(fi_indptr_host), tokens, stream));
     }
@@ -830,10 +849,10 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                                           int64_t max_blocks_per_seq) {
   const int64_t h = config.hidden_size;
-  const int64_t heads = config.num_attention_heads;
-  const int64_t kv_heads = config.num_key_value_heads;
+  const int64_t heads = LocalHeads();
+  const int64_t kv_heads = LocalKvHeads();
   const int64_t hd = config.head_dim;
-  const int64_t inter = config.intermediate_size;
+  const int64_t inter = LocalIntermediate();
 
   const auto i32 = [&](const DeviceBuffer& buf,
                        const Shape& shape) -> StatusOr<TensorView> {
@@ -864,16 +883,16 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qv,
-      q.View(DataType::kBFloat16, Shape({tokens, config.q_dim()})));
+      q.View(DataType::kBFloat16, Shape({tokens, LocalQDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView kv_,
-      k.View(DataType::kBFloat16, Shape({tokens, config.kv_dim()})));
+      k.View(DataType::kBFloat16, Shape({tokens, LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView vv,
-      v.View(DataType::kBFloat16, Shape({tokens, config.kv_dim()})));
+      v.View(DataType::kBFloat16, Shape({tokens, LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView av,
-      attn_out.View(DataType::kBFloat16, Shape({tokens, config.q_dim()})));
+      attn_out.View(DataType::kBFloat16, Shape({tokens, LocalQDim()})));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView q3,
@@ -894,7 +913,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qkv_v,
       qkv_fused.View(DataType::kBFloat16,
-                     Shape({tokens, config.q_dim() + 2 * config.kv_dim()})));
+                     Shape({tokens, LocalQDim() + 2 * LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView gate_up_v,
       gate_up_fused.View(DataType::kBFloat16, Shape({tokens, 2 * inter})));
@@ -1035,6 +1054,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     }
 
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s, x, 1));
+    INFERX_RETURN_IF_ERROR(
+        comm->AllReduceSum(x, static_cast<void*>(stream)));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
 
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
@@ -1052,6 +1073,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         kernels::SiluMulFused(gate_up_v, gate_v, stream));
     INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
                                   layer.down_s, x, 3));
+    INFERX_RETURN_IF_ERROR(
+        comm->AllReduceSum(x, static_cast<void*>(stream)));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
 
@@ -1178,7 +1201,30 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
 StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
                                       const Checkpoint& ckpt) {
+  return Load(config, ckpt, std::make_unique<comm::SingleRankComm>());
+}
+
+StatusOr<Qwen2Model> Qwen2Model::Load(
+    const ModelConfig& config, const Checkpoint& ckpt,
+    std::unique_ptr<comm::Communicator> communicator) {
   INFERX_RETURN_IF_ERROR(config.Validate());
+
+  if (communicator == nullptr)
+    return InvalidArgumentError("Qwen2Model: communicator is null");
+  const int tp_size = communicator->size();
+  const int tp_rank = communicator->rank();
+  if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size)
+    return InvalidArgumentError("Qwen2Model: invalid TP topology rank=",
+                                tp_rank, " size=", tp_size);
+  if (config.num_attention_heads % tp_size != 0 ||
+      config.num_key_value_heads % tp_size != 0 ||
+      config.intermediate_size % tp_size != 0) {
+    return InvalidArgumentError(
+        "Qwen2Model: TP size ", tp_size,
+        " must divide attention heads ", config.num_attention_heads,
+        ", KV heads ", config.num_key_value_heads, " and intermediate size ",
+        config.intermediate_size);
+  }
 
   if (config.weight_dtype != DataType::kBFloat16) {
     return UnimplementedError(
@@ -1191,7 +1237,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
   INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
                           kernels::CublasLtGemm::Create());
 
-  auto impl = std::make_unique<Impl>(std::move(gemm));
+  auto impl =
+      std::make_unique<Impl>(std::move(gemm), std::move(communicator));
   impl->config = config;
 
   // A dedicated stream, non-blocking. Two reasons, and the first is not
@@ -1206,6 +1253,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
 
   const int64_t h = config.hidden_size;
   const int64_t inter = config.intermediate_size;
+  const auto shard = [&](Tensor tensor, int axis) -> StatusOr<Tensor> {
+    if (tp_size == 1) return tensor;
+    return comm::ShardHostTensor(tensor, axis, tp_rank, tp_size);
+  };
 
   INFERX_ASSIGN_OR_RETURN(
       const Tensor embed_host,
@@ -1263,7 +1314,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
             {"self_attn.v_proj.weight", config.kv_dim()}}) {
         INFERX_ASSIGN_OR_RETURN(
             Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows, h})));
-        qkv.push_back(std::move(t));
+        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
+        qkv.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(w.qkv_w,
                               UploadConcatenated(qkv, &impl->weight_buffers));
@@ -1279,14 +1331,22 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
             {"self_attn.v_proj.bias", config.kv_dim()}}) {
         INFERX_ASSIGN_OR_RETURN(
             Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows})));
-        qkv_bias.push_back(std::move(t));
+        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
+        qkv_bias.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(
           w.qkv_b, UploadConcatenated(qkv_bias, &impl->weight_buffers));
     }
 
-    INFERX_RETURN_IF_ERROR(load("self_attn.o_proj.weight",
-                                Shape({h, config.q_dim()}), &w.o_w));
+    {
+      INFERX_ASSIGN_OR_RETURN(
+          Tensor host,
+          ckpt.GetChecked(absl::StrCat(p, "self_attn.o_proj.weight"),
+                          Shape({h, config.q_dim()})));
+      INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
+      INFERX_ASSIGN_OR_RETURN(w.o_w,
+                              Upload(local, &impl->weight_buffers));
+    }
     w.o_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
     {
@@ -1296,7 +1356,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
         INFERX_ASSIGN_OR_RETURN(
             Tensor t,
             ckpt.GetChecked(absl::StrCat(p, name), Shape({inter, h})));
-        gate_up.push_back(std::move(t));
+        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
+        gate_up.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
                               UploadConcatenated(gate_up,
@@ -1304,8 +1365,15 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
       w.gate_up_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
     }
 
-    INFERX_RETURN_IF_ERROR(load("mlp.down_proj.weight", Shape({h, inter}),
-                                &w.down_w));
+    {
+      INFERX_ASSIGN_OR_RETURN(
+          Tensor host,
+          ckpt.GetChecked(absl::StrCat(p, "mlp.down_proj.weight"),
+                          Shape({h, inter})));
+      INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
+      INFERX_ASSIGN_OR_RETURN(w.down_w,
+                              Upload(local, &impl->weight_buffers));
+    }
     w.down_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
     impl->layers.push_back(w);
@@ -1328,11 +1396,16 @@ StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
 }
 
 StatusOr<Qwen2Model> Qwen2Model::LoadFromDirectory(std::string_view dir) {
+  return LoadFromDirectory(dir, std::make_unique<comm::SingleRankComm>());
+}
+
+StatusOr<Qwen2Model> Qwen2Model::LoadFromDirectory(
+    std::string_view dir, std::unique_ptr<comm::Communicator> communicator) {
   INFERX_ASSIGN_OR_RETURN(const ModelConfig config,
                           ModelConfig::FromDirectory(dir));
   INFERX_ASSIGN_OR_RETURN(const Checkpoint ckpt, Checkpoint::Open(dir));
 
-  return Load(config, ckpt);
+  return Load(config, ckpt, std::move(communicator));
 }
 
 Qwen2Model::Qwen2Model(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -1341,6 +1414,8 @@ Qwen2Model::Qwen2Model(Qwen2Model&&) noexcept = default;
 Qwen2Model& Qwen2Model::operator=(Qwen2Model&&) noexcept = default;
 
 const ModelConfig& Qwen2Model::config() const { return impl_->config; }
+int Qwen2Model::tensor_parallel_rank() const { return impl_->comm->rank(); }
+int Qwen2Model::tensor_parallel_size() const { return impl_->comm->size(); }
 size_t Qwen2Model::WeightBytes() const { return impl_->weight_bytes; }
 
 namespace {
@@ -1406,7 +1481,7 @@ Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
 Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   KvLayout layout;
   layout.entries_per_token = 2;  // K and V; MLA would say 1 (T11)
-  layout.kv_heads = impl_->config.num_key_value_heads;
+  layout.kv_heads = impl_->LocalKvHeads();
   layout.head_dim = impl_->config.head_dim;
   layout.dtype =
       impl_->fp8_kv ? DataType::kFloat8E4M3FN : DataType::kBFloat16;
@@ -1435,6 +1510,11 @@ Status Qwen2Model::ReserveActivations(int64_t max_tokens) {
 
 Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
                                       int64_t max_blocks_per_seq) {
+  if (impl_->comm->size() > 1) {
+    return UnimplementedError(
+        "tensor-parallel graph capture is not implemented; HostSimComm stages "
+        "through the host and cannot be captured");
+  }
   if (impl_->pool == nullptr) {
     return FailedPreconditionError(
         "CaptureDecodeGraph requires a KV cache; call AttachKvCache first");
