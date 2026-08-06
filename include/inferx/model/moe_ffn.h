@@ -51,10 +51,10 @@ struct MoeWeights {
   /// `[num_experts, hidden]`.
   TensorView down_bias;
 
-  // MXFP4 expert weights, for the fused-GEMM path. When these are defined,
-  // MoeFfn::Forward calls kernels::Mxfp4Gemm per expert instead of the bf16
-  // GEMM against the dequantized `gate_up`/`down` above. gpt-oss is the only
-  // user today; the bf16 path stays default and untouched.
+  // MXFP4 expert weights, for the fused grouped-GEMM path. When defined,
+  // MoeFfn::Forward consumes the device dispatch offsets directly, without a
+  // host readback or one launch per expert. gpt-oss is the only user today;
+  // the bf16 path stays default and untouched.
   //
   // Shape per expert: gate_up_blocks is [2*inter, hidden/2] u8, gate_up_scales
   // is [2*inter, hidden/32] u8, down similarly. The expert axis is handled by

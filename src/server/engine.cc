@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <thread>
 #include <unordered_map>
@@ -614,7 +615,11 @@ struct Engine::Impl {
   }
 
   void FailAll(const Status& why) {
-    (void)why;
+    // A model-step failure is fatal to every active sequence. Keep the reason
+    // visible in the server log: the HTTP streams can only express a generic
+    // finish reason, and discarding `why` made GPU/kernel failures look like a
+    // clean shutdown during serving benchmarks.
+    std::fprintf(stderr, "engine step failed: %s\n", why.ToString().c_str());
 
     for (auto& [id, state] : active) {
       state.generation->Finish(FinishReason::kOutOfMemory, state.generated);

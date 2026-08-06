@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
 MODEL_DIR="${MODEL_DIR:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1}"
-MODEL_NAME=Qwen2.5-3B-Instruct
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B-Instruct}"
 SERVE=${SERVE:-$ROOT/build-cuda/src/server/inferx-serve}
 BENCH=$ROOT/bench/serve_bench.py
 
@@ -75,7 +75,11 @@ start_inferx() {  # $1: extra inferx-serve flags
 }
 
 start_vllm() {
-  MAX_SEQS="$MAX_SEQS" PORT=8001 setsid bash "$ROOT/scripts/run_vllm.sh" &
+  MODEL="$MODEL_DIR" MODEL_NAME="$MODEL_NAME" MAX_SEQS="$MAX_SEQS" \
+    MAX_SEQ_LEN="$MAX_SEQ_LEN" \
+    GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}" PORT=8001 \
+    VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}" \
+    setsid bash "$ROOT/scripts/run_vllm.sh" &
   SERVER_PID=$!
 }
 

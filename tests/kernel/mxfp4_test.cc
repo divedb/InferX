@@ -35,6 +35,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/mxfp4.h"
+#include "inferx/kernels/mxfp4_gemm.h"
 #include "inferx/model/safetensors.h"
 
 namespace inferx {
@@ -388,6 +389,149 @@ TEST_F(Mxfp4Test, RejectsAnOddRowCountForGateUp) {
   EXPECT_TRUE(kernels::DequantizeMxfp4ToBf16(*blocks, *scales, *out).ok());
   EXPECT_FALSE(
       kernels::DequantizeMxfp4GateUpToBf16(*blocks, *scales, *out).ok());
+}
+
+TEST(Mxfp4GroupedGemmTest, MatchesAHostReferenceForRaggedExperts) {
+  if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+
+  // Expert 1 is empty; experts 0 and 2 both cross the kernel's 16-row chunk
+  // boundary. Six output rows also exercise gate/up de-interleaving.
+  constexpr int64_t experts = 3, assignments = 35, n = 6, k = 32;
+  const std::vector<int32_t> offsets = {0, 17, 17, 35};
+  std::vector<bf16> x(assignments * k);
+  std::vector<uint8_t> blocks(experts * n * k / 2);
+  std::vector<uint8_t> scales(experts * n * k / 32, 127);  // 2^(127-127) = 1
+  std::vector<bf16> bias(experts * n);
+
+  for (int64_t i = 0; i < assignments * k; ++i)
+    x[static_cast<size_t>(i)] =
+        __float2bfloat16(static_cast<float>((i * 7) % 13 - 6) / 8.0f);
+  for (int64_t i = 0; i < experts * n * k / 2; ++i) {
+    const uint8_t lo = static_cast<uint8_t>((i * 3 + 1) & 0xf);
+    const uint8_t hi = static_cast<uint8_t>((i * 5 + 2) & 0xf);
+    blocks[static_cast<size_t>(i)] = static_cast<uint8_t>(lo | (hi << 4));
+  }
+  for (int64_t e = 0; e < experts; ++e)
+    for (int64_t j = 0; j < n; ++j)
+      bias[static_cast<size_t>(e * n + j)] =
+          __float2bfloat16(static_cast<float>(10 * e + j) / 16.0f);
+
+  auto xb = DeviceBuffer::Allocate(x.size() * sizeof(bf16), DeviceId::Cuda(0));
+  auto ob = DeviceBuffer::Allocate(offsets.size() * sizeof(int32_t),
+                                   DeviceId::Cuda(0));
+  auto wb = DeviceBuffer::Allocate(blocks.size(), DeviceId::Cuda(0));
+  auto sb = DeviceBuffer::Allocate(scales.size(), DeviceId::Cuda(0));
+  auto bb =
+      DeviceBuffer::Allocate(bias.size() * sizeof(bf16), DeviceId::Cuda(0));
+  auto yb =
+      DeviceBuffer::Allocate(assignments * n * sizeof(bf16), DeviceId::Cuda(0));
+  ASSERT_TRUE(xb.ok() && ob.ok() && wb.ok() && sb.ok() && bb.ok() && yb.ok());
+  ASSERT_EQ(
+      cudaMemcpy(xb->data(), x.data(), xb->size(), cudaMemcpyHostToDevice),
+      cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(ob->data(), offsets.data(), ob->size(),
+                       cudaMemcpyHostToDevice),
+            cudaSuccess);
+  ASSERT_EQ(
+      cudaMemcpy(wb->data(), blocks.data(), wb->size(), cudaMemcpyHostToDevice),
+      cudaSuccess);
+  ASSERT_EQ(
+      cudaMemcpy(sb->data(), scales.data(), sb->size(), cudaMemcpyHostToDevice),
+      cudaSuccess);
+  ASSERT_EQ(
+      cudaMemcpy(bb->data(), bias.data(), bb->size(), cudaMemcpyHostToDevice),
+      cudaSuccess);
+  ASSERT_EQ(cudaMemset(yb->data(), 0x7f, yb->size()), cudaSuccess);
+
+  auto xv = TensorView::Create(xb->data(), DataType::kBFloat16,
+                               Shape({assignments, k}), DeviceId::Cuda(0));
+  auto ov = TensorView::Create(ob->data(), DataType::kInt32,
+                               Shape({experts + 1}), DeviceId::Cuda(0));
+  auto wv = TensorView::Create(wb->data(), DataType::kUInt8,
+                               Shape({experts, n, k / 32, 16}),
+                               DeviceId::Cuda(0));
+  auto sv = TensorView::Create(sb->data(), DataType::kUInt8,
+                               Shape({experts, n, k / 32}), DeviceId::Cuda(0));
+  auto bv = TensorView::Create(bb->data(), DataType::kBFloat16,
+                               Shape({experts, n}), DeviceId::Cuda(0));
+  auto yv = TensorView::Create(yb->data(), DataType::kBFloat16,
+                               Shape({assignments, n}), DeviceId::Cuda(0));
+  ASSERT_TRUE(xv.ok() && ov.ok() && wv.ok() && sv.ok() && bv.ok() && yv.ok());
+  ASSERT_TRUE(kernels::Mxfp4GroupedGemm(*xv, *ov, *wv, *sv, *bv, *yv,
+                                        /*deinterleave=*/true)
+                  .ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  std::vector<bf16> got(assignments * n);
+  ASSERT_EQ(
+      cudaMemcpy(got.data(), yb->data(), yb->size(), cudaMemcpyDeviceToHost),
+      cudaSuccess);
+  constexpr float lut[16] = {0, 0.5f,  1,  1.5f,  2,  3,  4,  6,
+                             0, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+  for (int64_t e : {0, 2}) {
+    for (int64_t row = offsets[e]; row < offsets[e + 1]; ++row) {
+      for (int64_t j_raw = 0; j_raw < n; ++j_raw) {
+        const int64_t j = (j_raw & 1) ? n / 2 + j_raw / 2 : j_raw / 2;
+        float want = __bfloat162float(bias[static_cast<size_t>(e * n + j)]);
+        const int64_t weight_row = e * n + j_raw;
+        for (int64_t kk = 0; kk < k; ++kk) {
+          const uint8_t packed =
+              blocks[static_cast<size_t>(weight_row * (k / 2) + kk / 2)];
+          const uint8_t nibble = (kk & 1) ? packed >> 4 : packed & 0xf;
+          want += __bfloat162float(x[static_cast<size_t>(row * k + kk)]) *
+                  lut[nibble];
+        }
+        EXPECT_EQ(__bfloat162float(got[static_cast<size_t>(row * n + j)]),
+                  __bfloat162float(__float2bfloat16(want)))
+            << "expert=" << e << " row=" << row << " j_raw=" << j_raw;
+      }
+    }
+  }
+
+  // Exercise the decode specialization explicitly. Four grouped assignments
+  // take the direct grouped-row -> expert binary lookup; expert 1 is empty and
+  // the two active experts own two rows each, so this also checks boundaries
+  // rather than only the usual one-row-per-selected-expert case.
+  const std::vector<int32_t> decode_offsets = {0, 2, 2, 4};
+  ASSERT_EQ(cudaMemcpy(ob->data(), decode_offsets.data(), ob->size(),
+                       cudaMemcpyHostToDevice),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemset(yb->data(), 0x7f, 4 * n * sizeof(bf16)), cudaSuccess);
+  auto x4 = TensorView::Create(xb->data(), DataType::kBFloat16, Shape({4, k}),
+                               DeviceId::Cuda(0));
+  auto y4 = TensorView::Create(yb->data(), DataType::kBFloat16, Shape({4, n}),
+                               DeviceId::Cuda(0));
+  ASSERT_TRUE(x4.ok() && y4.ok());
+  ASSERT_TRUE(kernels::Mxfp4GroupedGemm(*x4, *ov, *wv, *sv, *bv, *y4,
+                                        /*deinterleave=*/true)
+                  .ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  std::vector<bf16> decode_got(4 * n);
+  ASSERT_EQ(cudaMemcpy(decode_got.data(), yb->data(),
+                       decode_got.size() * sizeof(bf16),
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  for (int64_t e : {0, 2}) {
+    for (int64_t row = decode_offsets[e]; row < decode_offsets[e + 1]; ++row) {
+      for (int64_t j_raw = 0; j_raw < n; ++j_raw) {
+        const int64_t j = (j_raw & 1) ? n / 2 + j_raw / 2 : j_raw / 2;
+        float want = __bfloat162float(bias[static_cast<size_t>(e * n + j)]);
+        const int64_t weight_row = e * n + j_raw;
+        for (int64_t kk = 0; kk < k; ++kk) {
+          const uint8_t packed =
+              blocks[static_cast<size_t>(weight_row * (k / 2) + kk / 2)];
+          const uint8_t nibble = (kk & 1) ? packed >> 4 : packed & 0xf;
+          want += __bfloat162float(x[static_cast<size_t>(row * k + kk)]) *
+                  lut[nibble];
+        }
+        EXPECT_EQ(
+            __bfloat162float(decode_got[static_cast<size_t>(row * n + j)]),
+            __bfloat162float(__float2bfloat16(want)))
+            << "decode expert=" << e << " row=" << row
+            << " j_raw=" << j_raw;
+      }
+    }
+  }
 }
 
 }  // namespace

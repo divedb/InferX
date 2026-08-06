@@ -1,10 +1,10 @@
 #include "inferx/model/moe_ffn.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cstring>
 #include <utility>
-
-#include <cuda_runtime.h>
 
 #include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
@@ -54,10 +54,10 @@ struct MoeFfn::Impl {
   Scratch dest;           // [tokens * k] i32
 
   // Expert compute, all in grouped order.
-  Scratch gathered;   // [tokens * k, hidden] bf16
-  Scratch gate_up;    // [tokens * k, 2 * moe_inter] bf16
-  Scratch activated;  // [tokens * k, moe_inter] bf16
-  Scratch expert_out; // [tokens * k, hidden] bf16
+  Scratch gathered;    // [tokens * k, hidden] bf16
+  Scratch gate_up;     // [tokens * k, 2 * moe_inter] bf16
+  Scratch activated;   // [tokens * k, moe_inter] bf16
+  Scratch expert_out;  // [tokens * k, hidden] bf16
 
   // The shared expert, which is dense over every token rather than grouped.
   Scratch shared_gate_up;  // [tokens, 2 * shared_inter] bf16
@@ -77,8 +77,8 @@ Status MoeFfn::Impl::EnsureCapacity(int64_t tokens) {
   const int64_t assignments = tokens * k;
   const size_t bf16_size = DataTypeByteSize(kBf16, 1);
 
-  INFERX_RETURN_IF_ERROR(Grow(&router_logits,
-                              bf16_size * tokens * config.num_experts));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&router_logits, bf16_size * tokens * config.num_experts));
   INFERX_RETURN_IF_ERROR(Grow(&weights, sizeof(float) * assignments));
   INFERX_RETURN_IF_ERROR(Grow(&experts, sizeof(int32_t) * assignments));
   INFERX_RETURN_IF_ERROR(
@@ -105,9 +105,10 @@ Status MoeFfn::Impl::EnsureCapacity(int64_t tokens) {
 
 StatusOr<MoeFfn> MoeFfn::Create(const Config& config, int64_t max_tokens) {
   if (config.hidden <= 0 || config.moe_intermediate <= 0) {
-    return InvalidArgumentError("MoeFfn: hidden and moe_intermediate must be "
-                                "positive, got ", config.hidden, " and ",
-                                config.moe_intermediate);
+    return InvalidArgumentError(
+        "MoeFfn: hidden and moe_intermediate must be "
+        "positive, got ",
+        config.hidden, " and ", config.moe_intermediate);
   }
 
   if (config.num_experts <= 0 || config.top_k <= 0 ||
@@ -173,8 +174,7 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
   INFERX_ASSIGN_OR_RETURN(
       const TensorView logits_v,
       impl_->router_logits.View(kBf16, Shape({tokens, c.num_experts})));
-  INFERX_RETURN_IF_ERROR(
-      gemm->LinearBF16(x, weights.router, logits_v, stream));
+  INFERX_RETURN_IF_ERROR(gemm->LinearBF16(x, weights.router, logits_v, stream));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView weights_v,
@@ -190,8 +190,8 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
         kernels::AddBiasInPlace(logits_v, weights.router_bias, stream));
   }
 
-  INFERX_RETURN_IF_ERROR(kernels::MoeRouteTopK(
-      logits_v, weights_v, experts_v, c.norm_topk_prob, stream));
+  INFERX_RETURN_IF_ERROR(kernels::MoeRouteTopK(logits_v, weights_v, experts_v,
+                                               c.norm_topk_prob, stream));
 
   // --- 2. Group by expert ---------------------------------------------------
 
@@ -211,29 +211,9 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
   INFERX_ASSIGN_OR_RETURN(
       const TensorView gathered_v,
       impl_->gathered.View(kBf16, Shape({assignments, c.hidden})));
-  INFERX_RETURN_IF_ERROR(
-      kernels::MoeGatherRows(x, rows_v, gathered_v, stream));
+  INFERX_RETURN_IF_ERROR(kernels::MoeGatherRows(x, rows_v, gathered_v, stream));
 
-  // --- 3. One GEMM per expert ----------------------------------------------
-  //
-  // The offsets have to come back to the host: a GEMM's `m` is an argument to
-  // a host-side cuBLASLt call, so the loop cannot be expressed without knowing
-  // how many rows each expert got. That is the real cost of the per-expert
-  // loop and the real reason a grouped GEMM exists -- it takes the counts as
-  // device memory and never round-trips. Until then this is one D2H copy per
-  // layer per step, which also makes the layer uncapturable as a graph.
-  std::vector<int32_t> host_offsets(
-      static_cast<size_t>(c.num_experts + 1));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      host_offsets.data(), offsets_v.Data(),
-      sizeof(int32_t) * host_offsets.size(), cudaMemcpyDeviceToHost, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
-
-  if (host_offsets.back() != assignments) {
-    return InternalError("MoeFfn: dispatch placed ", host_offsets.back(),
-                         " of ", assignments, " assignments");
-  }
-
+  // --- 3. Expert projections ------------------------------------------------
   INFERX_ASSIGN_OR_RETURN(
       const TensorView gate_up_all,
       impl_->gate_up.View(kBf16, Shape({assignments, 2 * inter})));
@@ -244,60 +224,72 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       const TensorView expert_out_all,
       impl_->expert_out.View(kBf16, Shape({assignments, c.hidden})));
 
-  for (int64_t e = 0; e < c.num_experts; ++e) {
-    const int64_t begin = host_offsets[static_cast<size_t>(e)];
-    const int64_t end = host_offsets[static_cast<size_t>(e) + 1];
-    const int64_t rows_here = end - begin;
+  const bool grouped_mxfp4 = weights.gate_up_blocks.IsDefined();
+  if (grouped_mxfp4) {
+    // Both ragged projections consume device-resident offsets. Bias is fused
+    // into each projection, leaving only one dense activation launch between
+    // them and no host involvement in expert dispatch.
+    INFERX_RETURN_IF_ERROR(kernels::Mxfp4GroupedGemm(
+        gathered_v, offsets_v, weights.gate_up_blocks, weights.gate_up_scales,
+        weights.gate_up_bias, gate_up_all,
+        /*deinterleave=*/true, stream));
+    switch (c.activation) {
+      case Activation::kSiluMul:
+        INFERX_RETURN_IF_ERROR(
+            kernels::SiluMulFused(gate_up_all, activated_all, stream));
+        break;
+      case Activation::kGptOssClamped:
+        INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(gate_up_all, activated_all,
+                                                     c.swiglu_limit,
+                                                     c.swiglu_alpha, stream));
+        break;
+    }
+    INFERX_RETURN_IF_ERROR(kernels::Mxfp4GroupedGemm(
+        activated_all, offsets_v, weights.down_blocks, weights.down_scales,
+        weights.down_bias, expert_out_all, /*deinterleave=*/false, stream));
+  } else {
+    // The bf16 fallback still uses one GEMM per expert. A future general
+    // grouped GEMM can replace this without affecting the checkpoint-critical
+    // MXFP4 path.
+    //
+    // The offsets have to come back to the host: a GEMM's `m` is an argument to
+    // a host-side cuBLASLt call, so the loop cannot be expressed without
+    // knowing how many rows each expert got. That is the real cost of the
+    // per-expert loop and the real reason a grouped GEMM exists -- it takes the
+    // counts as device memory and never round-trips. Until then this is one D2H
+    // copy per layer per step, which also makes the layer uncapturable as a
+    // graph.
+    std::vector<int32_t> host_offsets(static_cast<size_t>(c.num_experts + 1));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        host_offsets.data(), offsets_v.Data(),
+        sizeof(int32_t) * host_offsets.size(), cudaMemcpyDeviceToHost, stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
 
-    // An expert nobody routed to this step does no work at all. That is the
-    // whole economic argument for MoE, and it is also why the loop cannot be
-    // hoisted into a single GEMM with a block-diagonal weight.
-    if (rows_here == 0) continue;
+    if (host_offsets.back() != assignments) {
+      return InternalError("MoeFfn: dispatch placed ", host_offsets.back(),
+                           " of ", assignments, " assignments");
+    }
 
-    INFERX_ASSIGN_OR_RETURN(const TensorView xe,
-                            gathered_v.Slice(begin, end));
-    INFERX_ASSIGN_OR_RETURN(const TensorView gu_e,
-                            gate_up_all.Slice(begin, end));
-    INFERX_ASSIGN_OR_RETURN(const TensorView act_e,
-                            activated_all.Slice(begin, end));
-    INFERX_ASSIGN_OR_RETURN(const TensorView ye,
-                            expert_out_all.Slice(begin, end));
+    for (int64_t e = 0; e < c.num_experts; ++e) {
+      const int64_t begin = host_offsets[static_cast<size_t>(e)];
+      const int64_t end = host_offsets[static_cast<size_t>(e) + 1];
+      const int64_t rows_here = end - begin;
 
-    // The fused MXFP4 path: read 4-bit expert weights directly in the GEMM
-    // mainloop, skipping the dequant-to-bf16 scratch entirely. Branch is
-    // uniform across the loop (gpt-oss always sets these, everyone else never
-    // does), so the cost is one device-side predictable per layer.
-    const bool mxfp4 = weights.gate_up_blocks.IsDefined();
+      // An expert nobody routed to this step does no work at all. That is the
+      // whole economic argument for MoE, and it is also why the loop cannot be
+      // hoisted into a single GEMM with a block-diagonal weight.
+      if (rows_here == 0) continue;
 
-    TensorView gu_w, down_w;
-    TensorView gu_blocks, gu_scales, dn_blocks, dn_scales;
+      INFERX_ASSIGN_OR_RETURN(const TensorView xe,
+                              gathered_v.Slice(begin, end));
+      INFERX_ASSIGN_OR_RETURN(const TensorView gu_e,
+                              gate_up_all.Slice(begin, end));
+      INFERX_ASSIGN_OR_RETURN(const TensorView act_e,
+                              activated_all.Slice(begin, end));
+      INFERX_ASSIGN_OR_RETURN(const TensorView ye,
+                              expert_out_all.Slice(begin, end));
 
-    if (mxfp4) {
-      // MXFP4 weight slices: [2*inter, hidden/2] blocks + [2*inter, hidden/32]
-      // scales, one expert's worth.
-      INFERX_ASSIGN_OR_RETURN(
-          const TensorView gb3,
-          weights.gate_up_blocks.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(gu_blocks,
-                              gb3.Reshape(Shape({2 * inter, c.hidden / 2})));
-      INFERX_ASSIGN_OR_RETURN(
-          const TensorView gs3,
-          weights.gate_up_scales.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(gu_scales,
-                              gs3.Reshape(Shape({2 * inter, c.hidden / 32})));
-
-      INFERX_ASSIGN_OR_RETURN(
-          const TensorView db3,
-          weights.down_blocks.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(dn_blocks,
-                              db3.Reshape(Shape({inter, c.hidden / 2})));
-      INFERX_ASSIGN_OR_RETURN(
-          const TensorView ds3,
-          weights.down_scales.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(dn_scales,
-                              ds3.Reshape(Shape({inter, c.hidden / 32})));
-    } else {
-      // The stacked bf16 weights, viewed one expert at a time.
+      TensorView gu_w, down_w;
       INFERX_ASSIGN_OR_RETURN(const TensorView gu_w_3d,
                               weights.gate_up.Slice(e, e + 1));
       INFERX_ASSIGN_OR_RETURN(gu_w,
@@ -306,55 +298,43 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
                               weights.down.Slice(e, e + 1));
       INFERX_ASSIGN_OR_RETURN(down_w,
                               down_w_3d.Reshape(Shape({c.hidden, inter})));
-    }
 
-    if (mxfp4) {
-      INFERX_RETURN_IF_ERROR(
-          kernels::Mxfp4Gemm(xe, gu_blocks, gu_scales, gu_e,
-                             /*deinterleave=*/true, stream));
-    } else {
       INFERX_RETURN_IF_ERROR(gemm->LinearBF16(xe, gu_w, gu_e, stream));
-    }
 
-    if (weights.gate_up_bias.IsDefined()) {
-      INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
-                              weights.gate_up_bias.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(const TensorView b,
-                              b2d.Reshape(Shape({2 * inter})));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(gu_e, b, stream));
-    }
+      if (weights.gate_up_bias.IsDefined()) {
+        INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
+                                weights.gate_up_bias.Slice(e, e + 1));
+        INFERX_ASSIGN_OR_RETURN(const TensorView b,
+                                b2d.Reshape(Shape({2 * inter})));
+        INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(gu_e, b, stream));
+      }
 
-    switch (c.activation) {
-      case Activation::kSiluMul:
-        INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu_e, act_e, stream));
-        break;
-      case Activation::kGptOssClamped:
-        INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(
-            gu_e, act_e, c.swiglu_limit, c.swiglu_alpha, stream));
-        break;
-    }
+      switch (c.activation) {
+        case Activation::kSiluMul:
+          INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu_e, act_e, stream));
+          break;
+        case Activation::kGptOssClamped:
+          INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(
+              gu_e, act_e, c.swiglu_limit, c.swiglu_alpha, stream));
+          break;
+      }
 
-    if (mxfp4) {
-      INFERX_RETURN_IF_ERROR(
-          kernels::Mxfp4Gemm(act_e, dn_blocks, dn_scales, ye,
-                             /*deinterleave=*/false, stream));
-    } else {
       INFERX_RETURN_IF_ERROR(gemm->LinearBF16(act_e, down_w, ye, stream));
-    }
 
-    if (weights.down_bias.IsDefined()) {
-      INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
-                              weights.down_bias.Slice(e, e + 1));
-      INFERX_ASSIGN_OR_RETURN(const TensorView b,
-                              b2d.Reshape(Shape({c.hidden})));
-      INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(ye, b, stream));
+      if (weights.down_bias.IsDefined()) {
+        INFERX_ASSIGN_OR_RETURN(const TensorView b2d,
+                                weights.down_bias.Slice(e, e + 1));
+        INFERX_ASSIGN_OR_RETURN(const TensorView b,
+                                b2d.Reshape(Shape({c.hidden})));
+        INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(ye, b, stream));
+      }
     }
   }
 
   // --- 4. Combine, then the shared expert -----------------------------------
 
-  INFERX_RETURN_IF_ERROR(kernels::MoeCombineRows(expert_out_all, dest_v,
-                                                 weights_v, out, stream));
+  INFERX_RETURN_IF_ERROR(
+      kernels::MoeCombineRows(expert_out_all, dest_v, weights_v, out, stream));
 
   if (c.shared_intermediate > 0) {
     if (!weights.shared_gate_up.IsDefined() ||
@@ -369,15 +349,13 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     INFERX_ASSIGN_OR_RETURN(
         const TensorView sgu,
         impl_->shared_gate_up.View(kBf16, Shape({tokens, 2 * si})));
-    INFERX_ASSIGN_OR_RETURN(
-        const TensorView sact,
-        impl_->shared_act.View(kBf16, Shape({tokens, si})));
+    INFERX_ASSIGN_OR_RETURN(const TensorView sact,
+                            impl_->shared_act.View(kBf16, Shape({tokens, si})));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView sout,
         impl_->shared_out.View(kBf16, Shape({tokens, c.hidden})));
-    INFERX_ASSIGN_OR_RETURN(
-        const TensorView sgate,
-        impl_->shared_gate.View(kBf16, Shape({tokens, 1})));
+    INFERX_ASSIGN_OR_RETURN(const TensorView sgate,
+                            impl_->shared_gate.View(kBf16, Shape({tokens, 1})));
 
     INFERX_RETURN_IF_ERROR(
         gemm->LinearBF16(x, weights.shared_gate_up, sgu, stream));
@@ -410,8 +388,8 @@ StatusOr<std::vector<int32_t>> MoeFfn::LastExpertCounts() const {
 
   std::vector<int32_t> counts(static_cast<size_t>(num_experts));
   for (int64_t e = 0; e < num_experts; ++e) {
-    counts[static_cast<size_t>(e)] = offsets[static_cast<size_t>(e) + 1] -
-                                     offsets[static_cast<size_t>(e)];
+    counts[static_cast<size_t>(e)] =
+        offsets[static_cast<size_t>(e) + 1] - offsets[static_cast<size_t>(e)];
   }
 
   return counts;

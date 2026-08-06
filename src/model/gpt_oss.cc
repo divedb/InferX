@@ -23,13 +23,10 @@ namespace inferx::model {
 namespace {
 
 /// Wall-clock phase accumulator for `Forward`, gated by the
-/// `INFERX_GPTOSS_PROFILE` env var. Measures host time across the layer loop,
-/// which -- because every `cudaMemcpy` in the MoE path is the blocking form --
-/// is also where the host sits waiting on PCIe. The breakdown names the phase
-/// to fix rather than the kernel to tune: if `dequant_upload` dominates, the
-/// fix is async double-buffering; if `moe_forward` dominates, it is the GEMM
-/// (X3); if `sync` dominates, the host is already launching faster than the
-/// device can consume and the win is elsewhere.
+/// `INFERX_GPTOSS_PROFILE` env var. Profiling deliberately synchronizes at each
+/// phase boundary. Without that synchronization CUDA launch time is charged to
+/// whichever later operation happens to block first, which produced plausible
+/// but false phase attribution after the expert upload was removed.
 struct ForwardProfile {
   using Clock = std::chrono::steady_clock;
   Clock::time_point last = Clock::now();
@@ -40,6 +37,9 @@ struct ForwardProfile {
   int64_t layers = 0;
 
   void tick(double& bucket) {
+    // Profiling mode only. A synchronization here would be disastrous in the
+    // serving path, but is required for phase timings to describe device work.
+    (void)cudaDeviceSynchronize();
     const auto now = Clock::now();
     bucket += std::chrono::duration<double, std::milli>(now - last).count();
     last = now;
@@ -540,10 +540,19 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
+  // Same profiling harness as Forward, so a server decode step (this path) and
+  // the batch-1 reference (Forward) can be diffed directly. The env var is read
+  // here rather than once at construction because Forward and RunPagedForward
+  // are different call sites and a caller may profile one without the other.
+  const char* prof_env = std::getenv("INFERX_GPTOSS_PROFILE");
+  ForwardProfile prof;
+  const bool profiling = prof_env != nullptr;
+
   for (int64_t layer = 0; layer < c.num_hidden_layers; ++layer) {
     const LayerWeights& w = m.layers[static_cast<size_t>(layer)];
 
     // --- attention ---------------------------------------------------------
+    if (profiling) prof.last = ForwardProfile::Clock::now();
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
         cudaMemcpyDeviceToDevice));
@@ -558,6 +567,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
         q, k, pos_v, inv_freq, m.attn_factor));
+    if (profiling) prof.tick(prof.attn_proj);
 
     // Cache write *after* RoPE: a cached key is stored at the position it was
     // rotated for, so it never needs re-rotating when read back.
@@ -583,6 +593,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     // false -- unlike the FlashInfer path, which is base-2.
     INFERX_RETURN_IF_ERROR(kernels::ApplyAttentionSinks(
         attn, lse_v, w.sinks, /*lse_is_log2=*/false));
+    if (profiling) prof.tick(prof.attn_kernel);
 
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
     INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b));
@@ -590,6 +601,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
         x.Data(), proj.Data(), DataTypeByteSize(kBf16, tokens * h),
         cudaMemcpyDeviceToDevice));
+    if (profiling) prof.tick(prof.attn_proj);
 
     // --- MoE ---------------------------------------------------------------
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
@@ -614,12 +626,16 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     mw.down_bias = w.down_bias_dev;
 
     INFERX_RETURN_IF_ERROR(m.moe->Forward(normed, mw, moe_out, &m.gemm));
+    if (profiling) prof.tick(prof.moe_forward);
 
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid));
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
         x.Data(), moe_out.Data(), DataTypeByteSize(kBf16, tokens * h),
         cudaMemcpyDeviceToDevice));
+    if (profiling) ++prof.layers;
   }
+
+  if (profiling) prof.report(tokens);
 
   INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, m.final_norm, normed,
                                           static_cast<float>(c.rms_norm_eps)));

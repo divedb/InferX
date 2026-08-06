@@ -3,11 +3,12 @@
 A plan for making `inferx-serve` run `openai/gpt-oss-20b`, the MoE checkpoint
 already cached on this box, and for what that buys.
 
-**Status: Phases 0–2 done. Phases 3–4 proposed.** The oracle exists, the MXFP4 bit
-layout is settled against HuggingFace's own decoder, and every definition this
-document originally marked "recalled, verify later" has been read out of the
-reference implementation. §8 records what changed. The rest exists to be argued
-with before it is written.
+**Status: M11 done.** Phases
+0–3 are done, and the main Phase 4 risks have landed: resident MXFP4 experts, a
+fused MXFP4 GEMM, fused QKV projection, paged KV, and continuous batching. The
+grouped MXFP4 projections now consume routing offsets on the GPU, removing the
+last per-layer host synchronization. This document retains the original plan
+and records where implementation changed it.
 
 The short case for doing it: M9 built MoE and MLA layers that are tested
 against their own definitions and nothing else, because no MoE checkpoint fit
@@ -422,23 +423,53 @@ uploaded in checkpoint order, so every gate's bias landed on an `up` and vice
 versa. It produced a model that ran, and generated fluent text, and was wrong.
 No unit test would have caught it; only the end-to-end comparison did.
 
-### Phase 3 — the tokenizer and the server path *(medium)*
+### Phase 3 — the tokenizer and the server path ✅ *done*
 
 R-F and R-G. Conformance corpus, exact id equality, chat template.
 
-- **Exit:** `inferx-serve --model <gpt-oss>` answers `/v1/completions` with
-  text that matches vLLM's for a greedy prompt.
+- The o200k split pattern matches HuggingFace exactly on the conformance corpus.
+- `inferx-serve --model <gpt-oss>` answers `/v1/completions` through the paged
+  model path and continuous scheduler.
 
-### Phase 4 — make it fast *(large, and genuinely open)*
+### Phase 4 — make it fast *(in progress)*
 
-- MXFP4 in the GEMM mainloop, which is also the moment to find out why
-  `w4a16_gemm` is behind cuBLASLt bf16.
-- Sliding-window KV (R-C) as a scheduler change, with the prefix cache made
-  aware of per-layer lifetime.
-- CUDA graph capture, which the MoE dispatch's host round-trip currently
-  prevents (§7.3) — this is where a grouped GEMM stops being optional.
-- **Exit:** a `bench_serve.sh` row against vLLM on the same model, and an
-  honest comparison against the ~290 tok/s estimate above.
+- ✅ MXFP4 is consumed directly in the GEMM mainloop; the dequant scratch is
+  gone and the forward fell from 235 ms to 128 ms in the recorded batch-1 run.
+- ✅ Paged attention enforces the per-layer sliding window while computing.
+  Physical KV reclamation for expired sliding-window tokens remains open.
+- ✅ MXFP4 MoE projections consume device-resident offsets in a fixed launch
+  geometry; there is no expert-offset readback or host-driven expert loop.
+- ✅ The grouped projection has a one-row decode specialization, direct
+  grouped-row-to-expert lookup, and a coalesced 8-values-per-lane MXFP4
+  mainloop. FP4 E2M1 is decoded arithmetically rather than through a divergent
+  constant-memory LUT; that LUT serialized a warp's data-dependent indices and
+  was the largest single kernel defect. Against the first working grouped path,
+  stable batch-1 decode rises from 26.4 to **73.6 tok/s** (32 generated tokens,
+  five measured requests, two warmups); median ITL is 12.8 ms, p99 ITL is
+  21.7 ms, and median TTFT is 142 ms. This remains below the ~290 tok/s
+  bandwidth-floor estimate, so the MXFP4 projection remains an optimization
+  target rather than a finished kernel.
+- **Comparison status:** the shared harness is ready, but vLLM 0.26 cannot
+  allocate even its minimum KV cache beside this checkpoint on the 16 GiB
+  card. At 4096 context it reports -1.85 GiB available; with CUDA graphs off,
+  `gpu_memory_utilization=0.915`, and context reduced to 2048 it has 0.04 GiB
+  available against 0.09 GiB required. A 512-token retry varied to -0.01 GiB.
+  Raising the fraction further exceeds the 14.55 GiB free at process startup.
+  A CPU-offloaded vLLM row would measure PCIe paging rather than the same
+  serving problem, so it is not presented as a head-to-head result.
+
+The shared serving harness is model-parameterized. On a GPU with enough
+headroom, the intended matched measurement is:
+
+```bash
+MODEL_DIR="$HOME/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee" \
+MODEL_NAME=gpt-oss-20b MAX_SEQS=1 MAX_SEQ_LEN=4096 \
+GPU_MEMORY_UTILIZATION=0.95 \
+  ./scripts/bench_serve.sh inferx-bf16 vllm
+```
+
+Do not use the `inferx-fp8` rows for this checkpoint: gpt-oss already carries
+MXFP4 expert weights, while those switches configure the dense Qwen path.
 
 ---
 
@@ -456,16 +487,15 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
 
 ## 7. Recommendation
 
-Phases 0–2 are done. Phase 2's exit criterion is met: gpt-oss-20b runs
-end to end and its logits match HuggingFace's. Phases 3 (tokenizer and
-serving) and 4 (make it fast) are the remaining work, and §9 revises what they
-look like now that the model runs.
+Phases 0–3 are done: gpt-oss-20b matches HuggingFace, tokenizes exactly against
+the checkpoint corpus, and runs through `inferx-serve`. Most of Phase 4 is also
+done: experts are resident in MXFP4, the GEMM consumes MXFP4 directly, QKV is
+fused, and the model uses paged KV with continuous batching.
 
-That subset is where nearly all the value sits: it retires M9's caveat, it
-proves MXFP4, and it produces a checkpoint-validated MoE forward pass — while
-being the part *least* exposed to X1 and X3, the two risks that could stall the
-effort indefinitely. Phases 3–4 turn it into a serving story, and are worth
-deciding on with Phase 2's findings in hand rather than now.
+The MXFP4 serving path now has GPU-resident grouped dispatch: `MoeFfn` passes
+its offsets directly to fixed-geometry ragged projections, with bias fused into
+each projection. The bf16 compatibility path retains its cuBLASLt expert loop.
+The batch-1 reference path is no longer the serving performance oracle.
 
 Call it **M11**. M9 stays what it is: layers, tested against their definitions.
 Folding this into M9 retroactively would make a finished milestone

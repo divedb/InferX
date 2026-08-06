@@ -4,7 +4,7 @@ A high-performance LLM inference server in C++20, aiming at throughput and
 latency comparable to vLLM and SGLang — without Python or libtorch in the
 serving path.
 
-**Status: M10 done.** `inferx-serve` answers OpenAI-compatible completions over
+**Status: M11 done.** `inferx-serve` answers OpenAI-compatible completions over
 HTTP with SSE streaming, running Qwen2.5-3B-Instruct on a paged KV cache with
 FlashInfer attention, CUDA graphs, and on-device temperature/top-p sampling.
 Measured against vLLM 0.26 on the same box, same model, same client: **bf16
@@ -14,10 +14,11 @@ does continuous batching with chunked prefill, recompute preemption, and a
 radix prefix cache. The CPU is already off the critical path — 1.9% of a step —
 so M6's overlap pipeline was measured and deliberately not built.
 
-M9's MoE and MLA layers exist and are tested against host references, but
-neither is wired into a served model and neither has a checkpoint on this box
-to validate against. Still open: tensor parallelism (M7), a fused W4A16 GEMM
-that beats bf16 (M8), and loading a real MoE or MLA checkpoint (M9).
+M9's MoE path is now checkpoint-validated and serves gpt-oss-20b directly from
+MXFP4 weights. Its grouped MoE projections consume device-resident dispatch
+offsets, removing the per-layer host synchronization and making the path CUDA
+graph-capturable. Still open: tensor parallelism (M7), a W4A16 GEMM that beats bf16
+(M8), and wiring MLA into a served checkpoint (M9).
 
 ## Why another engine
 
@@ -77,6 +78,7 @@ conventions, and troubleshooting.
 | M8 | W4A16 weights + FP8 KV cache | next |
 | M9 | MoE and MLA | **layers done** (TP=1, no checkpoint yet) |
 | M10 | Benchmarks vs vLLM/SGLang | **done** (vLLM; SGLang unmeasured) |
+| M11 | Serve gpt-oss-20b from MXFP4 weights | **done** |
 
 M1 deliberately preceded the model layer: torch-free quantized GEMM was the
 largest unknown in the design, and finding out it was intractable after building
