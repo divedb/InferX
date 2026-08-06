@@ -25,7 +25,8 @@ both `nccl.h` and `libnccl.so` are discoverable at configure time. CMake prints
 
 Both GPUs must be in the same machine and visible to the process. Record
 `nvidia-smi topo -m` and verify CUDA P2P access before interpreting TP
-performance.
+performance. The complete rental-host acceptance procedure is in
+[TP_VALIDATION.md](TP_VALIDATION.md).
 
 ### Why CUDA 13.x
 

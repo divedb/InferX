@@ -187,7 +187,11 @@ DCGM Exporter and optional Node Exporter will be pinned as container images in t
 5. **Monitoring stack** — implemented as a pinned Compose deployment with
    Prometheus scrape/recording/alert rules, provisioned Grafana dashboards,
    optional DCGM Exporter and Node Exporter profiles, and rank/GPU selectors.
-6. **Validation** — test single-GPU baselines first, then one-host/two-GPU TP under prompt-heavy, decode-heavy, saturated, cache-hit, cache-miss, cancellation, and injected rank-failure scenarios.
+6. **Validation** — harness implemented in `scripts/validate_tp.sh`; physical
+   two-GPU execution remains pending. It captures topology/software evidence,
+   rejects skipped NCCL coverage, runs TP regressions, and optionally measures
+   TP=1 plus unsampled, scraped, and sampled TP=2 serving with the common
+   benchmark client.
 
 ## Acceptance criteria
 

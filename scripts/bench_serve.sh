@@ -4,6 +4,7 @@
 #
 #   ./scripts/bench_serve.sh                   # every engine, default sweep
 #   ./scripts/bench_serve.sh inferx-bf16 vllm  # a subset, in this order
+#   ./scripts/bench_serve.sh inferx-tp1 inferx-tp2
 #
 # One at a time is not a limitation of the script, it is the measurement: this
 # box has one 16 GB GPU and both engines size their KV cache to fill it, so two
@@ -102,6 +103,10 @@ echo | tee -a "$LOG"
 for engine in "${ENGINES[@]}"; do
   case "$engine" in
     inferx-bf16) start_inferx "" ;;
+    inferx-tp1)  start_inferx "--tensor-parallel-size 1 --devices 0 --comm-backend single" ;;
+    inferx-tp2)  start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl" ;;
+    inferx-tp2-scraped) start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl" ;;
+    inferx-tp2-sampled) start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl --collective-timing-sample-rate ${COLLECTIVE_SAMPLE_RATE:-128}" ;;
     # Weights-only fp8 exists as its own row to attribute a difference to the
     # weights or to the KV cache; --fp8-kv also forces the prefill dequant
     # workaround (§14, M8), so the two are not one knob.
