@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: inferx
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: inferx
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    static_configs:
+      - targets: [host.docker.internal:8000]
+        labels:
+          environment: local
+
+  - job_name: dcgm
+    static_configs:
+      - targets: [dcgm-exporter:9400]
+
+  - job_name: node
+    static_configs:
+      - targets: [node-exporter:9100]

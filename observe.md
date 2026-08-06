@@ -184,7 +184,9 @@ DCGM Exporter and optional Node Exporter will be pinned as container images in t
    enabled with `--collective-timing-sample-rate N`. It exports completed
    samples, graph skips, and ring/event drops; zero (the default) performs no
    CUDA timing calls.
-5. **Monitoring stack** — add Prometheus scrape/rule configuration, pinned container deployment, Grafana provisioning/dashboards, and DCGM Exporter mapping from CUDA rank to GPU UUID.
+5. **Monitoring stack** — implemented as a pinned Compose deployment with
+   Prometheus scrape/recording/alert rules, provisioned Grafana dashboards,
+   optional DCGM Exporter and Node Exporter profiles, and rank/GPU selectors.
 6. **Validation** — test single-GPU baselines first, then one-host/two-GPU TP under prompt-heavy, decode-heavy, saturated, cache-hit, cache-miss, cancellation, and injected rank-failure scenarios.
 
 ## Acceptance criteria

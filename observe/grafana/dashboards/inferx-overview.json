@@ -1,0 +1,142 @@
+{
+  "annotations": {"list": []},
+  "description": "InferX request SLOs, throughput, scheduler pressure and KV cache.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "inferx:request_rate5m", "refId": "A"}],
+      "title": "Request rate",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "inferx:generation_tokens_per_second5m", "refId": "A"}],
+      "title": "Output tokens/s",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "inferx:ttft_seconds:p99_5m", "refId": "A"}],
+      "title": "TTFT p99",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "inferx_kv_cache_usage_ratio{instance=~\"$instance\"}", "refId": "A"}],
+      "title": "KV utilization",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(inferx_requests_running{instance=~\"$instance\"})", "refId": "A"}],
+      "title": "Running",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 6,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(inferx_requests_waiting{instance=~\"$instance\"})", "refId": "A"}],
+      "title": "Waiting",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "id": 7,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "inferx:ttft_seconds:p50_5m", "legendFormat": "TTFT p50", "refId": "A"},
+        {"expr": "inferx:ttft_seconds:p95_5m", "legendFormat": "TTFT p95", "refId": "B"},
+        {"expr": "inferx:ttft_seconds:p99_5m", "legendFormat": "TTFT p99", "refId": "C"},
+        {"expr": "inferx:itl_seconds:p99_5m", "legendFormat": "ITL p99", "refId": "D"},
+        {"expr": "inferx:request_duration_seconds:p99_5m", "legendFormat": "E2E p99", "refId": "E"}
+      ],
+      "title": "Serving latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "id": 8,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum(rate(inferx_prompt_tokens_total{instance=~\"$instance\"}[5m]))", "legendFormat": "prompt tokens/s", "refId": "A"},
+        {"expr": "sum(rate(inferx_generation_tokens_total{instance=~\"$instance\"}[5m]))", "legendFormat": "output tokens/s", "refId": "B"},
+        {"expr": "sum(rate(inferx_requests_total{instance=~\"$instance\",outcome=\"accepted\"}[5m]))", "legendFormat": "requests/s", "refId": "C"}
+      ],
+      "title": "Throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "id": 9,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "inferx_requests_running{instance=~\"$instance\"}", "legendFormat": "running", "refId": "A"},
+        {"expr": "inferx_requests_waiting{instance=~\"$instance\"}", "legendFormat": "waiting", "refId": "B"},
+        {"expr": "rate(inferx_preemptions_total{instance=~\"$instance\"}[5m])", "legendFormat": "preemptions/s", "refId": "C"}
+      ],
+      "title": "Scheduler pressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "id": 10,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "inferx_kv_blocks{instance=~\"$instance\"}", "legendFormat": "{{state}}", "refId": "A"},
+        {"expr": "inferx:prefix_cache_hit_ratio5m", "legendFormat": "prefix hit ratio", "refId": "B"},
+        {"expr": "rate(inferx_prefix_cache_evictions_total{instance=~\"$instance\"}[5m])", "legendFormat": "evictions/s", "refId": "C"}
+      ],
+      "title": "KV and prefix cache",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["inferx", "serving"],
+  "templating": {
+    "list": [
+      {"current": {"text": "All", "value": ".*"}, "datasource": {"type": "prometheus", "uid": "inferx-prometheus"}, "definition": "label_values(inferx_requests_running, instance)", "includeAll": true, "label": "Instance", "name": "instance", "query": {"query": "label_values(inferx_requests_running, instance)", "refId": "variable-query"}, "refresh": 1, "type": "query"}
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "InferX Serving Overview",
+  "uid": "inferx-overview",
+  "version": 1
+}

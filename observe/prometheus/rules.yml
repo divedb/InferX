@@ -1,0 +1,85 @@
+groups:
+  - name: inferx-recording
+    interval: 15s
+    rules:
+      - record: inferx:request_rate5m
+        expr: sum(rate(inferx_requests_total{outcome="accepted"}[5m]))
+      - record: inferx:generation_tokens_per_second5m
+        expr: sum(rate(inferx_generation_tokens_total[5m]))
+      - record: inferx:prompt_tokens_per_second5m
+        expr: sum(rate(inferx_prompt_tokens_total[5m]))
+      - record: inferx:ttft_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum by (le) (rate(inferx_time_to_first_token_seconds_bucket[5m])))
+      - record: inferx:ttft_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(inferx_time_to_first_token_seconds_bucket[5m])))
+      - record: inferx:ttft_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le) (rate(inferx_time_to_first_token_seconds_bucket[5m])))
+      - record: inferx:itl_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le) (rate(inferx_inter_token_latency_seconds_bucket[5m])))
+      - record: inferx:request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le) (rate(inferx_request_duration_seconds_bucket[5m])))
+      - record: inferx:prefix_cache_hit_ratio5m
+        expr: sum(rate(inferx_prefix_cache_hits_total[5m])) / clamp_min(sum(rate(inferx_prefix_cache_hits_total[5m]) + rate(inferx_prefix_cache_misses_total[5m])), 1)
+      - record: inferx:rank_step_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (rank, phase, le) (rate(inferx_engine_step_seconds_bucket[5m])))
+      - record: inferx:collective_payload_bytes_per_second5m
+        expr: sum by (backend, op, rank) (rate(inferx_collective_bytes_total[5m]))
+
+  - name: inferx-alerts
+    rules:
+      - alert: InferXMetricsMissing
+        expr: up{job="inferx"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: InferX metrics endpoint is unavailable
+      - alert: InferXCollectiveFailure
+        expr: increase(inferx_collective_failures_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Tensor-parallel collective failed
+      - alert: InferXCommunicatorAbort
+        expr: increase(inferx_communicator_aborts_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Tensor-parallel communicator was aborted
+      - alert: InferXRankTimeout
+        expr: increase(inferx_rank_timeouts_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Tensor-parallel rank timed out
+      - alert: InferXRankUnhealthy
+        expr: inferx_rank_healthy == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: Tensor-parallel rank is unhealthy
+      - alert: InferXRankStalled
+        expr: inferx_requests_running > 0 and inferx_rank_last_progress_seconds > 30
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: Active rank has made no progress for 30 seconds
+      - alert: InferXQueueBacklog
+        expr: inferx_requests_waiting > 0 and inferx:generation_tokens_per_second5m == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Requests are queued while generation is stalled
+      - alert: NvidiaGpuXidError
+        expr: increase(DCGM_FI_DEV_XID_ERRORS[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: NVIDIA GPU reported an XID error
+      - alert: NvidiaGpuHot
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: NVIDIA GPU temperature is above 85 C
+      - alert: NvidiaGpuMemoryPressure
+        expr: DCGM_FI_DEV_FB_USED / clamp_min(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE, 1) > 0.95
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: NVIDIA GPU framebuffer usage is above 95 percent

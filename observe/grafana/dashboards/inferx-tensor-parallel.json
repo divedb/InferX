@@ -1,0 +1,152 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "min(inferx_rank_healthy{instance=~\"$instance\",rank=~\"$rank\"})", "refId": "A"}],
+      "title": "All selected ranks healthy",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [], "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(inferx_rank_healthy{instance=~\"$instance\"})", "refId": "A"}],
+      "title": "Observed world size",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [], "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 8, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "sum(increase(inferx_communicator_aborts_total{instance=~\"$instance\"}[5m])) + sum(increase(inferx_rank_timeouts_total{instance=~\"$instance\"}[5m]))", "legendFormat": "aborts + timeouts", "refId": "A"}],
+      "title": "Aborts and timeouts (5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "id": 4,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "inferx:rank_step_seconds:p95_5m{instance=~\"$instance\",rank=~\"$rank\"}", "legendFormat": "rank {{rank}} {{phase}}", "refId": "A"}],
+      "title": "Per-rank step duration p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "inferx_rank_last_progress_seconds{instance=~\"$instance\",rank=~\"$rank\"}", "legendFormat": "rank {{rank}}", "refId": "A"}],
+      "title": "Seconds since rank progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "id": 6,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "inferx:collective_payload_bytes_per_second5m{instance=~\"$instance\"}", "legendFormat": "rank {{rank}} {{op}}", "refId": "A"}],
+      "title": "Collective payload throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le, op) (rate(inferx_collective_seconds_bucket{instance=~\"$instance\"}[5m])))", "legendFormat": "p95 {{op}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.99, sum by (le, op) (rate(inferx_collective_seconds_bucket{instance=~\"$instance\"}[5m])))", "legendFormat": "p99 {{op}}", "refId": "B"}
+      ],
+      "title": "Sampled collective latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (op) (rate(inferx_collective_failures_total{instance=~\"$instance\"}[5m]))", "legendFormat": "failure {{op}}", "refId": "A"},
+        {"expr": "sum(rate(inferx_collective_timing_graph_skips_total{instance=~\"$instance\"}[5m]))", "legendFormat": "graph skip", "refId": "B"},
+        {"expr": "sum(rate(inferx_collective_timing_samples_dropped_total{instance=~\"$instance\"}[5m]))", "legendFormat": "timing drop", "refId": "C"}
+      ],
+      "title": "Communication diagnostics",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "max": 100, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "id": 9,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_UTIL{gpu=~\"$gpu\"}", "legendFormat": "GPU {{gpu}} {{UUID}}", "refId": "A"}],
+      "title": "GPU utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "max": 100, "min": 0, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 28},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "100 * DCGM_FI_DEV_FB_USED{gpu=~\"$gpu\"} / clamp_min(DCGM_FI_DEV_FB_USED{gpu=~\"$gpu\"} + DCGM_FI_DEV_FB_FREE{gpu=~\"$gpu\"}, 1)", "legendFormat": "GPU {{gpu}}", "refId": "A"}],
+      "title": "GPU framebuffer used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}}, "overrides": [{"matcher": {"id": "byName", "options": "temperature"}, "properties": [{"id": "unit", "value": "celsius"}]}, {"matcher": {"id": "byName", "options": "power"}, "properties": [{"id": "unit", "value": "watt"}]}]},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 28},
+      "id": 11,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_TEMP{gpu=~\"$gpu\"}", "legendFormat": "temperature", "refId": "A"}, {"expr": "DCGM_FI_DEV_POWER_USAGE{gpu=~\"$gpu\"}", "legendFormat": "power", "refId": "B"}],
+      "title": "GPU temperature and power",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "inferx-prometheus"},
+      "description": "Availability depends on the GPU, driver, and DCGM profiling support.",
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}, "unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 28},
+      "id": 12,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "DCGM_FI_PROF_PCIE_TX_BYTES{gpu=~\"$gpu\"}", "legendFormat": "PCIe TX GPU {{gpu}}", "refId": "A"}, {"expr": "DCGM_FI_PROF_PCIE_RX_BYTES{gpu=~\"$gpu\"}", "legendFormat": "PCIe RX GPU {{gpu}}", "refId": "B"}, {"expr": "DCGM_FI_PROF_NVLINK_TX_BYTES{gpu=~\"$gpu\"}", "legendFormat": "NVLink TX GPU {{gpu}}", "refId": "C"}, {"expr": "DCGM_FI_PROF_NVLINK_RX_BYTES{gpu=~\"$gpu\"}", "legendFormat": "NVLink RX GPU {{gpu}}", "refId": "D"}],
+      "title": "GPU interconnect traffic",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["inferx", "tensor-parallel", "nccl", "gpu"],
+  "templating": {
+    "list": [
+      {"current": {"selected": false, "text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "inferx-prometheus"}, "definition": "label_values(inferx_rank_healthy, instance)", "includeAll": true, "label": "InferX instance", "multi": true, "name": "instance", "options": [], "query": {"query": "label_values(inferx_rank_healthy, instance)", "refId": "VariableQuery"}, "refresh": 1, "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "inferx-prometheus"}, "definition": "label_values(inferx_rank_healthy{instance=~\"$instance\"}, rank)", "includeAll": true, "label": "Rank", "multi": true, "name": "rank", "options": [], "query": {"query": "label_values(inferx_rank_healthy{instance=~\"$instance\"}, rank)", "refId": "VariableQuery"}, "refresh": 1, "type": "query"},
+      {"current": {"selected": false, "text": "All", "value": "$__all"}, "datasource": {"type": "prometheus", "uid": "inferx-prometheus"}, "definition": "label_values(DCGM_FI_DEV_GPU_UTIL, gpu)", "includeAll": true, "label": "GPU", "multi": true, "name": "gpu", "options": [], "query": {"query": "label_values(DCGM_FI_DEV_GPU_UTIL, gpu)", "refId": "VariableQuery"}, "refresh": 1, "type": "query"}
+    ]
+  },
+  "time": {"from": "now-30m", "to": "now"},
+  "timezone": "browser",
+  "title": "InferX Tensor Parallel and GPUs",
+  "uid": "inferx-tensor-parallel",
+  "version": 1
+}

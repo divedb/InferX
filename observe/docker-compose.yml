@@ -1,0 +1,61 @@
+name: inferx-observe
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.10.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - 127.0.0.1:${PROMETHEUS_PORT:-9090}:9090
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-inferx}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - 127.0.0.1:${GRAFANA_PORT:-3000}:3000
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.5.3-4.8.2-ubuntu22.04
+    cap_add:
+      - SYS_ADMIN
+    gpus: all
+    ports:
+      - 127.0.0.1:${DCGM_EXPORTER_PORT:-9400}:9400
+    restart: unless-stopped
+    profiles: [gpu]
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.11.1
+    command:
+      - --path.rootfs=/host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - 127.0.0.1:${NODE_EXPORTER_PORT:-9100}:9100
+    restart: unless-stopped
+    profiles: [host]
+
+volumes:
+  prometheus-data:
+  grafana-data:
