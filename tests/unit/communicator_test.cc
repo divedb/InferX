@@ -21,6 +21,7 @@ namespace {
 
 uint16_t Bf16(float value);
 float Float(uint16_t value);
+TensorView CpuView(void* data, DataType dtype, int64_t count);
 
 TEST(NcclCommTest, MissingBackendFailsClearly) {
   if (NcclBackendAvailable()) GTEST_SKIP() << "NCCL backend is installed";
@@ -105,6 +106,38 @@ TEST(NcclCommTest, TwoGpuBf16AllReduceUsesTheSuppliedStreams) {
     EXPECT_FLOAT_EQ(Float(outputs[static_cast<size_t>(rank)]), 3.0f);
   }
 }
+
+TEST(CommunicatorMetricsTest, TimingSkipsCudaGraphCapture) {
+  if (CudaDeviceCount() < 1) GTEST_SKIP() << "needs a CUDA device";
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  cudaStream_t stream = nullptr;
+  ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+            cudaSuccess);
+  auto metrics = std::make_shared<CommMetrics>();
+  std::unique_ptr<Communicator> communicator = ObserveCommunicator(
+      std::make_unique<SingleRankComm>(DeviceId::Cuda(0)), metrics,
+      {.timing_sample_every = 1, .timing_ring_size = 2});
+  auto buffer = DeviceBuffer::Allocate(4, DeviceId::Cuda(0));
+  ASSERT_TRUE(buffer.ok()) << buffer.status();
+  std::vector<float> values = {1.0f};
+
+  ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+            cudaSuccess);
+  ASSERT_EQ(cudaMemsetAsync(buffer->data(), 0, buffer->size(), stream),
+            cudaSuccess);
+  EXPECT_TRUE(
+      communicator
+          ->AllReduceSum(
+              CpuView(values.data(), DataType::kFloat, values.size()), stream)
+          .ok());
+  cudaGraph_t graph = nullptr;
+  ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+
+  EXPECT_EQ(metrics->Snapshot().timing_graph_skips, 1);
+  ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+  communicator.reset();
+  ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
 #endif
 
 TensorView CpuView(void* data, DataType dtype, int64_t count) {
@@ -157,6 +190,23 @@ TEST(CommunicatorMetricsTest, DecoratorCountsCallsBytesFailuresAndAborts) {
   EXPECT_EQ(snapshot.collective_failures, 1);
   EXPECT_EQ(snapshot.aborts, 1);
   EXPECT_EQ(CommBackendName(comm->backend()), std::string_view("single"));
+}
+
+TEST(CommunicatorMetricsTest, LatencySnapshotUsesFixedNonCumulativeBuckets) {
+  CommMetrics metrics;
+  metrics.RecordLatency(0.00002);
+  metrics.RecordLatency(0.00007);
+  metrics.RecordLatency(0.2);
+  metrics.RecordTimingDrop();
+  metrics.RecordGraphSkip();
+
+  const CommMetricSnapshot snapshot = metrics.Snapshot();
+  EXPECT_EQ(snapshot.latency_count, 3);
+  EXPECT_DOUBLE_EQ(snapshot.latency_sum_seconds, 0.20009);
+  EXPECT_EQ(snapshot.latency_buckets[1], 1);
+  EXPECT_EQ(snapshot.latency_buckets[3], 1);
+  EXPECT_EQ(snapshot.timing_samples_dropped, 1);
+  EXPECT_EQ(snapshot.timing_graph_skips, 1);
 }
 
 TEST(HostSimCommTest, FourRanksAllReceiveTheSum) {

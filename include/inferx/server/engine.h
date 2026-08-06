@@ -32,6 +32,10 @@ struct EngineConfig {
   std::vector<int> devices{0};
   std::string comm_backend = "single";
 
+  /// Diagnostic CUDA-event timing. Zero disables it; N samples every Nth
+  /// collective. Sampling is automatically skipped during graph capture.
+  uint64_t collective_timing_sample_every = 0;
+
   /// Quantize weights to FP8 e4m3 at load. Roughly halves weight bandwidth and
   /// so nearly halves decode latency, at the cost of per-tensor quantization
   /// error. Off by default: it changes the model's output, and that should be

@@ -1,9 +1,9 @@
 # InferX observability design
 
-Status: implementation plan for M7 tensor parallelism. Milestones 1 through 3
-are implemented: serving lifecycle metrics are joined by backend-neutral
-collective counters, communicator aborts/timeouts, rank health/progress, and
-per-rank device-step histograms.
+Status: implementation plan for M7 tensor parallelism. Milestones 1 through 4
+are implemented, including opt-in sampled CUDA-event timing with a preallocated
+per-rank ring. Completed events are polled on later collective calls without a
+stream/device synchronization; graph capture is detected and skipped.
 
 ## Scope and reviewed implementations
 
@@ -180,7 +180,10 @@ DCGM Exporter and optional Node Exporter will be pinned as container images in t
 1. **Registry and endpoint** — implement counter/gauge/histogram primitives, escaping and text exposition; add `/metrics`; preserve `/stats`; add golden-format and concurrent-scrape tests.
 2. **Serving lifecycle** — attach request timestamps and terminal outcomes; expose scheduler, token, latency, batch, KV, prefix-cache, preemption, graph, and engine-info metrics from their current owners.
 3. **Communicator hooks** — add backend-neutral callbacks for call/byte/failure/abort/timeout accounting; instrument NCCL without timing synchronization; add rank health and per-rank step timing.
-4. **Diagnostic timing** — implement opt-in sampled CUDA-event timing behind the communicator interface and validate that graph capture behavior is unchanged.
+4. **Diagnostic timing** — implemented behind the communicator interface and
+   enabled with `--collective-timing-sample-rate N`. It exports completed
+   samples, graph skips, and ring/event drops; zero (the default) performs no
+   CUDA timing calls.
 5. **Monitoring stack** — add Prometheus scrape/rule configuration, pinned container deployment, Grafana provisioning/dashboards, and DCGM Exporter mapping from CUDA rank to GPU UUID.
 6. **Validation** — test single-GPU baselines first, then one-host/two-GPU TP under prompt-heavy, decode-heavy, saturated, cache-hit, cache-miss, cancellation, and injected rank-failure scenarios.
 

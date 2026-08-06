@@ -196,6 +196,17 @@ void Histogram::Observe(double value) noexcept {
   count_.fetch_add(1, std::memory_order_relaxed);
   sum_.fetch_add(value, std::memory_order_relaxed);
 }
+void Histogram::SetSnapshot(const std::vector<uint64_t>& bucket_counts,
+                            uint64_t count, double sum) {
+  if (bucket_counts.size() != buckets_.size()) {
+    throw std::invalid_argument("histogram snapshot bucket count mismatch");
+  }
+  for (size_t i = 0; i < bucket_counts.size(); ++i) {
+    bucket_counts_[i].store(bucket_counts[i], std::memory_order_relaxed);
+  }
+  count_.store(count, std::memory_order_relaxed);
+  sum_.store(sum, std::memory_order_relaxed);
+}
 uint64_t Histogram::count() const noexcept {
   return count_.load(std::memory_order_relaxed);
 }

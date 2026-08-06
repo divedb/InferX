@@ -16,6 +16,7 @@ struct QwenRunnerConfig {
   std::string model_dir;
   std::vector<int> devices{0};
   bool use_nccl = false;
+  uint64_t collective_timing_sample_every = 0;
   bool fp8_weights = false;
   bool int4_weights = false;
   bool fp8_kv_cache = false;

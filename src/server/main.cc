@@ -1,7 +1,8 @@
 /// inferx-serve -- the OpenAI-compatible server.
 ///
 /// M4's deliverable, and the point at which the engine becomes usable by
-/// something other than a test: a checkpoint directory in, an HTTP endpoint out.
+/// something other than a test: a checkpoint directory in, an HTTP endpoint
+/// out.
 
 #include <csignal>
 #include <cstdio>
@@ -23,7 +24,8 @@ void HandleSignal(int /*signum*/) {
 }
 
 void PrintUsage(const char* argv0) {
-  std::fprintf(stderr,
+  std::fprintf(
+      stderr,
       "usage: %s --model <dir> [options]\n"
       "\n"
       "  --model <dir>          checkpoint directory (required)\n"
@@ -37,6 +39,8 @@ void PrintUsage(const char* argv0) {
       "  --tensor-parallel-size <n>  tensor-parallel ranks (1 or 2)\n"
       "  --devices <ids>        comma-separated CUDA devices (default 0)\n"
       "  --comm-backend <name>  single or nccl\n"
+      "  --collective-timing-sample-rate <n>\n"
+      "                         sample every Nth collective (default off)\n"
       "  --fp8                  quantize weights to FP8 e4m3\n"
       "  --w4a16                quantize projection weights to grouped int4\n"
       "  --fp8-kv               store the KV cache as FP8 e4m3\n"
@@ -119,18 +123,27 @@ int main(int argc, char** argv) {
       if (!NextValue(argc, argv, &i, "--block-size", &value)) return 2;
       engine_config.block_size = std::atoll(value.c_str());
     } else if (arg == "--tensor-parallel-size") {
-      if (!NextValue(argc, argv, &i, "--tensor-parallel-size", &value)) return 2;
+      if (!NextValue(argc, argv, &i, "--tensor-parallel-size", &value))
+        return 2;
       engine_config.tensor_parallel_size = std::atoi(value.c_str());
     } else if (arg == "--devices") {
       if (!NextValue(argc, argv, &i, "--devices", &value)) return 2;
       if (!ParseDevices(value, &engine_config.devices)) {
-        std::fprintf(stderr, "error: invalid --devices list %s\n", value.c_str());
+        std::fprintf(stderr, "error: invalid --devices list %s\n",
+                     value.c_str());
         return 2;
       }
     } else if (arg == "--comm-backend") {
       if (!NextValue(argc, argv, &i, "--comm-backend", &value)) return 2;
       engine_config.comm_backend = value;
       comm_backend_explicit = true;
+    } else if (arg == "--collective-timing-sample-rate") {
+      if (!NextValue(argc, argv, &i, "--collective-timing-sample-rate",
+                     &value)) {
+        return 2;
+      }
+      engine_config.collective_timing_sample_every =
+          std::strtoull(value.c_str(), nullptr, 10);
     } else if (arg == "--fp8") {
       engine_config.fp8_weights = true;
     } else if (arg == "--w4a16") {

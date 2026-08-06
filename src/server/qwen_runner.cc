@@ -197,8 +197,9 @@ class RankWorker {
       if (!communicator.ok()) {
         status = communicator.status();
       } else {
-        *communicator =
-            comm::ObserveCommunicator(std::move(*communicator), communication_);
+        *communicator = comm::ObserveCommunicator(
+            std::move(*communicator), communication_,
+            {.timing_sample_every = config_.collective_timing_sample_every});
         auto loaded = model::Qwen2Model::LoadFromDirectory(
             config_.model_dir, std::move(*communicator));
         if (!loaded.ok()) {
@@ -395,8 +396,9 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   auto communicator = std::make_unique<comm::SingleRankComm>(
       DeviceId::Cuda(static_cast<int8_t>(device)));
   auto communication = std::make_shared<comm::CommMetrics>();
-  std::unique_ptr<comm::Communicator> observed =
-      comm::ObserveCommunicator(std::move(communicator), communication);
+  std::unique_ptr<comm::Communicator> observed = comm::ObserveCommunicator(
+      std::move(communicator), communication,
+      {.timing_sample_every = config.collective_timing_sample_every});
   INFERX_ASSIGN_OR_RETURN(model::Qwen2Model model,
                           model::Qwen2Model::LoadFromDirectory(
                               config.model_dir, std::move(observed)));

@@ -49,6 +49,23 @@ TEST(MetricsTest, HistogramBucketsAreCumulative) {
             "inferx_step_seconds_count{rank=\"0\"} 3\n");
 }
 
+TEST(MetricsTest, HistogramCanRenderAnExternalSnapshot) {
+  Registry registry;
+  auto histogram =
+      registry.AddHistogram("inferx_external_seconds", "Time.", {0.1, 1.0});
+  histogram->SetSnapshot({2, 3}, 7, 4.5);
+  const std::string rendered = registry.Render();
+  EXPECT_NE(rendered.find("inferx_external_seconds_bucket{le=\"0.1\"} 2"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("inferx_external_seconds_bucket{le=\"1\"} 5"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("inferx_external_seconds_bucket{le=\"+Inf\"} 7"),
+            std::string::npos);
+  EXPECT_NE(rendered.find("inferx_external_seconds_sum 4.5"),
+            std::string::npos);
+  EXPECT_THROW(histogram->SetSnapshot({1}, 1, 0.1), std::invalid_argument);
+}
+
 TEST(MetricsTest, RejectsInvalidAndConflictingDescriptors) {
   Registry registry;
   EXPECT_THROW(registry.AddCounter("9bad", "Bad."), std::invalid_argument);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -32,6 +33,21 @@ struct CommMetricSnapshot {
   uint64_t all_reduce_bytes = 0;
   uint64_t collective_failures = 0;
   uint64_t aborts = 0;
+  std::array<uint64_t, 13> latency_buckets{};
+  uint64_t latency_count = 0;
+  double latency_sum_seconds = 0.0;
+  uint64_t timing_samples_dropped = 0;
+  uint64_t timing_graph_skips = 0;
+};
+
+inline constexpr std::array<double, 13> kCollectiveLatencyBuckets = {
+    .00001, .000025, .00005, .0001, .00025, .0005, .001,
+    .0025,  .005,    .01,    .025,  .05,    .1};
+
+struct CommObservationConfig {
+  /// Zero disables CUDA-event timing. N samples every Nth collective.
+  uint64_t timing_sample_every = 0;
+  size_t timing_ring_size = 256;
 };
 
 /// Backend-neutral counters shared with the owner after the decorated
@@ -41,12 +57,20 @@ class CommMetrics {
   CommMetricSnapshot Snapshot() const noexcept;
   void RecordAllReduce(uint64_t bytes, bool success) noexcept;
   void RecordAbort() noexcept;
+  void RecordLatency(double seconds) noexcept;
+  void RecordTimingDrop() noexcept;
+  void RecordGraphSkip() noexcept;
 
  private:
   std::atomic<uint64_t> all_reduce_calls_{0};
   std::atomic<uint64_t> all_reduce_bytes_{0};
   std::atomic<uint64_t> collective_failures_{0};
   std::atomic<uint64_t> aborts_{0};
+  std::array<std::atomic<uint64_t>, 13> latency_buckets_{};
+  std::atomic<uint64_t> latency_count_{0};
+  std::atomic<double> latency_sum_seconds_{0.0};
+  std::atomic<uint64_t> timing_samples_dropped_{0};
+  std::atomic<uint64_t> timing_graph_skips_{0};
 };
 
 /// Collective communication used by tensor-parallel model layers.
@@ -77,7 +101,8 @@ class Communicator {
 /// Wraps any communicator with lock-free call/byte/error accounting. The
 /// wrapper adds no CUDA operations and measures no host-call duration.
 std::unique_ptr<Communicator> ObserveCommunicator(
-    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics);
+    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics,
+    CommObservationConfig config = {});
 
 /// The production default at TP=1. The collective validates its input and is
 /// otherwise a no-op, so model code always exercises the communicator call.

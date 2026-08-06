@@ -72,6 +72,10 @@ class Histogram final : public Metric {
             Labels labels = {});
 
   void Observe(double value) noexcept;
+  /// Replaces values from an external non-cumulative histogram snapshot.
+  /// Intended for scrape-time adapters, not concurrent live instruments.
+  void SetSnapshot(const std::vector<uint64_t>& bucket_counts, uint64_t count,
+                   double sum);
   uint64_t count() const noexcept;
 
   Type type() const override;

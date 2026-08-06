@@ -22,8 +22,40 @@ namespace {
 class ObservedCommunicator final : public Communicator {
  public:
   ObservedCommunicator(std::unique_ptr<Communicator> inner,
-                       std::shared_ptr<CommMetrics> metrics)
-      : inner_(std::move(inner)), metrics_(std::move(metrics)) {}
+                       std::shared_ptr<CommMetrics> metrics,
+                       CommObservationConfig config)
+      : inner_(std::move(inner)),
+        metrics_(std::move(metrics)),
+        config_(config) {
+#if defined(INFERX_WITH_CUDA)
+    if (config_.timing_sample_every == 0 || !inner_->device().IsCuda()) return;
+    if (config_.timing_ring_size == 0) config_.timing_ring_size = 1;
+    if (cudaSetDevice(static_cast<int>(inner_->device().index)) !=
+        cudaSuccess) {
+      metrics_->RecordTimingDrop();
+      config_.timing_sample_every = 0;
+      return;
+    }
+    slots_.resize(config_.timing_ring_size);
+    for (Slot& slot : slots_) {
+      if (cudaEventCreate(&slot.start) != cudaSuccess ||
+          cudaEventCreate(&slot.end) != cudaSuccess) {
+        metrics_->RecordTimingDrop();
+        config_.timing_sample_every = 0;
+        break;
+      }
+    }
+#endif
+  }
+
+  ~ObservedCommunicator() override {
+#if defined(INFERX_WITH_CUDA)
+    for (Slot& slot : slots_) {
+      if (slot.start != nullptr) (void)cudaEventDestroy(slot.start);
+      if (slot.end != nullptr) (void)cudaEventDestroy(slot.end);
+    }
+#endif
+  }
 
   int rank() const override { return inner_->rank(); }
   int size() const override { return inner_->size(); }
@@ -35,7 +67,14 @@ class ObservedCommunicator final : public Communicator {
 
   Status AllReduceSum(const TensorView& tensor, void* stream) override {
     const uint64_t bytes = tensor.IsDefined() ? tensor.NBytes() : 0;
+#if defined(INFERX_WITH_CUDA)
+    PollSamples();
+    Slot* sample = BeginSample(stream);
+#endif
     Status result = inner_->AllReduceSum(tensor, stream);
+#if defined(INFERX_WITH_CUDA)
+    EndSample(sample, stream, result.ok());
+#endif
     metrics_->RecordAllReduce(bytes, result.ok());
     return result;
   }
@@ -46,8 +85,83 @@ class ObservedCommunicator final : public Communicator {
   }
 
  private:
+#if defined(INFERX_WITH_CUDA)
+  struct Slot {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+    bool active = false;
+    bool record = true;
+  };
+
+  void PollSamples() noexcept {
+    for (Slot& slot : slots_) {
+      if (!slot.active) continue;
+      const cudaError_t ready = cudaEventQuery(slot.end);
+      if (ready == cudaErrorNotReady) continue;
+      if (ready == cudaSuccess) {
+        if (slot.record) {
+          float milliseconds = 0.0f;
+          if (cudaEventElapsedTime(&milliseconds, slot.start, slot.end) ==
+              cudaSuccess) {
+            metrics_->RecordLatency(milliseconds / 1000.0);
+          } else {
+            metrics_->RecordTimingDrop();
+          }
+        }
+      } else {
+        metrics_->RecordTimingDrop();
+      }
+      slot.active = false;
+    }
+  }
+
+  Slot* BeginSample(void* stream) noexcept {
+    if (config_.timing_sample_every == 0 || slots_.empty()) return nullptr;
+    if (++collective_sequence_ % config_.timing_sample_every != 0) {
+      return nullptr;
+    }
+    auto cuda_stream = static_cast<cudaStream_t>(stream);
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cuda_stream, &capture) != cudaSuccess) {
+      metrics_->RecordTimingDrop();
+      return nullptr;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
+      metrics_->RecordGraphSkip();
+      return nullptr;
+    }
+    for (Slot& slot : slots_) {
+      if (slot.active) continue;
+      if (cudaEventRecord(slot.start, cuda_stream) != cudaSuccess) {
+        metrics_->RecordTimingDrop();
+        return nullptr;
+      }
+      return &slot;
+    }
+    metrics_->RecordTimingDrop();
+    return nullptr;
+  }
+
+  void EndSample(Slot* slot, void* stream, bool success) noexcept {
+    if (slot == nullptr) return;
+    if (cudaEventRecord(slot->end, static_cast<cudaStream_t>(stream)) !=
+        cudaSuccess) {
+      metrics_->RecordTimingDrop();
+      return;
+    }
+    slot->active = true;
+    slot->record = success;
+    if (!success) metrics_->RecordTimingDrop();
+  }
+#endif
+
   std::unique_ptr<Communicator> inner_;
   std::shared_ptr<CommMetrics> metrics_;
+  CommObservationConfig config_;
+#if defined(INFERX_WITH_CUDA)
+  std::vector<Slot> slots_;
+  uint64_t collective_sequence_ = 0;
+#endif
 };
 
 Status ValidateTensor(const TensorView& tensor, bool allow_cuda) {
@@ -278,13 +392,25 @@ const char* CommBackendName(CommBackend backend) {
 }
 
 CommMetricSnapshot CommMetrics::Snapshot() const noexcept {
-  return {
+  CommMetricSnapshot snapshot = {
       .all_reduce_calls = all_reduce_calls_.load(std::memory_order_relaxed),
       .all_reduce_bytes = all_reduce_bytes_.load(std::memory_order_relaxed),
       .collective_failures =
           collective_failures_.load(std::memory_order_relaxed),
       .aborts = aborts_.load(std::memory_order_relaxed),
   };
+  for (size_t i = 0; i < snapshot.latency_buckets.size(); ++i) {
+    snapshot.latency_buckets[i] =
+        latency_buckets_[i].load(std::memory_order_relaxed);
+  }
+  snapshot.latency_count = latency_count_.load(std::memory_order_relaxed);
+  snapshot.latency_sum_seconds =
+      latency_sum_seconds_.load(std::memory_order_relaxed);
+  snapshot.timing_samples_dropped =
+      timing_samples_dropped_.load(std::memory_order_relaxed);
+  snapshot.timing_graph_skips =
+      timing_graph_skips_.load(std::memory_order_relaxed);
+  return snapshot;
 }
 
 void CommMetrics::RecordAllReduce(uint64_t bytes, bool success) noexcept {
@@ -297,11 +423,33 @@ void CommMetrics::RecordAbort() noexcept {
   aborts_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void CommMetrics::RecordLatency(double seconds) noexcept {
+  const auto bucket =
+      std::lower_bound(kCollectiveLatencyBuckets.begin(),
+                       kCollectiveLatencyBuckets.end(), seconds);
+  if (bucket != kCollectiveLatencyBuckets.end()) {
+    latency_buckets_[static_cast<size_t>(bucket -
+                                         kCollectiveLatencyBuckets.begin())]
+        .fetch_add(1, std::memory_order_relaxed);
+  }
+  latency_count_.fetch_add(1, std::memory_order_relaxed);
+  latency_sum_seconds_.fetch_add(seconds, std::memory_order_relaxed);
+}
+
+void CommMetrics::RecordTimingDrop() noexcept {
+  timing_samples_dropped_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CommMetrics::RecordGraphSkip() noexcept {
+  timing_graph_skips_.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::unique_ptr<Communicator> ObserveCommunicator(
-    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics) {
+    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics,
+    CommObservationConfig config) {
   if (inner == nullptr || metrics == nullptr) return inner;
   return std::make_unique<ObservedCommunicator>(std::move(inner),
-                                                std::move(metrics));
+                                                std::move(metrics), config);
 }
 
 Status SingleRankComm::AllReduceSum(const TensorView& tensor, void*) {

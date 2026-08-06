@@ -188,6 +188,27 @@ std::string RenderRankMetrics(const std::vector<RankTelemetry>& ranks) {
         .AddCounter("inferx_collective_failures_total",
                     "Collective failures by rank.", collective_labels)
         ->Increment(rank.communication.collective_failures);
+    auto latency = registry.AddHistogram(
+        "inferx_collective_seconds",
+        "Sampled CUDA-event collective duration by rank.",
+        std::vector<double>(comm::kCollectiveLatencyBuckets.begin(),
+                            comm::kCollectiveLatencyBuckets.end()),
+        collective_labels);
+    latency->SetSnapshot(
+        std::vector<uint64_t>(rank.communication.latency_buckets.begin(),
+                              rank.communication.latency_buckets.end()),
+        rank.communication.latency_count,
+        rank.communication.latency_sum_seconds);
+    registry
+        .AddCounter("inferx_collective_timing_samples_dropped_total",
+                    "Collective timing samples dropped before observation.",
+                    collective_labels)
+        ->Increment(rank.communication.timing_samples_dropped);
+    registry
+        .AddCounter("inferx_collective_timing_graph_skips_total",
+                    "Collective timing samples skipped during graph capture.",
+                    collective_labels)
+        ->Increment(rank.communication.timing_graph_skips);
     registry
         .AddCounter("inferx_communicator_aborts_total",
                     "Communicator abort calls by rank.",
@@ -957,6 +978,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     runner_config.model_dir = config.model_dir;
     runner_config.devices = config.devices;
     runner_config.use_nccl = config.comm_backend == "nccl";
+    runner_config.collective_timing_sample_every =
+        config.collective_timing_sample_every;
     runner_config.fp8_weights = config.fp8_weights;
     runner_config.int4_weights = config.int4_weights;
     runner_config.fp8_kv_cache = config.fp8_kv_cache;
