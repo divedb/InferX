@@ -22,7 +22,10 @@ class Communicator {
 
   /// Sums corresponding elements across ranks and writes the result in-place
   /// on every rank. All ranks must provide the same dtype and element count.
-  virtual Status AllReduceSum(const TensorView& tensor) = 0;
+  /// `stream` is the backend's opaque execution stream (a cudaStream_t for
+  /// CUDA/NCCL). Host tensors ignore it.
+  virtual Status AllReduceSum(const TensorView& tensor,
+                              void* stream = nullptr) = 0;
 };
 
 /// The production default at TP=1. The collective validates its input and is
@@ -31,14 +34,15 @@ class SingleRankComm final : public Communicator {
  public:
   int rank() const override { return 0; }
   int size() const override { return 1; }
-  Status AllReduceSum(const TensorView& tensor) override;
+  Status AllReduceSum(const TensorView& tensor, void* stream = nullptr) override;
 };
 
 /// Creates one host-simulated communicator per rank, sharing one rendezvous.
 ///
-/// HostSimComm accepts CPU f32, f64, i32, i64 and bf16 tensors. Each rank is
-/// intended to run on its own host thread. Reduction order is rank 0..N-1,
-/// making numerical tests reproducible without multi-GPU hardware.
+/// HostSimComm accepts CPU tensors and, in a CUDA build, CUDA tensors staged
+/// through host memory. Each rank is intended to run on its own host thread.
+/// Reduction order is rank 0..N-1, making numerical tests reproducible without
+/// multi-GPU hardware. CUDA staging is a correctness backend, not a benchmark.
 StatusOr<std::vector<std::unique_ptr<Communicator>>>
 CreateHostSimCommunicators(int size);
 

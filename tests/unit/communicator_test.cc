@@ -7,6 +7,13 @@
 #include <thread>
 #include <vector>
 
+#if defined(INFERX_WITH_CUDA)
+#include <cuda_runtime_api.h>
+
+#include "inferx/core/cuda_utils.h"
+#include "inferx/core/device_buffer.h"
+#endif
+
 namespace inferx::comm {
 namespace {
 
@@ -129,6 +136,48 @@ TEST(HostSimCommTest, RejectsInvalidWorldSize) {
   EXPECT_FALSE(CreateHostSimCommunicators(0).ok());
   EXPECT_FALSE(CreateHostSimCommunicators(-2).ok());
 }
+
+#if defined(INFERX_WITH_CUDA)
+TEST(HostSimCommTest, StagesCudaTensorsForDifferentialTesting) {
+  if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+  auto created = CreateHostSimCommunicators(2);
+  ASSERT_TRUE(created.ok()) << created.status();
+  auto comms = std::move(*created);
+  std::vector<std::vector<float>> host = {{1.0f, 2.0f}, {3.0f, -1.0f}};
+  std::vector<DeviceBuffer> buffers;
+  std::vector<cudaStream_t> streams(2, nullptr);
+  for (int rank = 0; rank < 2; ++rank) {
+    auto buffer = DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0));
+    ASSERT_TRUE(buffer.ok()) << buffer.status();
+    ASSERT_EQ(cudaMemcpy(buffer->data(), host[rank].data(), buffer->size(),
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    buffers.push_back(std::move(*buffer));
+    ASSERT_EQ(cudaStreamCreateWithFlags(&streams[rank], cudaStreamNonBlocking),
+              cudaSuccess);
+  }
+  std::vector<Status> statuses(2);
+  std::vector<std::thread> threads;
+  for (int rank = 0; rank < 2; ++rank) {
+    threads.emplace_back([&, rank] {
+      auto view = TensorView::Create(buffers[rank].data(), DataType::kFloat,
+                                     Shape({2}), DeviceId::Cuda(0));
+      ASSERT_TRUE(view.ok()) << view.status();
+      statuses[rank] =
+          comms[rank]->AllReduceSum(*view, static_cast<void*>(streams[rank]));
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  for (int rank = 0; rank < 2; ++rank) {
+    EXPECT_TRUE(statuses[rank].ok()) << statuses[rank];
+    ASSERT_EQ(cudaMemcpy(host[rank].data(), buffers[rank].data(),
+                         buffers[rank].size(), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(host[rank], (std::vector<float>{4.0f, 1.0f}));
+    EXPECT_EQ(cudaStreamDestroy(streams[rank]), cudaSuccess);
+  }
+}
+#endif
 
 }  // namespace
 }  // namespace inferx::comm

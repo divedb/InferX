@@ -10,14 +10,23 @@
 #include <utility>
 #include <vector>
 
+#if defined(INFERX_WITH_CUDA)
+#include <cuda_runtime_api.h>
+
+#include "inferx/core/cuda_utils.h"
+#endif
+
 namespace inferx::comm {
 namespace {
 
-Status ValidateTensor(const TensorView& tensor, bool host_only) {
+Status ValidateTensor(const TensorView& tensor, bool allow_cuda) {
   if (!tensor.IsDefined())
     return InvalidArgumentError("AllReduceSum: tensor is undefined");
-  if (host_only && !tensor.IsCpu())
-    return InvalidArgumentError("HostSimComm requires a CPU tensor");
+  if (!tensor.IsCpu() && !tensor.IsCuda())
+    return InvalidArgumentError("AllReduceSum: unsupported device");
+  if (tensor.IsCuda() && !allow_cuda)
+    return UnimplementedError(
+        "HostSimComm CUDA tensors require a CUDA-enabled build");
   switch (tensor.GetDataType()) {
     case DataType::kFloat:
     case DataType::kDouble:
@@ -68,10 +77,16 @@ void SumBf16(const std::vector<std::vector<std::byte>>& inputs, int64_t count,
 struct HostSimState {
   explicit HostSimState(int world_size)
       : size(world_size), inputs(static_cast<size_t>(world_size)),
-        outputs(static_cast<size_t>(world_size), nullptr) {}
+        outputs(static_cast<size_t>(world_size)) {}
 
-  Status AllReduce(int rank, const TensorView& tensor) {
-    INFERX_RETURN_IF_ERROR(ValidateTensor(tensor, /*host_only=*/true));
+  Status AllReduce(int rank, const TensorView& tensor, void* stream) {
+#if defined(INFERX_WITH_CUDA)
+    constexpr bool kAllowCuda = true;
+#else
+    constexpr bool kAllowCuda = false;
+    (void)stream;
+#endif
+    INFERX_RETURN_IF_ERROR(ValidateTensor(tensor, kAllowCuda));
 
     std::unique_lock lock(mu);
     if (arrived == 0) {
@@ -88,10 +103,27 @@ struct HostSimState {
 
     inputs[static_cast<size_t>(rank)].resize(tensor.NBytes());
     if (tensor.NBytes() != 0) {
-      std::memcpy(inputs[static_cast<size_t>(rank)].data(), tensor.Data(),
-                  tensor.NBytes());
+      if (tensor.IsCpu()) {
+        std::memcpy(inputs[static_cast<size_t>(rank)].data(), tensor.Data(),
+                    tensor.NBytes());
+      } else {
+#if defined(INFERX_WITH_CUDA)
+        auto cuda_stream = static_cast<cudaStream_t>(stream);
+        cudaError_t error = cudaStreamSynchronize(cuda_stream);
+        if (error == cudaSuccess) {
+          error = cudaMemcpy(inputs[static_cast<size_t>(rank)].data(),
+                             tensor.Data(), tensor.NBytes(),
+                             cudaMemcpyDeviceToHost);
+        }
+        if (error != cudaSuccess) {
+          collective_status = InternalError(
+              "HostSimComm CUDA staging failed on rank ", rank, ": ",
+              cudaGetErrorString(error));
+        }
+#endif
+      }
     }
-    outputs[static_cast<size_t>(rank)] = tensor.Data();
+    outputs[static_cast<size_t>(rank)] = tensor;
     ++arrived;
 
     if (arrived == size) {
@@ -138,7 +170,22 @@ struct HostSimState {
         return;
     }
     if (bytes != 0) {
-      for (void* output : outputs) std::memcpy(output, result.data(), bytes);
+      for (const TensorView& output : outputs) {
+        if (output.IsCpu()) {
+          std::memcpy(output.Data(), result.data(), bytes);
+        } else {
+#if defined(INFERX_WITH_CUDA)
+          const cudaError_t error = cudaMemcpy(
+              output.Data(), result.data(), bytes, cudaMemcpyHostToDevice);
+          if (error != cudaSuccess) {
+            collective_status = InternalError(
+                "HostSimComm CUDA broadcast failed: ",
+                cudaGetErrorString(error));
+            return;
+          }
+#endif
+        }
+      }
     }
   }
 
@@ -153,7 +200,7 @@ struct HostSimState {
   size_t bytes = 0;
   Status collective_status;
   std::vector<std::vector<std::byte>> inputs;
-  std::vector<void*> outputs;
+  std::vector<TensorView> outputs;
 };
 
 class HostSimComm final : public Communicator {
@@ -163,8 +210,8 @@ class HostSimComm final : public Communicator {
 
   int rank() const override { return rank_; }
   int size() const override { return state_->size; }
-  Status AllReduceSum(const TensorView& tensor) override {
-    return state_->AllReduce(rank_, tensor);
+  Status AllReduceSum(const TensorView& tensor, void* stream) override {
+    return state_->AllReduce(rank_, tensor, stream);
   }
 
  private:
@@ -174,8 +221,8 @@ class HostSimComm final : public Communicator {
 
 }  // namespace
 
-Status SingleRankComm::AllReduceSum(const TensorView& tensor) {
-  return ValidateTensor(tensor, /*host_only=*/false);
+Status SingleRankComm::AllReduceSum(const TensorView& tensor, void*) {
+  return ValidateTensor(tensor, /*allow_cuda=*/true);
 }
 
 StatusOr<std::vector<std::unique_ptr<Communicator>>>
