@@ -1,5 +1,14 @@
 include(GoogleTest)
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME analyze_tp_test
+    COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_analyze_tp -v)
+  set_tests_properties(analyze_tp_test PROPERTIES
+    LABELS unit
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+endif()
+
 # Every test here must run to completion on a machine with no GPU. Tests that
 # need a device gate themselves on inferx::CudaAvailable() and skip.
 function(inferx_add_test name)

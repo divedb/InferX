@@ -42,7 +42,7 @@ if [[ ${#ENGINES[@]} -eq 0 ]]; then
   ENGINES=(inferx-bf16 inferx-fp8 vllm)
 fi
 
-OUT_DIR="$ROOT/bench-results/$(date +%Y%m%d-%H%M%S)"
+OUT_DIR="${OUT_DIR:-$ROOT/bench-results/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT_DIR"
 LOG="$OUT_DIR/console.log"
 

@@ -128,13 +128,22 @@ export ROUNDS=${ROUNDS:-2}
 export CONCURRENCY=${CONCURRENCY:-1,2,4,8}
 export PREFILL_LENS=${PREFILL_LENS:-512,2048}
 export DECODE_TOKENS=${DECODE_TOKENS:-128}
-run_recorded ./scripts/bench_serve.sh inferx-tp1 || exit 6
-run_recorded ./scripts/bench_serve.sh inferx-tp2 || exit 7
+OUT_DIR=$RESULT_DIR/tp1 run_recorded ./scripts/bench_serve.sh inferx-tp1 || exit 6
+OUT_DIR=$RESULT_DIR/tp2 run_recorded ./scripts/bench_serve.sh inferx-tp2 || exit 7
 start_scraper
-run_recorded ./scripts/bench_serve.sh inferx-tp2-scraped || exit 8
+OUT_DIR=$RESULT_DIR/tp2-scraped run_recorded ./scripts/bench_serve.sh inferx-tp2-scraped || exit 8
 stop_scraper
-run_recorded ./scripts/bench_serve.sh inferx-tp2-sampled || exit 9
+OUT_DIR=$RESULT_DIR/tp2-sampled run_recorded ./scripts/bench_serve.sh inferx-tp2-sampled || exit 9
+
+section "Serving comparison"
+run_recorded python3 bench/analyze_tp.py \
+  --tp1 "$RESULT_DIR/tp1/inferx-tp1.json" \
+  --tp2 "$RESULT_DIR/tp2/inferx-tp2.json" \
+  --scraped "$RESULT_DIR/tp2-scraped/inferx-tp2-scraped.json" \
+  --sampled "$RESULT_DIR/tp2-sampled/inferx-tp2-sampled.json" \
+  --overhead-budget-percent "${MONITORING_OVERHEAD_BUDGET_PERCENT:-1}" \
+  --json "$RESULT_DIR/comparison.json" || exit 10
 
 section "Result"
 echo "PASS: M7 one-host/two-GPU functional and serving validation completed"
-echo "Benchmark JSON is under bench-results; report=$REPORT"
+echo "Benchmark JSON and comparison are under $RESULT_DIR; report=$REPORT"

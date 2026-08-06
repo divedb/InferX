@@ -32,6 +32,12 @@ concurrency-driven saturation, 512/2048-token prefill, and decode-heavy generati
 `CONCURRENCY`, `PREFILL_LENS`, or `DECODE_TOKENS` to match the rented GPUs'
 memory envelope.
 
+The four runs and `comparison.json` are stored inside the validation report
+directory. `bench/analyze_tp.py` matches scenarios, reports TP scaling plus
+scrape/sampling ratios, and fails the run when aggregate scrape overhead is
+above 1%. Override the acceptance threshold only when explicitly investigating
+noise with `MONITORING_OVERHEAD_BUDGET_PERCENT`.
+
 ## Acceptance review
 
 Do not claim TP scaling from a single number. Retain the raw benchmark JSON and
