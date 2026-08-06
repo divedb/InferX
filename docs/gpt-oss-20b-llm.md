@@ -455,6 +455,15 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
   five-run workload, graphs measure **86.1 tok/s** versus 66.4 tok/s disabled
   (1.30x). A checkpoint-level test compares every logit from direct execution
   and graph replay.
+- Three decode-kernel follow-ups were measured and rejected on the identical
+  16-token latency workload (existing scalar path: **86.8 tok/s**). Widening
+  each lane from 8 to 16 weights fell to 68.6 tok/s; sharing the expert lookup
+  across four warps fell to 77.5 tok/s because the block barrier cost more than
+  cached offset reads; and dequantizing into BF16 WMMA tiles fell to 28.9 tok/s
+  because batch-one pads one useful activation row to a 16-row MMA tile. The
+  next kernel must therefore exploit several real routed rows per MMA tile (or
+  use a true mixed-input instruction on newer hardware), not merely substitute
+  tensor cores into the current one-row mapping.
 - **Comparison status:** the shared harness is ready, but vLLM 0.26 cannot
   allocate even its minimum KV cache beside this checkpoint on the 16 GiB
   card. At 4096 context it reports -1.85 GiB available; with CUDA graphs off,
