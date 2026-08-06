@@ -56,6 +56,8 @@ struct ServingMetrics {
   std::shared_ptr<observe::Histogram> duration;
   std::shared_ptr<observe::Histogram> prompt_length;
   std::shared_ptr<observe::Histogram> generation_length;
+  std::vector<std::shared_ptr<observe::Histogram>> prefill_step;
+  std::vector<std::shared_ptr<observe::Histogram>> decode_step;
 
   ServingMetrics() {
     accepted = registry.AddCounter(
@@ -114,7 +116,87 @@ struct ServingMetrics {
     duration->Observe(
         SecondsSince(submitted, std::chrono::steady_clock::now()));
   }
+
+  void ConfigureRanks(const std::vector<RankTelemetry>& ranks) {
+    const std::vector<double> buckets = {
+        .00001, .000025, .00005, .0001, .00025, .0005, .001,
+        .0025,  .005,    .01,    .025,  .05,    .1};
+    for (const RankTelemetry& rank : ranks) {
+      const observe::Labels prefill_labels = {
+          {"phase", "prefill"}, {"rank", std::to_string(rank.rank)}};
+      const observe::Labels decode_labels = {
+          {"phase", "decode"}, {"rank", std::to_string(rank.rank)}};
+      prefill_step.push_back(registry.AddHistogram(
+          "inferx_engine_step_seconds", "Device step duration by rank.",
+          buckets, prefill_labels));
+      decode_step.push_back(registry.AddHistogram(
+          "inferx_engine_step_seconds", "Device step duration by rank.",
+          buckets, decode_labels));
+    }
+  }
+
+  void RecordRankSteps(const std::vector<RankTelemetry>& ranks, bool prefill) {
+    auto& histograms = prefill ? prefill_step : decode_step;
+    for (size_t i = 0; i < ranks.size() && i < histograms.size(); ++i) {
+      histograms[i]->Observe(ranks[i].last_step_device_ms / 1000.0);
+    }
+  }
 };
+
+std::string RenderRankMetrics(const std::vector<RankTelemetry>& ranks) {
+  if (ranks.empty()) return {};
+  observe::Registry registry;
+  const std::string backend = comm::CommBackendName(ranks.front().backend);
+  registry
+      .AddGauge("inferx_communicator_info",
+                "Active communicator backend and world size.",
+                {{"backend", backend},
+                 {"world_size", std::to_string(ranks.front().world_size)}})
+      ->Set(1);
+  for (const RankTelemetry& rank : ranks) {
+    const observe::Labels rank_label = {{"rank", std::to_string(rank.rank)}};
+    registry
+        .AddGauge("inferx_rank_healthy", "Whether the rank is operational.",
+                  rank_label)
+        ->Set(rank.healthy ? 1 : 0);
+    registry
+        .AddGauge("inferx_rank_last_progress_seconds",
+                  "Seconds since the rank last completed worker work.",
+                  rank_label)
+        ->Set(rank.last_progress_age_seconds);
+    registry
+        .AddGauge("inferx_rank_last_step_seconds",
+                  "Most recent device step duration for the rank.", rank_label)
+        ->Set(rank.last_step_device_ms / 1000.0);
+    registry
+        .AddCounter("inferx_rank_timeouts_total", "Rank worker timeouts.",
+                    rank_label)
+        ->Increment(rank.timeouts);
+    const observe::Labels collective_labels = {
+        {"backend", backend},
+        {"op", "all_reduce_sum"},
+        {"rank", std::to_string(rank.rank)}};
+    registry
+        .AddCounter("inferx_collectives_total", "Collective calls by rank.",
+                    collective_labels)
+        ->Increment(rank.communication.all_reduce_calls);
+    registry
+        .AddCounter("inferx_collective_bytes_total",
+                    "Collective payload bytes by rank.", collective_labels)
+        ->Increment(rank.communication.all_reduce_bytes);
+    registry
+        .AddCounter("inferx_collective_failures_total",
+                    "Collective failures by rank.", collective_labels)
+        ->Increment(rank.communication.collective_failures);
+    registry
+        .AddCounter("inferx_communicator_aborts_total",
+                    "Communicator abort calls by rank.",
+                    {{"backend", backend},
+                     {"rank", std::to_string(rank.rank)}})
+        ->Increment(rank.communication.aborts);
+  }
+  return registry.Render();
+}
 
 }  // namespace
 
@@ -562,6 +644,8 @@ struct Engine::Impl {
         }
 
         for (const TokenDelta& delta : deltas) Deliver(delta);
+        metrics.RecordRankSteps(qwen2_model->telemetry(),
+                                batch.num_tokens() > batch.num_seqs);
 
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
@@ -887,6 +971,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler::Create(config.scheduler, model->kv_pool()));
 
     impl->qwen2_model = std::move(model);
+    impl->metrics.ConfigureRanks(impl->qwen2_model->telemetry());
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = config.kv_blocks;
 
@@ -1003,6 +1088,12 @@ Engine::Stats Engine::stats() const {
   return impl_->stats;
 }
 
-std::string Engine::metrics() const { return impl_->metrics.registry.Render(); }
+std::string Engine::metrics() const {
+  std::string output = impl_->metrics.registry.Render();
+  if (impl_->qwen2_model != nullptr) {
+    output += RenderRankMetrics(impl_->qwen2_model->telemetry());
+  }
+  return output;
+}
 
 }  // namespace inferx::server

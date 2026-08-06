@@ -19,6 +19,37 @@
 namespace inferx::comm {
 namespace {
 
+class ObservedCommunicator final : public Communicator {
+ public:
+  ObservedCommunicator(std::unique_ptr<Communicator> inner,
+                       std::shared_ptr<CommMetrics> metrics)
+      : inner_(std::move(inner)), metrics_(std::move(metrics)) {}
+
+  int rank() const override { return inner_->rank(); }
+  int size() const override { return inner_->size(); }
+  DeviceId device() const override { return inner_->device(); }
+  CommBackend backend() const override { return inner_->backend(); }
+  CommCapabilities capabilities() const override {
+    return inner_->capabilities();
+  }
+
+  Status AllReduceSum(const TensorView& tensor, void* stream) override {
+    const uint64_t bytes = tensor.IsDefined() ? tensor.NBytes() : 0;
+    Status result = inner_->AllReduceSum(tensor, stream);
+    metrics_->RecordAllReduce(bytes, result.ok());
+    return result;
+  }
+
+  Status Abort() override {
+    metrics_->RecordAbort();
+    return inner_->Abort();
+  }
+
+ private:
+  std::unique_ptr<Communicator> inner_;
+  std::shared_ptr<CommMetrics> metrics_;
+};
+
 Status ValidateTensor(const TensorView& tensor, bool allow_cuda) {
   if (!tensor.IsDefined())
     return InvalidArgumentError("AllReduceSum: tensor is undefined");
@@ -76,7 +107,8 @@ void SumBf16(const std::vector<std::vector<std::byte>>& inputs, int64_t count,
 
 struct HostSimState {
   explicit HostSimState(int world_size)
-      : size(world_size), inputs(static_cast<size_t>(world_size)),
+      : size(world_size),
+        inputs(static_cast<size_t>(world_size)),
         outputs(static_cast<size_t>(world_size)) {}
 
   Status AllReduce(int rank, const TensorView& tensor, void* stream) {
@@ -116,9 +148,9 @@ struct HostSimState {
                              cudaMemcpyDeviceToHost);
         }
         if (error != cudaSuccess) {
-          collective_status = InternalError(
-              "HostSimComm CUDA staging failed on rank ", rank, ": ",
-              cudaGetErrorString(error));
+          collective_status =
+              InternalError("HostSimComm CUDA staging failed on rank ", rank,
+                            ": ", cudaGetErrorString(error));
         }
 #endif
       }
@@ -175,12 +207,12 @@ struct HostSimState {
           std::memcpy(output.Data(), result.data(), bytes);
         } else {
 #if defined(INFERX_WITH_CUDA)
-          const cudaError_t error = cudaMemcpy(
-              output.Data(), result.data(), bytes, cudaMemcpyHostToDevice);
+          const cudaError_t error = cudaMemcpy(output.Data(), result.data(),
+                                               bytes, cudaMemcpyHostToDevice);
           if (error != cudaSuccess) {
-            collective_status = InternalError(
-                "HostSimComm CUDA broadcast failed: ",
-                cudaGetErrorString(error));
+            collective_status =
+                InternalError("HostSimComm CUDA broadcast failed: ",
+                              cudaGetErrorString(error));
             return;
           }
 #endif
@@ -231,12 +263,53 @@ class HostSimComm final : public Communicator {
 
 }  // namespace
 
+const char* CommBackendName(CommBackend backend) {
+  switch (backend) {
+    case CommBackend::kSingleRank:
+      return "single";
+    case CommBackend::kHostSim:
+      return "host_sim";
+    case CommBackend::kNccl:
+      return "nccl";
+    case CommBackend::kMscclpp:
+      return "mscclpp";
+  }
+  return "unknown";
+}
+
+CommMetricSnapshot CommMetrics::Snapshot() const noexcept {
+  return {
+      .all_reduce_calls = all_reduce_calls_.load(std::memory_order_relaxed),
+      .all_reduce_bytes = all_reduce_bytes_.load(std::memory_order_relaxed),
+      .collective_failures =
+          collective_failures_.load(std::memory_order_relaxed),
+      .aborts = aborts_.load(std::memory_order_relaxed),
+  };
+}
+
+void CommMetrics::RecordAllReduce(uint64_t bytes, bool success) noexcept {
+  all_reduce_calls_.fetch_add(1, std::memory_order_relaxed);
+  all_reduce_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (!success) collective_failures_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CommMetrics::RecordAbort() noexcept {
+  aborts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::unique_ptr<Communicator> ObserveCommunicator(
+    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics) {
+  if (inner == nullptr || metrics == nullptr) return inner;
+  return std::make_unique<ObservedCommunicator>(std::move(inner),
+                                                std::move(metrics));
+}
+
 Status SingleRankComm::AllReduceSum(const TensorView& tensor, void*) {
   return ValidateTensor(tensor, /*allow_cuda=*/true);
 }
 
-StatusOr<std::vector<std::unique_ptr<Communicator>>>
-CreateHostSimCommunicators(int size) {
+StatusOr<std::vector<std::unique_ptr<Communicator>>> CreateHostSimCommunicators(
+    int size) {
   if (size <= 0)
     return InvalidArgumentError("communicator size must be positive, got ",
                                 size);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -20,6 +21,32 @@ enum class CommBackend : uint8_t {
 struct CommCapabilities {
   bool cuda_graph_capture = false;
   bool device_collectives = false;
+};
+
+const char* CommBackendName(CommBackend backend);
+
+class Communicator;
+
+struct CommMetricSnapshot {
+  uint64_t all_reduce_calls = 0;
+  uint64_t all_reduce_bytes = 0;
+  uint64_t collective_failures = 0;
+  uint64_t aborts = 0;
+};
+
+/// Backend-neutral counters shared with the owner after the decorated
+/// communicator itself has moved into a model.
+class CommMetrics {
+ public:
+  CommMetricSnapshot Snapshot() const noexcept;
+  void RecordAllReduce(uint64_t bytes, bool success) noexcept;
+  void RecordAbort() noexcept;
+
+ private:
+  std::atomic<uint64_t> all_reduce_calls_{0};
+  std::atomic<uint64_t> all_reduce_bytes_{0};
+  std::atomic<uint64_t> collective_failures_{0};
+  std::atomic<uint64_t> aborts_{0};
 };
 
 /// Collective communication used by tensor-parallel model layers.
@@ -47,6 +74,11 @@ class Communicator {
   virtual Status Abort() = 0;
 };
 
+/// Wraps any communicator with lock-free call/byte/error accounting. The
+/// wrapper adds no CUDA operations and measures no host-call duration.
+std::unique_ptr<Communicator> ObserveCommunicator(
+    std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics);
+
 /// The production default at TP=1. The collective validates its input and is
 /// otherwise a no-op, so model code always exercises the communicator call.
 class SingleRankComm final : public Communicator {
@@ -60,7 +92,8 @@ class SingleRankComm final : public Communicator {
   CommCapabilities capabilities() const override {
     return {.cuda_graph_capture = true, .device_collectives = true};
   }
-  Status AllReduceSum(const TensorView& tensor, void* stream = nullptr) override;
+  Status AllReduceSum(const TensorView& tensor,
+                      void* stream = nullptr) override;
   Status Abort() override { return OkStatus(); }
 
  private:
@@ -73,7 +106,7 @@ class SingleRankComm final : public Communicator {
 /// through host memory. Each rank is intended to run on its own host thread.
 /// Reduction order is rank 0..N-1, making numerical tests reproducible without
 /// multi-GPU hardware. CUDA staging is a correctness backend, not a benchmark.
-StatusOr<std::vector<std::unique_ptr<Communicator>>>
-CreateHostSimCommunicators(int size);
+StatusOr<std::vector<std::unique_ptr<Communicator>>> CreateHostSimCommunicators(
+    int size);
 
 }  // namespace inferx::comm

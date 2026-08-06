@@ -1,5 +1,4 @@
 #include "inferx/comm/communicator.h"
-#include "inferx/comm/nccl_communicator.h"
 
 #include <gtest/gtest.h>
 
@@ -7,6 +6,8 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
+
+#include "inferx/comm/nccl_communicator.h"
 
 #if defined(INFERX_WITH_CUDA)
 #include <cuda_runtime_api.h>
@@ -55,7 +56,8 @@ TEST(NcclCommTest, TwoGpuBf16AllReduceUsesTheSuppliedStreams) {
       }
 
       cudaStream_t stream = nullptr;
-      cudaError_t error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+      cudaError_t error =
+          cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
       if (error != cudaSuccess) {
         statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
             error, "cudaStreamCreateWithFlags", __FILE__, __LINE__);
@@ -79,13 +81,13 @@ TEST(NcclCommTest, TwoGpuBf16AllReduceUsesTheSuppliedStreams) {
             view.ok() ? (*communicator)->AllReduceSum(*view, stream)
                       : view.status();
       } else {
-        statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
-            error, "cudaMemcpyAsync", __FILE__, __LINE__);
+        statuses[static_cast<size_t>(rank)] =
+            CudaErrorToStatus(error, "cudaMemcpyAsync", __FILE__, __LINE__);
       }
       if (statuses[static_cast<size_t>(rank)].ok()) {
-        error = cudaMemcpyAsync(&outputs[static_cast<size_t>(rank)],
-                                buffer->data(), sizeof(uint16_t),
-                                cudaMemcpyDeviceToHost, stream);
+        error =
+            cudaMemcpyAsync(&outputs[static_cast<size_t>(rank)], buffer->data(),
+                            sizeof(uint16_t), cudaMemcpyDeviceToHost, stream);
         if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
         if (error != cudaSuccess) {
           statuses[static_cast<size_t>(rank)] = CudaErrorToStatus(
@@ -130,11 +132,31 @@ TEST(SingleRankCommTest, IsAValidatedNoOp) {
   std::vector<float> values = {1.0f, -2.0f, 3.5f};
   EXPECT_EQ(comm.rank(), 0);
   EXPECT_EQ(comm.size(), 1);
-  EXPECT_TRUE(comm.AllReduceSum(
-                      CpuView(values.data(), DataType::kFloat, values.size()))
-                  .ok());
+  EXPECT_TRUE(
+      comm.AllReduceSum(CpuView(values.data(), DataType::kFloat, values.size()))
+          .ok());
   EXPECT_EQ(values, (std::vector<float>{1.0f, -2.0f, 3.5f}));
   EXPECT_FALSE(comm.AllReduceSum(TensorView()).ok());
+}
+
+TEST(CommunicatorMetricsTest, DecoratorCountsCallsBytesFailuresAndAborts) {
+  auto metrics = std::make_shared<CommMetrics>();
+  std::unique_ptr<Communicator> comm = ObserveCommunicator(
+      std::make_unique<SingleRankComm>(DeviceId::Cpu()), metrics);
+  std::vector<float> values = {1.0f, 2.0f, 3.0f};
+
+  EXPECT_TRUE(comm->AllReduceSum(
+                      CpuView(values.data(), DataType::kFloat, values.size()))
+                  .ok());
+  EXPECT_FALSE(comm->AllReduceSum(TensorView()).ok());
+  EXPECT_TRUE(comm->Abort().ok());
+
+  const CommMetricSnapshot snapshot = metrics->Snapshot();
+  EXPECT_EQ(snapshot.all_reduce_calls, 2);
+  EXPECT_EQ(snapshot.all_reduce_bytes, values.size() * sizeof(float));
+  EXPECT_EQ(snapshot.collective_failures, 1);
+  EXPECT_EQ(snapshot.aborts, 1);
+  EXPECT_EQ(CommBackendName(comm->backend()), std::string_view("single"));
 }
 
 TEST(HostSimCommTest, FourRanksAllReceiveTheSum) {
@@ -169,8 +191,8 @@ TEST(HostSimCommTest, ReusesTheRendezvousAcrossCollectives) {
       for (int round = 0; round < 20; ++round) {
         values[rank] = {rank + round, 1};
         ASSERT_TRUE(comms[rank]
-                        ->AllReduceSum(CpuView(values[rank].data(),
-                                              DataType::kInt32, 2))
+                        ->AllReduceSum(
+                            CpuView(values[rank].data(), DataType::kInt32, 2))
                         .ok());
         EXPECT_EQ(values[rank][0], 3 * round + 3);
         EXPECT_EQ(values[rank][1], 3);
@@ -184,19 +206,19 @@ TEST(HostSimCommTest, Bf16AccumulatesInFloatInRankOrder) {
   auto created = CreateHostSimCommunicators(2);
   ASSERT_TRUE(created.ok()) << created.status();
   auto comms = std::move(*created);
-  std::vector<std::vector<uint16_t>> values = {
-      {Bf16(1.5f), Bf16(-2.0f)}, {Bf16(0.25f), Bf16(5.0f)}};
+  std::vector<std::vector<uint16_t>> values = {{Bf16(1.5f), Bf16(-2.0f)},
+                                               {Bf16(0.25f), Bf16(5.0f)}};
   std::thread rank0([&] {
-    EXPECT_TRUE(comms[0]
-                    ->AllReduceSum(CpuView(values[0].data(),
-                                          DataType::kBFloat16, 2))
-                    .ok());
+    EXPECT_TRUE(
+        comms[0]
+            ->AllReduceSum(CpuView(values[0].data(), DataType::kBFloat16, 2))
+            .ok());
   });
   std::thread rank1([&] {
-    EXPECT_TRUE(comms[1]
-                    ->AllReduceSum(CpuView(values[1].data(),
-                                          DataType::kBFloat16, 2))
-                    .ok());
+    EXPECT_TRUE(
+        comms[1]
+            ->AllReduceSum(CpuView(values[1].data(), DataType::kBFloat16, 2))
+            .ok());
   });
   rank0.join();
   rank1.join();

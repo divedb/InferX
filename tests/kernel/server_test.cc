@@ -702,7 +702,9 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   for (const char* metric :
        {"inferx_requests_running ", "inferx_requests_waiting ",
         "inferx_kv_blocks{state=\"used\"} ", "inferx_steps_total ",
-        "inferx_generation_tokens_total "}) {
+        "inferx_generation_tokens_total ", "inferx_rank_healthy{rank=\"0\"} ",
+        "inferx_collectives_total{backend=\"single\",op=\"all_reduce_sum\","
+        "rank=\"0\"} "}) {
     EXPECT_NE(response->body.find(metric), std::string::npos)
         << "/metrics is missing \"" << metric << "\": " << response->body;
   }

@@ -1,8 +1,9 @@
 # InferX observability design
 
-Status: implementation plan for M7 tensor parallelism. Milestones 1 and 2 are
-implemented: the registry and `/metrics` endpoint now report request outcomes,
-queue time, TTFT, ITL, end-to-end latency, and request token distributions.
+Status: implementation plan for M7 tensor parallelism. Milestones 1 through 3
+are implemented: serving lifecycle metrics are joined by backend-neutral
+collective counters, communicator aborts/timeouts, rank health/progress, and
+per-rank device-step histograms.
 
 ## Scope and reviewed implementations
 

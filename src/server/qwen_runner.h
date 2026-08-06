@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "inferx/comm/communicator.h"
 #include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
 #include "inferx/model/qwen2.h"
@@ -23,6 +24,18 @@ struct QwenRunnerConfig {
   int64_t max_sampling_rows = 8;
 };
 
+struct RankTelemetry {
+  int rank = 0;
+  int device = 0;
+  int world_size = 1;
+  comm::CommBackend backend = comm::CommBackend::kSingleRank;
+  bool healthy = true;
+  double last_progress_age_seconds = 0.0;
+  float last_step_device_ms = 0.0f;
+  uint64_t timeouts = 0;
+  comm::CommMetricSnapshot communication;
+};
+
 /// Model execution boundary used by the server. TP=1 calls the model directly;
 /// TP=2 dispatches the same operation to two persistent rank workers.
 class QwenRunner {
@@ -39,6 +52,7 @@ class QwenRunner {
   virtual Status CaptureDecodeGraph(int64_t num_seqs,
                                     int64_t max_blocks_per_seq) = 0;
   virtual float last_step_device_ms() const = 0;
+  virtual std::vector<RankTelemetry> telemetry() const = 0;
 };
 
 }  // namespace inferx::server

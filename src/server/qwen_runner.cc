@@ -1,7 +1,10 @@
 #include "qwen_runner.h"
 
-#include <condition_variable>
+#include <cuda_runtime_api.h>
+
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
@@ -10,13 +13,22 @@
 #include <utility>
 #include <vector>
 
-#include <cuda_runtime_api.h>
-
 #include "inferx/comm/nccl_communicator.h"
 #include "inferx/core/cuda_utils.h"
 
 namespace inferx::server {
 namespace {
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+double ProgressAgeSeconds(int64_t last_progress_ns) {
+  if (last_progress_ns == 0) return 0.0;
+  return static_cast<double>(SteadyNowNs() - last_progress_ns) / 1e9;
+}
 
 Status ConfigureModel(model::Qwen2Model* model,
                       const QwenRunnerConfig& config) {
@@ -36,28 +48,58 @@ Status ConfigureModel(model::Qwen2Model* model,
 
 class SingleQwenRunner final : public QwenRunner {
  public:
-  explicit SingleQwenRunner(model::Qwen2Model model)
-      : model_(std::move(model)) {}
+  SingleQwenRunner(model::Qwen2Model model, int device,
+                   std::shared_ptr<comm::CommMetrics> communication)
+      : model_(std::move(model)),
+        device_(device),
+        communication_(std::move(communication)) {}
 
   KvBlockPool* kv_pool() override { return model_.kv_pool(); }
   Status ReserveActivations(int64_t n) override {
     return model_.ReserveActivations(n);
   }
   Status StepAsync(const model::ForwardBatch& batch) override {
-    return model_.StepAsync(batch);
+    Status result = model_.StepAsync(batch);
+    if (!result.ok()) healthy_.store(false, std::memory_order_relaxed);
+    return result;
   }
   Status AwaitStep(std::vector<int32_t>* sampled) override {
-    return model_.AwaitStep(sampled);
+    Status result = model_.AwaitStep(sampled);
+    healthy_.store(result.ok(), std::memory_order_relaxed);
+    if (result.ok()) {
+      last_step_device_ms_.store(model_.last_step_device_ms(),
+                                 std::memory_order_relaxed);
+      last_progress_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
+    }
+    return result;
   }
   Status CaptureDecodeGraph(int64_t n, int64_t blocks) override {
     return model_.CaptureDecodeGraph(n, blocks);
   }
   float last_step_device_ms() const override {
-    return model_.last_step_device_ms();
+    return last_step_device_ms_.load(std::memory_order_relaxed);
+  }
+  std::vector<RankTelemetry> telemetry() const override {
+    return {{.rank = 0,
+             .device = device_,
+             .world_size = 1,
+             .backend = comm::CommBackend::kSingleRank,
+             .healthy = healthy_.load(std::memory_order_relaxed),
+             .last_progress_age_seconds = ProgressAgeSeconds(
+                 last_progress_ns_.load(std::memory_order_relaxed)),
+             .last_step_device_ms =
+                 last_step_device_ms_.load(std::memory_order_relaxed),
+             .timeouts = 0,
+             .communication = communication_->Snapshot()}};
   }
 
  private:
   model::Qwen2Model model_;
+  int device_ = 0;
+  std::shared_ptr<comm::CommMetrics> communication_;
+  std::atomic<bool> healthy_{true};
+  std::atomic<int64_t> last_progress_ns_{0};
+  std::atomic<float> last_step_device_ms_{0.0f};
 };
 
 class RankWorker {
@@ -66,7 +108,10 @@ class RankWorker {
 
   RankWorker(const QwenRunnerConfig& config, int rank,
              const comm::NcclUniqueIdBytes& unique_id)
-      : config_(config), rank_(rank), unique_id_(unique_id) {
+      : config_(config),
+        rank_(rank),
+        unique_id_(unique_id),
+        communication_(std::make_shared<comm::CommMetrics>()) {
     thread_ = std::thread([this] { ThreadMain(); });
   }
 
@@ -77,7 +122,8 @@ class RankWorker {
   Status Submit(Job job) {
     std::lock_guard lock(mu_);
     if (stopping_) return FailedPreconditionError("rank worker is stopping");
-    if (has_job_) return FailedPreconditionError("rank worker already has work");
+    if (has_job_)
+      return FailedPreconditionError("rank worker already has work");
     job_ = std::move(job);
     has_job_ = true;
     done_ = false;
@@ -107,6 +153,25 @@ class RankWorker {
   KvBlockPool* kv_pool() const { return pool_; }
   float last_step_device_ms() const { return last_step_device_ms_; }
 
+  RankTelemetry telemetry() const {
+    return {.rank = rank_,
+            .device = config_.devices[static_cast<size_t>(rank_)],
+            .world_size = static_cast<int>(config_.devices.size()),
+            .backend = comm::CommBackend::kNccl,
+            .healthy = healthy_.load(std::memory_order_relaxed),
+            .last_progress_age_seconds = ProgressAgeSeconds(
+                last_progress_ns_.load(std::memory_order_relaxed)),
+            .last_step_device_ms =
+                last_step_device_ms_atomic_.load(std::memory_order_relaxed),
+            .timeouts = timeouts_.load(std::memory_order_relaxed),
+            .communication = communication_->Snapshot()};
+  }
+
+  void RecordTimeout() {
+    timeouts_.fetch_add(1, std::memory_order_relaxed);
+    healthy_.store(false, std::memory_order_relaxed);
+  }
+
   void Stop() {
     {
       std::lock_guard lock(mu_);
@@ -121,7 +186,7 @@ class RankWorker {
   void ThreadMain() {
     const int device = config_.devices[static_cast<size_t>(rank_)];
     Status status = CudaErrorToStatus(cudaSetDevice(device), "cudaSetDevice",
-                                     __FILE__, __LINE__);
+                                      __FILE__, __LINE__);
     if (status.ok()) {
       comm::NcclCommConfig comm_config;
       comm_config.rank = rank_;
@@ -132,6 +197,8 @@ class RankWorker {
       if (!communicator.ok()) {
         status = communicator.status();
       } else {
+        *communicator =
+            comm::ObserveCommunicator(std::move(*communicator), communication_);
         auto loaded = model::Qwen2Model::LoadFromDirectory(
             config_.model_dir, std::move(*communicator));
         if (!loaded.ok()) {
@@ -143,6 +210,7 @@ class RankWorker {
         }
       }
     }
+    healthy_.store(status.ok(), std::memory_order_relaxed);
     initialized_.set_value(status);
 
     while (true) {
@@ -156,7 +224,15 @@ class RankWorker {
       }
 
       Status result = status.ok() ? job(*model_) : status;
-      if (model_ != nullptr) last_step_device_ms_ = model_->last_step_device_ms();
+      if (model_ != nullptr) {
+        last_step_device_ms_ = model_->last_step_device_ms();
+        last_step_device_ms_atomic_.store(last_step_device_ms_,
+                                          std::memory_order_relaxed);
+      }
+      healthy_.store(result.ok(), std::memory_order_relaxed);
+      if (result.ok()) {
+        last_progress_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
+      }
       {
         std::lock_guard lock(mu_);
         result_ = std::move(result);
@@ -176,6 +252,11 @@ class RankWorker {
   std::unique_ptr<model::Qwen2Model> model_;
   KvBlockPool* pool_ = nullptr;
   float last_step_device_ms_ = 0.0f;
+  std::shared_ptr<comm::CommMetrics> communication_;
+  std::atomic<bool> healthy_{false};
+  std::atomic<int64_t> last_progress_ns_{0};
+  std::atomic<float> last_step_device_ms_atomic_{0.0f};
+  std::atomic<uint64_t> timeouts_{0};
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
@@ -222,15 +303,14 @@ class NcclQwenRunner final : public QwenRunner {
   }
 
   Status StepAsync(const model::ForwardBatch& batch) override {
-    return Dispatch([batch](model::Qwen2Model& model) {
-      return model.StepAsync(batch);
-    });
+    return Dispatch(
+        [batch](model::Qwen2Model& model) { return model.StepAsync(batch); });
   }
 
   Status AwaitStep(std::vector<int32_t>* sampled) override {
     std::vector<std::vector<int32_t>> outputs(workers_.size());
-    INFERX_RETURN_IF_ERROR(DispatchIndexed(
-        [&outputs](size_t rank, model::Qwen2Model& model) {
+    INFERX_RETURN_IF_ERROR(
+        DispatchIndexed([&outputs](size_t rank, model::Qwen2Model& model) {
           return model.AwaitStep(&outputs[rank]);
         }));
     *sampled = std::move(outputs[0]);
@@ -248,6 +328,13 @@ class NcclQwenRunner final : public QwenRunner {
     return workers_[0]->last_step_device_ms();
   }
 
+  std::vector<RankTelemetry> telemetry() const override {
+    std::vector<RankTelemetry> result;
+    result.reserve(workers_.size());
+    for (const auto& worker : workers_) result.push_back(worker->telemetry());
+    return result;
+  }
+
  private:
   template <typename Fn>
   Status Dispatch(Fn fn) {
@@ -260,8 +347,8 @@ class NcclQwenRunner final : public QwenRunner {
   template <typename Fn>
   Status DispatchIndexed(Fn fn) {
     for (size_t rank = 0; rank < workers_.size(); ++rank) {
-      INFERX_RETURN_IF_ERROR(workers_[rank]->Submit(
-          [fn, rank](model::Qwen2Model& model) mutable {
+      INFERX_RETURN_IF_ERROR(
+          workers_[rank]->Submit([fn, rank](model::Qwen2Model& model) mutable {
             return fn(rank, model);
           }));
     }
@@ -269,6 +356,7 @@ class NcclQwenRunner final : public QwenRunner {
     for (auto& worker : workers_) {
       Status status;
       if (!worker->WaitFor(std::chrono::seconds(30), &status)) {
+        worker->RecordTimeout();
         for (auto& peer : workers_) (void)peer->AbortCommunication();
         return InternalError(
             "tensor-parallel rank timed out; all communicators were aborted");
@@ -306,13 +394,15 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(device));
   auto communicator = std::make_unique<comm::SingleRankComm>(
       DeviceId::Cuda(static_cast<int8_t>(device)));
-  INFERX_ASSIGN_OR_RETURN(
-      model::Qwen2Model model,
-      model::Qwen2Model::LoadFromDirectory(config.model_dir,
-                                           std::move(communicator)));
+  auto communication = std::make_shared<comm::CommMetrics>();
+  std::unique_ptr<comm::Communicator> observed =
+      comm::ObserveCommunicator(std::move(communicator), communication);
+  INFERX_ASSIGN_OR_RETURN(model::Qwen2Model model,
+                          model::Qwen2Model::LoadFromDirectory(
+                              config.model_dir, std::move(observed)));
   INFERX_RETURN_IF_ERROR(ConfigureModel(&model, config));
-  return std::unique_ptr<QwenRunner>(
-      std::make_unique<SingleQwenRunner>(std::move(model)));
+  return std::unique_ptr<QwenRunner>(std::make_unique<SingleQwenRunner>(
+      std::move(model), device, std::move(communication)));
 }
 
 }  // namespace inferx::server
