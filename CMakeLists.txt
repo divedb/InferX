@@ -51,6 +51,10 @@ if(INFERX_BUILD_BENCH AND INFERX_CUDA_MEETS_FLOOR)
   add_subdirectory(bench)
 endif()
 
+# Demos exercise FlashInfer kernel templates directly (no PyTorch/TVM-FFI layer).
+# Gated on both the CUDA floor and FlashInfer presence (see demo/CMakeLists.txt).
+add_subdirectory(demo)
+
 message(STATUS "")
 message(STATUS "==== InferX ${PROJECT_VERSION} ====")
 message(STATUS "  Build type      : ${CMAKE_BUILD_TYPE}")
