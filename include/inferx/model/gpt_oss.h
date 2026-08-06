@@ -93,9 +93,9 @@ class GptOssModel {
   /// FlashInfer wrapper does not expose it yet. Slower per launch; attention is
   /// not the bottleneck.
   ///
-  /// Synchronizes before returning and argmaxes on the host, so this is the
-  /// synchronous sibling of Qwen2Model::Step -- no device sampling, no CUDA
-  /// graphs. Those stack on later.
+  /// Synchronizes before returning and argmaxes on the host, so this remains
+  /// the synchronous sibling of Qwen2Model::Step. Fixed decode shapes may be
+  /// CUDA-graph replayed; prefill remains launch-by-launch.
   ///
   /// \param batch      What to run. \see ForwardBatch.
   /// \param out_logits Receives `[logits_indices.size() × vocab]` fp32,
@@ -109,6 +109,15 @@ class GptOssModel {
   /// later growth a no-op. Required before any `Step` larger than what
   /// `Forward` already sized.
   Status ReserveActivations(int64_t max_tokens);
+
+  /// \brief Captures one fixed decode shape for replay by `Step`.
+  ///
+  /// Decode has one token per sequence. The graph records the device body only;
+  /// `Step` still uploads positions, slots and block tables before each replay
+  /// and downloads the requested logits afterwards.
+  Status CaptureDecodeGraph(int64_t num_seqs, int64_t max_blocks_per_seq);
+
+  int64_t captured_graphs() const;
 
  private:
   struct Impl;

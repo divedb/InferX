@@ -323,5 +323,58 @@ TEST_F(GptOssModelTest, TheTopTokensAgreeAndNotJustTheFirst) {
                         << " of the reference's top 5 tokens appear in ours";
 }
 
+TEST_F(GptOssModelTest, CapturedDecodeMatchesLaunchByLaunch) {
+  auto model = GptOssModel::Load(CheckpointDir());
+  if (!model.ok()) GTEST_SKIP() << "no gpt-oss checkpoint";
+
+  constexpr int64_t kBlockSize = 16;
+  constexpr int64_t kMaxBlocks = 2;
+  ASSERT_TRUE(model->AttachKvCache(/*num_blocks=*/4, kBlockSize).ok());
+  ASSERT_TRUE(model->ReserveActivations(/*max_tokens=*/32).ok());
+  auto block = model->kv_pool()->AllocateBlock();
+  ASSERT_TRUE(block.ok());
+
+  ForwardBatch prefill;
+  prefill.num_seqs = 1;
+  prefill.max_blocks_per_seq = kMaxBlocks;
+  prefill.block_table = {*block, *block};
+  prefill.token_ids = reference_.ids;
+  prefill.positions.resize(reference_.ids.size());
+  prefill.seq_of_token.assign(reference_.ids.size(), 0);
+  prefill.slots.resize(reference_.ids.size());
+  for (size_t i = 0; i < reference_.ids.size(); ++i) {
+    prefill.positions[i] = static_cast<int32_t>(i);
+    prefill.slots[i] = *block * kBlockSize + static_cast<int32_t>(i);
+  }
+  prefill.logits_indices = {
+      static_cast<int32_t>(reference_.ids.size() - 1)};
+
+  std::vector<float> prefill_logits;
+  ASSERT_TRUE(model->Step(prefill, &prefill_logits).ok());
+  const int32_t next_token = static_cast<int32_t>(
+      std::max_element(prefill_logits.begin(), prefill_logits.end()) -
+      prefill_logits.begin());
+
+  ForwardBatch decode;
+  decode.num_seqs = 1;
+  decode.max_blocks_per_seq = kMaxBlocks;
+  decode.block_table = {*block, *block};
+  decode.token_ids = {next_token};
+  decode.positions = {static_cast<int32_t>(reference_.ids.size())};
+  decode.seq_of_token = {0};
+  decode.slots = {static_cast<int32_t>(
+      *block * kBlockSize + static_cast<int64_t>(reference_.ids.size()))};
+  decode.logits_indices = {0};
+
+  std::vector<float> direct;
+  ASSERT_TRUE(model->Step(decode, &direct).ok());
+  ASSERT_TRUE(model->CaptureDecodeGraph(/*num_seqs=*/1, kMaxBlocks).ok());
+  ASSERT_EQ(model->captured_graphs(), 1);
+
+  std::vector<float> captured;
+  ASSERT_TRUE(model->Step(decode, &captured).ok());
+  ASSERT_EQ(captured, direct);
+}
+
 }  // namespace
 }  // namespace inferx::model

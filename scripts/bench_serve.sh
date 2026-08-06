@@ -34,6 +34,7 @@ ROUNDS="${ROUNDS:-4}"
 ITERS="${ITERS:-10}"
 WARMUP="${WARMUP:-2}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+INFERX_SERVER_ARGS="${INFERX_SERVER_ARGS:-}"
 
 ENGINES=("$@")
 if [[ ${#ENGINES[@]} -eq 0 ]]; then
@@ -70,7 +71,7 @@ start_inferx() {  # $1: extra inferx-serve flags
   setsid "$SERVE" --model "$MODEL_DIR" --port 8000 \
     --served-model-name "$MODEL_NAME" \
     --max-running "$MAX_SEQS" --max-seq-len "$MAX_SEQ_LEN" \
-    $1 > "$OUT_DIR/inferx_server.log" 2>&1 &
+    $1 $INFERX_SERVER_ARGS > "$OUT_DIR/inferx_server.log" 2>&1 &
   SERVER_PID=$!
 }
 

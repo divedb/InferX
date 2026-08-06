@@ -477,10 +477,9 @@ struct Engine::Impl {
   // batch costs ~1/4 the bandwidth-floor latency of the single-sequence path,
   // even before Phase 4's fused GEMM makes the upload itself resident.
   //
-  // No CUDA graphs and no device sampling yet: the per-layer
-  // cudaDeviceSynchronize inside GptOssModel's MoE path (R-E's bias_keep free)
-  // forbids capture, and device sampling is moot while the logits already come
-  // back to the host for argmax. Both stack on later, after Phase 4.
+  // Decode may replay a captured CUDA graph. Sampling remains on the host:
+  // logits already come back for argmax, so device sampling is a separate
+  // optimization rather than a graph prerequisite.
   void RunGptOss() {
     std::vector<float> logits;
     std::vector<int32_t> sampled;
@@ -703,6 +702,16 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // but doing it up front avoids the first-step reallocation cost.
     INFERX_RETURN_IF_ERROR(
         impl->gpt_oss_model->ReserveActivations(config.scheduler.max_batch_tokens));
+
+    if (config.capture_graphs) {
+      const int64_t max_blocks =
+          (config.scheduler.max_seq_len + config.block_size - 1) /
+          config.block_size;
+      for (int64_t seqs = config.scheduler.max_running; seqs >= 1; --seqs) {
+        INFERX_RETURN_IF_ERROR(
+            impl->gpt_oss_model->CaptureDecodeGraph(seqs, max_blocks));
+      }
+    }
   } else {
     INFERX_ASSIGN_OR_RETURN(Qwen2Model model,
                             Qwen2Model::LoadFromDirectory(config.model_dir));

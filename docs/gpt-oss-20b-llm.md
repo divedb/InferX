@@ -449,6 +449,12 @@ R-F and R-G. Conformance corpus, exact id equality, chat template.
   21.7 ms, and median TTFT is 142 ms. This remains below the ~290 tok/s
   bandwidth-floor estimate, so the MXFP4 projection remains an optimization
   target rather than a finished kernel.
+- ✅ Fixed decode shapes replay through CUDA graphs. The paged device body runs
+  on an owned nonblocking stream; host index staging and logits download remain
+  outside capture, and prefill stays launch-by-launch. On the same 32-token,
+  five-run workload, graphs measure **86.1 tok/s** versus 66.4 tok/s disabled
+  (1.30x). A checkpoint-level test compares every logit from direct execution
+  and graph replay.
 - **Comparison status:** the shared harness is ready, but vLLM 0.26 cannot
   allocate even its minimum KV cache beside this checkpoint on the 16 GiB
   card. At 4096 context it reports -1.85 GiB available; with CUDA graphs off,

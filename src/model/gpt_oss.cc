@@ -221,6 +221,12 @@ struct LayerWeights {
 struct GptOssModel::Impl {
   Impl(ModelConfig c, Checkpoint ck, kernels::CublasLtGemm g)
       : config(std::move(c)), ckpt(std::move(ck)), gemm(std::move(g)) {}
+  ~Impl() {
+    for (DecodeGraph& graph : graphs) {
+      if (graph.exec != nullptr) cudaGraphExecDestroy(graph.exec);
+    }
+    if (stream != nullptr) cudaStreamDestroy(stream);
+  }
 
   ModelConfig config;
   Checkpoint ckpt;
@@ -234,6 +240,28 @@ struct GptOssModel::Impl {
 
   kernels::CublasLtGemm gemm;
   std::unique_ptr<MoeFfn> moe;
+  // Paged serving owns a nonblocking stream so its device half can be captured
+  // without involving the legacy default stream. Forward() remains the
+  // synchronous reference path and deliberately does not use this stream.
+  cudaStream_t stream = nullptr;
+
+  struct DecodeGraph {
+    int64_t tokens = 0;
+    int64_t seqs = 0;
+    int64_t blocks = 0;
+    cudaGraphExec_t exec = nullptr;
+  };
+  std::vector<DecodeGraph> graphs;
+
+  cudaGraphExec_t FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
+    for (const DecodeGraph& graph : graphs) {
+      if (graph.tokens == tokens && graph.seqs == seqs &&
+          graph.blocks == blocks) {
+        return graph.exec;
+      }
+    }
+    return nullptr;
+  }
 
   // YaRN's frequency table, computed once on the host.
   Scratch inv_freq;
@@ -436,21 +464,23 @@ Status GptOssModel::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   // copy costs -- is noise. Keeping it simple here is worth not reproducing the
   // pinned-buffer plumbing until the MoE upload itself is gone (Phase 4).
   if (!batch.tokens_from_device) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
-        ids.buf.data(), batch.token_ids.data(), tok_bytes, cudaMemcpyHostToDevice));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        ids.buf.data(), batch.token_ids.data(), tok_bytes,
+        cudaMemcpyHostToDevice, stream));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
       positions.buf.data(), batch.positions.data(), tok_bytes,
-      cudaMemcpyHostToDevice));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
-      slots_buf.data(), batch.slots.data(), tok_bytes, cudaMemcpyHostToDevice));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+      cudaMemcpyHostToDevice, stream));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+      slots_buf.data(), batch.slots.data(), tok_bytes, cudaMemcpyHostToDevice,
+      stream));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
       seq_of_token_buf.data(), batch.seq_of_token.data(), tok_bytes,
-      cudaMemcpyHostToDevice));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+      cudaMemcpyHostToDevice, stream));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
       block_table_buf.data(), batch.block_table.data(),
       static_cast<size_t>(table_elems) * sizeof(int32_t),
-      cudaMemcpyHostToDevice));
+      cudaMemcpyHostToDevice, stream));
 
   // Longest key sequence any query attends over. For full-attention layers this
   // sizes the reference kernel's shared-memory tile; for sliding layers it is
@@ -536,7 +566,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
       const TensorView qkv_v,
       m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x));
+  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x, stream));
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
@@ -553,20 +583,22 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
     // --- attention ---------------------------------------------------------
     if (profiling) prof.last = ForwardProfile::Clock::now();
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.input_norm, normed,
-                                            static_cast<float>(c.rms_norm_eps)));
+                                            static_cast<float>(c.rms_norm_eps),
+                                            stream));
 
     // One fused QKV GEMM instead of three, then split + bias in one pass.
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v));
     INFERX_RETURN_IF_ERROR(
-        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2));
+        m.gemm.LinearBF16(normed, w.qkv_w, qkv_v, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
-        q, k, pos_v, inv_freq, m.attn_factor));
+        q, k, pos_v, inv_freq, m.attn_factor, stream));
     if (profiling) prof.tick(prof.attn_proj);
 
     // Cache write *after* RoPE: a cached key is stored at the position it was
@@ -575,41 +607,46 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     INFERX_ASSIGN_OR_RETURN(const TensorView v_cache, m.pool->ValueCache(layer));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::AppendToKvCache(k, v, k_cache, v_cache, slots_v));
+        kernels::AppendToKvCache(k, v, k_cache, v_cache, slots_v, stream));
 
     // Per-layer window: gpt-oss alternates full and sliding (128). The tile is
     // sized from `window` on a sliding layer, which is also the smem win.
     const int64_t window =
         c.IsSlidingLayer(layer) ? c.sliding_window : 0;
-    const int64_t max_ctx =
-        window > 0 ? window : m.batch_max_context;
+    // Use the table's fixed capacity for full attention. The kernel still
+    // stops at each query's device-resident position, while a fixed launch
+    // shape lets one captured decode graph replay as the sequence grows.
+    const int64_t max_ctx = window > 0
+                                ? window
+                                : batch.max_blocks_per_seq *
+                                      m.pool->block_size();
 
     INFERX_RETURN_IF_ERROR(kernels::PagedAttentionWithLse(
         q, k_cache, v_cache, table_v, seq_v, pos_v, attn, lse_v, scale, window,
-        max_ctx));
+        max_ctx, stream));
 
     // The sink, folded in using the lse the kernel just wrote. Natural-log
     // convention here (the kernel computes max + ln(sum)), so lse_is_log2 is
     // false -- unlike the FlashInfer path, which is base-2.
     INFERX_RETURN_IF_ERROR(kernels::ApplyAttentionSinks(
-        attn, lse_v, w.sinks, /*lse_is_log2=*/false));
+        attn, lse_v, w.sinks, /*lse_is_log2=*/false, stream));
     if (profiling) prof.tick(prof.attn_kernel);
 
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj, stream));
+    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b, stream));
+    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid, stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         x.Data(), proj.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice, stream));
     if (profiling) prof.tick(prof.attn_proj);
 
     // --- MoE ---------------------------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps)));
+        x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
     MoeWeights mw;
     mw.router = w.router_w;
@@ -625,27 +662,28 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     mw.gate_up_bias = w.gate_up_bias_dev;
     mw.down_bias = w.down_bias_dev;
 
-    INFERX_RETURN_IF_ERROR(m.moe->Forward(normed, mw, moe_out, &m.gemm));
+    INFERX_RETURN_IF_ERROR(
+        m.moe->Forward(normed, mw, moe_out, &m.gemm, stream));
     if (profiling) prof.tick(prof.moe_forward);
 
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid, stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         x.Data(), moe_out.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice));
+        cudaMemcpyDeviceToDevice, stream));
     if (profiling) ++prof.layers;
   }
 
   if (profiling) prof.report(tokens);
 
   INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, m.final_norm, normed,
-                                          static_cast<float>(c.rms_norm_eps)));
+                                          static_cast<float>(c.rms_norm_eps),
+                                          stream));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView logits,
       m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
-  INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, m.lm_head, logits));
-
-  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  INFERX_RETURN_IF_ERROR(
+      m.gemm.LinearBF16(normed, m.lm_head, logits, stream));
 
   return OkStatus();
 }
@@ -663,6 +701,8 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
                           kernels::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm));
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
 
   const int64_t h = config.hidden_size;
   const int64_t heads = config.num_attention_heads;
@@ -1054,6 +1094,75 @@ Status GptOssModel::ReserveActivations(int64_t max_tokens) {
   return impl_->EnsureCapacity(max_tokens);
 }
 
+Status GptOssModel::CaptureDecodeGraph(int64_t num_seqs,
+                                       int64_t max_blocks_per_seq) {
+  if (impl_->pool == nullptr) {
+    return FailedPreconditionError(
+        "CaptureDecodeGraph requires a KV cache; call AttachKvCache first");
+  }
+  if (num_seqs <= 0 || max_blocks_per_seq <= 0) {
+    return InvalidArgumentError("graph shape must be positive, got num_seqs=",
+                                num_seqs, " max_blocks_per_seq=",
+                                max_blocks_per_seq);
+  }
+  if (impl_->FindGraph(num_seqs, num_seqs, max_blocks_per_seq) != nullptr) {
+    return OkStatus();
+  }
+
+  INFERX_ASSIGN_OR_RETURN(const int32_t scratch_block,
+                          impl_->pool->AllocateBlock());
+  struct ScratchGuard {
+    KvBlockPool* pool;
+    int32_t block;
+    ~ScratchGuard() { (void)pool->FreeBlock(block); }
+  } guard{impl_->pool.get(), scratch_block};
+
+  const int64_t last_position =
+      max_blocks_per_seq * impl_->pool->block_size() - 1;
+  const int64_t scratch_slot =
+      static_cast<int64_t>(scratch_block) * impl_->pool->block_size() +
+      last_position % impl_->pool->block_size();
+
+  ForwardBatch probe;
+  probe.num_seqs = num_seqs;
+  probe.max_blocks_per_seq = max_blocks_per_seq;
+  probe.block_table.assign(
+      static_cast<size_t>(num_seqs * max_blocks_per_seq), scratch_block);
+  for (int64_t seq = 0; seq < num_seqs; ++seq) {
+    probe.token_ids.push_back(0);
+    probe.positions.push_back(static_cast<int32_t>(last_position));
+    probe.seq_of_token.push_back(static_cast<int32_t>(seq));
+    probe.slots.push_back(static_cast<int32_t>(scratch_slot));
+    probe.logits_indices.push_back(static_cast<int32_t>(seq));
+  }
+
+  INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(probe));
+  INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(probe));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
+      impl_->stream, cudaStreamCaptureModeThreadLocal));
+  const Status body = impl_->RunPagedForward(probe);
+  cudaGraph_t graph = nullptr;
+  const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
+  INFERX_RETURN_IF_ERROR(body);
+  INFERX_CUDA_RETURN_IF_ERROR(ended);
+
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t instantiated =
+      cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  cudaGraphDestroy(graph);
+  INFERX_CUDA_RETURN_IF_ERROR(instantiated);
+
+  impl_->graphs.push_back(
+      {num_seqs, num_seqs, max_blocks_per_seq, exec});
+  return OkStatus();
+}
+
+int64_t GptOssModel::captured_graphs() const {
+  return static_cast<int64_t>(impl_->graphs.size());
+}
+
 Status GptOssModel::Step(const ForwardBatch& batch,
                          std::vector<float>* out_logits) {
   if (impl_->pool == nullptr) {
@@ -1066,7 +1175,18 @@ Status GptOssModel::Step(const ForwardBatch& batch,
   INFERX_RETURN_IF_ERROR(batch.Validate(impl_->config.vocab_size, total_slots));
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(batch));
-  INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(batch));
+  cudaGraphExec_t graph = nullptr;
+  const bool decode_shape = batch.num_tokens() == batch.num_seqs;
+  if (decode_shape) {
+    graph = impl_->FindGraph(batch.num_tokens(), batch.num_seqs,
+                             batch.max_blocks_per_seq);
+  }
+  if (graph != nullptr) {
+    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, impl_->stream));
+  } else {
+    INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(batch));
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
 
   // Download only the rows a caller asked for. At a 201088-wide vocabulary that
   // is 804 KB per row, which is the same reason Qwen2's Step downloads logits

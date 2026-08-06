@@ -16,9 +16,9 @@ so M6's overlap pipeline was measured and deliberately not built.
 
 M9's MoE path is now checkpoint-validated and serves gpt-oss-20b directly from
 MXFP4 weights. Its grouped MoE projections consume device-resident dispatch
-offsets, removing the per-layer host synchronization and making the path CUDA
-graph-capturable. Still open: tensor parallelism (M7), a W4A16 GEMM that beats bf16
-(M8), and wiring MLA into a served checkpoint (M9).
+offsets, removing the per-layer host synchronization; fixed decode shapes now
+replay as CUDA graphs. Still open: tensor parallelism (M7), a W4A16 GEMM that
+beats bf16 (M8), and wiring MLA into a served checkpoint (M9).
 
 ## Why another engine
 
