@@ -43,11 +43,11 @@ struct EngineConfig {
   /// embeddings, norms, and the tied LM head remain bf16.
   bool int4_weights = false;
 
-  /// Store the KV cache as FP8 e4m3 instead of bf16. Halves KV memory (twice the
-  /// concurrency at the same VRAM) at the cost of fp8 quantization error on K/V.
-  /// Per-layer dequant scales are frozen from warmup; prefill folds the K scale
-  /// into the query and decode into sm_scale. Off by default for the same reason
-  /// as `fp8_weights`.
+  /// Store the KV cache as FP8 e4m3 instead of bf16. Halves KV memory (twice
+  /// the concurrency at the same VRAM) at the cost of fp8 quantization error on
+  /// K/V. Per-layer dequant scales are frozen from warmup; prefill folds the K
+  /// scale into the query and decode into sm_scale. Off by default for the same
+  /// reason as `fp8_weights`.
   bool fp8_kv_cache = false;
 
   /// Capture a CUDA graph per batch size at startup.
@@ -172,8 +172,7 @@ class Engine {
   ///                  greedy, so callers predating sampling are unaffected.
   StatusOr<std::shared_ptr<Generation>> Submit(
       std::vector<int32_t> prompt, int32_t max_tokens,
-      std::vector<std::string> stop,
-      scheduler::SamplingParams sampling = {});
+      std::vector<std::string> stop, scheduler::SamplingParams sampling = {});
 
   /// \brief The tokenizer, for callers that need to encode prompts.
   const tokenizer::Tokenizer& tokenizer() const;
@@ -208,6 +207,10 @@ class Engine {
   };
 
   Stats stats() const;
+
+  /// Prometheus text exposition for process-lifetime serving metrics and the
+  /// current scheduler/cache snapshot. Safe to call from HTTP scrape threads.
+  std::string metrics() const;
 
  private:
   struct Impl;

@@ -1,8 +1,8 @@
 # InferX observability design
 
-Status: implementation plan for M7 tensor parallelism. Milestone 1 (the internal
-registry and Prometheus `/metrics` endpoint) is implemented; serving lifecycle
-instrumentation begins in milestone 2.
+Status: implementation plan for M7 tensor parallelism. Milestones 1 and 2 are
+implemented: the registry and `/metrics` endpoint now report request outcomes,
+queue time, TTFT, ITL, end-to-end latency, and request token distributions.
 
 ## Scope and reviewed implementations
 

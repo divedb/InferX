@@ -1,6 +1,7 @@
 #include "inferx/server/engine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include "inferx/api/openai.h"
 #include "inferx/model/forward_batch.h"
 #include "inferx/model/gpt_oss.h"
+#include "inferx/observe/metrics.h"
 #include "qwen_runner.h"
 
 namespace inferx::server {
@@ -36,6 +38,83 @@ constexpr auto kIdleWait = std::chrono::milliseconds(2);
 // Wait for a short quiet period only at the idle-to-busy transition. Decode
 // steps and arrivals while work is already running pay no delay.
 constexpr auto kBatchCoalesceWait = std::chrono::milliseconds(1);
+
+double SecondsSince(std::chrono::steady_clock::time_point start,
+                    std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double>(end - start).count();
+}
+
+struct ServingMetrics {
+  observe::Registry registry;
+  std::shared_ptr<observe::Counter> accepted;
+  std::array<std::shared_ptr<observe::Counter>, 6> finished;
+  std::shared_ptr<observe::Counter> prompt_tokens;
+  std::shared_ptr<observe::Counter> generation_tokens;
+  std::shared_ptr<observe::Histogram> queue;
+  std::shared_ptr<observe::Histogram> ttft;
+  std::shared_ptr<observe::Histogram> itl;
+  std::shared_ptr<observe::Histogram> duration;
+  std::shared_ptr<observe::Histogram> prompt_length;
+  std::shared_ptr<observe::Histogram> generation_length;
+
+  ServingMetrics() {
+    accepted = registry.AddCounter(
+        "inferx_requests_total", "Requests by terminal outcome and reason.",
+        {{"finish_reason", ""}, {"outcome", "accepted"}});
+    for (int i = 1; i <= 5; ++i) {
+      const auto reason = static_cast<FinishReason>(i);
+      std::string outcome = "failed";
+      if (reason == FinishReason::kStopToken ||
+          reason == FinishReason::kMaxTokens) {
+        outcome = "completed";
+      } else if (reason == FinishReason::kCancelled) {
+        outcome = "cancelled";
+      }
+      finished[static_cast<size_t>(i)] = registry.AddCounter(
+          "inferx_requests_total", "Requests by terminal outcome and reason.",
+          {{"finish_reason", scheduler::FinishReasonName(reason)},
+           {"outcome", std::move(outcome)}});
+    }
+    prompt_tokens = registry.AddCounter("inferx_prompt_tokens_total",
+                                        "Accepted prompt tokens.");
+    generation_tokens = registry.AddCounter("inferx_generation_tokens_total",
+                                            "Generated output tokens.");
+    queue = registry.AddHistogram(
+        "inferx_request_queue_seconds", "Time from acceptance to admission.",
+        {.0001, .001, .005, .01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60});
+    ttft = registry.AddHistogram("inferx_time_to_first_token_seconds",
+                                 "Time from acceptance to first output token.",
+                                 {.001, .002, .005, .01, .02, .04, .06, .08, .1,
+                                  .2, .4, .8, 1, 2, 4, 8, 16, 32, 64});
+    itl = registry.AddHistogram(
+        "inferx_inter_token_latency_seconds",
+        "Time between consecutive generated tokens for a request.",
+        {.001, .002, .004, .006, .008, .01, .015, .02, .025, .03, .04, .06, .08,
+         .1, .2, .4, 1, 2});
+    duration = registry.AddHistogram(
+        "inferx_request_duration_seconds",
+        "Time from acceptance to terminal completion.",
+        {.1, .25, .5, 1, 2.5, 5, 10, 20, 40, 60, 120, 300, 600});
+    const std::vector<double> token_buckets = {
+        1,   2,   4,    8,    16,   32,   64,    128,
+        256, 512, 1024, 2048, 4096, 8192, 16384, 32768};
+    prompt_length = registry.AddHistogram("inferx_request_prompt_tokens",
+                                          "Prompt tokens per accepted request.",
+                                          token_buckets);
+    generation_length = registry.AddHistogram(
+        "inferx_request_generation_tokens",
+        "Generated tokens per terminal request.", token_buckets);
+  }
+
+  void RecordFinish(FinishReason reason, int32_t generated,
+                    std::chrono::steady_clock::time_point submitted) {
+    const size_t index = static_cast<size_t>(reason);
+    if (index > 0 && index < finished.size()) finished[index]->Increment();
+    generation_length->Observe(generated);
+    duration->Observe(
+        SecondsSince(submitted, std::chrono::steady_clock::now()));
+  }
+};
 
 }  // namespace
 
@@ -134,6 +213,7 @@ struct Engine::Impl {
     RequestId id;
     std::vector<int32_t> prompt;
     scheduler::SamplingParams params;
+    std::chrono::steady_clock::time_point submitted;
 
     // Held here rather than in `params` because the scheduler never sees text
     // (§3.1); matching these is this layer's job.
@@ -147,6 +227,7 @@ struct Engine::Impl {
   RequestId next_id = 1;
 
   Engine::Stats stats;
+  ServingMetrics metrics;
 
   std::thread loop;
 
@@ -165,6 +246,10 @@ struct Engine::Impl {
     std::vector<std::string> stop;
     bool stop_hit = false;
     int32_t generated = 0;
+    std::chrono::steady_clock::time_point submitted;
+    std::chrono::steady_clock::time_point last_token;
+    bool admitted = false;
+    bool produced_token = false;
   };
 
   std::unordered_map<RequestId, Active> active;
@@ -182,8 +267,17 @@ struct Engine::Impl {
 
     Active& state = it->second;
 
+    const auto now = std::chrono::steady_clock::now();
+    if (state.produced_token) {
+      metrics.itl->Observe(SecondsSince(state.last_token, now));
+    } else {
+      metrics.ttft->Observe(SecondsSince(state.submitted, now));
+      state.produced_token = true;
+    }
+    state.last_token = now;
+
     ++state.generated;
-    ++stats.tokens_generated;
+    metrics.generation_tokens->Increment();
 
     state.text += state.decoder->Push(delta.token);
 
@@ -264,7 +358,18 @@ struct Engine::Impl {
         state.stop_hit ? FinishReason::kStopToken : reason;
 
     state.generation->Finish(reported, state.generated);
+    metrics.RecordFinish(reported, state.generated, state.submitted);
     active.erase(it);
+  }
+
+  void RecordAdmissions() {
+    const auto now = std::chrono::steady_clock::now();
+    for (const RequestId id : scheduler->TakeAdmitted()) {
+      const auto it = active.find(id);
+      if (it == active.end() || it->second.admitted) continue;
+      it->second.admitted = true;
+      metrics.queue->Observe(SecondsSince(it->second.submitted, now));
+    }
   }
 
   // Drives one short request all the way through, before anything real is
@@ -332,9 +437,25 @@ struct Engine::Impl {
       RunQwen2();
     }
 
+    // Requests can still be in the intake queue when shutdown wins the race
+    // with the loop. Close those streams and account for them just like active
+    // cancellations; otherwise their consumers wait forever and accepted
+    // requests never receive a terminal outcome.
+    std::deque<Pending> abandoned;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      abandoned.swap(intake);
+    }
+    for (Pending& pending : abandoned) {
+      pending.generation->Finish(FinishReason::kCancelled, 0);
+      metrics.RecordFinish(FinishReason::kCancelled, 0, pending.submitted);
+    }
+
     // Shutting down: nothing else will ever produce for these streams.
     for (auto& [id, state] : active) {
       state.generation->Finish(FinishReason::kCancelled, state.generated);
+      metrics.RecordFinish(FinishReason::kCancelled, state.generated,
+                           state.submitted);
     }
 
     active.clear();
@@ -359,8 +480,7 @@ struct Engine::Impl {
               std::chrono::steady_clock::now() + kBatchCoalesceWait;
 
           while (!stopping.load(std::memory_order_relaxed)) {
-            if (wake.wait_until(lock, quiet_until) ==
-                std::cv_status::timeout) {
+            if (wake.wait_until(lock, quiet_until) == std::cv_status::timeout) {
               break;
             }
 
@@ -385,6 +505,8 @@ struct Engine::Impl {
           if (!added.ok()) {
             lock.unlock();
             pending.generation->Finish(FinishReason::kOutOfMemory, 0);
+            metrics.RecordFinish(FinishReason::kOutOfMemory, 0,
+                                 pending.submitted);
             lock.lock();
             continue;
           }
@@ -394,6 +516,7 @@ struct Engine::Impl {
           state.decoder = std::make_unique<tokenizer::IncrementalDecoder>(
               tokenizer.get(), /*skip_special=*/true);
           state.stop = std::move(pending.stop);
+          state.submitted = pending.submitted;
 
           active.emplace(pending.id, std::move(state));
         }
@@ -415,6 +538,7 @@ struct Engine::Impl {
         FailAll(prepared);
         continue;
       }
+      RecordAdmissions();
 
       if (!batch.token_ids.empty()) {
         Status stepped = qwen2_model->StepAsync(batch);
@@ -441,10 +565,12 @@ struct Engine::Impl {
 
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
+        stats.tokens_generated += static_cast<int64_t>(deltas.size());
         stats.last_step_ms = qwen2_model->last_step_device_ms();
       }
 
-      for (const scheduler::Completion& completion : scheduler->TakeCompleted()) {
+      for (const scheduler::Completion& completion :
+           scheduler->TakeCompleted()) {
         Retire(completion.id, completion.reason);
       }
 
@@ -518,6 +644,8 @@ struct Engine::Impl {
           if (!added.ok()) {
             lock.unlock();
             pending.generation->Finish(FinishReason::kOutOfMemory, 0);
+            metrics.RecordFinish(FinishReason::kOutOfMemory, 0,
+                                 pending.submitted);
             lock.lock();
             continue;
           }
@@ -527,6 +655,7 @@ struct Engine::Impl {
           state.decoder = std::make_unique<tokenizer::IncrementalDecoder>(
               tokenizer.get(), /*skip_special=*/true);
           state.stop = std::move(pending.stop);
+          state.submitted = pending.submitted;
 
           active.emplace(pending.id, std::move(state));
         }
@@ -548,6 +677,7 @@ struct Engine::Impl {
         FailAll(prepared);
         continue;
       }
+      RecordAdmissions();
 
       if (batch.token_ids.empty()) {
         for (const scheduler::Completion& completion :
@@ -576,8 +706,8 @@ struct Engine::Impl {
       sampled.reserve(batch.logits_indices.size());
       for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
         const float* row = logits.data() + i * static_cast<size_t>(vocab);
-        const int32_t tok = static_cast<int32_t>(
-            std::max_element(row, row + vocab) - row);
+        const int32_t tok =
+            static_cast<int32_t>(std::max_element(row, row + vocab) - row);
         sampled.push_back(tok);
       }
 
@@ -593,6 +723,7 @@ struct Engine::Impl {
       {
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
+        stats.tokens_generated += static_cast<int64_t>(deltas.size());
         stats.running = scheduler->num_running();
         stats.waiting = scheduler->num_waiting();
         stats.blocks_in_use = scheduler->blocks_in_use();
@@ -619,6 +750,8 @@ struct Engine::Impl {
 
     for (auto& [id, state] : active) {
       state.generation->Finish(FinishReason::kOutOfMemory, state.generated);
+      metrics.RecordFinish(FinishReason::kOutOfMemory, state.generated,
+                           state.submitted);
     }
 
     active.clear();
@@ -648,8 +781,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     return InvalidArgumentError("tensor_parallel_size must be 1 or 2, got ",
                                 config.tensor_parallel_size);
   }
-  if (static_cast<int>(config.devices.size()) !=
-      config.tensor_parallel_size) {
+  if (static_cast<int>(config.devices.size()) != config.tensor_parallel_size) {
     return InvalidArgumentError("devices has ", config.devices.size(),
                                 " entries but tensor_parallel_size is ",
                                 config.tensor_parallel_size);
@@ -658,15 +790,14 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     return InvalidArgumentError("unknown communication backend ",
                                 config.comm_backend);
   }
-  if ((config.tensor_parallel_size == 1) !=
-      (config.comm_backend == "single")) {
+  if ((config.tensor_parallel_size == 1) != (config.comm_backend == "single")) {
     return InvalidArgumentError(
         "TP=1 requires comm_backend=single and TP=2 requires nccl");
   }
 
-  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<tokenizer::Tokenizer> tok,
-                          tokenizer::Tokenizer::LoadFromDirectory(
-                              config.model_dir));
+  INFERX_ASSIGN_OR_RETURN(
+      std::unique_ptr<tokenizer::Tokenizer> tok,
+      tokenizer::Tokenizer::LoadFromDirectory(config.model_dir));
 
   // Architecture dispatch. The checkpoint's config.json says which model class
   // to build, and the two classes expose different contracts: Qwen2Model has
@@ -681,11 +812,10 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
   impl->config = config;
   impl->tokenizer = std::move(tok);
 
-  impl->model_name = config.served_model_name.empty()
-                         ? std::filesystem::path(config.model_dir)
-                               .filename()
-                               .string()
-                         : config.served_model_name;
+  impl->model_name =
+      config.served_model_name.empty()
+          ? std::filesystem::path(config.model_dir).filename().string()
+          : config.served_model_name;
 
   if (model_config.architecture == model::Architecture::kGptOss) {
     if (config.tensor_parallel_size != 1) {
@@ -711,7 +841,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // gpt-oss has 24 layers × 8 kv_heads × 64 head_dim × 2 (bf16) = 2048
     // bytes/token/layer; the pool sizing is a VRAM/latency trade the caller
     // makes via --kv-blocks, same as Qwen2.
-    INFERX_RETURN_IF_ERROR(gpt_oss.AttachKvCache(config.kv_blocks, config.block_size));
+    INFERX_RETURN_IF_ERROR(
+        gpt_oss.AttachKvCache(config.kv_blocks, config.block_size));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,
@@ -725,8 +856,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // Size the activation scratch once, for the largest batch that will ever
     // run. The scratch only grows, so a later growth inside a step is fine --
     // but doing it up front avoids the first-step reallocation cost.
-    INFERX_RETURN_IF_ERROR(
-        impl->gpt_oss_model->ReserveActivations(config.scheduler.max_batch_tokens));
+    INFERX_RETURN_IF_ERROR(impl->gpt_oss_model->ReserveActivations(
+        config.scheduler.max_batch_tokens));
 
     if (config.capture_graphs) {
       const int64_t max_blocks =
@@ -836,11 +967,16 @@ StatusOr<std::shared_ptr<Generation>> Engine::Submit(
 
   Impl::Pending pending;
   pending.prompt = std::move(prompt);
+  pending.submitted = std::chrono::steady_clock::now();
   pending.params = std::move(sampling);
   pending.params.max_tokens = max_tokens;
   pending.params.stop_tokens = {impl_->tokenizer->eos_id()};
   pending.stop = std::move(stop);
   pending.generation = generation;
+
+  impl_->metrics.accepted->Increment();
+  impl_->metrics.prompt_tokens->Increment(static_cast<uint64_t>(prompt_len));
+  impl_->metrics.prompt_length->Observe(prompt_len);
 
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -866,5 +1002,7 @@ Engine::Stats Engine::stats() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   return impl_->stats;
 }
+
+std::string Engine::metrics() const { return impl_->metrics.registry.Render(); }
 
 }  // namespace inferx::server

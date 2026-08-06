@@ -9,12 +9,12 @@
 
 #include "inferx/scheduler/scheduler.h"
 
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <memory>
 #include <tuple>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "absl/container/flat_hash_map.h"
 #include "inferx/core/kv_cache.h"
@@ -36,8 +36,7 @@ StatusOr<KvBlockPool> HostPool(int64_t blocks, int64_t block_size = 4) {
                              DeviceId::Cpu());
 }
 
-SamplingParams Params(int32_t max_tokens,
-                      std::vector<int32_t> stops = {}) {
+SamplingParams Params(int32_t max_tokens, std::vector<int32_t> stops = {}) {
   SamplingParams p;
   p.max_tokens = max_tokens;
   p.stop_tokens = std::move(stops);
@@ -110,8 +109,22 @@ TEST_F(SchedulerTest, FirstStepIsAPrefillOfTheWholePrompt) {
   // 5 tokens at 4 per block is 2 blocks.
   EXPECT_EQ(sched_->blocks_in_use(), 2);
 
-  ASSERT_TRUE(batch.Validate(1000, pool_->num_blocks() * pool_->block_size())
-                  .ok());
+  ASSERT_TRUE(
+      batch.Validate(1000, pool_->num_blocks() * pool_->block_size()).ok());
+}
+
+TEST_F(SchedulerTest, ReportsAdmissionsExactlyOnceUntilReadmitted) {
+  ASSERT_TRUE(sched_->AddRequest(41, {10, 11}, Params(2)).ok());
+  ASSERT_TRUE(sched_->AddRequest(42, {20, 21}, Params(2)).ok());
+
+  ForwardBatch batch;
+  ASSERT_TRUE(sched_->PrepareStep(&batch).ok());
+  EXPECT_EQ(sched_->TakeAdmitted(), (std::vector<RequestId>{41, 42}));
+  EXPECT_TRUE(sched_->TakeAdmitted().empty());
+
+  ASSERT_TRUE(sched_->CommitStep({30, 31}).ok());
+  ASSERT_TRUE(sched_->PrepareStep(&batch).ok());
+  EXPECT_TRUE(sched_->TakeAdmitted().empty());
 }
 
 // After the prefill, each step carries exactly one token per sequence, at the
@@ -168,7 +181,8 @@ TEST_F(SchedulerTest, StopsOnAStopToken) {
 
   EXPECT_EQ(done[0].id, 7u);
   EXPECT_EQ(done[0].reason, FinishReason::kStopToken);
-  // The stop token is part of the output; the caller decides whether to show it.
+  // The stop token is part of the output; the caller decides whether to show
+  // it.
   EXPECT_EQ(done[0].output_tokens, (std::vector<int32_t>{5, 42}));
 
   EXPECT_FALSE(sched_->HasWork());
@@ -197,9 +211,9 @@ TEST_F(SchedulerTest, BlocksAreReturnedAndReused) {
   const int64_t total = pool_->num_blocks();
 
   for (int r = 0; r < 3; ++r) {
-    ASSERT_TRUE(sched_->AddRequest(static_cast<RequestId>(r), {1, 2, 3},
-                                   Params(1))
-                    .ok());
+    ASSERT_TRUE(
+        sched_->AddRequest(static_cast<RequestId>(r), {1, 2, 3}, Params(1))
+            .ok());
 
     ForwardBatch batch;
     ASSERT_TRUE(sched_->PrepareStep(&batch).ok());
@@ -237,9 +251,8 @@ TEST_F(SchedulerTest, RunsSeveralSequencesInOneBatch) {
 
 TEST_F(SchedulerTest, AdmissionIsCappedByMaxRunning) {
   for (int i = 0; i < 6; ++i) {
-    ASSERT_TRUE(sched_->AddRequest(static_cast<RequestId>(i), {1, 2},
-                                   Params(2))
-                    .ok());
+    ASSERT_TRUE(
+        sched_->AddRequest(static_cast<RequestId>(i), {1, 2}, Params(2)).ok());
   }
 
   ForwardBatch batch;
@@ -306,8 +319,8 @@ TEST_F(SchedulerTest, CancellingARunningRequestFreesItsBlocks) {
   const std::vector<Completion> done = sched_->TakeCompleted();
   ASSERT_EQ(done.size(), 1u);
   EXPECT_EQ(done[0].reason, FinishReason::kCancelled);
-  // Partial output survives cancellation -- the caller may already have streamed
-  // it (§4, step 10).
+  // Partial output survives cancellation -- the caller may already have
+  // streamed it (§4, step 10).
   EXPECT_EQ(done[0].output_tokens, (std::vector<int32_t>{7}));
 }
 
@@ -602,8 +615,8 @@ TEST_F(SchedulerTest, ChunkedPromptsDrainToCompletion) {
     }
 
     ASSERT_LE(batch.num_tokens(), 3) << "step " << steps << " overran budget";
-    ASSERT_TRUE(batch.Validate(1000, pool_->num_blocks() * pool_->block_size())
-                    .ok())
+    ASSERT_TRUE(
+        batch.Validate(1000, pool_->num_blocks() * pool_->block_size()).ok())
         << "step " << steps << ": "
         << batch.Validate(1000, pool_->num_blocks() * pool_->block_size());
 
@@ -741,8 +754,9 @@ TEST_F(SchedulerTest, APreemptedSequenceProducesWhatItWouldHaveAnyway) {
     ASSERT_NE(sched, nullptr);
 
     for (size_t i = 0; i < prompts.size(); ++i) {
-      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
-                                    Params(20))
+      ASSERT_TRUE(sched
+                      ->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
+                                   Params(20))
                       .ok());
     }
 
@@ -762,8 +776,9 @@ TEST_F(SchedulerTest, APreemptedSequenceProducesWhatItWouldHaveAnyway) {
     ASSERT_NE(sched, nullptr);
 
     for (size_t i = 0; i < prompts.size(); ++i) {
-      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
-                                    Params(20))
+      ASSERT_TRUE(sched
+                      ->AddRequest(static_cast<RequestId>(i + 1), prompts[i],
+                                   Params(20))
                       .ok());
     }
 
@@ -858,8 +873,8 @@ TEST_F(SchedulerTest, APreemptedSequenceGoesToTheFrontOfTheQueue) {
     ASSERT_TRUE(sched->CommitStep(sampled).ok());
   }
 
-  ASSERT_GT(sched->preemptions(), 0) << "nothing was preempted in " << step
-                                     << " steps";
+  ASSERT_GT(sched->preemptions(), 0)
+      << "nothing was preempted in " << step << " steps";
 
   // A newcomer arrives while the preempted sequence is queued.
   ASSERT_TRUE(sched->AddRequest(99, {7}, Params(2)).ok());
@@ -995,7 +1010,8 @@ Workload RunWorkload(Scheduler* sched, int max_steps = 2000) {
       for (const int32_t row : batch.logits_indices) {
         // A function of the sequence's own position, so the "same input gives
         // the same output" comparison below means something.
-        sampled.push_back(200 + (batch.positions[static_cast<size_t>(row)] * 3) % 40);
+        sampled.push_back(200 +
+                          (batch.positions[static_cast<size_t>(row)] * 3) % 40);
       }
 
       if (!sched->CommitStep(sampled).ok()) break;
@@ -1018,7 +1034,8 @@ Workload RunWorkload(Scheduler* sched, int max_steps = 2000) {
 TEST_F(SchedulerTest, ASecondRequestSkipsThePrefixItWouldHaveRecomputed) {
   // 16 tokens is 4 blocks at this block size.
   std::vector<int32_t> prompt(16);
-  for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = static_cast<int32_t>(i);
+  for (size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = static_cast<int32_t>(i);
 
   ASSERT_TRUE(sched_->AddRequest(1, prompt, Params(2)).ok());
   const Workload cold = RunWorkload(sched_.get());
@@ -1089,10 +1106,9 @@ TEST_F(SchedulerTest, TheCacheDoesNotChangeWhatIsGenerated) {
 
     ExpectNothingLeaked(*owned, *sched);
 
-    std::sort(all.begin(), all.end(),
-              [](const Completion& a, const Completion& b) {
-                return a.id < b.id;
-              });
+    std::sort(
+        all.begin(), all.end(),
+        [](const Completion& a, const Completion& b) { return a.id < b.id; });
     return all;
   };
 
@@ -1136,9 +1152,9 @@ TEST_F(SchedulerTest, APreemptedSequenceGetsItsOwnHistoryBackFromTheCache) {
     for (size_t k = 0; k < prompt.size(); ++k) {
       prompt[k] = static_cast<int32_t>(i * 100 + k);
     }
-    ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1), prompt,
-                                  Params(12))
-                    .ok());
+    ASSERT_TRUE(
+        sched->AddRequest(static_cast<RequestId>(i + 1), prompt, Params(12))
+            .ok());
   }
 
   const Workload w = RunWorkload(sched.get());
@@ -1248,8 +1264,9 @@ TEST_F(SchedulerTest, DestructionReturnsTheBlocksOfUnfinishedRequests) {
     // Enough requests to exceed max_running, so some are still queued when the
     // scheduler goes away and others are running with blocks held.
     for (int i = 0; i < 6; ++i) {
-      ASSERT_TRUE(sched->AddRequest(static_cast<RequestId>(i + 1),
-                                    {1, 2, 3, 4, 5}, Params(50))
+      ASSERT_TRUE(sched
+                      ->AddRequest(static_cast<RequestId>(i + 1),
+                                   {1, 2, 3, 4, 5}, Params(50))
                       .ok());
     }
 
@@ -1302,8 +1319,8 @@ TEST_F(SchedulerTest, DrainsAMixedWorkloadToCompletion) {
       continue;
     }
 
-    ASSERT_TRUE(batch.Validate(1000, pool_->num_blocks() * pool_->block_size())
-                    .ok())
+    ASSERT_TRUE(
+        batch.Validate(1000, pool_->num_blocks() * pool_->block_size()).ok())
         << "step " << steps << " produced an invalid batch";
 
     // Stand-in for the executor: hand back one token per requested logits row.
@@ -1367,8 +1384,7 @@ TEST_F(SchedulerTest, EveryBatchSlotIsCoveredByTheBatchBlockTable) {
       const int64_t seq = batch.seq_of_token[i];
 
       // Where the token's KV is actually written.
-      const int32_t physical_block =
-          static_cast<int32_t>(slot / block_size);
+      const int32_t physical_block = static_cast<int32_t>(slot / block_size);
 
       // Where attention will look for it: the logical block this position
       // falls in, resolved through the batch's own table.

@@ -6,6 +6,8 @@
 /// client would. Everything below the wire format is covered elsewhere; what is
 /// only covered here is that the pieces are actually connected.
 
+#include <gtest/gtest.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,8 +15,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "httplib.h"
 #include "inferx/common/json.h"
@@ -39,8 +39,7 @@ std::string CheckpointDir() {
 bool CheckpointPresent() {
   const std::string dir = CheckpointDir();
 
-  return !dir.empty() &&
-         std::ifstream(dir + "/config.json").good();
+  return !dir.empty() && std::ifstream(dir + "/config.json").good();
 }
 
 TEST(ServerConfigTest, RejectsConflictingWeightFormatsBeforeLoading) {
@@ -59,11 +58,11 @@ TEST(ServerConfigTest, RejectsConflictingWeightFormatsBeforeLoading) {
 // FP8 KV cache, end to end. A separate engine (small config, so it coexists
 // with the suite's engine on the 16 GB card) built with fp8_kv_cache=true:
 // warmup freezes the per-layer K/V scales, the decode graph captures the fp8
-// path, and the run goes through AppendBf16AsFp8 + RunFp8/PrefillFp8 against the
-// real model. The gate is the same robust fact the bf16 suite checks -- fp8 KV
-// quantization error is small enough that "The capital of France is" still
-// continues " Paris". A regression here means the fp8 path is wired wrong or the
-// freeze did not take.
+// path, and the run goes through AppendBf16AsFp8 + RunFp8/PrefillFp8 against
+// the real model. The gate is the same robust fact the bf16 suite checks -- fp8
+// KV quantization error is small enough that "The capital of France is" still
+// continues " Paris". A regression here means the fp8 path is wired wrong or
+// the freeze did not take.
 TEST(ServerTestFp8Kv, Fp8KvCacheServesTheExpectedContinuation) {
   if (!CudaAvailable() || !CheckpointPresent()) {
     GTEST_SKIP() << "needs a CUDA device and the test checkpoint";
@@ -302,8 +301,8 @@ TEST_F(ServerTest, CancellingStopsGenerationEarly) {
 
   // The stream must terminate rather than hang: a client that disconnects must
   // not leave a sequence occupying KV blocks forever.
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::seconds(30);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
   bool finished = false;
 
@@ -381,9 +380,8 @@ TEST_F(ServerTest, IdenticalRequestsProduceIdenticalOutput) {
 
     const JsonValue root = ParseBody(response->body);
     const StatusOr<std::string_view> content =
-        (**root.Find("choices")->AsArray())[0]
-            .Find("message")
-            ->RequiredString("content");
+        (**root.Find("choices")->AsArray())[0].Find("message")->RequiredString(
+            "content");
     ASSERT_TRUE(content.ok());
 
     answers.emplace_back(*content);
@@ -430,12 +428,12 @@ TEST_F(ServerTest, HealthAndModelsRespond) {
 TEST_F(ServerTest, ChatCompletionReturnsAnAnswer) {
   httplib::Client client = Client();
 
-  const httplib::Result response = client.Post(
-      "/v1/chat/completions",
-      R"({"messages":[{"role":"user","content":)"
-      R"("What is the capital of France? Answer in one word."}],)"
-      R"("max_tokens":16})",
-      "application/json");
+  const httplib::Result response =
+      client.Post("/v1/chat/completions",
+                  R"({"messages":[{"role":"user","content":)"
+                  R"("What is the capital of France? Answer in one word."}],)"
+                  R"("max_tokens":16})",
+                  "application/json");
 
   ASSERT_TRUE(response) << "no response";
   ASSERT_EQ(response->status, 200) << response->body;
@@ -505,9 +503,8 @@ TEST_F(ServerTest, StreamingDeltasConcatenateToTheBlockingAnswer) {
 
   const JsonValue root = ParseBody(blocking->body);
   const StatusOr<std::string_view> expected =
-      (**root.Find("choices")->AsArray())[0]
-          .Find("message")
-          ->RequiredString("content");
+      (**root.Find("choices")->AsArray())[0].Find("message")->RequiredString(
+          "content");
   ASSERT_TRUE(expected.ok());
 
   const std::string streaming_body =
@@ -515,8 +512,8 @@ TEST_F(ServerTest, StreamingDeltasConcatenateToTheBlockingAnswer) {
                   R"("Name three colours."}],"max_tokens":32,"stream":true})");
 
   std::string raw;
-  const httplib::Result streamed = client.Post(
-      "/v1/chat/completions", streaming_body, "application/json");
+  const httplib::Result streamed =
+      client.Post("/v1/chat/completions", streaming_body, "application/json");
 
   ASSERT_TRUE(streamed);
   ASSERT_EQ(streamed->status, 200);
@@ -643,7 +640,8 @@ TEST_F(ServerTest, StreamingUsageChunkMatchesTheBlockingCounts) {
   }
 
   EXPECT_EQ(usage_chunks, 1) << "expected exactly one usage chunk";
-  EXPECT_TRUE(usage_was_last) << "the usage chunk was not the last before [DONE]";
+  EXPECT_TRUE(usage_was_last)
+      << "the usage chunk was not the last before [DONE]";
   EXPECT_EQ(prompt_tokens, *expected_prompt);
   EXPECT_EQ(completion_tokens, *expected_completion);
 }
@@ -667,11 +665,11 @@ TEST_F(ServerTest, StreamingOmitsUsageUnlessAsked) {
 TEST_F(ServerTest, StopStringIsRemovedFromTheOutput) {
   httplib::Client client = Client();
 
-  const httplib::Result response = client.Post(
-      "/v1/completions",
-      R"({"prompt":"The capital of France is","max_tokens":32,)"
-      R"("stop":["Germany"]})",
-      "application/json");
+  const httplib::Result response =
+      client.Post("/v1/completions",
+                  R"({"prompt":"The capital of France is","max_tokens":32,)"
+                  R"("stop":["Germany"]})",
+                  "application/json");
 
   ASSERT_TRUE(response);
   ASSERT_EQ(response->status, 200) << response->body;
@@ -701,11 +699,10 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   ASSERT_EQ(response->status, 200);
   EXPECT_NE(response->get_header_value("Content-Type").find("text/plain"),
             std::string::npos);
-  for (const char* metric : {"inferx_requests_running ",
-                             "inferx_requests_waiting ",
-                             "inferx_kv_blocks{state=\"used\"} ",
-                             "inferx_steps_total ",
-                             "inferx_generation_tokens_total "}) {
+  for (const char* metric :
+       {"inferx_requests_running ", "inferx_requests_waiting ",
+        "inferx_kv_blocks{state=\"used\"} ", "inferx_steps_total ",
+        "inferx_generation_tokens_total "}) {
     EXPECT_NE(response->body.find(metric), std::string::npos)
         << "/metrics is missing \"" << metric << "\": " << response->body;
   }
@@ -725,9 +722,9 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   // Generate something *here* rather than relying on earlier tests: ctest runs
   // each test in its own process, so a counter that looks warm when the whole
   // binary runs is zero when the case runs alone.
-  const httplib::Result generated = client.Post(
-      "/v1/completions", R"({"prompt":"Hello","max_tokens":4})",
-      "application/json");
+  const httplib::Result generated =
+      client.Post("/v1/completions", R"({"prompt":"Hello","max_tokens":4})",
+                  "application/json");
 
   ASSERT_TRUE(generated);
   ASSERT_EQ(generated->status, 200) << generated->body;
@@ -738,6 +735,17 @@ TEST_F(ServerTest, MetricsReportTheEnginesCounters) {
   const int64_t after = sample(after_response->body, "inferx_steps_total");
   ASSERT_GE(after, 0);
   EXPECT_GT(after, before) << "the step counter did not advance";
+  for (const char* metric :
+       {"inferx_requests_total{finish_reason=\"\",outcome=\"accepted\"} 1",
+        "inferx_request_queue_seconds_count 1",
+        "inferx_time_to_first_token_seconds_count 1",
+        "inferx_request_duration_seconds_count 1",
+        "inferx_request_prompt_tokens_count 1",
+        "inferx_request_generation_tokens_count 1"}) {
+    EXPECT_NE(after_response->body.find(metric), std::string::npos)
+        << "completed request did not update \"" << metric
+        << "\": " << after_response->body;
+  }
 }
 
 }  // namespace

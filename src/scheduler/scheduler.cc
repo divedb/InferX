@@ -63,12 +63,18 @@ struct Contribution {
 
 const char* FinishReasonName(FinishReason reason) {
   switch (reason) {
-    case FinishReason::kNotFinished: return "not_finished";
-    case FinishReason::kStopToken:   return "stop_token";
-    case FinishReason::kMaxTokens:   return "max_tokens";
-    case FinishReason::kCancelled:   return "cancelled";
-    case FinishReason::kOutOfMemory: return "out_of_memory";
-    case FinishReason::kContextLimit: return "context_limit";
+    case FinishReason::kNotFinished:
+      return "not_finished";
+    case FinishReason::kStopToken:
+      return "stop_token";
+    case FinishReason::kMaxTokens:
+      return "max_tokens";
+    case FinishReason::kCancelled:
+      return "cancelled";
+    case FinishReason::kOutOfMemory:
+      return "out_of_memory";
+    case FinishReason::kContextLimit:
+      return "context_limit";
   }
   return "?";
 }
@@ -105,6 +111,7 @@ struct Scheduler::Impl {
   std::deque<Sequence> waiting;
   std::vector<Sequence> running;
   std::vector<Completion> completed;
+  std::vector<RequestId> admitted;
 
   /// What the last prepared batch asked of each sequence, in the order the
   /// batch lists them, so `CommitStep` can put the results back where they
@@ -355,6 +362,7 @@ struct Scheduler::Impl {
       }
 
       waiting.pop_front();
+      admitted.push_back(seq.id);
       running.push_back(std::move(seq));
     }
   }
@@ -416,6 +424,7 @@ void Scheduler::Cancel(RequestId id) {
 Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
   *out_batch = model::ForwardBatch{};
   impl_->step.clear();
+  impl_->admitted.clear();
 
   // Cancellations take effect before admission, so a cancelled running
   // sequence releases its blocks in time for a waiting one to use them.
@@ -455,8 +464,7 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 
       Sequence& seq = impl_->running[s];
 
-      const Impl::Grow grew =
-          impl_->Reserve(&seq, seq.cached + impl_->take[s]);
+      const Impl::Grow grew = impl_->Reserve(&seq, seq.cached + impl_->take[s]);
 
       if (grew == Impl::Grow::kOk) continue;
 
@@ -533,7 +541,8 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
     // The growth itself now happens in the reserve loop above, before any row
     // is written, which preserves that ordering for the whole batch at once
     // rather than per sequence. The invariant is the same one and
-    // SchedulerTest.EveryBatchSlotIsCoveredByTheBatchBlockTable still guards it.
+    // SchedulerTest.EveryBatchSlotIsCoveredByTheBatchBlockTable still guards
+    // it.
 
     // A sequence's row in the block table, regardless of whether it contributes
     // tokens this step -- the row index is its identity for the whole batch.
@@ -588,9 +597,9 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 
       // Mixed into the position so a request's successive tokens draw
       // differently while staying reproducible from its seed alone.
-      out_batch->seeds.push_back(seq.params.seed ^
-                                 (0x9e3779b97f4a7c15ULL *
-                                  static_cast<uint64_t>(seq.tokens.size())));
+      out_batch->seeds.push_back(
+          seq.params.seed ^
+          (0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(seq.tokens.size())));
     }
 
     impl_->step.push_back({static_cast<int64_t>(s), take, complete});
@@ -614,8 +623,10 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
   for (const Contribution& c : impl_->step) expected += c.sampled ? 1 : 0;
 
   if (sampled.size() != expected) {
-    return InvalidArgumentError("got ", sampled.size(), " sampled tokens but "
-                                "the batch asked for ", expected);
+    return InvalidArgumentError("got ", sampled.size(),
+                                " sampled tokens but "
+                                "the batch asked for ",
+                                expected);
   }
 
   size_t next = 0;
@@ -669,6 +680,12 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
   }
 
   return OkStatus();
+}
+
+std::vector<RequestId> Scheduler::TakeAdmitted() {
+  std::vector<RequestId> result;
+  result.swap(impl_->admitted);
+  return result;
 }
 
 std::vector<Completion> Scheduler::TakeCompleted() {

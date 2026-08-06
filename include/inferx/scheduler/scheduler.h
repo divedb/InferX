@@ -155,7 +155,8 @@ class Scheduler {
   /// \brief Marks a request finished without generating further tokens.
   ///
   /// Safe to call for a request that is queued, running, or already gone --
-  /// a disconnect races with everything, so it cannot be an error (§4, step 10).
+  /// a disconnect races with everything, so it cannot be an error (§4, step
+  /// 10).
   void Cancel(RequestId id);
 
   /// \brief Builds the next step's batch, admitting waiting requests if it can.
@@ -165,7 +166,13 @@ class Scheduler {
   /// \return           OK, or the reason admission could not proceed at all.
   Status PrepareStep(model::ForwardBatch* out_batch);
 
-  /// \brief Applies one sampled token per logits row of the last prepared batch.
+  /// Removes and returns requests admitted by the most recent preparations.
+  /// A preempted request can appear again; consumers that measure initial
+  /// queue time should ignore IDs they have already observed.
+  std::vector<RequestId> TakeAdmitted();
+
+  /// \brief Applies one sampled token per logits row of the last prepared
+  /// batch.
   ///
   /// Not one per sequence: a sequence part-way through a chunked prefill
   /// advances its cached length and produces no token, so a step that finishes

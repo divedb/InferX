@@ -123,8 +123,6 @@ std::string RenderMetrics(const Engine::Stats& stats) {
         "Device duration of the most recently completed engine step.",
         stats.last_step_ms / 1000.0);
   counter("inferx_steps_total", "Completed engine steps.", stats.steps);
-  counter("inferx_generation_tokens_total", "Generated output tokens.",
-          stats.tokens_generated);
   counter("inferx_preemptions_total", "Scheduler preemptions.",
           stats.preemptions);
   counter("inferx_prefix_cache_hits_total", "Prompt tokens served from cache.",
@@ -333,7 +331,7 @@ struct HttpServer::Impl {
 
     server.Get("/metrics", [this](const httplib::Request&,
                                   httplib::Response& response) {
-      response.set_content(RenderMetrics(engine->stats()),
+      response.set_content(engine->metrics() + RenderMetrics(engine->stats()),
                            "text/plain; version=0.0.4; charset=utf-8");
     });
 
