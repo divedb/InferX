@@ -35,11 +35,11 @@ namespace {
 /// The source is a borrowed host tensor over the checkpoint's mapping, so this
 /// is the point where 6 GB actually crosses PCIe -- and the point where the
 /// pages get faulted in, one tensor at a time, rather than all at once.
-StatusOr<TensorView> Upload(const Tensor& host, std::vector<DeviceBuffer>* keep) {
+StatusOr<TensorView> Upload(const Tensor& host, DeviceId device,
+                            std::vector<DeviceBuffer>* keep) {
   INFERX_ASSIGN_OR_RETURN(
       DeviceBuffer buf,
-      DeviceBuffer::Allocate(static_cast<size_t>(host.nbytes()),
-                             DeviceId::Cuda(0)));
+      DeviceBuffer::Allocate(static_cast<size_t>(host.nbytes()), device));
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), host.data(),
                                          static_cast<size_t>(host.nbytes()),
@@ -48,7 +48,7 @@ StatusOr<TensorView> Upload(const Tensor& host, std::vector<DeviceBuffer>* keep)
   keep->push_back(std::move(buf));
 
   return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
-                            DeviceId::Cuda(0));
+                            device);
 }
 
 /// Weights for one decoder block. Views into buffers owned by Impl.
@@ -95,6 +95,7 @@ struct LayerWeights {
 /// once, at load, and a copy per tensor into the right offset is simpler than
 /// any kernel that would do the same thing.
 StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
+                                        DeviceId device,
                                         std::vector<DeviceBuffer>* keep) {
   int64_t rows = 0;
   int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
@@ -111,7 +112,7 @@ StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
   }
 
   INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+                          DeviceBuffer::Allocate(bytes, device));
 
   size_t offset = 0;
   for (const Tensor& t : parts) {
@@ -127,7 +128,7 @@ StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
                                                 : Shape({rows});
 
   return TensorView::Create(keep->back().data(), parts.front().dtype(), shape,
-                            DeviceId::Cuda(0));
+                            device);
 }
 
 /// A scratch buffer plus the view over it, so activations are allocated once
@@ -136,7 +137,7 @@ struct Scratch {
   DeviceBuffer buf;
 
   StatusOr<TensorView> View(DataType dtype, const Shape& shape) const {
-    return TensorView::Create(buf.data(), dtype, shape, DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), dtype, shape, buf.device());
   }
 };
 
@@ -340,7 +341,7 @@ struct Qwen2Model::Impl {
     INFERX_ASSIGN_OR_RETURN(
         const TensorView in_f8,
         TensorView::Create(act_f8.data(), DataType::kFloat8E4M3FN,
-                           in.GetShape(), DeviceId::Cuda(0)));
+                           in.GetShape(), comm->device()));
 
     INFERX_RETURN_IF_ERROR(
         kernels::QuantizeToF8E4M3Dynamic(in, in_f8, act_scale, stream));
@@ -366,7 +367,7 @@ struct Qwen2Model::Impl {
     if (need <= act_f8.size()) return OkStatus();
 
     INFERX_ASSIGN_OR_RETURN(act_f8,
-                            DeviceBuffer::Allocate(need, DeviceId::Cuda(0)));
+                            DeviceBuffer::Allocate(need, comm->device()));
     return OkStatus();
   }
 
@@ -405,7 +406,7 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   const auto alloc = [&](Scratch* s, int64_t elems, size_t elem_size) -> Status {
     INFERX_ASSIGN_OR_RETURN(
         s->buf, DeviceBuffer::Allocate(static_cast<size_t>(elems) * elem_size,
-                                       DeviceId::Cuda(0)));
+                                       comm->device()));
     return OkStatus();
   };
 
@@ -430,17 +431,17 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
     INFERX_ASSIGN_OR_RETURN(
         fp8_scratch,
         DeviceBuffer::Allocate(static_cast<size_t>(tokens * kvd),
-                               DeviceId::Cuda(0)));
+                               comm->device()));
   }
 
   INFERX_ASSIGN_OR_RETURN(
       positions, DeviceBuffer::Allocate(
                      static_cast<size_t>(tokens) * sizeof(int32_t),
-                     DeviceId::Cuda(0)));
+                     comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       token_ids, DeviceBuffer::Allocate(
                      static_cast<size_t>(tokens) * sizeof(int32_t),
-                     DeviceId::Cuda(0)));
+                     comm->device()));
 
   // Sized for the largest download any caller can ask for: every token's row.
   const size_t logits_bytes = static_cast<size_t>(tokens) *
@@ -488,11 +489,11 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
   INFERX_ASSIGN_OR_RETURN(
       const TensorView ids_v,
       TensorView::Create(token_ids.data(), DataType::kInt32, Shape({tokens}),
-                         DeviceId::Cuda(0)));
+                         comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView pos_v,
       TensorView::Create(positions.data(), DataType::kInt32, Shape({tokens}),
-                         DeviceId::Cuda(0)));
+                         comm->device()));
 
   const Shape hidden_shape({tokens, h});
   INFERX_ASSIGN_OR_RETURN(const TensorView x,
@@ -616,7 +617,7 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
         block_table_buf,
         DeviceBuffer::Allocate(static_cast<size_t>(table_elems) *
                                    sizeof(int32_t),
-                               DeviceId::Cuda(0)));
+                               comm->device()));
     block_table_capacity = table_elems;
   }
 
@@ -624,11 +625,11 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     INFERX_ASSIGN_OR_RETURN(
         slots_buf, DeviceBuffer::Allocate(
                        static_cast<size_t>(tokens) * sizeof(int32_t),
-                       DeviceId::Cuda(0)));
+                       comm->device()));
     INFERX_ASSIGN_OR_RETURN(
         seq_of_token_buf, DeviceBuffer::Allocate(
                               static_cast<size_t>(tokens) * sizeof(int32_t),
-                              DeviceId::Cuda(0)));
+                              comm->device()));
   }
 
   // Reserved before anything is staged, and generously: four per-token arrays,
@@ -795,7 +796,7 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
       INFERX_ASSIGN_OR_RETURN(
           fi_indices_buf,
           DeviceBuffer::Allocate(indices.size() * sizeof(int32_t),
-                                 DeviceId::Cuda(0)));
+                                 comm->device()));
       fi_indices_capacity = static_cast<int64_t>(indices.size());
     }
 
@@ -804,17 +805,17 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
           fi_indptr_buf,
           DeviceBuffer::Allocate(
               static_cast<size_t>(batch.num_seqs + 1) * sizeof(int32_t),
-              DeviceId::Cuda(0)));
+              comm->device()));
       INFERX_ASSIGN_OR_RETURN(
           fi_last_page_buf,
           DeviceBuffer::Allocate(
               static_cast<size_t>(batch.num_seqs) * sizeof(int32_t),
-              DeviceId::Cuda(0)));
+              comm->device()));
       INFERX_ASSIGN_OR_RETURN(
           fi_qo_indptr_buf,
           DeviceBuffer::Allocate(
               static_cast<size_t>(batch.num_seqs + 1) * sizeof(int32_t),
-              DeviceId::Cuda(0)));
+              comm->device()));
       fi_seq_capacity = batch.num_seqs;
     }
 
@@ -872,7 +873,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   const auto i32 = [&](const DeviceBuffer& buf,
                        const Shape& shape) -> StatusOr<TensorView> {
     return TensorView::Create(buf.data(), DataType::kInt32, shape,
-                              DeviceId::Cuda(0));
+                              comm->device());
   };
 
   INFERX_ASSIGN_OR_RETURN(const TensorView ids_v,
@@ -993,7 +994,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         INFERX_ASSIGN_OR_RETURN(
             const TensorView k_fp8_tmp,
             TensorView::Create(fp8_scratch.data(), DataType::kFloat8E4M3FN,
-                               k3.GetShape(), DeviceId::Cuda(0)));
+                               k3.GetShape(), comm->device()));
         INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
             k3, k_fp8_tmp, k_scale_dev, stream));
         INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
@@ -1021,15 +1022,15 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           TensorView::Create(fi_indices_buf.data(), DataType::kInt32,
                              Shape({static_cast<int64_t>(
                                  fi_indptr_host.back())}),
-                             DeviceId::Cuda(0)));
+                             comm->device()));
       INFERX_ASSIGN_OR_RETURN(
           const TensorView fi_indptr,
           TensorView::Create(fi_indptr_buf.data(), DataType::kInt32,
-                             Shape({num_seqs + 1}), DeviceId::Cuda(0)));
+                             Shape({num_seqs + 1}), comm->device()));
       INFERX_ASSIGN_OR_RETURN(
           const TensorView fi_last_page,
           TensorView::Create(fi_last_page_buf.data(), DataType::kInt32,
-                             Shape({num_seqs}), DeviceId::Cuda(0)));
+                             Shape({num_seqs}), comm->device()));
 
       if (use_flashinfer) {
         if (fp8_kv) {
@@ -1045,7 +1046,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         INFERX_ASSIGN_OR_RETURN(
             const TensorView fi_qo_indptr,
             TensorView::Create(fi_qo_indptr_buf.data(), DataType::kInt32,
-                               Shape({num_seqs + 1}), DeviceId::Cuda(0)));
+                               Shape({num_seqs + 1}), comm->device()));
         if (fp8_kv) {
           INFERX_RETURN_IF_ERROR(flashinfer_prefill->PrefillFp8(
               q3, k_cache, v_cache, fi_qo_indptr,
@@ -1128,29 +1129,29 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_ASSIGN_OR_RETURN(
         const TensorView ids_out,
         TensorView::Create(sampled_ids.data(), DataType::kInt32,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView slots_out,
         TensorView::Create(sample_slots.data(), DataType::kInt32,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
 
     INFERX_ASSIGN_OR_RETURN(
         const TensorView rows_in,
         TensorView::Create(sample_rows.data(), DataType::kInt32,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
 
     INFERX_ASSIGN_OR_RETURN(
         const TensorView temp_in,
         TensorView::Create(sample_temp.data(), DataType::kFloat,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView top_p_in,
         TensorView::Create(sample_top_p.data(), DataType::kFloat,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView seeds_in,
         TensorView::Create(sample_seeds.data(), DataType::kUInt64,
-                           Shape({sampled_count}), DeviceId::Cuda(0)));
+                           Shape({sampled_count}), comm->device()));
 
     // One kernel for both modes rather than a branch between two. Greedy is
     // temperature 0 inside SampleTokens, so a captured graph records the same
@@ -1162,7 +1163,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_ASSIGN_OR_RETURN(
         const TensorView next_ids,
         TensorView::Create(token_ids.data(), DataType::kInt32, Shape({tokens}),
-                           DeviceId::Cuda(0)));
+                           comm->device()));
 
     INFERX_RETURN_IF_ERROR(
         kernels::ScatterTokens(ids_out, next_ids, slots_out, stream));
@@ -1232,6 +1233,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     return InvalidArgumentError("Qwen2Model: communicator is null");
   const int tp_size = communicator->size();
   const int tp_rank = communicator->rank();
+  const DeviceId device = communicator->device();
   if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size)
     return InvalidArgumentError("Qwen2Model: invalid TP topology rank=",
                                 tp_rank, " size=", tp_size);
@@ -1252,6 +1254,11 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         ". Converting on upload is straightforward but is not done here, so "
         "that what runs is what the file contains.");
   }
+  if (!device.IsCuda()) {
+    return InvalidArgumentError("Qwen2Model requires a CUDA communicator "
+                                "device, got ", device.ToString());
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(static_cast<int>(device.index)));
 
   INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
                           kernels::CublasLtGemm::Create());
@@ -1282,7 +1289,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
       ckpt.GetChecked("model.embed_tokens.weight",
                       Shape({config.vocab_size, h})));
   INFERX_ASSIGN_OR_RETURN(impl->embed,
-                          Upload(embed_host, &impl->weight_buffers));
+                          Upload(embed_host, device, &impl->weight_buffers));
 
   // Tied embeddings: the output projection *is* the embedding matrix, so the
   // LM head is the same device buffer rather than a second 600 MB copy.
@@ -1293,13 +1300,14 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         const Tensor lm_host,
         ckpt.GetChecked("lm_head.weight", Shape({config.vocab_size, h})));
     INFERX_ASSIGN_OR_RETURN(impl->lm_head,
-                            Upload(lm_host, &impl->weight_buffers));
+                            Upload(lm_host, device, &impl->weight_buffers));
   }
 
   INFERX_ASSIGN_OR_RETURN(const Tensor final_norm_host,
                           ckpt.GetChecked("model.norm.weight", Shape({h})));
   INFERX_ASSIGN_OR_RETURN(impl->final_norm,
-                          Upload(final_norm_host, &impl->weight_buffers));
+                          Upload(final_norm_host, device,
+                                 &impl->weight_buffers));
 
   impl->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
 
@@ -1312,7 +1320,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
                           TensorView* dst) -> Status {
       INFERX_ASSIGN_OR_RETURN(const Tensor host,
                               ckpt.GetChecked(absl::StrCat(p, suffix), shape));
-      INFERX_ASSIGN_OR_RETURN(*dst, Upload(host, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(*dst,
+                              Upload(host, device, &impl->weight_buffers));
       return OkStatus();
     };
 
@@ -1337,7 +1346,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         qkv.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(w.qkv_w,
-                              UploadConcatenated(qkv, &impl->weight_buffers));
+                              UploadConcatenated(qkv, device,
+                                                 &impl->weight_buffers));
       w.qkv_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
     }
 
@@ -1354,7 +1364,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         qkv_bias.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(
-          w.qkv_b, UploadConcatenated(qkv_bias, &impl->weight_buffers));
+          w.qkv_b,
+          UploadConcatenated(qkv_bias, device, &impl->weight_buffers));
     }
 
     {
@@ -1364,7 +1375,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
                           Shape({h, config.q_dim()})));
       INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
       INFERX_ASSIGN_OR_RETURN(w.o_w,
-                              Upload(local, &impl->weight_buffers));
+                              Upload(local, device, &impl->weight_buffers));
     }
     w.o_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
@@ -1379,7 +1390,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         gate_up.push_back(std::move(local));
       }
       INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
-                              UploadConcatenated(gate_up,
+                              UploadConcatenated(gate_up, device,
                                                  &impl->weight_buffers));
       w.gate_up_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
     }
@@ -1391,7 +1402,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
                           Shape({h, inter})));
       INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
       INFERX_ASSIGN_OR_RETURN(w.down_w,
-                              Upload(local, &impl->weight_buffers));
+                              Upload(local, device, &impl->weight_buffers));
     }
     w.down_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
 
@@ -1508,7 +1519,7 @@ Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
       KvBlockPool::Create(impl_->config.num_hidden_layers, num_blocks,
-                          block_size, layout));
+                          block_size, layout, impl_->comm->device()));
 
   impl_->pool = std::make_unique<KvBlockPool>(std::move(pool));
 
@@ -1529,10 +1540,9 @@ Status Qwen2Model::ReserveActivations(int64_t max_tokens) {
 
 Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
                                       int64_t max_blocks_per_seq) {
-  if (impl_->comm->size() > 1) {
+  if (!impl_->comm->capabilities().cuda_graph_capture) {
     return UnimplementedError(
-        "tensor-parallel graph capture is not implemented; HostSimComm stages "
-        "through the host and cannot be captured");
+        "the selected communication backend cannot be CUDA-graph captured");
   }
   if (impl_->pool == nullptr) {
     return FailedPreconditionError(
@@ -1700,7 +1710,7 @@ Status Qwen2Model::QuantizeWeightsToF8() {
   INFERX_ASSIGN_OR_RETURN(
       DeviceBuffer scales,
       DeviceBuffer::Allocate(static_cast<size_t>(layers) * 4 * sizeof(float),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
 
   auto* scale_base = reinterpret_cast<float*>(scales.data());
 
@@ -1709,14 +1719,14 @@ Status Qwen2Model::QuantizeWeightsToF8() {
     INFERX_ASSIGN_OR_RETURN(
         DeviceBuffer buf,
         DeviceBuffer::Allocate(static_cast<size_t>(src.Numel()),
-                               DeviceId::Cuda(0)));
+                               impl_->comm->device()));
 
     impl_->f8_buffers.push_back(std::move(buf));
 
     INFERX_ASSIGN_OR_RETURN(
         *dst, TensorView::Create(impl_->f8_buffers.back().data(),
                                  DataType::kFloat8E4M3FN, src.GetShape(),
-                                 DeviceId::Cuda(0)));
+                                 impl_->comm->device()));
 
     *scale = scale_base + index;
 
@@ -1742,7 +1752,7 @@ Status Qwen2Model::QuantizeWeightsToF8() {
 
   INFERX_ASSIGN_OR_RETURN(
       impl_->act_scales,
-      DeviceBuffer::Allocate(4 * sizeof(float), DeviceId::Cuda(0)));
+      DeviceBuffer::Allocate(4 * sizeof(float), impl_->comm->device()));
 
   // Release the bf16 originals of exactly the tensors that were quantized, and
   // only after every quantization has landed. Clearing the whole vector would
@@ -1799,25 +1809,25 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
     INFERX_ASSIGN_OR_RETURN(
         DeviceBuffer packed_buf,
         DeviceBuffer::Allocate(static_cast<size_t>(rows * cols / 2),
-                               DeviceId::Cuda(0)));
+                               impl_->comm->device()));
     impl_->int4_buffers.push_back(std::move(packed_buf));
     INFERX_ASSIGN_OR_RETURN(
         *packed, TensorView::Create(impl_->int4_buffers.back().data(),
                                     DataType::kInt4, src.GetShape(),
-                                    DeviceId::Cuda(0)));
+                                    impl_->comm->device()));
 
     INFERX_ASSIGN_OR_RETURN(
         DeviceBuffer scale_buf,
         DeviceBuffer::Allocate(
             static_cast<size_t>(rows * (cols / Impl::kInt4Group) * 2),
-            DeviceId::Cuda(0)));
+            impl_->comm->device()));
     impl_->int4_buffers.push_back(std::move(scale_buf));
     INFERX_ASSIGN_OR_RETURN(
         *scales,
         TensorView::Create(impl_->int4_buffers.back().data(),
                            DataType::kBFloat16,
                            Shape({rows, cols / Impl::kInt4Group}),
-                           DeviceId::Cuda(0)));
+                           impl_->comm->device()));
 
     return kernels::QuantizeBf16ToInt4(src, *packed, *scales, impl_->stream);
   };
@@ -1860,7 +1870,7 @@ Status Qwen2Model::EnableFp8KvCache() {
 
   INFERX_ASSIGN_OR_RETURN(
       impl_->kv_scale_dev,
-      DeviceBuffer::Allocate(2 * sizeof(float), DeviceId::Cuda(0)));
+      DeviceBuffer::Allocate(2 * sizeof(float), impl_->comm->device()));
 
   impl_->fp8_kv = true;
   return OkStatus();
@@ -1889,27 +1899,27 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
   INFERX_ASSIGN_OR_RETURN(
       impl_->sampled_ids,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       impl_->sample_slots,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       impl_->sample_rows,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(int32_t),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       impl_->sample_temp,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(float),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       impl_->sample_top_p,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(float),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
       impl_->sample_seeds,
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(uint64_t),
-                             DeviceId::Cuda(0)));
+                             impl_->comm->device()));
 
   if (impl_->pinned_sampled != nullptr) cudaFreeHost(impl_->pinned_sampled);
   INFERX_CUDA_RETURN_IF_ERROR(
