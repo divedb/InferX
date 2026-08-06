@@ -76,7 +76,7 @@ conventions, and troubleshooting.
 | M5 | Continuous batching, chunked prefill, prefix cache, preemption | **done** |
 | M6 | Overlap pipeline + CUDA graphs for decode | **done** (graphs; overlap measured, not built) |
 | M7 | Tensor parallelism | **done** (HostSim; NCCL deferred) |
-| M8 | W4A16 weights + FP8 KV cache | next |
+| M8 | W4A16 weights + FP8 KV cache | **serving paths done; W4 tuning open** |
 | M9 | MoE and MLA | **layers done** (TP=1, no checkpoint yet) |
 | M10 | Benchmarks vs vLLM/SGLang | **done** (vLLM; SGLang unmeasured) |
 | M11 | Serve gpt-oss-20b from MXFP4 weights | **done** |

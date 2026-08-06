@@ -35,6 +35,7 @@ void PrintUsage(const char* argv0) {
       "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
       "  --block-size <n>       tokens per block (default 16)\n"
       "  --fp8                  quantize weights to FP8 e4m3\n"
+      "  --w4a16                quantize projection weights to grouped int4\n"
       "  --fp8-kv               store the KV cache as FP8 e4m3\n"
       "  --no-cuda-graphs       skip decode graph capture at startup\n"
       "\n"
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {
       engine_config.block_size = std::atoll(value.c_str());
     } else if (arg == "--fp8") {
       engine_config.fp8_weights = true;
+    } else if (arg == "--w4a16") {
+      engine_config.int4_weights = true;
     } else if (arg == "--fp8-kv") {
       engine_config.fp8_kv_cache = true;
     } else if (arg == "--no-cuda-graphs") {
@@ -112,6 +115,11 @@ int main(int argc, char** argv) {
   if (engine_config.model_dir.empty()) {
     std::fprintf(stderr, "error: --model is required\n\n");
     PrintUsage(argv[0]);
+    return 2;
+  }
+
+  if (engine_config.fp8_weights && engine_config.int4_weights) {
+    std::fprintf(stderr, "error: --fp8 and --w4a16 are mutually exclusive\n");
     return 2;
   }
 

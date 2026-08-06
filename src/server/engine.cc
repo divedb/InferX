@@ -643,6 +643,10 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
   if (config.model_dir.empty()) {
     return InvalidArgumentError("model_dir is empty");
   }
+  if (config.fp8_weights && config.int4_weights) {
+    return InvalidArgumentError(
+        "fp8_weights and int4_weights are mutually exclusive");
+  }
 
   INFERX_ASSIGN_OR_RETURN(std::unique_ptr<tokenizer::Tokenizer> tok,
                           tokenizer::Tokenizer::LoadFromDirectory(
@@ -673,7 +677,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // ignoring them keeps `inferx-serve --model <gpt-oss> --fp8` from crashing
     // on a method that does not exist, and the launch log below names the path
     // so the slowness is not a mystery.
-    if (config.fp8_weights || config.fp8_kv_cache || config.capture_graphs) {
+    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache ||
+        config.capture_graphs) {
       // Not an error: the flags are accepted, the gpt-oss path simply does not
       // use them. Logging is the caller's business; the return path is what
       // matters here.
@@ -718,6 +723,9 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
 
     if (config.fp8_weights) {
       INFERX_RETURN_IF_ERROR(model.QuantizeWeightsToF8());
+    }
+    if (config.int4_weights) {
+      INFERX_RETURN_IF_ERROR(model.QuantizeWeightsToInt4());
     }
 
     if (config.fp8_kv_cache) {

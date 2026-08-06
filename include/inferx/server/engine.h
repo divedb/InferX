@@ -32,6 +32,11 @@ struct EngineConfig {
   /// an explicit choice.
   bool fp8_weights = false;
 
+  /// Quantize projection weights to symmetric per-group int4 and run them
+  /// through the fused W4A16 kernel. Mutually exclusive with `fp8_weights`;
+  /// embeddings, norms, and the tied LM head remain bf16.
+  bool int4_weights = false;
+
   /// Store the KV cache as FP8 e4m3 instead of bf16. Halves KV memory (twice the
   /// concurrency at the same VRAM) at the cost of fp8 quantization error on K/V.
   /// Per-layer dequant scales are frozen from warmup; prefill folds the K scale

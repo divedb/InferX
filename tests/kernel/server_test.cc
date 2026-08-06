@@ -43,6 +43,19 @@ bool CheckpointPresent() {
          std::ifstream(dir + "/config.json").good();
 }
 
+TEST(ServerConfigTest, RejectsConflictingWeightFormatsBeforeLoading) {
+  EngineConfig config;
+  config.model_dir = "/path/that/must/not/be-read";
+  config.fp8_weights = true;
+  config.int4_weights = true;
+
+  const StatusOr<std::unique_ptr<Engine>> created = Engine::Create(config);
+  ASSERT_FALSE(created.ok());
+  EXPECT_EQ(created.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(created.status().message().find("mutually exclusive"),
+            std::string::npos);
+}
+
 // FP8 KV cache, end to end. A separate engine (small config, so it coexists
 // with the suite's engine on the 16 GB card) built with fp8_kv_cache=true:
 // warmup freezes the per-layer K/V scales, the decode graph captures the fp8
@@ -85,6 +98,41 @@ TEST(ServerTestFp8Kv, Fp8KvCacheServesTheExpectedContinuation) {
 
   EXPECT_TRUE(text.rfind(" Paris", 0) == 0)
       << "expected the fp8-KV continuation to start with \" Paris\", got: "
+      << text;
+}
+
+TEST(ServerTestW4A16, Int4WeightsServeTheExpectedContinuation) {
+  if (!CudaAvailable() || !CheckpointPresent()) {
+    GTEST_SKIP() << "needs a CUDA device and the test checkpoint";
+  }
+
+  EngineConfig config;
+  config.model_dir = CheckpointDir();
+  config.scheduler.max_running = 2;
+  config.scheduler.max_seq_len = 256;
+  config.scheduler.max_batch_tokens = 256;
+  config.kv_blocks = 128;
+  config.int4_weights = true;
+
+  StatusOr<std::unique_ptr<Engine>> created = Engine::Create(config);
+  ASSERT_TRUE(created.ok()) << created.status().ToString();
+  std::unique_ptr<Engine> engine = std::move(*created);
+
+  const std::vector<int32_t> prompt =
+      engine->tokenizer().EncodeOrdinary("The capital of France is");
+  StatusOr<std::shared_ptr<Generation>> generation =
+      engine->Submit(prompt, /*max_tokens=*/4, /*stop=*/{});
+  ASSERT_TRUE(generation.ok()) << generation.status().ToString();
+
+  std::string text;
+  Generation::Event event;
+  while ((*generation)->Next(&event)) {
+    if (event.done) break;
+    text += event.text;
+  }
+
+  EXPECT_TRUE(text.rfind(" Paris", 0) == 0)
+      << "expected the W4A16 continuation to start with \" Paris\", got: "
       << text;
 }
 
