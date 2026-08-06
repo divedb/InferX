@@ -2,16 +2,19 @@
 ///
 /// ARCHITECTURE.md R7 wanted exactness by construction, through FFI to the Rust
 /// implementation. We reimplemented instead, so exactness is a claim rather
-/// than a guarantee -- and this file is the evidence for the claim. Every string
-/// in `testdata/tokenizer_corpus.txt` carries the ids HuggingFace produced for
-/// it, and we require exact equality.
+/// than a guarantee -- and this file is the evidence for the claim. Every
+/// string in `testdata/tokenizer_corpus.txt` carries the ids HuggingFace
+/// produced for it, and we require exact equality.
 ///
 /// There is deliberately no tolerance here and there never should be. Token ids
 /// are discrete: an "almost right" tokenization is a different prompt, and a
 /// model given a different prompt produces different output for reasons that
 /// are invisible downstream. If this test fails, the tokenizer is wrong.
 
+#include <gtest/gtest.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -19,9 +22,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "inferx/tokenizer/chat_template.h"
 #include "inferx/tokenizer/tokenizer.h"
@@ -112,9 +114,7 @@ std::vector<Record> LoadCorpusAt(const std::string& path) {
   return records;
 }
 
-std::vector<Record> LoadCorpus() {
-  return LoadCorpusAt(RepoPath(kCorpusPath));
-}
+std::vector<Record> LoadCorpus() { return LoadCorpusAt(RepoPath(kCorpusPath)); }
 
 // The Qwen2 conformance suite is parametric over (checkpoint, corpus) so the
 // o200k suite below can share the loader. Each (checkpoint, corpus) pair is
@@ -124,10 +124,12 @@ std::string Qwen2CheckpointDir() {
   const char* home = std::getenv("HOME");
   if (home == nullptr) return {};
 
-  const std::string base = std::string(home) +
+  const std::string base =
+      std::string(home) +
       "/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots";
 
-  if (std::FILE* pipe = popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
+  if (std::FILE* pipe =
+          popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
       pipe != nullptr) {
     char buffer[4096] = {};
     std::string path;
@@ -149,10 +151,12 @@ std::string O200kCheckpointDir() {
   const char* home = std::getenv("HOME");
   if (home == nullptr) return {};
 
-  const std::string base = std::string(home) +
+  const std::string base =
+      std::string(home) +
       "/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots";
 
-  if (std::FILE* pipe = popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
+  if (std::FILE* pipe =
+          popen(("ls -d " + base + "/*/ 2>/dev/null").c_str(), "r");
       pipe != nullptr) {
     char buffer[4096] = {};
     std::string path;
@@ -305,17 +309,54 @@ TEST_F(TokenizerConformance, EncodeOrdinaryDoesNotHonourControlTokens) {
   const std::vector<int32_t> as_text = tokenizer_->EncodeOrdinary("<|im_end|>");
 
   ASSERT_EQ(as_control.size(), 1u);
-  EXPECT_EQ(as_control[0], tokenizer_->TokenToId("<|im_end|>").value());
+  EXPECT_EQ(as_control[0], tokenizer_->TokenToId("<|im_end|>"));
 
   EXPECT_GT(as_text.size(), 1u)
       << "user-supplied text was tokenized as a control token";
   EXPECT_EQ(std::count(as_text.begin(), as_text.end(), as_control[0]), 0);
 }
 
+TEST_F(TokenizerConformance, ReportsSelectedBackendAndCapabilities) {
+  EXPECT_EQ(tokenizer_->info().backend, "tokenizers-cpp/huggingface");
+  EXPECT_FALSE(tokenizer_->info().backend_version.empty());
+  EXPECT_EQ(tokenizer_->info().vocabulary_size, tokenizer_->VocabSize());
+  EXPECT_TRUE(tokenizer_->info().supports_incremental_decode);
+  ASSERT_TRUE(tokenizer_->info().eos_id.has_value());
+  EXPECT_EQ(tokenizer_->info().stop_ids,
+            std::vector<int32_t>{*tokenizer_->info().eos_id});
+}
+
+TEST_F(TokenizerConformance, RequestClonesAreIndependentAcrossThreads) {
+  const std::string input = "Concurrent 你好 tokenizer 🙂 <|im_end|>";
+  const std::vector<int32_t> expected = tokenizer_->EncodeOrdinary(input);
+  std::vector<std::thread> threads;
+  std::atomic<bool> mismatch = false;
+
+  for (int worker = 0; worker < 8; ++worker) {
+    threads.emplace_back([&] {
+      StatusOr<std::unique_ptr<Tokenizer>> clone = tokenizer_->Clone();
+      if (!clone.ok() ||
+          (*clone)->info().backend != tokenizer_->info().backend ||
+          (*clone)->eos_id() != tokenizer_->eos_id()) {
+        mismatch.store(true, std::memory_order_relaxed);
+        return;
+      }
+      for (int iteration = 0; iteration < 50; ++iteration) {
+        const std::vector<int32_t> ids = (*clone)->EncodeOrdinary(input);
+        if (ids != expected || (*clone)->Decode(ids) != input) {
+          mismatch.store(true, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+  EXPECT_FALSE(mismatch.load(std::memory_order_relaxed));
+}
+
 TEST_F(TokenizerConformance, EosIsImEnd) {
   // Qwen2.5-Instruct stops on <|im_end|>, not <|endoftext|>; getting this wrong
   // makes generation run to the token limit on every request.
-  EXPECT_EQ(tokenizer_->eos_id(), tokenizer_->TokenToId("<|im_end|>").value());
+  EXPECT_EQ(tokenizer_->eos_id(), tokenizer_->TokenToId("<|im_end|>"));
 }
 
 TEST_F(TokenizerConformance, ChatTemplateMatchesTheCheckpointsTemplate) {
@@ -335,10 +376,12 @@ TEST_F(TokenizerConformance, ChatTemplateMatchesTheCheckpointsTemplate) {
 }
 
 TEST_F(TokenizerConformance, ChatTemplateUsesACallerSuppliedSystemTurn) {
-  const StatusOr<std::string> rendered = ApplyQwen2ChatTemplate(
-      {{"system", "Be terse."}, {"user", "Hi"}, {"assistant", "Hello."},
-       {"user", "Again"}},
-      /*add_generation_prompt=*/true);
+  const StatusOr<std::string> rendered =
+      ApplyQwen2ChatTemplate({{"system", "Be terse."},
+                              {"user", "Hi"},
+                              {"assistant", "Hello."},
+                              {"user", "Again"}},
+                             /*add_generation_prompt=*/true);
 
   ASSERT_TRUE(rendered.ok()) << rendered.status().ToString();
 
@@ -351,8 +394,7 @@ TEST_F(TokenizerConformance, ChatTemplateUsesACallerSuppliedSystemTurn) {
 }
 
 TEST_F(TokenizerConformance, ChatTemplateRejectsRolesItCannotRender) {
-  EXPECT_FALSE(
-      ApplyQwen2ChatTemplate({{"tool", "{}"}}, true).ok())
+  EXPECT_FALSE(ApplyQwen2ChatTemplate({{"tool", "{}"}}, true).ok())
       << "a tool turn was silently dropped rather than rejected";
 }
 
@@ -368,7 +410,8 @@ TEST_F(TokenizerConformance, LongWhitespaceRunIsNotQuadratic) {
   const auto elapsed = std::chrono::steady_clock::now() - start;
 
   EXPECT_FALSE(ids.empty());
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 5)
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+            5)
       << "encoding a long whitespace run took "
       << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
       << " ms, which suggests the merge loop is quadratic";
@@ -426,8 +469,7 @@ TEST_F(O200kConformance, LoadsAndPicksTheO200kPattern) {
 }
 
 TEST_F(O200kConformance, CorpusIsPresentAndNonTrivial) {
-  const std::vector<Record> records =
-      LoadCorpusAt(RepoPath(kO200kCorpusPath));
+  const std::vector<Record> records = LoadCorpusAt(RepoPath(kO200kCorpusPath));
 
   ASSERT_GE(records.size(), 100u)
       << "o200k corpus has " << records.size()
@@ -436,8 +478,7 @@ TEST_F(O200kConformance, CorpusIsPresentAndNonTrivial) {
 }
 
 TEST_F(O200kConformance, MatchesHuggingFaceOnEveryCorpusEntry) {
-  const std::vector<Record> records =
-      LoadCorpusAt(RepoPath(kO200kCorpusPath));
+  const std::vector<Record> records = LoadCorpusAt(RepoPath(kO200kCorpusPath));
   ASSERT_FALSE(records.empty());
 
   int mismatches = 0;

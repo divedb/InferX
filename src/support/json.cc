@@ -1,4 +1,4 @@
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 
 #include <cmath>
 #include <cstdlib>

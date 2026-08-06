@@ -9,7 +9,7 @@ function(inferx_add_bench name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
-    inferx::common
+    inferx::support
     inferx::model
     inferx::kernels
     inferx::scheduler

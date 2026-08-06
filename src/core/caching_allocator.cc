@@ -2,7 +2,7 @@
 
 #include <bit>
 
-#include "inferx/common/align.h"
+#include "inferx/support/align.h"
 #include "inferx/core/tensor_spec.h"
 
 namespace inferx {

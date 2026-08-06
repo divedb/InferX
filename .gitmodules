@@ -24,3 +24,6 @@
 	path = third_party/grafana
 	url = https://github.com/grafana/grafana.git
 	shallow = true
+[submodule "third_party/tokenizers-cpp"]
+	path = third_party/tokenizers-cpp
+	url = https://github.com/mlc-ai/tokenizers-cpp.git

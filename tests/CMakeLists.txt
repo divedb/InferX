@@ -15,7 +15,7 @@ function(inferx_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
-    inferx::common
+    inferx::support
     inferx::model
     inferx::scheduler
     inferx::tokenizer
@@ -38,7 +38,7 @@ function(inferx_add_kernel_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE
     inferx::core
-    inferx::common
+    inferx::support
     inferx::model
     inferx::scheduler
     inferx::kernels
@@ -61,6 +61,20 @@ inferx_add_test(scheduler_test         unit/scheduler_test.cc)
 inferx_add_test(prefix_cache_test      unit/prefix_cache_test.cc)
 inferx_add_test(checkpoint_conformance_test unit/checkpoint_conformance_test.cc)
 inferx_add_test(tokenizer_conformance_test unit/tokenizer_conformance_test.cc)
+
+# Keep dependency-level concurrency tests separate from InferX's tokenizer
+# wrapper. This target intentionally links tokenizers-cpp directly.
+add_executable(tokenizers_cpp_thread_safety_test
+  tokenizers/tokenizers_cpp_thread_safety_test.cc)
+target_link_libraries(tokenizers_cpp_thread_safety_test PRIVATE
+  tokenizers_cpp
+  GTest::gtest_main
+)
+gtest_discover_tests(tokenizers_cpp_thread_safety_test
+  PROPERTIES LABELS "unit;tokenizers"
+  DISCOVERY_TIMEOUT 30
+)
+
 inferx_add_test(openai_api_test        unit/openai_api_test.cc)
 inferx_add_test(intrusive_ref_cnt_ptr_test unit/intrusive_ref_cnt_ptr_test.cc)
 inferx_add_test(shape_test             unit/shape_test.cc)

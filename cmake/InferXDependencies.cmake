@@ -155,6 +155,31 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# tokenizers-cpp -- universal Hugging Face and SentencePiece backend.
+#
+# Pinned as a submodule. Its C++ common interface stays behind InferX's own
+# tokenizer service so dependency types do not leak into server call sites.
+# ---------------------------------------------------------------------------
+_inferx_require_submodule(tokenizers-cpp)
+set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER ON CACHE BOOL "" FORCE)
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+# InferX already builds its pinned Abseil before this dependency. Recent
+# SentencePiece otherwise fetches and defines a second Abseil target set.
+set(SPM_ABSL_PROVIDER "" CACHE STRING "" FORCE)
+set(_inferx_spm_compat "${CMAKE_BINARY_DIR}/sentencepiece-compat")
+file(MAKE_DIRECTORY "${_inferx_spm_compat}/third_party")
+if(NOT EXISTS "${_inferx_spm_compat}/third_party/absl")
+  file(CREATE_LINK "${INFERX_THIRD_PARTY}/abseil-cpp/absl"
+                   "${_inferx_spm_compat}/third_party/absl" SYMBOLIC)
+endif()
+add_subdirectory("${INFERX_THIRD_PARTY}/tokenizers-cpp"
+                 EXCLUDE_FROM_ALL SYSTEM)
+target_include_directories(sentencepiece-static PRIVATE
+  "${_inferx_spm_compat}"
+  "${_inferx_spm_compat}/third_party")
+
+# ---------------------------------------------------------------------------
 # Planned dependencies, by milestone. Add with:
 #   git submodule add --depth 1 <url> third_party/<name>
 #

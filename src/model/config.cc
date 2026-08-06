@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include "absl/strings/str_cat.h"
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 
 namespace inferx::model {
 namespace {

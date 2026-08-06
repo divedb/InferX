@@ -2,8 +2,8 @@
 
 #include <bit>
 
-#include "inferx/common/align.h"
-#include "inferx/common/math_utils.h"
+#include "inferx/support/align.h"
+#include "inferx/support/math_utils.h"
 #include "inferx/core/tensor_spec.h"
 
 namespace inferx {

@@ -18,7 +18,7 @@ add_library(inferx::model ALIAS inferx_model)
 target_link_libraries(inferx_model
   PUBLIC
     inferx::core
-    inferx::common
+    inferx::support
     inferx::comm
     inferx::flags
 )

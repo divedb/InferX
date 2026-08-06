@@ -13,7 +13,7 @@ add_library(inferx::api ALIAS inferx_api)
 target_link_libraries(inferx_api
   PUBLIC
     inferx::core
-    inferx::common
+    inferx::support
     inferx::tokenizer
     inferx::flags
 )

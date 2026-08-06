@@ -7,7 +7,7 @@
 #include <type_traits>
 
 #include "absl/types/span.h"
-#include "inferx/common/host_device.h"
+#include "inferx/support/host_device.h"
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_spec.h"

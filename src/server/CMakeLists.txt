@@ -14,7 +14,7 @@ add_library(inferx::server ALIAS inferx_server)
 target_link_libraries(inferx_server
   PUBLIC
     inferx::core
-    inferx::common
+    inferx::support
     inferx::api
     inferx::model
     inferx::observe

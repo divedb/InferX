@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "inferx/api/openai.h"
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 
 namespace inferx::api {
 namespace {

@@ -11,7 +11,7 @@
 #include <utility>
 
 #include "absl/strings/str_cat.h"
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 #include "inferx/core/storage.h"
 
 namespace inferx::model {

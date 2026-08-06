@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "httplib.h"
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 #include "inferx/core/cuda_utils.h"
 #include "inferx/server/engine.h"
 #include "inferx/server/http_server.h"

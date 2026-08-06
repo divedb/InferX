@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "inferx/common/json.h"
+#include "inferx/support/json.h"
 
 namespace inferx::api {
 namespace {

@@ -48,7 +48,6 @@ FinishReason ToApiReason(scheduler::FinishReason reason) {
   return FinishReason::kLength;
 }
 
-
 // The API's view of sampling, as the scheduler wants it. A seed the caller did
 // not pin is derived per request rather than left at zero, so two concurrent
 // requests at the same temperature do not draw identically.
@@ -58,10 +57,9 @@ scheduler::SamplingParams ToSchedulerParams(const SamplingRequest& s) {
   scheduler::SamplingParams params;
   params.temperature = s.temperature;
   params.top_p = s.top_p;
-  params.seed = s.has_seed
-                    ? s.seed
-                    : counter.fetch_add(0x9e3779b97f4a7c15ULL,
-                                        std::memory_order_relaxed);
+  params.seed = s.has_seed ? s.seed
+                           : counter.fetch_add(0x9e3779b97f4a7c15ULL,
+                                               std::memory_order_relaxed);
 
   return params;
 }
@@ -167,9 +165,9 @@ struct HttpServer::Impl {
   void ServeBlocking(const SamplingRequest& sampling,
                      std::vector<int32_t> prompt, bool chat,
                      httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation = engine->Submit(
-        std::move(prompt), sampling.max_tokens, sampling.stop,
-        ToSchedulerParams(sampling));
+    StatusOr<std::shared_ptr<Generation>> generation =
+        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop,
+                       ToSchedulerParams(sampling));
 
     if (!generation.ok()) {
       SendError(response, StatusToHttp(generation.status()),
@@ -203,10 +201,12 @@ struct HttpServer::Impl {
     const int64_t created = NowSeconds();
 
     response->set_content(
-        chat ? api::ChatCompletionJson(id, engine->model_name(), text,
-                                       ToApiReason(reason), usage, created, sampled)
-             : api::CompletionJson(id, engine->model_name(), text,
-                                   ToApiReason(reason), usage, created, sampled),
+        chat
+            ? api::ChatCompletionJson(id, engine->model_name(), text,
+                                      ToApiReason(reason), usage, created,
+                                      sampled)
+            : api::CompletionJson(id, engine->model_name(), text,
+                                  ToApiReason(reason), usage, created, sampled),
         "application/json");
   }
 
@@ -214,9 +214,9 @@ struct HttpServer::Impl {
   void ServeStreaming(const SamplingRequest& sampling,
                       std::vector<int32_t> prompt, bool chat,
                       httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation = engine->Submit(
-        std::move(prompt), sampling.max_tokens, sampling.stop,
-        ToSchedulerParams(sampling));
+    StatusOr<std::shared_ptr<Generation>> generation =
+        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop,
+                       ToSchedulerParams(sampling));
 
     if (!generation.ok()) {
       SendError(response, StatusToHttp(generation.status()),
@@ -246,8 +246,9 @@ struct HttpServer::Impl {
           // what OpenAI's protocol specifies and what clients key on to open
           // the message.
           if (chat) {
-            const std::string first = api::SseFrame(api::ChatCompletionChunkJson(
-                id, model, "assistant", "", nullptr, created, sampled));
+            const std::string first =
+                api::SseFrame(api::ChatCompletionChunkJson(
+                    id, model, "assistant", "", nullptr, created, sampled));
 
             if (!sink.write(first.data(), first.size())) {
               stream->Cancel();
@@ -318,10 +319,10 @@ struct HttpServer::Impl {
   }
 
   void Route() {
-    server.Get("/health", [](const httplib::Request&,
-                             httplib::Response& response) {
-      response.set_content("{\"status\":\"ok\"}", "application/json");
-    });
+    server.Get(
+        "/health", [](const httplib::Request&, httplib::Response& response) {
+          response.set_content("{\"status\":\"ok\"}", "application/json");
+        });
 
     server.Get("/v1/models", [this](const httplib::Request&,
                                     httplib::Response& response) {
@@ -335,11 +336,11 @@ struct HttpServer::Impl {
                            "text/plain; version=0.0.4; charset=utf-8");
     });
 
-    server.Get("/stats", [this](const httplib::Request&,
-                                httplib::Response& response) {
-      response.set_content(RenderStatsJson(engine->stats()),
-                           "application/json");
-    });
+    server.Get("/stats",
+               [this](const httplib::Request&, httplib::Response& response) {
+                 response.set_content(RenderStatsJson(engine->stats()),
+                                      "application/json");
+               });
 
     server.Post("/v1/chat/completions", [this](const httplib::Request& request,
                                                httplib::Response& response) {
@@ -365,7 +366,23 @@ struct HttpServer::Impl {
       // control tokens. The user's own text was already escaped into the
       // template as data, and the template is the only thing that puts
       // <|im_start|> in this string.
-      std::vector<int32_t> ids = engine->tokenizer().Encode(*prompt);
+      StatusOr<std::unique_ptr<tokenizer::Tokenizer>> request_tokenizer =
+          engine->tokenizer().Clone();
+      if (!request_tokenizer.ok()) {
+        SendError(&response, 500, request_tokenizer.status().message(),
+                  "server_error");
+        return;
+      }
+      tokenizer::EncodeOptions encode_options;
+      encode_options.special_tokens = tokenizer::SpecialTokenMode::kAsControl;
+      StatusOr<std::vector<int32_t>> encoded =
+          (*request_tokenizer)->EncodeWithOptions(*prompt, encode_options);
+      if (!encoded.ok()) {
+        SendError(&response, StatusToHttp(encoded.status()),
+                  encoded.status().message(), "invalid_request_error");
+        return;
+      }
+      std::vector<int32_t> ids = std::move(*encoded);
 
       if (parsed->sampling.stream) {
         ServeStreaming(parsed->sampling, std::move(ids), /*chat=*/true,
@@ -389,8 +406,21 @@ struct HttpServer::Impl {
 
       // A raw completion prompt is user text all the way through, so control
       // tokens in it are characters, not turn boundaries.
-      std::vector<int32_t> ids =
-          engine->tokenizer().EncodeOrdinary(parsed->prompt);
+      StatusOr<std::unique_ptr<tokenizer::Tokenizer>> request_tokenizer =
+          engine->tokenizer().Clone();
+      if (!request_tokenizer.ok()) {
+        SendError(&response, 500, request_tokenizer.status().message(),
+                  "server_error");
+        return;
+      }
+      StatusOr<std::vector<int32_t>> encoded =
+          (*request_tokenizer)->EncodeWithOptions(parsed->prompt, {});
+      if (!encoded.ok()) {
+        SendError(&response, StatusToHttp(encoded.status()),
+                  encoded.status().message(), "invalid_request_error");
+        return;
+      }
+      std::vector<int32_t> ids = std::move(*encoded);
 
       if (ids.empty()) {
         SendError(&response, 400, "prompt encodes to no tokens",
