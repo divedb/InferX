@@ -34,6 +34,9 @@ void PrintUsage(const char* argv0) {
       "  --max-seq-len <n>      prompt + generation cap (default 2048)\n"
       "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
       "  --block-size <n>       tokens per block (default 16)\n"
+      "  --tensor-parallel-size <n>  tensor-parallel ranks (1 or 2)\n"
+      "  --devices <ids>        comma-separated CUDA devices (default 0)\n"
+      "  --comm-backend <name>  single or nccl\n"
       "  --fp8                  quantize weights to FP8 e4m3\n"
       "  --w4a16                quantize projection weights to grouped int4\n"
       "  --fp8-kv               store the KV cache as FP8 e4m3\n"
@@ -58,11 +61,29 @@ bool NextValue(int argc, char** argv, int* i, const char* name,
   return true;
 }
 
+bool ParseDevices(const std::string& value, std::vector<int>* devices) {
+  devices->clear();
+  size_t begin = 0;
+  while (begin < value.size()) {
+    const size_t end = value.find(',', begin);
+    const std::string item = value.substr(begin, end - begin);
+    if (item.empty()) return false;
+    char* tail = nullptr;
+    const long parsed = std::strtol(item.c_str(), &tail, 10);
+    if (tail == nullptr || *tail != '\0' || parsed < 0) return false;
+    devices->push_back(static_cast<int>(parsed));
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return !devices->empty();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   inferx::server::EngineConfig engine_config;
   inferx::server::HttpServerConfig http_config;
+  bool comm_backend_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -97,6 +118,19 @@ int main(int argc, char** argv) {
     } else if (arg == "--block-size") {
       if (!NextValue(argc, argv, &i, "--block-size", &value)) return 2;
       engine_config.block_size = std::atoll(value.c_str());
+    } else if (arg == "--tensor-parallel-size") {
+      if (!NextValue(argc, argv, &i, "--tensor-parallel-size", &value)) return 2;
+      engine_config.tensor_parallel_size = std::atoi(value.c_str());
+    } else if (arg == "--devices") {
+      if (!NextValue(argc, argv, &i, "--devices", &value)) return 2;
+      if (!ParseDevices(value, &engine_config.devices)) {
+        std::fprintf(stderr, "error: invalid --devices list %s\n", value.c_str());
+        return 2;
+      }
+    } else if (arg == "--comm-backend") {
+      if (!NextValue(argc, argv, &i, "--comm-backend", &value)) return 2;
+      engine_config.comm_backend = value;
+      comm_backend_explicit = true;
     } else if (arg == "--fp8") {
       engine_config.fp8_weights = true;
     } else if (arg == "--w4a16") {
@@ -121,6 +155,9 @@ int main(int argc, char** argv) {
   if (engine_config.fp8_weights && engine_config.int4_weights) {
     std::fprintf(stderr, "error: --fp8 and --w4a16 are mutually exclusive\n");
     return 2;
+  }
+  if (!comm_backend_explicit && engine_config.tensor_parallel_size == 2) {
+    engine_config.comm_backend = "nccl";
   }
 
   // The batch is bounded by how many sequences can be resident, so the token

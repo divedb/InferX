@@ -12,13 +12,12 @@
 #include "inferx/api/openai.h"
 #include "inferx/model/forward_batch.h"
 #include "inferx/model/gpt_oss.h"
-#include "inferx/model/qwen2.h"
+#include "qwen_runner.h"
 
 namespace inferx::server {
 namespace {
 
 using model::ForwardBatch;
-using model::Qwen2Model;
 using scheduler::FinishReason;
 using scheduler::RequestId;
 using scheduler::Scheduler;
@@ -108,16 +107,14 @@ struct Engine::Impl {
   EngineConfig config;
 
   // Exactly one of these is populated, decided once in Engine::Create from the
-  // checkpoint's declared architecture. They are not a variant because both
-  // types are move-only and the Qwen2 path reads `model.X()` dozens of times;
-  // `qwen2_model->X()` is the smaller diff against that hot path than threading
-  // `std::get<Qwen2Model>(model)` through every call site.
+  // checkpoint's declared architecture. QwenRunner hides whether execution is
+  // direct TP=1 or dispatched to NCCL rank workers.
   //
   // The gpt-oss path is the Phase 3 slow serve: GptOssModel has only Forward(),
   // no paged KV, no continuous batching. It is batch-1, full recompute per
   // token, and exists so the engine can serve the checkpoint end to end before
   // Phase 4 makes it fast.
-  std::unique_ptr<Qwen2Model> qwen2_model;
+  std::unique_ptr<QwenRunner> qwen2_model;
   std::unique_ptr<model::GptOssModel> gpt_oss_model;
 
   // Null in the gpt-oss path, which does not continuous-batch. Held by pointer
@@ -647,6 +644,25 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     return InvalidArgumentError(
         "fp8_weights and int4_weights are mutually exclusive");
   }
+  if (config.tensor_parallel_size != 1 && config.tensor_parallel_size != 2) {
+    return InvalidArgumentError("tensor_parallel_size must be 1 or 2, got ",
+                                config.tensor_parallel_size);
+  }
+  if (static_cast<int>(config.devices.size()) !=
+      config.tensor_parallel_size) {
+    return InvalidArgumentError("devices has ", config.devices.size(),
+                                " entries but tensor_parallel_size is ",
+                                config.tensor_parallel_size);
+  }
+  if (config.comm_backend != "single" && config.comm_backend != "nccl") {
+    return InvalidArgumentError("unknown communication backend ",
+                                config.comm_backend);
+  }
+  if ((config.tensor_parallel_size == 1) !=
+      (config.comm_backend == "single")) {
+    return InvalidArgumentError(
+        "TP=1 requires comm_backend=single and TP=2 requires nccl");
+  }
 
   INFERX_ASSIGN_OR_RETURN(std::unique_ptr<tokenizer::Tokenizer> tok,
                           tokenizer::Tokenizer::LoadFromDirectory(
@@ -672,6 +688,10 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
                          : config.served_model_name;
 
   if (model_config.architecture == model::Architecture::kGptOss) {
+    if (config.tensor_parallel_size != 1) {
+      return UnimplementedError(
+          "tensor parallel serving is currently implemented for Qwen2 only");
+    }
     // Phase 3 slow serve. FP8 weights / KV cache, CUDA graphs and the scheduler
     // are Qwen2-path options that GptOssModel does not expose; silently
     // ignoring them keeps `inferx-serve --model <gpt-oss> --fp8` from crashing
@@ -718,33 +738,24 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       }
     }
   } else {
-    INFERX_ASSIGN_OR_RETURN(Qwen2Model model,
-                            Qwen2Model::LoadFromDirectory(config.model_dir));
-
-    if (config.fp8_weights) {
-      INFERX_RETURN_IF_ERROR(model.QuantizeWeightsToF8());
-    }
-    if (config.int4_weights) {
-      INFERX_RETURN_IF_ERROR(model.QuantizeWeightsToInt4());
-    }
-
-    if (config.fp8_kv_cache) {
-      INFERX_RETURN_IF_ERROR(model.EnableFp8KvCache());
-    }
-
-    INFERX_RETURN_IF_ERROR(
-        model.AttachKvCache(config.kv_blocks, config.block_size));
-
-    // Device sampling is what makes StepAsync possible: without it the next
-    // step's token ids would have to come back through the host first (§5.2).
-    INFERX_RETURN_IF_ERROR(
-        model.EnableDeviceSampling(config.scheduler.max_running));
+    QwenRunnerConfig runner_config;
+    runner_config.model_dir = config.model_dir;
+    runner_config.devices = config.devices;
+    runner_config.use_nccl = config.comm_backend == "nccl";
+    runner_config.fp8_weights = config.fp8_weights;
+    runner_config.int4_weights = config.int4_weights;
+    runner_config.fp8_kv_cache = config.fp8_kv_cache;
+    runner_config.kv_blocks = config.kv_blocks;
+    runner_config.block_size = config.block_size;
+    runner_config.max_sampling_rows = config.scheduler.max_running;
+    INFERX_ASSIGN_OR_RETURN(std::unique_ptr<QwenRunner> model,
+                            QwenRunner::Create(runner_config));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,
-        Scheduler::Create(config.scheduler, model.kv_pool()));
+        Scheduler::Create(config.scheduler, model->kv_pool()));
 
-    impl->qwen2_model = std::make_unique<Qwen2Model>(std::move(model));
+    impl->qwen2_model = std::move(model);
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = config.kv_blocks;
 

@@ -26,6 +26,12 @@ struct EngineConfig {
   int64_t kv_blocks = 4096;
   int64_t block_size = 16;
 
+  /// Tensor-parallel deployment. The first NCCL runtime supports two distinct
+  /// GPUs in one process; TP=1 retains the direct single-rank path.
+  int tensor_parallel_size = 1;
+  std::vector<int> devices{0};
+  std::string comm_backend = "single";
+
   /// Quantize weights to FP8 e4m3 at load. Roughly halves weight bandwidth and
   /// so nearly halves decode latency, at the cost of per-tensor quantization
   /// error. Off by default: it changes the model's output, and that should be

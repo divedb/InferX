@@ -7,6 +7,7 @@
 add_library(inferx_server
   engine.cc
   http_server.cc
+  qwen_runner.cc
 )
 add_library(inferx::server ALIAS inferx_server)
 
