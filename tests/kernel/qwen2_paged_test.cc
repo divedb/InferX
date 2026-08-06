@@ -413,6 +413,42 @@ TEST_F(PagedModelTest, Fp8WeightsStillAnswerCorrectly) {
                                 "quantization should produce";
 }
 
+// M8's model-level W4A16 path: packed projection weights must actually replace
+// the bf16 storage and the serving dispatch must consume them end to end. The
+// numerical gate is intentionally semantic, as above: int4 is a different
+// model, so matching bf16 logits would be the wrong contract.
+TEST_F(PagedModelTest, Int4WeightsServeThroughTheFusedKernel) {
+  const std::vector<int32_t> prompt = {kThe, kCapital, kOf, kFrance, kIs};
+
+  ASSERT_FALSE(model_->weights_are_int4());
+  const size_t before = model_->WeightBytes();
+  const Status quantized = model_->QuantizeWeightsToInt4();
+  ASSERT_TRUE(quantized.ok()) << quantized;
+  ASSERT_TRUE(model_->weights_are_int4());
+  EXPECT_FALSE(model_->weights_are_f8());
+  EXPECT_LT(model_->WeightBytes(), before * 2 / 5)
+      << "packed projections should reduce total resident weights by more "
+         "than 60%";
+
+  // Precision modes own the same source weights and are deliberately
+  // irreversible. A second mode must fail clearly rather than reading the
+  // already released bf16 buffers.
+  EXPECT_EQ(model_->QuantizeWeightsToF8().code(),
+            absl::StatusCode::kFailedPrecondition);
+
+  std::vector<float> logits;
+  TestSequence seq(model_->kv_pool(), 8);
+  auto batch = seq.MakeBatch(prompt, 0);
+  ASSERT_TRUE(batch.ok()) << batch.status();
+  const Status stepped = model_->Step(*batch, &logits);
+  ASSERT_TRUE(stepped.ok()) << stepped;
+  EXPECT_EQ(Argmax(logits), kParis)
+      << "W4A16 weights changed the answer; top token was " << Argmax(logits);
+
+  std::printf("  int4 weights: %.2f GB -> %.2f GB\n", before / 1e9,
+              model_->WeightBytes() / 1e9);
+}
+
 // The overlap pipeline, against the synchronous path it replaces.
 //
 // §5.2 depth 1: issue a step and return without waiting, so the host can build

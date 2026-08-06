@@ -19,6 +19,7 @@
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/quantize.h"
+#include "inferx/kernels/w4a16_gemm.h"
 
 #ifdef INFERX_WITH_FLASHINFER
 #include "absl/types/span.h"
@@ -67,6 +68,11 @@ struct LayerWeights {
   // Populated by QuantizeWeightsToF8. Each carries a device-resident dequant
   // scale, which cuBLASLt folds into the epilogue.
   TensorView qkv_w8, o_w8, gate_up_w8, down_w8;
+  // Populated by QuantizeWeightsToInt4. Scales are bf16 and grouped along the
+  // contraction dimension; the packed views retain the logical [out, in]
+  // shape even though their storage is two elements per byte.
+  TensorView qkv_w4, o_w4, gate_up_w4, down_w4;
+  TensorView qkv_s4, o_s4, gate_up_s4, down_s4;
   // Indices into Impl::weight_buffers for the four large tensors, so FP8
   // conversion can release exactly those. The norm weights and the embedding
   // share that vector and must survive.
@@ -272,6 +278,10 @@ struct Qwen2Model::Impl {
   DeviceBuffer act_f8;        // quantized activations, reused every GEMM
   DeviceBuffer act_scales;    // one float per GEMM input per layer
 
+  bool weights_int4 = false;
+  std::vector<DeviceBuffer> int4_buffers;
+  static constexpr int64_t kInt4Group = 128;
+
   // FP8 KV cache. The cache's element type is fixed at AttachKvCache from this
   // flag; the per-layer K/V dequant scales are frozen from the first warmup
   // forward (kv_scales_frozen), so the value baked into a captured decode graph
@@ -315,7 +325,12 @@ struct Qwen2Model::Impl {
   /// saved, which at these sizes is the trade that pays.
   Status Linear(const TensorView& in, const TensorView& w_bf16,
                 const TensorView& w_f8, const float* w_scale,
+                const TensorView& w_int4, const TensorView& int4_scales,
                 const TensorView& out, int scale_slot) {
+    if (weights_int4 && w_int4.IsDefined()) {
+      return kernels::W4A16Gemm(in, w_int4, int4_scales, out, kInt4Group,
+                                stream);
+    }
     if (!weights_f8 || !w_f8.IsDefined()) {
       return gemm.LinearBF16(in, w_bf16, out, stream);
     }
@@ -948,7 +963,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // token, so Q is strided for more than one token -- but folding the bias
     // into it means the fused path still costs four launches fewer per layer.
     INFERX_RETURN_IF_ERROR(Linear(norm, layer.qkv_w, layer.qkv_w8,
-                                  layer.qkv_s, qkv_v, 0));
+                                  layer.qkv_s, layer.qkv_w4, layer.qkv_s4,
+                                  qkv_v, 0));
     INFERX_RETURN_IF_ERROR(
         kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
 
@@ -1053,7 +1069,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           batch_max_context, stream));
     }
 
-    INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s, x, 1));
+    INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s,
+                                  layer.o_w4, layer.o_s4, x, 1));
     INFERX_RETURN_IF_ERROR(
         comm->AllReduceSum(x, static_cast<void*>(stream)));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
@@ -1068,11 +1085,13 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // Gate and up need no split: SiluMul is elementwise, so it reads both
     // halves straight out of the fused buffer. This fusion is free.
     INFERX_RETURN_IF_ERROR(Linear(norm, layer.gate_up_w, layer.gate_up_w8,
-                                  layer.gate_up_s, gate_up_v, 2));
+                                  layer.gate_up_s, layer.gate_up_w4,
+                                  layer.gate_up_s4, gate_up_v, 2));
     INFERX_RETURN_IF_ERROR(
         kernels::SiluMulFused(gate_up_v, gate_v, stream));
     INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
-                                  layer.down_s, x, 3));
+                                  layer.down_s, layer.down_w4, layer.down_s4,
+                                  x, 3));
     INFERX_RETURN_IF_ERROR(
         comm->AllReduceSum(x, static_cast<void*>(stream)));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
@@ -1652,15 +1671,19 @@ int64_t Qwen2Model::captured_graphs() const {
 // the honest boundary; making it FP8-capable means moving it onto the model's
 // stream, which is a change worth making only if something needs it.
 Status Qwen2Model::RequireBf16Weights() const {
-  if (!impl_->weights_f8) return OkStatus();
+  if (!impl_->weights_f8 && !impl_->weights_int4) return OkStatus();
 
   return FailedPreconditionError(
       "Forward()/ForwardLastLogits() run the bf16 recompute path and the "
-      "weights have been quantized to FP8; use Step() with a KV cache");
+      "weights have been quantized; use Step() with a KV cache");
 }
 
 Status Qwen2Model::QuantizeWeightsToF8() {
   if (impl_->weights_f8) return OkStatus();
+  if (impl_->weights_int4) {
+    return FailedPreconditionError(
+        "weights are already quantized to int4; reload before selecting FP8");
+  }
 
   if (!impl_->graphs.empty()) {
     // A captured graph holds the bf16 weight addresses and the bf16 kernels.
@@ -1751,6 +1774,79 @@ Status Qwen2Model::QuantizeWeightsToF8() {
 }
 
 bool Qwen2Model::weights_are_f8() const { return impl_->weights_f8; }
+
+Status Qwen2Model::QuantizeWeightsToInt4() {
+  if (impl_->weights_int4) return OkStatus();
+  if (impl_->weights_f8) {
+    return FailedPreconditionError(
+        "weights are already quantized to FP8; reload before selecting int4");
+  }
+  if (!impl_->graphs.empty()) {
+    return FailedPreconditionError(
+        "cannot quantize weights after capturing a graph; quantize first, then "
+        "capture");
+  }
+
+  const auto quantize = [&](const TensorView& src, TensorView* packed,
+                            TensorView* scales) -> Status {
+    const int64_t rows = src.Dim(0);
+    const int64_t cols = src.Dim(1);
+    if (cols % Impl::kInt4Group != 0) {
+      return InvalidArgumentError("int4 group size ", Impl::kInt4Group,
+                                  " does not divide weight width ", cols);
+    }
+
+    INFERX_ASSIGN_OR_RETURN(
+        DeviceBuffer packed_buf,
+        DeviceBuffer::Allocate(static_cast<size_t>(rows * cols / 2),
+                               DeviceId::Cuda(0)));
+    impl_->int4_buffers.push_back(std::move(packed_buf));
+    INFERX_ASSIGN_OR_RETURN(
+        *packed, TensorView::Create(impl_->int4_buffers.back().data(),
+                                    DataType::kInt4, src.GetShape(),
+                                    DeviceId::Cuda(0)));
+
+    INFERX_ASSIGN_OR_RETURN(
+        DeviceBuffer scale_buf,
+        DeviceBuffer::Allocate(
+            static_cast<size_t>(rows * (cols / Impl::kInt4Group) * 2),
+            DeviceId::Cuda(0)));
+    impl_->int4_buffers.push_back(std::move(scale_buf));
+    INFERX_ASSIGN_OR_RETURN(
+        *scales,
+        TensorView::Create(impl_->int4_buffers.back().data(),
+                           DataType::kBFloat16,
+                           Shape({rows, cols / Impl::kInt4Group}),
+                           DeviceId::Cuda(0)));
+
+    return kernels::QuantizeBf16ToInt4(src, *packed, *scales, impl_->stream);
+  };
+
+  for (LayerWeights& w : impl_->layers) {
+    INFERX_RETURN_IF_ERROR(quantize(w.qkv_w, &w.qkv_w4, &w.qkv_s4));
+    INFERX_RETURN_IF_ERROR(quantize(w.o_w, &w.o_w4, &w.o_s4));
+    INFERX_RETURN_IF_ERROR(
+        quantize(w.gate_up_w, &w.gate_up_w4, &w.gate_up_s4));
+    INFERX_RETURN_IF_ERROR(quantize(w.down_w, &w.down_w4, &w.down_s4));
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+
+  for (const LayerWeights& w : impl_->layers) {
+    for (const int index : {w.qkv_buf, w.o_buf, w.gate_up_buf, w.down_buf}) {
+      if (index >= 0 && index < static_cast<int>(impl_->weight_buffers.size())) {
+        impl_->weight_buffers[static_cast<size_t>(index)].Reset();
+      }
+    }
+  }
+
+  impl_->weight_bytes = 0;
+  for (const DeviceBuffer& b : impl_->weight_buffers) impl_->weight_bytes += b.size();
+  for (const DeviceBuffer& b : impl_->int4_buffers) impl_->weight_bytes += b.size();
+  impl_->weights_int4 = true;
+  return OkStatus();
+}
+
+bool Qwen2Model::weights_are_int4() const { return impl_->weights_int4; }
 
 Status Qwen2Model::EnableFp8KvCache() {
   // The cache's element type is fixed when the pool is allocated, so this must

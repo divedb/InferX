@@ -182,6 +182,16 @@ class Qwen2Model {
   /// \brief True once `QuantizeWeightsToF8` has run.
   bool weights_are_f8() const;
 
+  /// \brief Requantizes projection weights to symmetric per-group int4.
+  ///
+  /// Serving projections then use the fused W4A16 kernel. Embeddings, norms,
+  /// and the tied LM head remain bf16. Must run before graph capture and is
+  /// mutually exclusive with `QuantizeWeightsToF8`.
+  Status QuantizeWeightsToInt4();
+
+  /// \brief True once `QuantizeWeightsToInt4` has run.
+  bool weights_are_int4() const;
+
   /// \brief Switches the KV cache to FP8 e4m3 before it is allocated.
   ///
   /// Must be called before `AttachKvCache`, which is when the pool's element
