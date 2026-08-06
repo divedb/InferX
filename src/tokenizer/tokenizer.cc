@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "inferx/support/file.h"
+#include "inferx/support/file_util.h"
 #include "inferx/support/json.h"
 
 namespace inferx::tokenizer {
