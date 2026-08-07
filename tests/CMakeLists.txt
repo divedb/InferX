@@ -8,6 +8,7 @@ add_executable(inferx_transport_test
 target_link_libraries(inferx_transport_test PRIVATE
   inferx::http_transport
   inferx::server_protocol
+  inferx::request_runtime
   GTest::gtest_main)
 
 include(GoogleTest)

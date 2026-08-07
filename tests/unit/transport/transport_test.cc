@@ -18,6 +18,7 @@
 #include "inferx/server/transport/routes.h"
 #include "inferx/server/transport/sse_writer.h"
 #include "inferx/server/api/error_mapping.h"
+#include "inferx/server/request/request_context.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -151,6 +152,28 @@ TEST(ErrorMappingTest, MapsRetryableStatusAndEscapesFields) {
             "{\"error\":{\"message\":\"quota \\\"full\\\"\","
             "\"type\":\"rate_limit_error\",\"param\":\"max_tokens\","
             "\"code\":\"capacity_exceeded\",\"request_id\":\"req_1\"}}");
+}
+
+TEST(RequestStateTest, EnforcesLifecycleAndIdempotentCancellation) {
+  using ::inferx::server::request::RequestContext;
+  using ::inferx::server::request::RequestState;
+  RequestContext context;
+  EXPECT_TRUE(context.TransitionTo(RequestState::kValidating));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kAuthenticated));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kAdmissionPending));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kQueued));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kPrefilling));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kDecoding));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kFinishing));
+  EXPECT_TRUE(context.TransitionTo(RequestState::kCompleted));
+  EXPECT_FALSE(context.TransitionTo(RequestState::kDecoding));
+
+  RequestContext cancelled;
+  cancelled.Cancel(
+      ::inferx::server::request::CancellationReason::kClientDisconnected);
+  cancelled.Cancel(::inferx::server::request::CancellationReason::kInternal);
+  EXPECT_EQ(cancelled.state, RequestState::kCancelled);
+  EXPECT_TRUE(cancelled.cancellation.isCancellationRequested());
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
