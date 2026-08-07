@@ -8,6 +8,7 @@ add_executable(inferx_transport_test
 target_link_libraries(inferx_transport_test PRIVATE
   inferx::http_transport
   inferx::server_protocol
+  inferx::admission
   inferx::request_runtime
   inferx::streaming
   GTest::gtest_main)

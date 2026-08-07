@@ -22,6 +22,7 @@
 #include "inferx/server/request/request_manager.h"
 #include "inferx/server/streaming/event_buffer.h"
 #include "inferx/server/streaming/event_router.h"
+#include "inferx/server/admission/admission_controller.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -243,6 +244,24 @@ TEST(EventRouterTest, RejectsGapsAndWrongRequests) {
   first.sequence_number = 1;
   EXPECT_TRUE(router.Route(std::move(first)).ok());
   EXPECT_EQ(router.next_sequence(), 2);
+}
+
+TEST(AdmissionTest, EnforcesAndReleasesTenantReservations) {
+  ::inferx::server::admission::AdmissionController controller(
+      {.max_active_requests = 2,
+       .max_reserved_tokens = 100,
+       .max_active_per_tenant = 1});
+  const ::inferx::server::admission::AdmissionRequest first{"tenant_a", 40};
+  EXPECT_TRUE(controller.TryAdmit(first).admitted());
+  EXPECT_FALSE(controller.TryAdmit(first).admitted());
+  const ::inferx::server::admission::AdmissionRequest other{"tenant_b", 70};
+  EXPECT_FALSE(controller.TryAdmit(other).admitted());
+  controller.Release(first);
+  EXPECT_TRUE(controller.TryAdmit(other).admitted());
+  EXPECT_EQ(controller.active_requests(), 1);
+  EXPECT_EQ(controller.reserved_tokens(), 70);
+  controller.Release(other);
+  EXPECT_EQ(controller.active_requests(), 0);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
