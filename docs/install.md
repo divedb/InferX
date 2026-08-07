@@ -13,7 +13,63 @@ sudo apt-get install -y \
   libgoogle-glog-dev \
   libgflags-dev \
   libevent-dev \
-  libssl-dev
+  libssl-dev \
+  protobuf-compiler \
+  libprotobuf-dev \
+  protobuf-compiler-grpc \
+  libgrpc++-dev
+```
+
+The protobuf packages provide the C++ compiler and runtime; the gRPC packages
+provide `grpc_cpp_plugin`, headers, and libraries for the optional
+process-separated scheduler client. Verify both code generators before
+configuring:
+
+```bash
+protoc --version
+command -v grpc_cpp_plugin
+```
+
+On Ubuntu 24.04 systems where APT packages cannot be installed system-wide,
+download and extract the packages into the ignored `.tools/grpc` prefix:
+
+```bash
+mkdir -p .tools/grpc
+package_dir=$(mktemp -d)
+(
+  cd "$package_dir"
+  apt-get download \
+    protobuf-compiler libprotobuf-dev protobuf-compiler-grpc libgrpc++-dev \
+    libprotobuf32t64 libprotobuf-lite32t64 libprotoc32t64 \
+    libgrpc29t64 libgrpc++1.51t64 libgrpc-dev \
+    libabsl-dev libabsl20220623t64 \
+    libc-ares-dev libcares2 libre2-dev libre2-10 \
+    pkgconf pkgconf-bin libpkgconf3
+)
+for package_file in "$package_dir"/*.deb; do
+  dpkg-deb -x "$package_file" "$PWD/.tools/grpc"
+done
+```
+
+Configure the shell and CMake to use that local prefix:
+
+```bash
+export PATH="$PWD/.tools/grpc/usr/bin:$PATH"
+export CMAKE_PREFIX_PATH="$PWD/.tools/grpc/usr${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+export PKG_CONFIG_PATH="$PWD/.tools/grpc/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LD_LIBRARY_PATH="$PWD/.tools/grpc/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+The `.tools` directory is ignored by Git and is local to one checkout.
+When invoking `protoc` manually, pass the local plugin explicitly if the
+compiler does not resolve it through `PATH`:
+
+```bash
+protoc -I proto \
+  --cpp_out=generated \
+  --grpc_out=generated \
+  --plugin=protoc-gen-grpc="$PWD/.tools/grpc/usr/bin/grpc_cpp_plugin" \
+  proto/inference/scheduler/v1/scheduler.proto
 ```
 
 InferX pins Boost and Folly as Git submodules. The repository uses GitHub SSH

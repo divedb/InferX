@@ -15,6 +15,7 @@ compile_commands.json
 .vscode/
 .idea/
 .cache/
+.tools/
 *.swp
 perf.data*
 *.nsys-rep

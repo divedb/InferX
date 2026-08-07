@@ -5,6 +5,7 @@ include_guard(GLOBAL)
 option(INFERX_BUILD_BENCH "Build benchmarks (requires CUDA >= the floor)" ON)
 option(INFERX_ENABLE_CUDA "Build the CUDA device layer" ON)
 option(INFERX_ENABLE_NCCL "Build the NCCL communication backend when found" ON)
+option(INFERX_ENABLE_GRPC "Build the process-separated scheduler gRPC transport when found" ON)
 option(INFERX_WERROR      "Treat warnings as errors" OFF)
 option(INFERX_ENABLE_ASAN "Build with AddressSanitizer + UBSan" OFF)
 
