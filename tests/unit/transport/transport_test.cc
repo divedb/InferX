@@ -45,6 +45,7 @@
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
+#include "inferx/server/config/server_config.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -1370,6 +1371,48 @@ TEST(AdminModelHandlerTest, UsesDistinctScopeAndListsTenantLifecycle) {
       (*routes)->Handle(std::move(load), {}, load_writer, {}));
   EXPECT_EQ(load_writer.status, 422);
   EXPECT_NE(load_writer.body.find("not implemented"), std::string::npos);
+}
+
+TEST(ServerConfigTest, RejectsUnsafeListenerAndAdmissionCombinations) {
+  using ::inferx::server::config::ServerConfig;
+  using ::inferx::server::config::Validate;
+  ServerConfig config;
+  config.development_auth_bypass = true;
+  EXPECT_FALSE(Validate(config).ok());
+  config.listen_address = "127.0.0.1";
+  EXPECT_TRUE(Validate(config).ok());
+  config.admin_enabled = true;
+  config.admin_listen_address = "127.0.0.1";
+  config.admin_port = config.port;
+  EXPECT_FALSE(Validate(config).ok());
+  config.admin_port = 9000;
+  config.max_active_per_tenant = config.max_active_requests + 1;
+  EXPECT_FALSE(Validate(config).ok());
+}
+
+TEST(ServerConfigTest, ReloadsPolicyAtomicallyAndRejectsTopologyChanges) {
+  using ::inferx::server::config::ConfigStore;
+  using ::inferx::server::config::ServerConfig;
+  ServerConfig initial;
+  auto created = ConfigStore::Create(initial);
+  ASSERT_TRUE(created.ok()) << created.status();
+  auto store = *created;
+  ServerConfig policy = initial;
+  policy.max_active_requests = 512;
+  policy.max_active_per_tenant = 64;
+  policy.completed_retention = std::chrono::seconds(60);
+  ASSERT_TRUE(store->Reload(policy).ok());
+  EXPECT_EQ(store->revision(), 2);
+  const auto snapshot = store->Snapshot();
+  EXPECT_EQ(snapshot->max_active_requests, 512);
+  EXPECT_EQ(snapshot->completed_retention, std::chrono::seconds(60));
+
+  ServerConfig topology = policy;
+  topology.port = 9000;
+  EXPECT_EQ(store->Reload(topology).code(),
+            absl::StatusCode::kFailedPrecondition);
+  EXPECT_EQ(store->revision(), 2);
+  EXPECT_EQ(store->Snapshot()->port, initial.port);
 }
 
 TEST(CompletionHandlerTest, CollectsTypedEventsFromImmutableModelRequest) {
