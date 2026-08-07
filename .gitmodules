@@ -1,29 +1,42 @@
 [submodule "third_party/googletest"]
 	path = third_party/googletest
-	url = https://github.com/google/googletest.git
+	url = git@github.com:google/googletest.git
 	shallow = true
 [submodule "third_party/abseil-cpp"]
 	path = third_party/abseil-cpp
-	url = https://github.com/abseil/abseil-cpp.git
+	url = git@github.com:abseil/abseil-cpp.git
 	shallow = false
 [submodule "third_party/mimalloc"]
 	path = third_party/mimalloc
-	url = https://github.com/microsoft/mimalloc.git
+	url = git@github.com:microsoft/mimalloc.git
 	shallow = true
 [submodule "third_party/cutlass"]
 	path = third_party/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+	url = git@github.com:NVIDIA/cutlass.git
 [submodule "third_party/flashinfer"]
 	path = third_party/flashinfer
-	url = https://github.com/flashinfer-ai/flashinfer.git
+	url = git@github.com:flashinfer-ai/flashinfer.git
 [submodule "third_party/prometheus"]
 	path = third_party/prometheus
-	url = https://github.com/prometheus/prometheus.git
+	url = git@github.com:prometheus/prometheus.git
 	shallow = true
 [submodule "third_party/grafana"]
 	path = third_party/grafana
-	url = https://github.com/grafana/grafana.git
+	url = git@github.com:grafana/grafana.git
 	shallow = true
 [submodule "third_party/tokenizers-cpp"]
 	path = third_party/tokenizers-cpp
-	url = https://github.com/mlc-ai/tokenizers-cpp.git
+	url = git@github.com:mlc-ai/tokenizers-cpp.git
+[submodule "third_party/boost"]
+	path = third_party/boost
+	url = git@github.com:boostorg/boost.git
+	shallow = true
+	update = none
+[submodule "third_party/folly"]
+	path = third_party/folly
+	url = git@github.com:facebook/folly.git
+	shallow = true
+	update = none
+[submodule "third_party/fast_float"]
+	path = third_party/fast_float
+	url = git@github.com:fastfloat/fast_float.git

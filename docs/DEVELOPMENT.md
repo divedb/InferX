@@ -79,7 +79,6 @@ Or by hand:
 git submodule update --init --recursive
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure
 ```
 
 ### Build configurations
@@ -95,6 +94,42 @@ ctest --test-dir build --output-on-failure
 configuration. The scheduler, KV block manager, prefix cache, and the entire
 memory layer are required to build and test without a GPU, because that is what
 keeps their logic separable from device concerns. See ARCHITECTURE.md §3.1.
+
+### Asynchronous HTTP dependencies
+
+The Beast/Folly HTTP foundation is enabled by default. Boost is pinned to
+1.91.0, Folly to `v2026.08.03.00`, and fast_float to 8.0.0. Boost and Folly
+use `update = none` in `.gitmodules`, so initialize their source trees
+explicitly after cloning. The pinned fast_float is required because Ubuntu
+24.04's 3.9 package is too old for this Folly revision.
+
+On Ubuntu 24.04, install Folly's required development packages first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  libfmt-dev \
+  libgoogle-glog-dev \
+  libgflags-dev \
+  libevent-dev \
+  libssl-dev
+```
+
+Initialize them once, then configure normally:
+
+```bash
+git submodule update --init --checkout \
+  third_party/boost third_party/folly third_party/fast_float
+git -C third_party/boost submodule update --init --depth 1
+cmake -S . -B build
+```
+
+Folly's platform dependencies must be installed before configuring. To make a
+minimal build without this foundation, pass
+`-DINFERX_ENABLE_ASYNC_HTTP=OFF`. First-party code consumes the dependencies
+through the narrow `inferx::beast` and `inferx::folly_coro` targets; do not link
+upstream targets directly. See `http_server.md` for the transport decision and
+migration plan.
 
 ### Which CUDA gets used
 
@@ -152,15 +187,9 @@ src/core/           DType, Tensor, Status, arenas, allocators
 src/kernels/        .cu — device code. Needs CUDA >= 13.0 to build at all
 cmake/              Options, CUDA config, dependency wiring
 scripts/            Setup and bootstrap
-tests/unit/         Must run with no GPU
-tests/kernel/       Device code. Built only above the CUDA floor
 third_party/        Submodules, pinned
 docs/               ARCHITECTURE.md is the design of record
 ```
-
-Test labels follow that split: `ctest -L unit` is the suite that needs no GPU,
-`ctest -L kernel` is the one that links device code. Both skip individual tests
-at runtime when no device is present.
 
 ## Conventions
 

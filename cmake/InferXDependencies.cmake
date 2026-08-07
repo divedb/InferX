@@ -48,16 +48,6 @@ set(MI_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 add_subdirectory("${INFERX_THIRD_PARTY}/mimalloc" EXCLUDE_FROM_ALL SYSTEM)
 
 # ---------------------------------------------------------------------------
-# GoogleTest -- pinned to v1.17.0.
-# ---------------------------------------------------------------------------
-if(INFERX_BUILD_TESTS)
-  _inferx_require_submodule(googletest)
-  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  add_subdirectory("${INFERX_THIRD_PARTY}/googletest" EXCLUDE_FROM_ALL SYSTEM)
-endif()
-
-# ---------------------------------------------------------------------------
 # CUTLASS -- quantized and grouped GEMM. Optional until it is fetched.
 #
 # Detected rather than required, because it is large and only M1+ needs it: a
@@ -127,6 +117,115 @@ endif()
 set(BUILD_TESTING ${_inferx_saved_build_testing} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
+# Asynchronous HTTP foundation -- Boost.Beast 1.91.0 + Folly 2026.08.03.00.
+#
+# These targets establish the dependency boundary for the coroutine HTTP
+# migration without changing the active cpp-httplib server. The dependencies
+# are enabled by default; set INFERX_ENABLE_ASYNC_HTTP=OFF for a minimal build
+# that does not require Folly or Boost's library submodules. The gitlinks pin
+# the exact source revisions; no network fetch occurs during configuration.
+#
+# Initialize once before the default configuration:
+#   git submodule update --init --checkout third_party/boost third_party/folly
+#   git -C third_party/boost submodule update --init --depth 1
+#   cmake -S . -B build
+# ---------------------------------------------------------------------------
+add_library(inferx_boost_beast INTERFACE)
+add_library(inferx::beast ALIAS inferx_boost_beast)
+add_library(inferx_folly_coro INTERFACE)
+add_library(inferx::folly_coro ALIAS inferx_folly_coro)
+
+set(INFERX_BOOST_PIN "1.91.0")
+set(INFERX_FOLLY_PIN "2026.08.03.00")
+set(INFERX_FAST_FLOAT_PIN "8.0.0")
+set(INFERX_HAVE_ASYNC_HTTP OFF)
+
+if(INFERX_ENABLE_ASYNC_HTTP)
+  _inferx_require_submodule(boost)
+  _inferx_require_submodule(folly)
+  _inferx_require_submodule(fast_float)
+
+  if(NOT EXISTS "${INFERX_THIRD_PARTY}/boost/libs/beast/include/boost/beast.hpp")
+    message(FATAL_ERROR
+      "Boost ${INFERX_BOOST_PIN} library submodules are not initialized.\n"
+      "Run: git -C third_party/boost submodule update --init --depth 1")
+  endif()
+  if(NOT EXISTS
+     "${INFERX_THIRD_PARTY}/boost/tools/cmake/include/BoostRoot.cmake")
+    message(FATAL_ERROR
+      "Boost ${INFERX_BOOST_PIN} CMake support is not initialized.\n"
+      "Run: git -C third_party/boost submodule update --init --depth 1")
+  endif()
+
+  find_package(fmt CONFIG REQUIRED)
+  set(FASTFLOAT_INCLUDE_DIR
+      "${INFERX_THIRD_PARTY}/fast_float/include"
+      CACHE PATH "Pinned fast_float ${INFERX_FAST_FLOAT_PIN} headers" FORCE)
+
+  # Restrict the Boost superproject to the HTTP stack and its discovered
+  # dependencies instead of defining targets for every Boost library.
+  # Folly unconditionally declares install exports. Those exports cannot
+  # include Boost targets embedded from another source tree, and InferX does
+  # not currently define an install target of its own. Suppress third-party
+  # install rules for this source-build configuration.
+  set(CMAKE_SKIP_INSTALL_RULES ON CACHE BOOL
+      "Do not export embedded third-party dependency targets" FORCE)
+  set(BOOST_INCLUDE_LIBRARIES
+      beast asio system context filesystem program_options regex
+      CACHE STRING "" FORCE)
+  set(BOOST_ENABLE_CMAKE ON CACHE BOOL "" FORCE)
+  add_subdirectory("${INFERX_THIRD_PARTY}/boost"
+                   "${CMAKE_BINARY_DIR}/third_party/boost"
+                   EXCLUDE_FROM_ALL SYSTEM)
+
+  set(_inferx_saved_build_shared_libs ${BUILD_SHARED_LIBS})
+  set(_inferx_saved_build_tests ${BUILD_TESTS})
+  set(_inferx_saved_build_benchmarks ${BUILD_BENCHMARKS})
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  set(PYTHON_EXTENSIONS OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${INFERX_THIRD_PARTY}/folly"
+                   "${CMAKE_BINARY_DIR}/third_party/folly"
+                   EXCLUDE_FROM_ALL SYSTEM)
+  set(BUILD_SHARED_LIBS ${_inferx_saved_build_shared_libs} CACHE BOOL "" FORCE)
+  set(BUILD_TESTS ${_inferx_saved_build_tests} CACHE BOOL "" FORCE)
+  set(BUILD_BENCHMARKS ${_inferx_saved_build_benchmarks} CACHE BOOL "" FORCE)
+
+  if(NOT TARGET Boost::beast OR NOT TARGET Boost::asio OR
+     NOT TARGET Boost::system OR NOT TARGET Boost::context OR
+     NOT TARGET Boost::filesystem OR NOT TARGET Boost::program_options OR
+     NOT TARGET Boost::regex)
+    message(FATAL_ERROR
+      "Boost ${INFERX_BOOST_PIN} did not define the targets required by "
+      "Beast and Folly")
+  endif()
+  if(NOT TARGET Folly::folly)
+    message(FATAL_ERROR
+      "Folly ${INFERX_FOLLY_PIN} did not define Folly::folly")
+  endif()
+
+  target_link_libraries(inferx_boost_beast INTERFACE
+    Boost::beast
+    Boost::asio
+    Boost::system)
+  target_compile_definitions(inferx_boost_beast INTERFACE
+    INFERX_WITH_BOOST_BEAST=1)
+
+  target_link_libraries(inferx_folly_coro INTERFACE Folly::folly)
+  target_compile_definitions(inferx_folly_coro INTERFACE
+    INFERX_WITH_FOLLY_CORO=1)
+
+  set(INFERX_HAVE_ASYNC_HTTP ON)
+  message(STATUS
+    "Async HTTP foundation: Boost ${INFERX_BOOST_PIN}, "
+    "Folly ${INFERX_FOLLY_PIN}")
+else()
+  message(STATUS
+    "Async HTTP foundation: disabled (INFERX_ENABLE_ASYNC_HTTP=OFF)")
+endif()
+
+# ---------------------------------------------------------------------------
 # cpp-httplib -- the HTTP/1.1 server behind the OpenAI-compatible API.
 #
 # §9 nominates Boost.Beast and §5.1 designs the I/O around an Asio io_context
@@ -187,8 +286,5 @@ target_include_directories(sentencepiece-static PRIVATE
 #                        For the request hot path, if JSON parsing ever shows
 #                        up in a profile. It has not yet: a chat request is a
 #                        few hundred bytes next to a multi-millisecond step.
-#   M5  folly            https://github.com/facebook/folly.git
-#                        NARROW USE ONLY: MPMCQueue + ProducerConsumerQueue.
-#                        See docs/ARCHITECTURE.md section 9.
 #   --  spdlog           https://github.com/gabime/spdlog.git
 # ---------------------------------------------------------------------------

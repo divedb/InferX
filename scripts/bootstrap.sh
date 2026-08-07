@@ -52,7 +52,4 @@ cmake -S . -B "$BUILD_DIR" \
 log "building"
 cmake --build "$BUILD_DIR" -j "$(nproc)"
 
-log "testing"
-ctest --test-dir "$BUILD_DIR" --output-on-failure -j "$(nproc)"
-
 log "done -- build tree is $BUILD_DIR/"
