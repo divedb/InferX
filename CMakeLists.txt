@@ -46,6 +46,7 @@ add_subdirectory(src/server/model_registry)
 add_subdirectory(src/server/request)
 add_subdirectory(src/server/scheduler_client)
 add_subdirectory(src/server/streaming)
+add_subdirectory(src/server/tokenization)
 add_subdirectory(src/server/transport)
 
 # The server owns the model, so it needs device code; the wire format it speaks

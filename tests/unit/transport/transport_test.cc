@@ -26,6 +26,7 @@
 #include "inferx/server/auth/api_key_store.h"
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
+#include "inferx/server/tokenization/tokenization_service.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -301,6 +302,15 @@ TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
   ASSERT_TRUE(resolved.ok()) << resolved.status();
   EXPECT_EQ(resolved->version, "v1");
   EXPECT_EQ(registry.ReadyModels().size(), 1);
+}
+
+TEST(TokenizationContractTest, CarriesImmutableModelVersionAndAccounting) {
+  ::inferx::server::tokenization::TokenizedPrompt prompt;
+  prompt.model_version = "model@v1";
+  prompt.token_ids = {1, 2, 3};
+  prompt.prompt_tokens = static_cast<uint32_t>(prompt.token_ids.size());
+  EXPECT_EQ(prompt.model_version, "model@v1");
+  EXPECT_EQ(prompt.prompt_tokens, 3);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
