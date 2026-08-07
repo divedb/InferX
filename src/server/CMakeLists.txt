@@ -26,6 +26,7 @@ target_link_libraries(inferx_server
     inferx::http_transport
     inferx::managed_request_service
     inferx::model_registry
+    inferx::generation
     inferx::request_handlers
     inferx::server_middleware
     inferx::tokenization_service

@@ -111,7 +111,7 @@ struct HttpServer::Impl {
     if (config.scheduler_endpoint.empty()) {
       scheduler_backend = std::make_unique<EngineSchedulerBackend>(engine);
       scheduler = std::make_unique<scheduler_client::InProcessSchedulerClient>(
-          scheduler_backend.get(), blocking_executor.get());
+          scheduler_backend.get());
     } else {
 #if defined(INFERX_WITH_GRPC_SCHEDULER)
       scheduler_transport =

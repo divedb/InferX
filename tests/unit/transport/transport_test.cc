@@ -1,52 +1,51 @@
-#include <gtest/gtest.h>
-
-#include <boost/asio.hpp>
-#include <boost/beast.hpp>
 #include <folly/CancellationToken.h>
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Task.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/futures/ManualTimekeeper.h>
+#include <gtest/gtest.h>
 
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
 #include <memory>
 #include <string>
 #include <thread>
 #include <utility>
 
+#include "inferx/api/openai.h"
+#include "inferx/server/admission/admission_controller.h"
+#include "inferx/server/admission/capacity_policy.h"
+#include "inferx/server/api/error_mapping.h"
+#include "inferx/server/auth/api_key_store.h"
+#include "inferx/server/auth/authenticator.h"
+#include "inferx/server/auth/rbac.h"
+#include "inferx/server/config/server_config.h"
+#include "inferx/server/coroutine/deadline.h"
+#include "inferx/server/handlers/admin_model_handler.h"
+#include "inferx/server/handlers/api_routes.h"
+#include "inferx/server/handlers/chat_completion_handler.h"
+#include "inferx/server/handlers/completion_handler.h"
+#include "inferx/server/handlers/embeddings_handler.h"
+#include "inferx/server/handlers/health_handler.h"
+#include "inferx/server/handlers/metrics_handler.h"
+#include "inferx/server/handlers/models_handler.h"
+#include "inferx/server/handlers/tokenize_handler.h"
+#include "inferx/server/middleware/authentication.h"
+#include "inferx/server/model_registry/registry.h"
+#include "inferx/server/request/managed_request_service.h"
+#include "inferx/server/request/request_context.h"
+#include "inferx/server/request/request_id.h"
+#include "inferx/server/request/request_manager.h"
+#include "inferx/server/scheduler_client/in_process_scheduler_client.h"
+#include "inferx/server/streaming/backpressure_controller.h"
+#include "inferx/server/streaming/event_buffer.h"
+#include "inferx/server/streaming/event_router.h"
+#include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/transport/beast_folly_adapter.h"
 #include "inferx/server/transport/beast_listener.h"
 #include "inferx/server/transport/io_runtime.h"
 #include "inferx/server/transport/routes.h"
 #include "inferx/server/transport/sse_writer.h"
-#include "inferx/api/openai.h"
-#include "inferx/server/api/error_mapping.h"
-#include "inferx/server/request/request_context.h"
-#include "inferx/server/request/request_manager.h"
-#include "inferx/server/request/request_id.h"
-#include "inferx/server/request/managed_request_service.h"
-#include "inferx/server/streaming/event_buffer.h"
-#include "inferx/server/streaming/backpressure_controller.h"
-#include "inferx/server/streaming/event_router.h"
-#include "inferx/server/admission/admission_controller.h"
-#include "inferx/server/admission/capacity_policy.h"
-#include "inferx/server/auth/api_key_store.h"
-#include "inferx/server/auth/authenticator.h"
-#include "inferx/server/auth/rbac.h"
-#include "inferx/server/model_registry/registry.h"
-#include "inferx/server/middleware/authentication.h"
-#include "inferx/server/handlers/health_handler.h"
-#include "inferx/server/handlers/embeddings_handler.h"
-#include "inferx/server/handlers/api_routes.h"
-#include "inferx/server/handlers/admin_model_handler.h"
-#include "inferx/server/handlers/completion_handler.h"
-#include "inferx/server/handlers/chat_completion_handler.h"
-#include "inferx/server/handlers/models_handler.h"
-#include "inferx/server/handlers/metrics_handler.h"
-#include "inferx/server/handlers/tokenize_handler.h"
-#include "inferx/server/tokenization/tokenization_service.h"
-#include "inferx/server/coroutine/deadline.h"
-#include "inferx/server/scheduler_client/in_process_scheduler_client.h"
-#include "inferx/server/config/server_config.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -58,19 +57,19 @@ using tcp = asio::ip::tcp;
 
 class CapturingWriter final : public ResponseWriter {
  public:
-  folly::coro::Task<Status> WriteResponse(
-      HttpResponse response, folly::CancellationToken) override {
+  folly::coro::Task<Status> WriteResponse(HttpResponse response,
+                                          folly::CancellationToken) override {
     status = response.result_int();
     body = std::move(response.body());
     co_return OkStatus();
   }
-  folly::coro::Task<Status> StartStream(
-      HttpStreamHead response, folly::CancellationToken) override {
+  folly::coro::Task<Status> StartStream(HttpStreamHead response,
+                                        folly::CancellationToken) override {
     status = response.result_int();
     co_return OkStatus();
   }
-  folly::coro::Task<Status> Write(
-      std::string data, folly::CancellationToken) override {
+  folly::coro::Task<Status> Write(std::string data,
+                                  folly::CancellationToken) override {
     body += data;
     co_return OkStatus();
   }
@@ -102,10 +101,10 @@ class OkHandler final : public RequestHandler {
 
 class ScopeGuard final : public RouteGuard {
  public:
-  folly::coro::Task<Status> Check(
-      const HttpRequest&, const RouteMetadata& metadata,
-      RequestContext&,
-      folly::CancellationToken) override {
+  folly::coro::Task<Status> Check(const HttpRequest&,
+                                  const RouteMetadata& metadata,
+                                  RequestContext&,
+                                  folly::CancellationToken) override {
     seen_scope = metadata.required_scope;
     if (deny) co_return absl::PermissionDeniedError("scope denied");
     co_return OkStatus();
@@ -117,12 +116,10 @@ class ScopeGuard final : public RouteGuard {
 class FakeEmbeddingsService final
     : public ::inferx::server::handlers::EmbeddingsService {
  public:
-  folly::coro::Task<StatusOr<
-      ::inferx::server::handlers::EmbeddingsOutput>>
+  folly::coro::Task<StatusOr<::inferx::server::handlers::EmbeddingsOutput>>
   Embed(const ::inferx::api::EmbeddingsRequest& request,
         const ::inferx::server::model_registry::ModelRecord& model,
-        const RequestContext& context,
-        folly::CancellationToken) override {
+        const RequestContext& context, folly::CancellationToken) override {
     seen_model_version = model.version;
     seen_tenant = context.tenant_id;
     ::inferx::server::handlers::EmbeddingsOutput output;
@@ -141,8 +138,7 @@ class FakeEmbeddingsService final
 class FakeTokenizationService final
     : public ::inferx::server::tokenization::TokenizationService {
  public:
-  StatusOr<::inferx::server::tokenization::TokenizedPrompt>
-  TokenizeCompletion(
+  StatusOr<::inferx::server::tokenization::TokenizedPrompt> TokenizeCompletion(
       const ::inferx::server::request::ModelVersion& model_version,
       std::string_view prompt, bool add_special_tokens) override {
     seen_version = model_version;
@@ -170,8 +166,7 @@ class FakeTokenizationService final
 class FakeRequestService final
     : public ::inferx::server::request::RequestService {
  public:
-  folly::coro::Task<StatusOr<
-      ::inferx::server::scheduler_client::SubmitResult>>
+  folly::coro::Task<StatusOr<::inferx::server::scheduler_client::SubmitResult>>
   Submit(::inferx::server::scheduler_client::ScheduledRequest request,
          folly::CancellationToken) override {
     submitted = std::move(request);
@@ -213,8 +208,7 @@ class FakeRequestService final
 class FakeSchedulerClient final
     : public ::inferx::server::scheduler_client::SchedulerClient {
  public:
-  folly::coro::Task<StatusOr<
-      ::inferx::server::scheduler_client::SubmitResult>>
+  folly::coro::Task<StatusOr<::inferx::server::scheduler_client::SubmitResult>>
   Submit(::inferx::server::scheduler_client::ScheduledRequest request,
          folly::CancellationToken) override {
     submitted = request;
@@ -240,8 +234,7 @@ class FakeSchedulerClient final
     ++cancel_count;
     co_return OkStatus();
   }
-  folly::coro::Task<StatusOr<
-      ::inferx::server::request::RequestSnapshot>>
+  folly::coro::Task<StatusOr<::inferx::server::request::RequestSnapshot>>
   GetStatus(::inferx::server::request::RequestId,
             folly::CancellationToken) override {
     co_return UnimplementedError("not used");
@@ -276,24 +269,29 @@ class FakeMetricsSource final
   }
 };
 
-class FakeLegacyGeneration final
-    : public ::inferx::server::scheduler_client::LegacyGeneration {
+class FakeInProcessGeneration final
+    : public ::inferx::server::scheduler_client::InProcessGeneration {
  public:
-  bool Next(
-      ::inferx::server::scheduler_client::LegacyGenerationEvent* event) override {
+  folly::coro::Task<StatusOr<std::optional<
+      ::inferx::server::scheduler_client::InProcessGenerationEvent>>>
+  Next(folly::CancellationToken) override {
     next_thread = std::this_thread::get_id();
+    ::inferx::server::scheduler_client::InProcessGenerationEvent event;
     if (index == 0) {
-      *event = {.text = "delta", .generated_tokens = 1};
+      event = {.text = "delta", .generated_tokens = 1};
     } else if (index == 1) {
-      *event = {.terminal = true,
-                .finish_reason =
-                    ::inferx::server::scheduler_client::FinishReason::kStop,
-                .generated_tokens = 1};
+      event = {.terminal = true,
+               .finish_reason =
+                   ::inferx::server::scheduler_client::FinishReason::kStop,
+               .generated_tokens = 1};
     } else {
-      return false;
+      co_return std::optional<
+          ::inferx::server::scheduler_client::InProcessGenerationEvent>{};
     }
     ++index;
-    return true;
+    co_return std::optional<
+        ::inferx::server::scheduler_client::InProcessGenerationEvent>(
+        std::move(event));
   }
   void Cancel() override { cancelled = true; }
   uint32_t prompt_tokens() const override { return 3; }
@@ -302,20 +300,20 @@ class FakeLegacyGeneration final
   std::thread::id next_thread;
 };
 
-class FakeLegacyBackend final
-    : public ::inferx::server::scheduler_client::LegacyEngineBackend {
+class FakeInProcessBackend final
+    : public ::inferx::server::scheduler_client::InProcessEngineBackend {
  public:
-  StatusOr<std::shared_ptr<
-      ::inferx::server::scheduler_client::LegacyGeneration>>
+  StatusOr<
+      std::shared_ptr<::inferx::server::scheduler_client::InProcessGeneration>>
   Submit(const ::inferx::server::scheduler_client::ScheduledRequest& request)
       override {
     seen_version = request.model_version;
-    generation = std::make_shared<FakeLegacyGeneration>();
+    generation = std::make_shared<FakeInProcessGeneration>();
     return std::static_pointer_cast<
-        ::inferx::server::scheduler_client::LegacyGeneration>(generation);
+        ::inferx::server::scheduler_client::InProcessGeneration>(generation);
   }
   std::string seen_version;
-  std::shared_ptr<FakeLegacyGeneration> generation;
+  std::shared_ptr<FakeInProcessGeneration> generation;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -326,8 +324,7 @@ TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
 
   auto task = [&]() -> folly::coro::Task<StatusOr<size_t>> {
     co_return co_await AwaitAsio<size_t>(
-        io.get_executor(),
-        [](auto completion) { completion({}, 17); }, [] {});
+        io.get_executor(), [](auto completion) { completion({}, 17); }, [] {});
   };
   auto future = folly::coro::co_withExecutor(&executor, task()).start();
   StatusOr<size_t> result = std::move(future).get();
@@ -362,8 +359,9 @@ TEST(BeastFollyAdapterTest, CancellationWinsBeforeInitiation) {
 
 TEST(RoutesTest, DistinguishesNotFoundAndMethodNotAllowed) {
   Routes routes;
-  ASSERT_TRUE(routes.Add(http::verb::get, "/ready",
-                         std::make_shared<OkHandler>()).ok());
+  ASSERT_TRUE(
+      routes.Add(http::verb::get, "/ready", std::make_shared<OkHandler>())
+          .ok());
 
   CapturingWriter writer;
   HttpRequest wrong_method{http::verb::post, "/ready", 11};
@@ -381,12 +379,13 @@ TEST(RoutesTest, DistinguishesNotFoundAndMethodNotAllowed) {
 TEST(RoutesTest, AppliesMetadataBodyLimitAndGuardBeforeHandler) {
   auto guard = std::make_shared<ScopeGuard>();
   Routes routes(guard);
-  ASSERT_TRUE(routes.Add(http::verb::post, "/completion",
-                         {.name = "completion",
-                          .max_body_bytes = 4,
-                          .authentication_required = true,
-                          .required_scope = "inference.invoke"},
-                         std::make_shared<OkHandler>())
+  ASSERT_TRUE(routes
+                  .Add(http::verb::post, "/completion",
+                       {.name = "completion",
+                        .max_body_bytes = 4,
+                        .authentication_required = true,
+                        .required_scope = "inference.invoke"},
+                       std::make_shared<OkHandler>())
                   .ok());
 
   CapturingWriter oversized_writer;
@@ -420,8 +419,8 @@ TEST(SseWriterTest, FramesEventsCommentsAndFinishes) {
 
 TEST(ErrorMappingTest, MapsRetryableStatusAndEscapesFields) {
   const ::inferx::server::api::HttpError error =
-      ::inferx::server::api::MapStatus(
-          ResourceExhaustedError("quota \"full\""), "max_tokens");
+      ::inferx::server::api::MapStatus(ResourceExhaustedError("quota \"full\""),
+                                       "max_tokens");
   EXPECT_EQ(error.status, 429);
   EXPECT_EQ(error.type, "rate_limit_error");
   EXPECT_EQ(error.retry_after, "1");
@@ -501,10 +500,9 @@ TEST(DeadlineTest, ReturnsResultOrCancelsExpiredOperation) {
   folly::CancellationSource success_cancellation;
   folly::ManualTimekeeper timekeeper;
   auto success = []() -> folly::coro::Task<StatusOr<int>> { co_return 7; };
-  auto result = folly::coro::blockingWait(
-      ::inferx::server::coroutine::WithDeadline(
-          success(), std::chrono::steady_clock::now() +
-                         std::chrono::seconds(1),
+  auto result =
+      folly::coro::blockingWait(::inferx::server::coroutine::WithDeadline(
+          success(), std::chrono::steady_clock::now() + std::chrono::seconds(1),
           success_cancellation, &timekeeper));
   ASSERT_TRUE(result.ok()) << result.status();
   EXPECT_EQ(*result, 7);
@@ -516,11 +514,10 @@ TEST(DeadlineTest, ReturnsResultOrCancelsExpiredOperation) {
     started = true;
     co_return 9;
   };
-  result = folly::coro::blockingWait(
-      ::inferx::server::coroutine::WithDeadline(
-          expired(), std::chrono::steady_clock::now() -
-                         std::chrono::milliseconds(1),
-          expired_cancellation));
+  result = folly::coro::blockingWait(::inferx::server::coroutine::WithDeadline(
+      expired(),
+      std::chrono::steady_clock::now() - std::chrono::milliseconds(1),
+      expired_cancellation));
   EXPECT_EQ(result.status().code(), absl::StatusCode::kDeadlineExceeded);
   EXPECT_TRUE(expired_cancellation.isCancellationRequested());
   EXPECT_FALSE(started);
@@ -533,8 +530,8 @@ TEST(RequestManagerTest, OwnsSnapshotsAndIdempotentTerminalCleanup) {
   auto created = manager.Create(std::move(context));
   ASSERT_TRUE(created.ok()) << created.status();
   EXPECT_EQ(manager.active_count(), 1);
-  ASSERT_TRUE(manager.Cancel(
-                          "req_manager",
+  ASSERT_TRUE(manager
+                  .Cancel("req_manager",
                           ::inferx::server::request::CancellationReason::
                               kClientDisconnected)
                   .ok());
@@ -552,8 +549,7 @@ TEST(RequestManagerTest, OwnsSnapshotsAndIdempotentTerminalCleanup) {
 TEST(RequestIdTest, GeneratesPrefixedSortableUuidV7) {
   using namespace std::chrono_literals;
   const auto epoch = std::chrono::system_clock::time_point(1234567890ms);
-  const std::string first =
-      ::inferx::server::request::GenerateRequestId(epoch);
+  const std::string first = ::inferx::server::request::GenerateRequestId(epoch);
   const std::string later =
       ::inferx::server::request::GenerateRequestId(epoch + 1ms);
   EXPECT_EQ(first.size(), 40);
@@ -576,10 +572,12 @@ TEST(RequestManagerTest, BoundsAndExpiresCompletedSnapshots) {
     context.request_id = id;
     auto created = manager.Create(std::move(context));
     ASSERT_TRUE(created.ok()) << created.status();
-    ASSERT_TRUE(manager.Cancel(
-                           id, ::inferx::server::request::CancellationReason::
-                                   kAdministrative)
-                    .ok());
+    ASSERT_TRUE(
+        manager
+            .Cancel(
+                id,
+                ::inferx::server::request::CancellationReason::kAdministrative)
+            .ok());
     ASSERT_TRUE(manager.Finalize(id).ok());
   }
   EXPECT_EQ(manager.completed_count(), 1);
@@ -707,11 +705,11 @@ TEST(CapacityPolicyTest, RejectsUnavailableAndExhaustedCapacity) {
   using ::inferx::server::admission::AdmissionReason;
   using ::inferx::server::admission::CapacityPolicy;
   using ::inferx::server::admission::CapacitySnapshot;
-  CapacityPolicy policy({.max_queued_requests = 2,
-                         .max_event_buffer_bytes = 100,
-                         .overload_retry_after = std::chrono::milliseconds(250),
-                         .unavailable_retry_after =
-                             std::chrono::milliseconds(500)});
+  CapacityPolicy policy(
+      {.max_queued_requests = 2,
+       .max_event_buffer_bytes = 100,
+       .overload_retry_after = std::chrono::milliseconds(250),
+       .unavailable_retry_after = std::chrono::milliseconds(500)});
 
   auto decision = policy.Evaluate({});
   EXPECT_EQ(decision.reason, AdmissionReason::kSchedulerUnavailable);
@@ -720,9 +718,8 @@ TEST(CapacityPolicyTest, RejectsUnavailableAndExhaustedCapacity) {
   decision = policy.Evaluate({.scheduler_healthy = true});
   EXPECT_EQ(decision.reason, AdmissionReason::kModelUnavailable);
 
-  decision = policy.Evaluate({.scheduler_healthy = true,
-                              .model_ready = true,
-                              .queued_requests = 2});
+  decision = policy.Evaluate(
+      {.scheduler_healthy = true, .model_ready = true, .queued_requests = 2});
   EXPECT_EQ(decision.reason, AdmissionReason::kQueueCapacity);
   EXPECT_EQ(decision.retry_after, std::chrono::milliseconds(250));
 
@@ -747,8 +744,7 @@ TEST(RateLimiterTest, RefillsAndReportsRetryAdvice) {
   auto rejected = limiter.Consume("tenant_rate", 1, start);
   EXPECT_FALSE(rejected.allowed);
   EXPECT_GT(rejected.retry_after.count(), 0);
-  EXPECT_TRUE(limiter.Consume("tenant_rate", 1,
-                             start + std::chrono::seconds(1))
+  EXPECT_TRUE(limiter.Consume("tenant_rate", 1, start + std::chrono::seconds(1))
                   .allowed);
 }
 
@@ -811,7 +807,8 @@ TEST(AuthTest, StoresHashesAndEnforcesScopes) {
   auto found = store.LookupHash("abc123");
   ASSERT_TRUE(found.ok()) << found.status();
   EXPECT_EQ(found->tenant_id, "tenant_a");
-  EXPECT_TRUE(::inferx::server::auth::Authorize(*found, "completions:write").ok());
+  EXPECT_TRUE(
+      ::inferx::server::auth::Authorize(*found, "completions:write").ok());
   EXPECT_EQ(::inferx::server::auth::Authorize(*found, "models:admin").code(),
             absl::StatusCode::kPermissionDenied);
   EXPECT_EQ(store.LookupHash("missing").status().code(),
@@ -848,12 +845,11 @@ TEST(AuthTest, AuthenticatesBearerTokenWithoutStoringRawCredential) {
   using ::inferx::server::auth::ApiKeyStore;
   using ::inferx::server::auth::Principal;
   ApiKeyStore store;
-  ASSERT_TRUE(
-      store
-          .AddHash(
-              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
-              Principal{"tenant", "user", "key_1"})
-          .ok());
+  ASSERT_TRUE(store
+                  .AddHash("2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25"
+                           "fe97bf527a25b",
+                           Principal{"tenant", "user", "key_1"})
+                  .ok());
   ApiKeyAuthenticator authenticator(&store);
 
   auto principal = authenticator.Authenticate("Bearer secret");
@@ -884,26 +880,28 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
   auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
   ::inferx::server::auth::Principal principal{"tenant", "user", "key"};
   principal.scopes.insert("inference.invoke");
-  ASSERT_TRUE(
-      store
-          ->AddHash(
-              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
-              principal)
-          .ok());
+  ASSERT_TRUE(store
+                  ->AddHash("2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a2"
+                            "5fe97bf527a25b",
+                            principal)
+                  .ok());
   auto authenticator =
-      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
-  auto guard = std::make_shared<
-      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(
+          store.get());
+  auto guard = std::make_shared<::inferx::server::middleware::BearerRouteGuard>(
+      authenticator);
   Routes routes(guard);
   auto invoke_handler = std::make_shared<OkHandler>();
-  ASSERT_TRUE(routes.Add(http::verb::post, "/invoke",
-                         {.authentication_required = true,
-                          .required_scope = "inference.invoke"},
-                         invoke_handler)
+  ASSERT_TRUE(routes
+                  .Add(http::verb::post, "/invoke",
+                       {.authentication_required = true,
+                        .required_scope = "inference.invoke"},
+                       invoke_handler)
                   .ok());
-  ASSERT_TRUE(routes.Add(http::verb::get, "/health",
-                         {.authentication_required = false},
-                         std::make_shared<OkHandler>())
+  ASSERT_TRUE(routes
+                  .Add(http::verb::get, "/health",
+                       {.authentication_required = false},
+                       std::make_shared<OkHandler>())
                   .ok());
 
   CapturingWriter missing_writer;
@@ -922,8 +920,7 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
   EXPECT_EQ(invoke_handler->last_context.tenant_id, "tenant");
   EXPECT_EQ(invoke_handler->last_context.subject, "user");
   EXPECT_EQ(invoke_handler->last_context.api_key_id, "key");
-  EXPECT_TRUE(
-      invoke_handler->last_context.scopes.contains("inference.invoke"));
+  EXPECT_TRUE(invoke_handler->last_context.scopes.contains("inference.invoke"));
 
   CapturingWriter health_writer;
   HttpRequest health{http::verb::get, "/health", 11};
@@ -935,22 +932,22 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
 TEST(AuthMiddlewareTest, DevelopmentBypassAuthorizesConfiguredApiScopes) {
   auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
   auto authenticator =
-      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(
-          store.get(), true);
-  auto guard = std::make_shared<
-      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get(),
+                                                                    true);
+  auto guard = std::make_shared<::inferx::server::middleware::BearerRouteGuard>(
+      authenticator);
   Routes routes(guard);
   auto handler = std::make_shared<OkHandler>();
-  ASSERT_TRUE(routes.Add(http::verb::post, "/invoke",
-                         {.authentication_required = true,
-                          .required_scope = "inference.invoke"},
-                         handler)
+  ASSERT_TRUE(routes
+                  .Add(http::verb::post, "/invoke",
+                       {.authentication_required = true,
+                        .required_scope = "inference.invoke"},
+                       handler)
                   .ok());
 
   CapturingWriter writer;
   HttpRequest request{http::verb::post, "/invoke", 11};
-  folly::coro::blockingWait(
-      routes.Handle(std::move(request), {}, writer, {}));
+  folly::coro::blockingWait(routes.Handle(std::move(request), {}, writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_TRUE(handler->last_context.authenticated);
   EXPECT_EQ(handler->last_context.tenant_id, "development");
@@ -965,14 +962,16 @@ TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
   record.state = ::inferx::server::model_registry::ModelState::kLoading;
   ASSERT_TRUE(registry.Register(record).ok());
   EXPECT_FALSE(registry.Resolve("current").ok());
-  ASSERT_TRUE(registry.SetState(
-                           "model", "v1",
-                           ::inferx::server::model_registry::ModelState::kWarming)
-                  .ok());
-  ASSERT_TRUE(registry.SetState(
-                           "model", "v1",
-                           ::inferx::server::model_registry::ModelState::kReady)
-                  .ok());
+  ASSERT_TRUE(
+      registry
+          .SetState("model", "v1",
+                    ::inferx::server::model_registry::ModelState::kWarming)
+          .ok());
+  ASSERT_TRUE(
+      registry
+          .SetState("model", "v1",
+                    ::inferx::server::model_registry::ModelState::kReady)
+          .ok());
   auto resolved = registry.Resolve("current");
   ASSERT_TRUE(resolved.ok()) << resolved.status();
   EXPECT_EQ(resolved->version, "v1");
@@ -992,10 +991,8 @@ TEST(ModelRegistryTest, EnforcesLifecycleCapabilitiesAndTenantVisibility) {
   record.visible_tenants.insert("tenant_a");
   ASSERT_TRUE(registry.Register(record).ok());
   EXPECT_FALSE(registry.SetState("embedding", "v2", ModelState::kReady).ok());
-  ASSERT_TRUE(
-      registry.SetState("embedding", "v2", ModelState::kLoading).ok());
-  ASSERT_TRUE(
-      registry.SetState("embedding", "v2", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("embedding", "v2", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("embedding", "v2", ModelState::kWarming).ok());
   ASSERT_TRUE(registry.SetState("embedding", "v2", ModelState::kReady).ok());
   auto visible = registry.Resolve("embedding-current", "tenant_a");
   ASSERT_TRUE(visible.ok()) << visible.status();
@@ -1019,23 +1016,22 @@ TEST(SchedulerContractTest, CarriesTypedTerminalUsageAndEmbeddings) {
   event.request_id = "req_contract";
   event.sequence_number = 3;
   event.terminal = true;
-  event.finish_reason =
-      ::inferx::server::scheduler_client::FinishReason::kStop;
+  event.finish_reason = ::inferx::server::scheduler_client::FinishReason::kStop;
   event.usage = {.prompt_tokens = 4, .completion_tokens = 2};
   event.embeddings.push_back({.index = 0, .values = {0.25f, -0.5f}});
   EXPECT_EQ(event.usage.prompt_tokens, 4);
   EXPECT_EQ(event.embeddings.front().values.size(), 2);
 }
 
-TEST(InProcessSchedulerClientTest, BridgesBlockingEventsOnDedicatedExecutor) {
-  FakeLegacyBackend backend;
-  folly::CPUThreadPoolExecutor blocking_executor(1);
+TEST(InProcessSchedulerClientTest, StreamsEventsWithoutBlockingBridge) {
+  FakeInProcessBackend backend;
   folly::CPUThreadPoolExecutor coroutine_executor(1);
-  ::inferx::server::scheduler_client::InProcessSchedulerClient client(
-      &backend, &blocking_executor);
-  const std::thread::id caller = std::this_thread::get_id();
-  auto task = [&]() -> folly::coro::Task<std::vector<
-      ::inferx::server::scheduler_client::GenerationEvent>> {
+  ::inferx::server::scheduler_client::InProcessSchedulerClient client(&backend);
+  std::thread::id stream_thread;
+  auto task = [&]()
+      -> folly::coro::Task<
+          std::vector<::inferx::server::scheduler_client::GenerationEvent>> {
+    stream_thread = std::this_thread::get_id();
     ::inferx::server::scheduler_client::ScheduledRequest command;
     command.request_id = "req_bridge";
     command.model_version = "model@v3";
@@ -1048,7 +1044,8 @@ TEST(InProcessSchedulerClientTest, BridgesBlockingEventsOnDedicatedExecutor) {
     }
     co_return events;
   };
-  auto future = folly::coro::co_withExecutor(&coroutine_executor, task()).start();
+  auto future =
+      folly::coro::co_withExecutor(&coroutine_executor, task()).start();
   auto events = std::move(future).get();
   ASSERT_EQ(events.size(), 2);
   EXPECT_EQ(events[0].sequence_number, 1);
@@ -1057,14 +1054,12 @@ TEST(InProcessSchedulerClientTest, BridgesBlockingEventsOnDedicatedExecutor) {
   EXPECT_TRUE(events[1].terminal);
   EXPECT_EQ(events[1].usage.prompt_tokens, 3);
   EXPECT_EQ(backend.seen_version, "model@v3");
-  EXPECT_NE(backend.generation->next_thread, caller);
+  EXPECT_EQ(backend.generation->next_thread, stream_thread);
 }
 
 TEST(InProcessSchedulerClientTest, RejectsEmbeddingWorkloadExplicitly) {
-  FakeLegacyBackend backend;
-  folly::CPUThreadPoolExecutor blocking_executor(1);
-  ::inferx::server::scheduler_client::InProcessSchedulerClient client(
-      &backend, &blocking_executor);
+  FakeInProcessBackend backend;
+  ::inferx::server::scheduler_client::InProcessSchedulerClient client(&backend);
   ::inferx::server::scheduler_client::ScheduledRequest command;
   command.request_id = "req_embedding";
   command.workload =
@@ -1080,24 +1075,23 @@ TEST(ManagedRequestServiceTest, OwnsLifecycleAdmissionAndFinalization) {
       {.max_active_requests = 1,
        .max_reserved_tokens = 16,
        .max_active_per_tenant = 1});
-  ::inferx::server::request::ManagedRequestService service(
-      &manager, &scheduler, &admission);
+  ::inferx::server::request::ManagedRequestService service(&manager, &scheduler,
+                                                           &admission);
   ::inferx::server::scheduler_client::ScheduledRequest command;
   command.request_id = "req_managed";
   command.tenant_id = "tenant";
   command.model_version = "model@v1";
   command.prompt_tokens = {1, 2};
   command.sampling.max_tokens = 3;
-  command.deadline = std::chrono::steady_clock::now() +
-                     std::chrono::seconds(10);
+  command.deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   auto submitted = folly::coro::blockingWait(service.Submit(command, {}));
   ASSERT_TRUE(submitted.ok()) << submitted.status();
   EXPECT_EQ(admission.active_requests(), 1);
   EXPECT_EQ(manager.active_count(), 1);
   auto queued = manager.GetStatus("req_managed");
   ASSERT_TRUE(queued.ok()) << queued.status();
-  EXPECT_EQ(queued->state,
-            ::inferx::server::request::RequestState::kQueued);
+  EXPECT_EQ(queued->state, ::inferx::server::request::RequestState::kQueued);
 
   auto consume = [&]() -> folly::coro::Task<void> {
     auto events = service.Events("req_managed", {});
@@ -1118,23 +1112,29 @@ TEST(ManagedRequestServiceTest, CancellationIsIdempotentAcrossCleanup) {
   ::inferx::server::request::RequestManager manager;
   FakeSchedulerClient scheduler;
   ::inferx::server::admission::AdmissionController admission({});
-  ::inferx::server::request::ManagedRequestService service(
-      &manager, &scheduler, &admission);
+  ::inferx::server::request::ManagedRequestService service(&manager, &scheduler,
+                                                           &admission);
   ::inferx::server::scheduler_client::ScheduledRequest command;
   command.request_id = "req_cancel";
   command.tenant_id = "tenant";
   command.model_version = "model@v1";
   command.prompt_tokens = {1};
   command.sampling.max_tokens = 1;
-  command.deadline = std::chrono::steady_clock::now() +
-                     std::chrono::seconds(10);
+  command.deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
   ASSERT_TRUE(folly::coro::blockingWait(service.Submit(command, {})).ok());
-  EXPECT_TRUE(folly::coro::blockingWait(service.Cancel(
-      "req_cancel",
-      ::inferx::server::request::CancellationReason::kAdministrative)).ok());
-  EXPECT_TRUE(folly::coro::blockingWait(service.Cancel(
-      "req_cancel",
-      ::inferx::server::request::CancellationReason::kAdministrative)).ok());
+  EXPECT_TRUE(
+      folly::coro::blockingWait(
+          service.Cancel(
+              "req_cancel",
+              ::inferx::server::request::CancellationReason::kAdministrative))
+          .ok());
+  EXPECT_TRUE(
+      folly::coro::blockingWait(
+          service.Cancel(
+              "req_cancel",
+              ::inferx::server::request::CancellationReason::kAdministrative))
+          .ok());
   EXPECT_EQ(scheduler.cancel_count, 1);
   EXPECT_EQ(admission.active_requests(), 0);
   auto snapshot = manager.GetStatus("req_cancel");
@@ -1176,15 +1176,15 @@ TEST(HealthHandlerTest, ReadinessRequiresEveryServingDependency) {
 
   CapturingWriter unavailable;
   HttpRequest first{http::verb::get, "/health/ready", 11};
-  folly::coro::blockingWait(ready.Handle(
-      std::move(first), {}, unavailable, folly::CancellationToken{}));
+  folly::coro::blockingWait(ready.Handle(std::move(first), {}, unavailable,
+                                         folly::CancellationToken{}));
   EXPECT_EQ(unavailable.status, 503);
 
   state.SetReadyModelAvailable(true);
   CapturingWriter available;
   HttpRequest second{http::verb::get, "/health/ready", 11};
-  folly::coro::blockingWait(ready.Handle(
-      std::move(second), {}, available, folly::CancellationToken{}));
+  folly::coro::blockingWait(ready.Handle(std::move(second), {}, available,
+                                         folly::CancellationToken{}));
   EXPECT_EQ(available.status, 200);
 }
 
@@ -1217,8 +1217,8 @@ TEST(ModelsHandlerTest, ListsOnlyReadyModelsVisibleToAuthenticatedTenant) {
   context.tenant_id = "tenant-a";
   CapturingWriter writer;
   HttpRequest request{http::verb::get, "/v1/models", 11};
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_EQ(writer.body,
             "{\"object\":\"list\",\"data\":[{\"id\":\"chat-current\","
@@ -1231,8 +1231,7 @@ TEST(ModelsHandlerTest, RejectsMissingAuthenticatedContext) {
   ::inferx::server::handlers::ModelsHandler handler(&registry);
   CapturingWriter writer;
   HttpRequest request{http::verb::get, "/v1/models", 11};
-  folly::coro::blockingWait(
-      handler.Handle(std::move(request), {}, writer, {}));
+  folly::coro::blockingWait(handler.Handle(std::move(request), {}, writer, {}));
   EXPECT_EQ(writer.status, 401);
 }
 
@@ -1262,8 +1261,8 @@ TEST(EmbeddingsHandlerTest, PreservesBatchIndicesAndImmutableModelVersion) {
   request.body() =
       "{\"model\":\"embed-current\",\"input\":[\"a\",\"b\"],"
       "\"dimensions\":2}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_NE(writer.body.find("\"index\":0"), std::string::npos);
   EXPECT_NE(writer.body.find("\"index\":1"), std::string::npos);
@@ -1289,8 +1288,8 @@ TEST(EmbeddingsHandlerTest, RejectsUnsupportedCapabilityBeforeExecution) {
   CapturingWriter writer;
   HttpRequest request{http::verb::post, "/v1/embeddings", 11};
   request.body() = "{\"model\":\"chat@v1\",\"input\":\"text\"}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 422);
   EXPECT_NE(writer.body.find("does not support embedding workloads"),
             std::string::npos);
@@ -1319,8 +1318,8 @@ TEST(TokenizeHandlerTest, ResolvesVersionAndDelegatesSpecialTokenPolicy) {
   request.body() =
       "{\"model\":\"chat-current\",\"text\":\"hello\","
       "\"add_special_tokens\":true}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_EQ(writer.body,
             "{\"model\":\"chat-current\",\"token_ids\":[11,12,13],"
@@ -1348,8 +1347,8 @@ TEST(TokenizeHandlerTest, EnforcesExactTokenContextLimit) {
   CapturingWriter writer;
   HttpRequest request{http::verb::post, "/v1/tokenize", 11};
   request.body() = "{\"model\":\"small@v1\",\"text\":\"hello\"}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 400);
   EXPECT_NE(writer.body.find("context limit"), std::string::npos);
 }
@@ -1359,16 +1358,16 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
   ::inferx::server::auth::Principal principal{"tenant-a", "user", "key"};
   principal.scopes.insert("models.read");
   principal.scopes.insert("inference.invoke");
-  ASSERT_TRUE(
-      store
-          ->AddHash(
-              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
-              principal)
-          .ok());
+  ASSERT_TRUE(store
+                  ->AddHash("2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a2"
+                            "5fe97bf527a25b",
+                            principal)
+                  .ok());
   auto authenticator =
-      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
-  auto guard = std::make_shared<
-      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(
+          store.get());
+  auto guard = std::make_shared<::inferx::server::middleware::BearerRouteGuard>(
+      authenticator);
   ::inferx::server::handlers::HealthState health;
   ::inferx::server::model_registry::Registry registry;
   FakeTokenizationService tokenization;
@@ -1392,8 +1391,8 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
 
   CapturingWriter compatibility_writer;
   HttpRequest compatibility{http::verb::get, "/health", 11};
-  folly::coro::blockingWait((*built)->Handle(
-      std::move(compatibility), {}, compatibility_writer, {}));
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(compatibility), {}, compatibility_writer, {}));
   EXPECT_EQ(compatibility_writer.status, 200);
 
   CapturingWriter denied_writer;
@@ -1414,23 +1413,20 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
 TEST(MetricsHandlerTest, RendersPrometheusAndLegacyStatsFromSameSnapshot) {
   FakeMetricsSource source;
   ::inferx::server::handlers::MetricsHandler metrics(
-      &source,
-      ::inferx::server::handlers::MetricsPresentation::kPrometheus);
+      &source, ::inferx::server::handlers::MetricsPresentation::kPrometheus);
   CapturingWriter metrics_writer;
   HttpRequest metrics_request{http::verb::get, "/metrics", 11};
-  folly::coro::blockingWait(metrics.Handle(
-      std::move(metrics_request), {}, metrics_writer, {}));
+  folly::coro::blockingWait(
+      metrics.Handle(std::move(metrics_request), {}, metrics_writer, {}));
   EXPECT_EQ(metrics_writer.status, 200);
   EXPECT_NE(metrics_writer.body.find("inferx_requests_running 2"),
             std::string::npos);
-  EXPECT_NE(metrics_writer.body.find(
-                "inferx_kv_blocks{state=\"free\"} 5"),
+  EXPECT_NE(metrics_writer.body.find("inferx_kv_blocks{state=\"free\"} 5"),
             std::string::npos);
   EXPECT_EQ(metrics_writer.body.find("tenant"), std::string::npos);
 
   ::inferx::server::handlers::MetricsHandler stats(
-      &source,
-      ::inferx::server::handlers::MetricsPresentation::kLegacyJson);
+      &source, ::inferx::server::handlers::MetricsPresentation::kLegacyJson);
   CapturingWriter stats_writer;
   HttpRequest stats_request{http::verb::get, "/stats", 11};
   folly::coro::blockingWait(
@@ -1445,16 +1441,16 @@ TEST(AdminModelHandlerTest, UsesDistinctScopeAndListsTenantLifecycle) {
   auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
   ::inferx::server::auth::Principal principal{"tenant-a", "operator", "key"};
   principal.scopes.insert("models.manage");
-  ASSERT_TRUE(
-      store
-          ->AddHash(
-              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
-              principal)
-          .ok());
+  ASSERT_TRUE(store
+                  ->AddHash("2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a2"
+                            "5fe97bf527a25b",
+                            principal)
+                  .ok());
   auto authenticator =
-      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
-  auto guard = std::make_shared<
-      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(
+          store.get());
+  auto guard = std::make_shared<::inferx::server::middleware::BearerRouteGuard>(
+      authenticator);
   using namespace ::inferx::server::model_registry;
   Registry registry;
   ModelRecord visible;
@@ -1478,8 +1474,7 @@ TEST(AdminModelHandlerTest, UsesDistinctScopeAndListsTenantLifecycle) {
   folly::coro::blockingWait(
       (*routes)->Handle(std::move(list), {}, list_writer, {}));
   EXPECT_EQ(list_writer.status, 200);
-  EXPECT_NE(list_writer.body.find("\"state\":\"loading\""),
-            std::string::npos);
+  EXPECT_NE(list_writer.body.find("\"state\":\"loading\""), std::string::npos);
   EXPECT_EQ(list_writer.body.find("hidden"), std::string::npos);
 
   CapturingWriter load_writer;
@@ -1560,8 +1555,8 @@ TEST(CompletionHandlerTest, CollectsTypedEventsFromImmutableModelRequest) {
   request.body() =
       "{\"model\":\"text-current\",\"prompt\":\"input\","
       "\"max_tokens\":2}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_NE(writer.body.find("\"text\":\"hello\""), std::string::npos);
   EXPECT_NE(writer.body.find("\"prompt_tokens\":3"), std::string::npos);
@@ -1594,8 +1589,8 @@ TEST(CompletionHandlerTest, StreamsSameEventsWithUsageAndDoneMarker) {
       "{\"model\":\"text@v1\",\"prompt\":\"input\","
       "\"max_tokens\":2,\"stream\":true,"
       "\"stream_options\":{\"include_usage\":true}}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_TRUE(writer.finished);
   EXPECT_NE(writer.body.find("hello"), std::string::npos);
@@ -1627,8 +1622,8 @@ TEST(ChatCompletionHandlerTest, UsesChatTokenizerAndCollectsAssistantMessage) {
   request.body() =
       "{\"model\":\"chat-current\",\"messages\":[{\"role\":\"user\","
       "\"content\":\"hi\"}],\"max_tokens\":2}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_NE(writer.body.find("\"role\":\"assistant\""), std::string::npos);
   EXPECT_NE(writer.body.find("\"content\":\"hello\""), std::string::npos);
@@ -1660,8 +1655,8 @@ TEST(ChatCompletionHandlerTest, StreamsRoleBeforeContentAndUsage) {
       "{\"model\":\"chat@v1\",\"messages\":[{\"role\":\"user\","
       "\"content\":\"hi\"}],\"max_tokens\":2,\"stream\":true,"
       "\"stream_options\":{\"include_usage\":true}}";
-  folly::coro::blockingWait(handler.Handle(
-      std::move(request), std::move(context), writer, {}));
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 200);
   const size_t role = writer.body.find("\"role\":\"assistant\"");
   const size_t content = writer.body.find("hello");
@@ -1679,8 +1674,8 @@ TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
   auto runtime = std::move(*runtime_result);
   BeastListenerConfig config;
   config.max_request_bytes = 4;
-  auto listener_result = BeastListener::Create(
-      runtime.get(), config, std::make_shared<OkHandler>());
+  auto listener_result = BeastListener::Create(runtime.get(), config,
+                                               std::make_shared<OkHandler>());
   ASSERT_TRUE(listener_result.ok()) << listener_result.status();
   auto listener = std::move(*listener_result);
   const Status listener_status = listener->Start();

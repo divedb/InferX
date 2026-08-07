@@ -221,68 +221,6 @@ std::string RenderRankMetrics(const std::vector<RankTelemetry>& ranks) {
 
 }  // namespace
 
-// --- Generation --------------------------------------------------------------
-
-bool Generation::Next(Event* out) {
-  std::unique_lock<std::mutex> lock(mutex_);
-
-  ready_.wait(lock, [this] { return !events_.empty() || finished_; });
-
-  if (events_.empty()) return false;
-
-  *out = std::move(events_.front());
-  events_.pop_front();
-
-  return true;
-}
-
-void Generation::Cancel() {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cancelled_ = true;
-  }
-
-  // Wakes a consumer blocked in Next. The engine will retire the request on its
-  // next step; this only stops the reader waiting for output that is no longer
-  // coming.
-  ready_.notify_all();
-}
-
-bool Generation::cancelled() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return cancelled_;
-}
-
-void Generation::Emit(Event event) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (finished_) return;
-
-    events_.push_back(std::move(event));
-  }
-
-  ready_.notify_one();
-}
-
-void Generation::Finish(FinishReason reason, int32_t generated) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    if (finished_) return;
-
-    Event event;
-    event.done = true;
-    event.reason = reason;
-    event.generated = generated;
-
-    events_.push_back(std::move(event));
-    finished_ = true;
-  }
-
-  ready_.notify_all();
-}
-
 // --- Engine ------------------------------------------------------------------
 
 struct Engine::Impl {

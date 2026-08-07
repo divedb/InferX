@@ -23,6 +23,13 @@ target_link_libraries(inferx_transport_test PRIVATE
 include(GoogleTest)
 gtest_discover_tests(inferx_transport_test)
 
+add_executable(inferx_generation_test
+  unit/server/generation_test.cc)
+target_link_libraries(inferx_generation_test PRIVATE
+  inferx::generation
+  GTest::gtest_main)
+gtest_discover_tests(inferx_generation_test)
+
 add_executable(inferx_remote_scheduler_client_test
   unit/scheduler_client/remote_scheduler_client_test.cc)
 target_link_libraries(inferx_remote_scheduler_client_test PRIVATE

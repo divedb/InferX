@@ -1,11 +1,15 @@
 #pragma once
 
-#include <condition_variable>
+#include <folly/CancellationToken.h>
+#include <folly/coro/AsyncPipe.h>
+#include <folly/coro/Task.h>
+
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "inferx/core/status.h"
@@ -93,9 +97,11 @@ class Generation {
     int32_t generated = 0;
   };
 
-  /// \brief Blocks until an event is available, returning false at end of
-  ///        stream.
-  bool Next(Event* out);
+  Generation();
+
+  /// Suspends without occupying a thread until an event is available.
+  folly::coro::Task<StatusOr<std::optional<Event>>> Next(
+      folly::CancellationToken cancellation = {});
 
   /// \brief Abandons the generation.
   ///
@@ -131,13 +137,19 @@ class Generation {
   /// @}
 
  private:
+  using Pipe = folly::coro::BoundedAsyncPipe<Event, false>;
+  using EventGenerator = folly::coro::AsyncGenerator<Event&&>;
+
+  explicit Generation(std::pair<EventGenerator, Pipe> pair);
   friend class Engine;
 
   mutable std::mutex mutex_;
-  std::condition_variable ready_;
-  std::deque<Event> events_;
+  EventGenerator events_;
+  Pipe producer_;
   bool finished_ = false;
   bool cancelled_ = false;
+  bool overflowed_ = false;
+  bool closed_ = false;
   int32_t prompt_tokens_ = 0;
   scheduler::RequestId id_ = 0;
 };

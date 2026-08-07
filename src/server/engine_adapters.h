@@ -7,11 +7,11 @@
 namespace inferx::server {
 
 class EngineSchedulerBackend final
-    : public scheduler_client::LegacyEngineBackend {
+    : public scheduler_client::InProcessEngineBackend {
  public:
   explicit EngineSchedulerBackend(Engine* engine) : engine_(engine) {}
 
-  StatusOr<std::shared_ptr<scheduler_client::LegacyGeneration>> Submit(
+  StatusOr<std::shared_ptr<scheduler_client::InProcessGeneration>> Submit(
       const scheduler_client::ScheduledRequest& request) override;
 
  private:

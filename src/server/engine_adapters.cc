@@ -21,19 +21,27 @@ scheduler_client::FinishReason ConvertFinishReason(
   return scheduler_client::FinishReason::kFailed;
 }
 
-class EngineGeneration final : public scheduler_client::LegacyGeneration {
+class EngineGeneration final : public scheduler_client::InProcessGeneration {
  public:
   explicit EngineGeneration(std::shared_ptr<Generation> generation)
       : generation_(std::move(generation)) {}
 
-  bool Next(scheduler_client::LegacyGenerationEvent* event) override {
-    Generation::Event legacy;
-    if (!generation_->Next(&legacy)) return false;
-    event->text = std::move(legacy.text);
-    event->terminal = legacy.done;
-    event->finish_reason = ConvertFinishReason(legacy.reason);
-    event->generated_tokens = static_cast<uint32_t>(legacy.generated);
-    return true;
+  folly::coro::Task<
+      StatusOr<std::optional<scheduler_client::InProcessGenerationEvent>>>
+  Next(folly::CancellationToken cancellation) override {
+    auto next = co_await generation_->Next(cancellation);
+    if (!next.ok()) co_return next.status();
+    if (!next->has_value()) {
+      co_return std::optional<scheduler_client::InProcessGenerationEvent>{};
+    }
+    auto engine_event = std::move(**next);
+    scheduler_client::InProcessGenerationEvent event;
+    event.text = std::move(engine_event.text);
+    event.terminal = engine_event.done;
+    event.finish_reason = ConvertFinishReason(engine_event.reason);
+    event.generated_tokens = static_cast<uint32_t>(engine_event.generated);
+    co_return std::optional<scheduler_client::InProcessGenerationEvent>(
+        std::move(event));
   }
 
   void Cancel() override { generation_->Cancel(); }
@@ -47,7 +55,7 @@ class EngineGeneration final : public scheduler_client::LegacyGeneration {
 
 }  // namespace
 
-StatusOr<std::shared_ptr<scheduler_client::LegacyGeneration>>
+StatusOr<std::shared_ptr<scheduler_client::InProcessGeneration>>
 EngineSchedulerBackend::Submit(
     const scheduler_client::ScheduledRequest& request) {
   if (engine_ == nullptr) return InternalError("engine is not configured");
@@ -55,11 +63,11 @@ EngineSchedulerBackend::Submit(
   sampling.temperature = request.sampling.temperature;
   sampling.top_p = request.sampling.top_p;
   sampling.seed = request.sampling.seed;
-  auto submitted = engine_->Submit(request.prompt_tokens,
-                                   request.sampling.max_tokens,
-                                   request.sampling.stop, sampling);
+  auto submitted =
+      engine_->Submit(request.prompt_tokens, request.sampling.max_tokens,
+                      request.sampling.stop, sampling);
   if (!submitted.ok()) return submitted.status();
-  return std::static_pointer_cast<scheduler_client::LegacyGeneration>(
+  return std::static_pointer_cast<scheduler_client::InProcessGeneration>(
       std::make_shared<EngineGeneration>(*submitted));
 }
 
