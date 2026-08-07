@@ -34,6 +34,7 @@
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/middleware/authentication.h"
 #include "inferx/server/handlers/health_handler.h"
+#include "inferx/server/handlers/embeddings_handler.h"
 #include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
@@ -102,6 +103,30 @@ class ScopeGuard final : public RouteGuard {
   }
   bool deny = false;
   std::string seen_scope;
+};
+
+class FakeEmbeddingsService final
+    : public ::inferx::server::handlers::EmbeddingsService {
+ public:
+  folly::coro::Task<StatusOr<
+      ::inferx::server::handlers::EmbeddingsOutput>>
+  Embed(const ::inferx::api::EmbeddingsRequest& request,
+        const ::inferx::server::model_registry::ModelRecord& model,
+        const RequestContext& context,
+        folly::CancellationToken) override {
+    seen_model_version = model.version;
+    seen_tenant = context.tenant_id;
+    ::inferx::server::handlers::EmbeddingsOutput output;
+    output.prompt_tokens = 7;
+    for (size_t index = 0; index < request.input.size(); ++index) {
+      output.values.push_back(
+          {static_cast<float>(index), static_cast<float>(index + 1)});
+    }
+    co_return output;
+  }
+
+  std::string seen_model_version;
+  std::string seen_tenant;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -880,6 +905,66 @@ TEST(ModelsHandlerTest, RejectsMissingAuthenticatedContext) {
   folly::coro::blockingWait(
       handler.Handle(std::move(request), {}, writer, {}));
   EXPECT_EQ(writer.status, 401);
+}
+
+TEST(EmbeddingsHandlerTest, PreservesBatchIndicesAndImmutableModelVersion) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "embed";
+  model.version = "v3";
+  model.alias = "embed-current";
+  model.supports_generation = false;
+  model.supports_embeddings = true;
+  model.embedding_dimensions = 2;
+  model.embedding_max_batch_size = 2;
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("embed", "v3", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("embed", "v3", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("embed", "v3", ModelState::kReady).ok());
+  auto service = std::make_shared<FakeEmbeddingsService>();
+  ::inferx::server::handlers::EmbeddingsHandler handler(&registry, service);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/embeddings", 11};
+  request.body() =
+      "{\"model\":\"embed-current\",\"input\":[\"a\",\"b\"],"
+      "\"dimensions\":2}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(writer.body.find("\"index\":0"), std::string::npos);
+  EXPECT_NE(writer.body.find("\"index\":1"), std::string::npos);
+  EXPECT_NE(writer.body.find("\"prompt_tokens\":7"), std::string::npos);
+  EXPECT_EQ(service->seen_model_version, "v3");
+  EXPECT_EQ(service->seen_tenant, "tenant-a");
+}
+
+TEST(EmbeddingsHandlerTest, RejectsUnsupportedCapabilityBeforeExecution) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v1";
+  model.supports_embeddings = false;
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kReady).ok());
+  ::inferx::server::handlers::EmbeddingsHandler handler(&registry);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/embeddings", 11};
+  request.body() = "{\"model\":\"chat@v1\",\"input\":\"text\"}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 422);
+  EXPECT_NE(writer.body.find("does not support embedding workloads"),
+            std::string::npos);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

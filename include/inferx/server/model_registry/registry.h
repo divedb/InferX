@@ -35,6 +35,8 @@ struct ModelRecord {
   uint32_t context_limit = 0;
   uint32_t max_output_tokens = 0;
   uint32_t embedding_dimensions = 0;
+  uint32_t embedding_max_batch_size = 1;
+  std::unordered_set<std::string> embedding_encoding_formats{"float"};
   std::string tokenizer_revision;
   std::unordered_set<std::string> visible_tenants;
 };
