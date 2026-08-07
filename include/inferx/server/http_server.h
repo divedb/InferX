@@ -36,6 +36,10 @@ struct HttpServerConfig {
   /// blocking event interface. Keeping it separate ensures a slow inference
   /// request can never stall accepts, reads, or response writes.
   size_t application_threads = 0;
+
+  /// Hard cap across queued, tokenizing, generating, and streaming requests.
+  /// Admission happens before work enters the application executor.
+  size_t max_active_requests = 1024;
 };
 
 /// \brief An OpenAI-compatible HTTP front end for an `Engine`.

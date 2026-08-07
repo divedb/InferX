@@ -214,6 +214,7 @@ struct HttpServer::Impl {
   std::vector<std::thread> io_workers;
   std::atomic<int> bound_port{0};
   std::atomic<bool> stopping{false};
+  std::atomic<size_t> active_requests{0};
   std::mutex ready_mutex;
   std::condition_variable ready_cv;
   bool ready = false;
@@ -252,6 +253,7 @@ struct HttpServer::Impl::Session
   asio::steady_timer request_timer;
   bool keep_alive = false;
   bool closed = false;
+  std::atomic<bool> admitted{false};
   std::string request_id;
   std::string client_request_id;
 
@@ -293,6 +295,15 @@ struct HttpServer::Impl::Session
     } else {
       client_request_id.clear();
     }
+    const size_t previous =
+        owner->active_requests.fetch_add(1, std::memory_order_acq_rel);
+    if (previous >= owner->config.max_active_requests) {
+      owner->active_requests.fetch_sub(1, std::memory_order_acq_rel);
+      return WriteError(429, "HTTP request capacity exceeded",
+                        "rate_limit_error", keep_alive,
+                        "request_capacity_exceeded");
+    }
+    admitted.store(true, std::memory_order_release);
     auto self = shared_from_this();
     asio::post(owner->application_pool,
                [self, request = std::move(request)]() mutable {
@@ -495,6 +506,12 @@ struct HttpServer::Impl::Session
     });
   }
 
+  void ReleaseAdmission() {
+    if (admitted.exchange(false, std::memory_order_acq_rel)) {
+      owner->active_requests.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  }
+
   void ArmRequestDeadline(const std::shared_ptr<Generation>& current) {
     auto self = shared_from_this();
     asio::post(stream.get_executor(), [self, current] {
@@ -550,6 +567,7 @@ struct HttpServer::Impl::Session
           std::chrono::seconds(self->owner->config.write_timeout_seconds));
       http::async_write(self->stream, *response,
                         [self, response](beast::error_code error, size_t) {
+                          self->ReleaseAdmission();
                           if (error || !response->keep_alive()) self->Close();
                           else self->Read();
                         });
@@ -610,6 +628,7 @@ struct HttpServer::Impl::Session
       asio::async_write(
           self->stream, http::make_chunk_last(),
           [self](beast::error_code error, size_t) {
+            self->ReleaseAdmission();
             if (error || !self->keep_alive || self->owner->stopping)
               self->Close();
             else
@@ -621,6 +640,7 @@ struct HttpServer::Impl::Session
   void Close() {
     if (closed) return;
     closed = true;
+    ReleaseAdmission();
     {
       std::lock_guard lock(generation_mutex);
       if (generation) generation->Cancel();
@@ -708,6 +728,8 @@ StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
     return InvalidArgumentError("port must be in [0, 65535]");
   if (config.max_request_bytes == 0)
     return InvalidArgumentError("max_request_bytes must be positive");
+  if (config.max_active_requests == 0)
+    return InvalidArgumentError("max_active_requests must be positive");
   if (config.read_timeout_seconds <= 0 || config.write_timeout_seconds <= 0 ||
       config.request_timeout_seconds <= 0)
     return InvalidArgumentError("HTTP timeouts must be positive");
