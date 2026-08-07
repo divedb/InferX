@@ -26,6 +26,7 @@
 #include "inferx/server/admission/admission_controller.h"
 #include "inferx/server/admission/capacity_policy.h"
 #include "inferx/server/auth/api_key_store.h"
+#include "inferx/server/auth/authenticator.h"
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/tokenization/tokenization_service.h"
@@ -438,6 +439,43 @@ TEST(AuthTest, RotatesCompleteKeySnapshotAtomically) {
             absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(store.size(), 2);
   EXPECT_TRUE(store.LookupHash("new_b").ok());
+}
+
+TEST(AuthTest, AuthenticatesBearerTokenWithoutStoringRawCredential) {
+  using ::inferx::server::auth::ApiKeyAuthenticator;
+  using ::inferx::server::auth::ApiKeyStore;
+  using ::inferx::server::auth::Principal;
+  ApiKeyStore store;
+  ASSERT_TRUE(
+      store
+          .AddHash(
+              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+              Principal{"tenant", "user", "key_1"})
+          .ok());
+  ApiKeyAuthenticator authenticator(&store);
+
+  auto principal = authenticator.Authenticate("Bearer secret");
+  ASSERT_TRUE(principal.ok()) << principal.status();
+  EXPECT_EQ(principal->key_id, "key_1");
+  EXPECT_EQ(store.size(), 1);
+  EXPECT_FALSE(store.LookupHash("secret").ok());
+  EXPECT_EQ(authenticator.Authenticate("").status().code(),
+            absl::StatusCode::kUnauthenticated);
+  EXPECT_EQ(authenticator.Authenticate("Basic secret").status().code(),
+            absl::StatusCode::kUnauthenticated);
+  EXPECT_EQ(authenticator.Authenticate("Bearer wrong token").status().code(),
+            absl::StatusCode::kUnauthenticated);
+}
+
+TEST(AuthTest, DevelopmentBypassMustBeExplicit) {
+  ::inferx::server::auth::ApiKeyStore store;
+  ::inferx::server::auth::ApiKeyAuthenticator secure(&store);
+  EXPECT_EQ(secure.Authenticate("").status().code(),
+            absl::StatusCode::kUnauthenticated);
+  ::inferx::server::auth::ApiKeyAuthenticator development(&store, true);
+  auto principal = development.Authenticate("");
+  ASSERT_TRUE(principal.ok()) << principal.status();
+  EXPECT_EQ(principal->tenant_id, "development");
 }
 
 TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
