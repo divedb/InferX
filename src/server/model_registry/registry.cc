@@ -97,6 +97,19 @@ std::vector<ModelRecord> Registry::ReadyModels(std::string_view tenant) const {
   return result;
 }
 
+std::vector<ModelRecord> Registry::Models(std::string_view tenant) const {
+  std::lock_guard lock(mutex_);
+  std::vector<ModelRecord> result;
+  for (const auto& [key, record] : records_) {
+    (void)key;
+    if (tenant.empty() || record.visible_tenants.empty() ||
+        record.visible_tenants.contains(std::string(tenant))) {
+      result.push_back(record);
+    }
+  }
+  return result;
+}
+
 size_t Registry::size() const {
   std::lock_guard lock(mutex_);
   return records_.size();

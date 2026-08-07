@@ -53,6 +53,7 @@ class Registry {
                                 std::string_view tenant) const;
   std::vector<ModelRecord> ReadyModels() const;
   std::vector<ModelRecord> ReadyModels(std::string_view tenant) const;
+  std::vector<ModelRecord> Models(std::string_view tenant) const;
   size_t size() const;
 
  private:

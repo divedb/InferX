@@ -37,6 +37,7 @@
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/handlers/embeddings_handler.h"
 #include "inferx/server/handlers/api_routes.h"
+#include "inferx/server/handlers/admin_model_handler.h"
 #include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/chat_completion_handler.h"
 #include "inferx/server/handlers/models_handler.h"
@@ -1318,6 +1319,57 @@ TEST(MetricsHandlerTest, RendersPrometheusAndLegacyStatsFromSameSnapshot) {
   EXPECT_NE(stats_writer.body.find("\"running\":2"), std::string::npos);
   EXPECT_NE(stats_writer.body.find("\"tokens_generated\":10"),
             std::string::npos);
+}
+
+TEST(AdminModelHandlerTest, UsesDistinctScopeAndListsTenantLifecycle) {
+  auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
+  ::inferx::server::auth::Principal principal{"tenant-a", "operator", "key"};
+  principal.scopes.insert("models.manage");
+  ASSERT_TRUE(
+      store
+          ->AddHash(
+              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+              principal)
+          .ok());
+  auto authenticator =
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
+  auto guard = std::make_shared<
+      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord visible;
+  visible.id = "model";
+  visible.version = "v2";
+  visible.alias = "current";
+  visible.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(visible).ok());
+  ASSERT_TRUE(registry.SetState("model", "v2", ModelState::kLoading).ok());
+  ModelRecord hidden;
+  hidden.id = "hidden";
+  hidden.version = "v1";
+  hidden.visible_tenants.insert("tenant-b");
+  ASSERT_TRUE(registry.Register(hidden).ok());
+  auto routes = ::inferx::server::handlers::BuildAdminRoutes(&registry, guard);
+  ASSERT_TRUE(routes.ok()) << routes.status();
+
+  CapturingWriter list_writer;
+  HttpRequest list{http::verb::get, "/admin/v1/models", 11};
+  list.set(http::field::authorization, "Bearer secret");
+  folly::coro::blockingWait(
+      (*routes)->Handle(std::move(list), {}, list_writer, {}));
+  EXPECT_EQ(list_writer.status, 200);
+  EXPECT_NE(list_writer.body.find("\"state\":\"loading\""),
+            std::string::npos);
+  EXPECT_EQ(list_writer.body.find("hidden"), std::string::npos);
+
+  CapturingWriter load_writer;
+  HttpRequest load{http::verb::post, "/admin/v1/models/load", 11};
+  load.set(http::field::authorization, "Bearer secret");
+  load.body() = "{}";
+  folly::coro::blockingWait(
+      (*routes)->Handle(std::move(load), {}, load_writer, {}));
+  EXPECT_EQ(load_writer.status, 422);
+  EXPECT_NE(load_writer.body.find("not implemented"), std::string::npos);
 }
 
 TEST(CompletionHandlerTest, CollectsTypedEventsFromImmutableModelRequest) {
