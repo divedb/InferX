@@ -10,32 +10,12 @@
 
 #include "inferx/support/file_util.h"
 #include "inferx/support/json.h"
+#include "inferx/tokenizer/unicode.h"
 
 namespace inferx::tokenizer {
 namespace {
 
 enum class ArtifactKind { kHuggingFaceJson, kSentencePiece };
-
-// Returns the length of the first UTF-8 code point. Invalid input is consumed
-// one byte at a time; the backend will apply its own invalid-input policy.
-size_t FirstCodepointLength(std::string_view text) {
-  if (text.empty()) return 0;
-  const unsigned char lead = static_cast<unsigned char>(text.front());
-  if (lead < 0x80) return 1;
-  if ((lead & 0xE0) == 0xC0 && text.size() >= 2) return 2;
-  if ((lead & 0xF0) == 0xE0 && text.size() >= 3) return 3;
-  if ((lead & 0xF8) == 0xF0 && text.size() >= 4) return 4;
-  return 1;
-}
-
-size_t Utf8BoundaryAtOrBefore(std::string_view text, size_t offset) {
-  offset = std::min(offset, text.size());
-  while (offset > 0 && offset < text.size() &&
-         (static_cast<unsigned char>(text[offset]) & 0xC0) == 0x80) {
-    --offset;
-  }
-  return offset;
-}
 
 }  // namespace
 
@@ -119,7 +99,9 @@ std::string Tokenizer::Decode(const std::vector<TokenId>& ids) {
 size_t Tokenizer::GetVocabSize() { return backend_->GetVocabSize(); }
 
 std::string Tokenizer::IdToToken(TokenId id) {
-  return id < 0 ? std::string() : backend_->IdToToken(id);
+  assert(IsValidTokenId(id) && "");
+
+  return backend_->IdToToken(id);
 }
 
 TokenId Tokenizer::TokenToId(const std::string& token) {
@@ -168,13 +150,13 @@ StatusOr<std::vector<TokenId>> Tokenizer::EncodeWithOptions(
     // can be recognized. Single-codepoint added tokens cannot be represented
     // safely through this API and are rejected.
     std::string_view remaining(*hit);
-    if (FirstCodepointLength(remaining) == remaining.size()) {
+    if (unicode::Utf8CodepointLength(remaining) == remaining.size()) {
       return UnimplementedError(
           "ordinary-text encoding of a single-codepoint added token requires "
           "a tokenizers-cpp API extension");
     }
     while (!remaining.empty()) {
-      const size_t length = FirstCodepointLength(remaining);
+      const size_t length = unicode::Utf8CodepointLength(remaining);
       std::vector<TokenId> ids =
           Encode(std::string(remaining.substr(0, length)));
       out.insert(out.end(), ids.begin(), ids.end());
@@ -190,11 +172,24 @@ StatusOr<std::vector<TokenId>> Tokenizer::EncodeWithOptions(
   return out;
 }
 
-StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFromFile(
-    const std::string& path) {
-  INFERX_ASSIGN_OR_RETURN(const std::string blob, ReadFile(path));
+StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFrom(
+    const std::string& directory) {
+  std::filesystem::path artifact;
+  for (std::string_view candidate :
+       {"tokenizer.json", "tokenizer.model", "spiece.model"}) {
+    const std::filesystem::path path =
+        std::filesystem::path(directory) / candidate;
+    if (std::filesystem::is_regular_file(path)) {
+      artifact = path;
+      break;
+    }
+  }
+  if (artifact.empty()) {
+    return NotFoundError("checkpoint has no supported tokenizer artifact: ",
+                         directory);
+  }
 
-  const std::filesystem::path artifact(path);
+  INFERX_ASSIGN_OR_RETURN(const std::string blob, ReadFile(artifact.string()));
   const ArtifactKind kind = artifact.extension() == ".json"
                                 ? ArtifactKind::kHuggingFaceJson
                                 : ArtifactKind::kSentencePiece;
@@ -212,28 +207,7 @@ StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFromFile(
                           CreateBackend(kind, blob));
   auto tokenizer = std::unique_ptr<Tokenizer>(
       new Tokenizer(std::move(backend), std::move(config)));
-  INFERX_RETURN_IF_ERROR(tokenizer->Validate());
-  return tokenizer;
-}
-
-StatusOr<std::unique_ptr<Tokenizer>> Tokenizer::LoadFromDirectory(
-    const std::string& dir) {
-  std::string artifact;
-  for (std::string_view candidate :
-       {"tokenizer.json", "tokenizer.model", "spiece.model"}) {
-    const std::string path = dir + "/" + std::string(candidate);
-    if (std::filesystem::is_regular_file(path)) {
-      artifact = path;
-      break;
-    }
-  }
-  if (artifact.empty()) {
-    return NotFoundError("checkpoint has no supported tokenizer artifact: ",
-                         dir);
-  }
-  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<Tokenizer> tokenizer,
-                          LoadFromFile(artifact));
-  INFERX_RETURN_IF_ERROR(tokenizer->ResolveCheckpointMetadata(dir));
+  INFERX_RETURN_IF_ERROR(tokenizer->ResolveCheckpointMetadata(directory));
   INFERX_RETURN_IF_ERROR(tokenizer->Validate());
   return tokenizer;
 }
@@ -256,7 +230,7 @@ Status Tokenizer::ResolveCheckpointMetadata(const std::string& dir) {
                             CreateBackend(config_->kind, config_->artifact,
                                           config_->tokenizer_config));
     const auto copy_id = [&](TokenId id, std::optional<TokenId>* destination) {
-      if (id >= 0) {
+      if (id >= 0 && id != ::tokenizers::kInvalidTokenId) {
         *destination = id;
         config_->special_ids[id] = true;
       }
@@ -335,7 +309,7 @@ class IncrementalDecoder::Impl {
     size_t common = 0;
     const size_t limit = std::min(decoded_.size(), next.size());
     while (common < limit && decoded_[common] == next[common]) ++common;
-    common = Utf8BoundaryAtOrBefore(decoded_, common);
+    common = unicode::Utf8BoundaryAtOrBefore(decoded_, common);
 
     std::string out;
     if (common > emitted_) out = decoded_.substr(emitted_, common - emitted_);

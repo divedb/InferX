@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -16,6 +17,10 @@ class Tokenizer;
 namespace inferx::tokenizer {
 
 using TokenId = int32_t;
+
+constexpr bool IsValidTokenId(TokenId id) {
+  return id != std::numeric_limits<TokenId>::max();
+}
 
 /// Whether strings which spell registered special tokens are interpreted as
 /// control tokens. User-controlled text must always use kAsText.
@@ -66,40 +71,56 @@ class IncrementalDecoder {
   std::unique_ptr<Impl> impl_;
 };
 
-/// Backend-neutral tokenizer used by the rest of InferX.
-///
-/// Thin InferX adapter around tokenizers::Tokenizer. The methods matching the
-/// tokenizers-cpp interface forward directly to the owned backend. Because that
-/// backend owns mutable result buffers, an instance is request-confined; use
-/// Clone() to give concurrent requests independent backend handles.
+/// \brief A tokenizer which wraps a third-party tokenizer implementation.
 class Tokenizer {
  public:
-  ~Tokenizer();
+  static StatusOr<std::unique_ptr<Tokenizer>> LoadFrom(
+      const std::string& directory);
 
   Tokenizer(const Tokenizer&) = delete;
   Tokenizer& operator=(const Tokenizer&) = delete;
   Tokenizer(Tokenizer&&) noexcept;
   Tokenizer& operator=(Tokenizer&&) noexcept;
+  ~Tokenizer();
 
-  /// Loads a complete Hugging Face tokenizer graph from tokenizer.json.
-  static StatusOr<std::unique_ptr<Tokenizer>> LoadFromFile(
-      const std::string& path);
-
-  /// Discovers tokenizer artifacts and checkpoint token metadata in dir.
-  static StatusOr<std::unique_ptr<Tokenizer>> LoadFromDirectory(
-      const std::string& dir);
-
-  /// Creates an independent tokenizer with its own backend handle and mutable
-  /// third-party buffers. Prefer one clone per concurrent request.
   StatusOr<std::unique_ptr<Tokenizer>> Clone() const;
 
-  // tokenizers::Tokenizer-compatible forwarding surface.
+  /// \brief Encodes input text into a sequence of token IDs.
+  ///
+  /// \param text The input UTF-8 encoded text.
+  /// \returns    A vector containing the generated token IDs.
   std::vector<TokenId> Encode(const std::string& text);
+
+  /// \brief Encodes a batch of input texts into sequences of token IDs.
+  ///
+  /// \param texts The input UTF-8 encoded texts.
+  /// \returns     A vector of vectors containing the generated token IDs for
+  ///              each input text.
   std::vector<std::vector<TokenId>> EncodeBatch(
       const std::vector<std::string>& texts);
+
+  /// \brief Decodes a sequence of token IDs back into text.
+  ///
+  /// \param ids The sequence of token IDs to decode.
+  /// \returns   The decoded UTF-8 encoded string.
   std::string Decode(const std::vector<TokenId>& ids);
+
+  /// \brief Returns the size of the vocabulary.
+  ///
+  /// \returns The number of tokens in the vocabulary.
   size_t GetVocabSize();
+
+  /// \brief Converts a token ID to its corresponding string representation.
+  ///
+  /// \param id The token ID.
+  /// \returns  The string representation of the token.
   std::string IdToToken(TokenId id);
+
+  /// \brief Converts a token string to its corresponding token ID.
+  ///
+  /// \param token The token string.
+  /// \returns     The corresponding token ID, or kInvalidTokenId if the token
+  ///              does not exist in the vocabulary.
   TokenId TokenToId(const std::string& token);
 
   // InferX-specific policy and checked operations.

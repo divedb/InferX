@@ -902,7 +902,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
 
   INFERX_ASSIGN_OR_RETURN(
       std::unique_ptr<tokenizer::Tokenizer> tok,
-      tokenizer::Tokenizer::LoadFromDirectory(config.model_dir));
+      tokenizer::Tokenizer::LoadFrom(config.model_dir));
 
   // Architecture dispatch. The checkpoint's config.json says which model class
   // to build, and the two classes expose different contracts: Qwen2Model has

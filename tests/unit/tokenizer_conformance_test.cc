@@ -182,7 +182,7 @@ class TokenizerConformance : public ::testing::Test {
     if (dir.empty()) return;
 
     StatusOr<std::unique_ptr<Tokenizer>> loaded =
-        Tokenizer::LoadFromDirectory(dir);
+        Tokenizer::LoadFrom(dir);
 
     ASSERT_TRUE(loaded.ok())
         << "the checkpoint is present but its tokenizer would not load: "
@@ -432,7 +432,7 @@ class O200kConformance : public ::testing::Test {
     if (dir.empty()) return;
 
     StatusOr<std::unique_ptr<Tokenizer>> loaded =
-        Tokenizer::LoadFromDirectory(dir);
+        Tokenizer::LoadFrom(dir);
 
     ASSERT_TRUE(loaded.ok())
         << "gpt-oss checkpoint is present but its tokenizer would not load: "

@@ -43,6 +43,17 @@ std::string Utf8Encode(const std::vector<uint32_t>& codepoints);
 /// decoder to decide whether a trailing partial sequence must be held back.
 int Utf8SequenceLength(unsigned char lead);
 
+/// \brief Length in bytes of the first codepoint in `text`.
+///
+/// Empty input returns 0. A malformed or truncated sequence consumes one byte,
+/// matching Utf8Decode's forward-progress behavior.
+size_t Utf8CodepointLength(std::string_view text);
+
+/// \brief Moves `offset` backward to the nearest UTF-8 codepoint boundary.
+///
+/// The returned offset is clamped to the size of `text`.
+size_t Utf8BoundaryAtOrBefore(std::string_view text, size_t offset);
+
 /// \brief Whether `text` ends in the middle of a UTF-8 sequence.
 ///
 /// The streaming path needs this because a token boundary is not a character
@@ -69,7 +80,8 @@ bool IsUpperLetter(uint32_t cp);
 /// \brief Whether `cp` is `\p{Ll}` (lowercase).
 bool IsLowerLetter(uint32_t cp);
 
-/// \brief Whether `cp` is in general category M* (`\p{M}`), the combining marks.
+/// \brief Whether `cp` is in general category M* (`\p{M}`), the combining
+/// marks.
 bool IsMark(uint32_t cp);
 
 /// \brief Whether `cp` is whitespace as Rust's regex crate defines `\s`.

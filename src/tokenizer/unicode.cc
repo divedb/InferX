@@ -38,11 +38,9 @@ bool InRanges(const Range* table, int count, uint32_t cp) {
 int CanonicalCombiningClass(uint32_t cp) {
   const CombiningRange* end = kCombining + kCombiningCount;
 
-  const CombiningRange* it =
-      std::upper_bound(kCombining, end, cp, [](uint32_t v,
-                                               const CombiningRange& r) {
-        return v < r.lo;
-      });
+  const CombiningRange* it = std::upper_bound(
+      kCombining, end, cp,
+      [](uint32_t v, const CombiningRange& r) { return v < r.lo; });
 
   if (it == kCombining) return 0;
 
@@ -257,6 +255,24 @@ int Utf8SequenceLength(unsigned char lead) {
   if ((lead & 0xF0u) == 0xE0u) return 3;
   if ((lead & 0xF8u) == 0xF0u) return 4;
   return 0;  // continuation byte or an invalid lead
+}
+
+size_t Utf8CodepointLength(std::string_view text) {
+  if (text.empty()) return 0;
+  const int length =
+      Utf8SequenceLength(static_cast<unsigned char>(text.front()));
+  return length > 0 && static_cast<size_t>(length) <= text.size()
+             ? static_cast<size_t>(length)
+             : 1;
+}
+
+size_t Utf8BoundaryAtOrBefore(std::string_view text, size_t offset) {
+  offset = std::min(offset, text.size());
+  while (offset > 0 && offset < text.size() &&
+         (static_cast<unsigned char>(text[offset]) & 0xC0u) == 0x80u) {
+    --offset;
+  }
+  return offset;
 }
 
 bool EndsWithPartialUtf8(std::string_view text) {
