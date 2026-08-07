@@ -7,6 +7,7 @@ add_executable(inferx_transport_test
   unit/transport/transport_test.cc)
 target_link_libraries(inferx_transport_test PRIVATE
   inferx::http_transport
+  inferx::server_protocol
   GTest::gtest_main)
 
 include(GoogleTest)

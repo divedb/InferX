@@ -17,6 +17,7 @@
 #include "inferx/server/transport/io_runtime.h"
 #include "inferx/server/transport/routes.h"
 #include "inferx/server/transport/sse_writer.h"
+#include "inferx/server/api/error_mapping.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -137,6 +138,19 @@ TEST(SseWriterTest, FramesEventsCommentsAndFinishes) {
   EXPECT_TRUE(folly::coro::blockingWait(sse.Finish({})).ok());
   EXPECT_EQ(writer.body, "data: one\ndata: two\n\n: keepalive\n\n");
   EXPECT_TRUE(writer.finished);
+}
+
+TEST(ErrorMappingTest, MapsRetryableStatusAndEscapesFields) {
+  const ::inferx::server::api::HttpError error =
+      ::inferx::server::api::MapStatus(
+          ResourceExhaustedError("quota \"full\""), "max_tokens");
+  EXPECT_EQ(error.status, 429);
+  EXPECT_EQ(error.type, "rate_limit_error");
+  EXPECT_EQ(error.retry_after, "1");
+  EXPECT_EQ(error.Json("req_1"),
+            "{\"error\":{\"message\":\"quota \\\"full\\\"\","
+            "\"type\":\"rate_limit_error\",\"param\":\"max_tokens\","
+            "\"code\":\"capacity_exceeded\",\"request_id\":\"req_1\"}}");
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
