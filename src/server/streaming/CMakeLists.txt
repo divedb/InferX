@@ -1,4 +1,5 @@
-add_library(inferx_streaming event_buffer.cc event_router.cc)
+add_library(inferx_streaming event_buffer.cc event_router.cc
+  backpressure_controller.cc)
 add_library(inferx::streaming ALIAS inferx_streaming)
 target_include_directories(inferx_streaming PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)

@@ -17,7 +17,8 @@ enum class PushResult { kQueued, kFull, kClosed };
 
 class EventBuffer {
  public:
-  static StatusOr<std::unique_ptr<EventBuffer>> Create(size_t max_events);
+  static StatusOr<std::unique_ptr<EventBuffer>> Create(size_t max_events,
+                                                       size_t max_bytes = 0);
   ~EventBuffer();
 
   EventBuffer(const EventBuffer&) = delete;
@@ -28,6 +29,8 @@ class EventBuffer {
       folly::CancellationToken cancellation = {});
   void Close();
   size_t queued_events();
+  size_t queued_bytes() const { return queued_bytes_; }
+  size_t max_bytes() const { return max_bytes_; }
 
  private:
   using Pipe = folly::coro::BoundedAsyncPipe<
@@ -35,10 +38,14 @@ class EventBuffer {
   using Generator = folly::coro::AsyncGenerator<
       scheduler_client::GenerationEvent&&>;
 
-  EventBuffer(Generator generator, Pipe pipe, size_t max_events);
+  EventBuffer(Generator generator, Pipe pipe, size_t max_events,
+              size_t max_bytes);
+  static size_t EventBytes(const scheduler_client::GenerationEvent& event);
   Generator generator_;
   Pipe pipe_;
   size_t max_events_;
+  size_t max_bytes_;
+  size_t queued_bytes_ = 0;
 };
 
 }  // namespace inferx::server::streaming

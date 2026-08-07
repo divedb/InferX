@@ -21,6 +21,7 @@
 #include "inferx/server/request/request_context.h"
 #include "inferx/server/request/request_manager.h"
 #include "inferx/server/streaming/event_buffer.h"
+#include "inferx/server/streaming/backpressure_controller.h"
 #include "inferx/server/streaming/event_router.h"
 #include "inferx/server/admission/admission_controller.h"
 #include "inferx/server/auth/api_key_store.h"
@@ -225,6 +226,36 @@ TEST(EventBufferTest, BoundsAndDeliversEvents) {
   buffer->Close();
   EXPECT_EQ(buffer->TryPush(first),
             ::inferx::server::streaming::PushResult::kClosed);
+}
+
+TEST(EventBufferTest, EnforcesByteBudgetAndAccountsConsumption) {
+  auto result = ::inferx::server::streaming::EventBuffer::Create(4, 64);
+  ASSERT_TRUE(result.ok()) << result.status();
+  auto buffer = std::move(*result);
+  ::inferx::server::scheduler_client::GenerationEvent event;
+  event.text_delta = std::string(50, 'x');
+  EXPECT_EQ(buffer->TryPush(event),
+            ::inferx::server::streaming::PushResult::kQueued);
+  EXPECT_GT(buffer->queued_bytes(), 0u);
+  event.text_delta = "y";
+  EXPECT_EQ(buffer->TryPush(event),
+            ::inferx::server::streaming::PushResult::kFull);
+  auto consumed = folly::coro::blockingWait(buffer->Next());
+  ASSERT_TRUE(consumed.has_value());
+  EXPECT_EQ(buffer->queued_bytes(), 0u);
+}
+
+TEST(BackpressureControllerTest, CancelsOnlyAfterContinuousFullPeriod) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::time_point(std::chrono::seconds(10));
+  ::inferx::server::streaming::BackpressureController controller(
+      std::chrono::milliseconds(100));
+  controller.Observe(::inferx::server::streaming::PushResult::kFull, start);
+  EXPECT_FALSE(controller.ShouldCancel(start + std::chrono::milliseconds(99)));
+  EXPECT_TRUE(controller.ShouldCancel(start + std::chrono::milliseconds(100)));
+  controller.Observe(::inferx::server::streaming::PushResult::kQueued,
+                     start + std::chrono::milliseconds(101));
+  EXPECT_FALSE(controller.full());
 }
 
 TEST(EventRouterTest, RejectsGapsAndWrongRequests) {
