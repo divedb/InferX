@@ -194,11 +194,17 @@ AdmissionDecision AdmissionController::TryAdmit(
   tokens_ += request.reserved_tokens;
   ++tenant.active;
   tenant.tokens += request.reserved_tokens;
-  return {AdmissionReason::kAdmitted, "admitted"};
+  uint64_t reservation_id = 0;
+  do {
+    reservation_id = next_reservation_id_++;
+  } while (reservation_id == 0 || reservations_.contains(reservation_id));
+  reservations_.emplace(reservation_id, request);
+  AdmissionDecision decision{AdmissionReason::kAdmitted, "admitted"};
+  decision.reservation_id = reservation_id;
+  return decision;
 }
 
-void AdmissionController::Release(const AdmissionRequest& request) {
-  std::lock_guard lock(mutex_);
+void AdmissionController::ReleaseLocked(const AdmissionRequest& request) {
   const auto it = tenants_.find(request.tenant_id);
   if (it == tenants_.end() || it->second.active == 0) return;
   --it->second.active;
@@ -210,6 +216,27 @@ void AdmissionController::Release(const AdmissionRequest& request) {
                 ? tokens_ - request.reserved_tokens
                 : 0;
   if (it->second.active == 0) tenants_.erase(it);
+}
+
+void AdmissionController::Release(uint64_t reservation_id) {
+  if (reservation_id == 0) return;
+  std::lock_guard lock(mutex_);
+  const auto reservation = reservations_.find(reservation_id);
+  if (reservation == reservations_.end()) return;
+  ReleaseLocked(reservation->second);
+  reservations_.erase(reservation);
+}
+
+void AdmissionController::Release(const AdmissionRequest& request) {
+  std::lock_guard lock(mutex_);
+  const auto reservation = std::find_if(
+      reservations_.begin(), reservations_.end(), [&](const auto& entry) {
+        return entry.second.tenant_id == request.tenant_id &&
+               entry.second.reserved_tokens == request.reserved_tokens;
+      });
+  if (reservation == reservations_.end()) return;
+  ReleaseLocked(reservation->second);
+  reservations_.erase(reservation);
 }
 
 uint32_t AdmissionController::active_requests() const {

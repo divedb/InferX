@@ -27,6 +27,7 @@ struct AdmissionDecision {
   AdmissionReason reason = AdmissionReason::kInvalidRequest;
   std::string message;
   std::chrono::milliseconds retry_after{0};
+  uint64_t reservation_id = 0;
   bool admitted() const { return reason == AdmissionReason::kAdmitted; }
   bool retryable() const { return retry_after.count() > 0; }
 };
@@ -104,6 +105,11 @@ class AdmissionController {
   explicit AdmissionController(AdmissionConfig config);
 
   AdmissionDecision TryAdmit(const AdmissionRequest& request);
+  /// Releases exactly one successful admission. Repeated release of the same
+  /// ID is a no-op and cannot affect another request from the same tenant.
+  void Release(uint64_t reservation_id);
+  /// Compatibility path for callers not yet carrying reservation IDs. New
+  /// lifecycle code should use Release(uint64_t).
   void Release(const AdmissionRequest& request);
   uint32_t active_requests() const;
   uint64_t reserved_tokens() const;
@@ -114,11 +120,15 @@ class AdmissionController {
     uint64_t tokens = 0;
   };
 
+  void ReleaseLocked(const AdmissionRequest& request);
+
   AdmissionConfig config_;
   mutable std::mutex mutex_;
   uint32_t active_ = 0;
   uint64_t tokens_ = 0;
+  uint64_t next_reservation_id_ = 1;
   std::unordered_map<request::TenantId, TenantUsage> tenants_;
+  std::unordered_map<uint64_t, AdmissionRequest> reservations_;
 };
 
 }  // namespace inferx::server::admission

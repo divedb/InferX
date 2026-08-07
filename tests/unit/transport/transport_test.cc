@@ -301,6 +301,28 @@ TEST(AdmissionTest, EnforcesAndReleasesTenantReservations) {
   EXPECT_EQ(controller.active_requests(), 0);
 }
 
+TEST(AdmissionTest, ReservationReleaseIsIdempotent) {
+  ::inferx::server::admission::AdmissionController controller(
+      {.max_active_requests = 2,
+       .max_reserved_tokens = 100,
+       .max_active_per_tenant = 2});
+  const ::inferx::server::admission::AdmissionRequest request{"tenant", 20};
+  const auto first = controller.TryAdmit(request);
+  const auto second = controller.TryAdmit(request);
+  ASSERT_TRUE(first.admitted());
+  ASSERT_TRUE(second.admitted());
+  ASSERT_NE(first.reservation_id, second.reservation_id);
+
+  controller.Release(first.reservation_id);
+  controller.Release(first.reservation_id);
+  EXPECT_EQ(controller.active_requests(), 1);
+  EXPECT_EQ(controller.reserved_tokens(), 20);
+
+  controller.Release(second.reservation_id);
+  EXPECT_EQ(controller.active_requests(), 0);
+  EXPECT_EQ(controller.reserved_tokens(), 0);
+}
+
 TEST(CapacityPolicyTest, RejectsUnavailableAndExhaustedCapacity) {
   using ::inferx::server::admission::AdmissionReason;
   using ::inferx::server::admission::CapacityPolicy;
