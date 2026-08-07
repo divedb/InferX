@@ -13,6 +13,8 @@
 
 namespace inferx::server::scheduler_client {
 
+using RequestId = request::RequestId;
+
 enum class WorkloadClass { kGeneration, kEmbedding };
 enum class PriorityClass { kInteractive, kBatch, kBackground };
 

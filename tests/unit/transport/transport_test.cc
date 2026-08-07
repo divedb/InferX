@@ -21,6 +21,7 @@
 #include "inferx/server/request/request_context.h"
 #include "inferx/server/request/request_manager.h"
 #include "inferx/server/streaming/event_buffer.h"
+#include "inferx/server/streaming/event_router.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -219,6 +220,29 @@ TEST(EventBufferTest, BoundsAndDeliversEvents) {
   buffer->Close();
   EXPECT_EQ(buffer->TryPush(first),
             ::inferx::server::streaming::PushResult::kClosed);
+}
+
+TEST(EventRouterTest, RejectsGapsAndWrongRequests) {
+  auto result = ::inferx::server::streaming::EventBuffer::Create(2);
+  ASSERT_TRUE(result.ok()) << result.status();
+  auto buffer = std::move(*result);
+  ::inferx::server::streaming::EventRouter router(buffer.get(), "req_router");
+
+  ::inferx::server::scheduler_client::GenerationEvent wrong;
+  wrong.request_id = "other";
+  wrong.sequence_number = 1;
+  EXPECT_FALSE(router.Route(std::move(wrong)).ok());
+
+  ::inferx::server::scheduler_client::GenerationEvent gap;
+  gap.request_id = "req_router";
+  gap.sequence_number = 2;
+  EXPECT_FALSE(router.Route(std::move(gap)).ok());
+
+  ::inferx::server::scheduler_client::GenerationEvent first;
+  first.request_id = "req_router";
+  first.sequence_number = 1;
+  EXPECT_TRUE(router.Route(std::move(first)).ok());
+  EXPECT_EQ(router.next_sequence(), 2);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
