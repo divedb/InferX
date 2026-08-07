@@ -23,6 +23,8 @@
 #include "inferx/server/streaming/event_buffer.h"
 #include "inferx/server/streaming/event_router.h"
 #include "inferx/server/admission/admission_controller.h"
+#include "inferx/server/auth/api_key_store.h"
+#include "inferx/server/auth/rbac.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -262,6 +264,23 @@ TEST(AdmissionTest, EnforcesAndReleasesTenantReservations) {
   EXPECT_EQ(controller.reserved_tokens(), 70);
   controller.Release(other);
   EXPECT_EQ(controller.active_requests(), 0);
+}
+
+TEST(AuthTest, StoresHashesAndEnforcesScopes) {
+  ::inferx::server::auth::ApiKeyStore store;
+  ::inferx::server::auth::Principal principal;
+  principal.tenant_id = "tenant_a";
+  principal.subject = "user_a";
+  principal.scopes.insert("completions:write");
+  ASSERT_TRUE(store.AddHash("abc123", principal).ok());
+  auto found = store.LookupHash("abc123");
+  ASSERT_TRUE(found.ok()) << found.status();
+  EXPECT_EQ(found->tenant_id, "tenant_a");
+  EXPECT_TRUE(::inferx::server::auth::Authorize(*found, "completions:write").ok());
+  EXPECT_EQ(::inferx::server::auth::Authorize(*found, "models:admin").code(),
+            absl::StatusCode::kPermissionDenied);
+  EXPECT_EQ(store.LookupHash("missing").status().code(),
+            absl::StatusCode::kUnauthenticated);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
