@@ -19,6 +19,7 @@
 #include "inferx/server/transport/sse_writer.h"
 #include "inferx/server/api/error_mapping.h"
 #include "inferx/server/request/request_context.h"
+#include "inferx/server/streaming/event_buffer.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -174,6 +175,28 @@ TEST(RequestStateTest, EnforcesLifecycleAndIdempotentCancellation) {
   cancelled.Cancel(::inferx::server::request::CancellationReason::kInternal);
   EXPECT_EQ(cancelled.state, RequestState::kCancelled);
   EXPECT_TRUE(cancelled.cancellation.isCancellationRequested());
+}
+
+TEST(EventBufferTest, BoundsAndDeliversEvents) {
+  auto result = ::inferx::server::streaming::EventBuffer::Create(1);
+  ASSERT_TRUE(result.ok()) << result.status();
+  auto buffer = std::move(*result);
+  ::inferx::server::scheduler_client::GenerationEvent first;
+  first.sequence_number = 1;
+  EXPECT_EQ(buffer->TryPush(first),
+            ::inferx::server::streaming::PushResult::kQueued);
+  ::inferx::server::scheduler_client::GenerationEvent second;
+  second.sequence_number = 2;
+  EXPECT_EQ(buffer->TryPush(second),
+            ::inferx::server::streaming::PushResult::kFull);
+  auto event = folly::coro::blockingWait(buffer->Next());
+  ASSERT_TRUE(event.has_value());
+  EXPECT_EQ(event->sequence_number, 1);
+  EXPECT_EQ(buffer->TryPush(second),
+            ::inferx::server::streaming::PushResult::kQueued);
+  buffer->Close();
+  EXPECT_EQ(buffer->TryPush(first),
+            ::inferx::server::streaming::PushResult::kClosed);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
