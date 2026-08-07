@@ -484,7 +484,7 @@ struct HttpServer::Impl::Session
       self->stream.expires_after(
           std::chrono::seconds(self->owner->config.write_timeout_seconds));
       asio::async_write(
-          self->stream.socket(), http::make_chunk(asio::buffer(*payload)),
+          self->stream, http::make_chunk(asio::buffer(*payload)),
           [self, payload, promise](beast::error_code error, size_t) {
             if (error) self->Close();
             promise->set_value(!error);
@@ -496,8 +496,10 @@ struct HttpServer::Impl::Session
   void FinishStream() {
     auto self = shared_from_this();
     asio::post(stream.get_executor(), [self] {
+      self->stream.expires_after(
+          std::chrono::seconds(self->owner->config.write_timeout_seconds));
       asio::async_write(
-          self->stream.socket(), http::make_chunk_last(),
+          self->stream, http::make_chunk_last(),
           [self](beast::error_code error, size_t) {
             if (error || !self->keep_alive || self->owner->stopping)
               self->Close();
