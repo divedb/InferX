@@ -33,6 +33,14 @@ struct AdapterState {
   std::exception_ptr exception;
 };
 
+template <>
+struct AdapterState<void> {
+  std::atomic<AdapterOutcome> outcome{AdapterOutcome::kPending};
+  folly::coro::Baton ready;
+  boost::system::error_code error;
+  std::exception_ptr exception;
+};
+
 inline Status AsioErrorStatus(const boost::system::error_code& error) {
   return absl::UnavailableError(error.message());
 }
@@ -125,6 +133,76 @@ folly::coro::Task<StatusOr<Result>> AwaitAsio(
     co_return detail::AsioErrorStatus(state->error);
   }
   co_return std::move(*state->result);
+}
+
+/// Void-result overload for Asio completions of the form
+/// `(boost::system::error_code)`.
+template <typename AsioExecutor, typename Initiate, typename Cancel>
+folly::coro::Task<Status> AwaitAsio(
+    AsioExecutor asio_executor, Initiate initiate, Cancel cancel,
+    folly::CancellationToken cancellation = {}) {
+  auto state = std::make_shared<detail::AdapterState<void>>();
+  auto folly_executor = co_await folly::coro::co_current_executor;
+
+  folly::CancellationCallback cancellation_callback(
+      cancellation,
+      [state, asio_executor, cancel = std::move(cancel)]() mutable {
+        auto expected = detail::AdapterOutcome::kPending;
+        if (!state->outcome.compare_exchange_strong(
+                expected, detail::AdapterOutcome::kCancelled,
+                std::memory_order_acq_rel)) {
+          return;
+        }
+        boost::asio::dispatch(asio_executor,
+                              [state, cancel = std::move(cancel)]() mutable {
+                                try {
+                                  cancel();
+                                } catch (...) {
+                                }
+                              });
+        state->ready.post();
+      });
+
+  boost::asio::dispatch(
+      asio_executor, [state, initiate = std::move(initiate)]() mutable {
+        try {
+          initiate([state](boost::system::error_code error) mutable {
+            auto expected = detail::AdapterOutcome::kPending;
+            if (!state->outcome.compare_exchange_strong(
+                    expected, detail::AdapterOutcome::kCompleted,
+                    std::memory_order_acq_rel)) {
+              return;
+            }
+            state->error = error;
+            state->ready.post();
+          });
+        } catch (...) {
+          auto expected = detail::AdapterOutcome::kPending;
+          if (state->outcome.compare_exchange_strong(
+                  expected, detail::AdapterOutcome::kCompleted,
+                  std::memory_order_acq_rel)) {
+            state->exception = std::current_exception();
+            state->ready.post();
+          }
+        }
+      });
+
+  co_await folly::coro::co_viaIfAsync(folly_executor, state->ready);
+  if (state->outcome.load(std::memory_order_acquire) ==
+      detail::AdapterOutcome::kCancelled) {
+    co_return absl::CancelledError("Asio operation cancelled");
+  }
+  if (state->exception) {
+    try {
+      std::rethrow_exception(state->exception);
+    } catch (const std::exception& error) {
+      co_return absl::InternalError(error.what());
+    } catch (...) {
+      co_return absl::InternalError("Asio operation initiation failed");
+    }
+  }
+  if (state->error) co_return detail::AsioErrorStatus(state->error);
+  co_return OkStatus();
 }
 
 }  // namespace inferx::server::transport

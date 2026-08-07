@@ -1351,36 +1351,591 @@ extending the Beast HTTP/1 implementation ad hoc.
 - Batch token events across requests and short time windows; do not issue one
   RPC per token.
 
-## 17. Implementation sequence and success criteria
+## 17. Repository-specific implementation plan
 
-Recommended implementation order:
+This section is based on the InferX code as it exists on 2026-08-07. It is an
+incremental migration plan, not a greenfield layout. Each phase must leave a
+buildable server and should land independently.
 
-1. Pin Boost and Folly versions and add narrow CMake targets.
-2. Use Beast request/response messages directly, define the inference-specific
-   coroutine response writer, and adopt Folly cancellation tokens.
-3. Implement and race-test the Beast/Folly awaitable adapter.
-4. Add the Asio listener and per-connection Beast session.
-5. Move health and model-list routes to coroutine handlers.
-6. Introduce `RequestContext` and its coroutine state machine.
-7. Move non-streaming completion handling to the new server.
-8. Add bounded event buffers, SSE writes, and disconnect cancellation.
-9. Migrate streaming completion handling and remove `cpp-httplib`.
-10. Add authentication, quotas, admission, and distributed tracing.
-11. Define the scheduler Protobuf boundary when process separation is needed.
-12. Add model registry and lifecycle control-plane handlers.
+### 17.1 Current implementation baseline
 
-The design is successful when:
+The existing code already provides useful parts of the target architecture:
 
-1. HTTP handlers contain no tokenizer, scheduler, or GPU-specific logic.
-2. Blocking and streaming generation consume the same event abstraction.
-3. Chat-template selection is model-version-aware.
-4. Protocol code remains testable without CUDA or sockets.
-5. Completion-service tests can use fake scheduler and tokenizer clients.
-6. Existing OpenAI wire behavior remains compatible.
-7. Client disconnects promptly cancel execution and release KV cache.
-8. Gateways can scale horizontally without owning model execution state.
-9. No synchronous or blocking wait runs on an I/O executor.
-10. Cancellation-versus-completion races pass deterministic stress tests and
-    sanitizers.
-11. The old `cpp-httplib` dependency and thread-per-connection implementation
-    are removed after wire-compatibility tests pass.
+- `cmake/InferXDependencies.cmake` pins Boost 1.91.0 and Folly
+  2026.08.03.00 and exposes only `inferx::beast` and
+  `inferx::folly_coro` to first-party targets.
+- `src/server/http_server.cc` uses asynchronous Beast reads, writes, accepts,
+  body limits, keep-alive, chunked SSE responses, socket deadlines, a bounded
+  active-request count, SHA-256 API-key matching, and disconnect-driven
+  generation cancellation.
+- `include/inferx/server/transport/response_writer.h` defines the coroutine
+  response boundary, and
+  `include/inferx/server/transport/beast_folly_adapter.h` contains the first
+  completion/cancellation race adapter.
+- `src/api/openai.cc` is host-only and already owns request parsing, response
+  JSON, SSE framing, stop-string matching, and usage encoding for chat and text
+  completions.
+- `src/server/engine.cc` supplies an in-process execution adapter: it owns the
+  tokenizer, scheduler, model runner, generation loop, metrics, and a blocking
+  `Generation::Next` event queue.
+- `src/scheduler/scheduler.cc` is host-only and already implements FCFS
+  continuous batching, chunked prefill, KV allocation, recompute preemption,
+  prefix caching, cancellation, token deltas, and terminal completions.
+
+The migration must explicitly address these current limitations:
+
+1. `HttpServer::Impl::Session` combines transport, routing, authentication,
+   validation, tokenization, engine submission, response encoding, metrics,
+   deadlines, and cleanup in one callback-driven type.
+2. `StartStream` and `WriteChunk` post an asynchronous operation to the I/O
+   executor and then block an application-pool thread on `std::future::get`.
+   This avoids blocking an I/O thread, but it is not structured asynchronous
+   request processing and consumes one application thread per active stream.
+3. `Generation::Next` is a condition-variable-backed blocking interface with
+   an unbounded deque. A slow client can therefore retain generated output and
+   an application thread without a defined event/byte limit.
+4. Request state is stored as fields on a reusable connection session. There
+   is no independent request state machine, terminal-transition guard, tenant
+   identity, absolute deadline, or queryable request snapshot.
+5. The HTTP server depends directly on the concrete, GPU-owning `Engine`.
+   Protocol and lifecycle tests consequently cannot replace execution with a
+   fake through the public server constructor.
+6. Authentication returns only a Boolean. There is no principal, tenant,
+   scope, RBAC, per-tenant rate limit, token quota, or capacity snapshot.
+7. Model routing is a string comparison against one loaded model, and the
+   Qwen2 chat template is selected directly by the handler.
+8. There is no embeddings endpoint, administrative listener, scheduler RPC,
+   distributed model registry, or tracing implementation.
+9. `tests/unit` is empty and the top-level build currently defines no first-
+   party test targets. Test infrastructure is therefore the first required
+   implementation dependency, not a final cleanup task.
+
+The current Beast server remains the wire-compatibility reference until the
+new coroutine path passes the compatibility and load gates below. Do not
+replace working behavior and architecture simultaneously without a test at
+the boundary being changed.
+
+### 17.2 Target dependency graph and build boundaries
+
+Use the directory layout in section 15 with public contracts under
+`include/inferx/server/<module>/` and implementations under
+`src/server/<module>/`. The intended dependency direction is:
+
+```text
+server/api                    server/auth      server/model_registry
+    │                              │                    │
+    └──────────────┬───────────────┴────────────┬───────┘
+                   ▼                            ▼
+             server/request              server/admission
+                   │                            │
+                   └──────────────┬─────────────┘
+                                  ▼
+                         request service/handlers
+                           │                 │
+                           ▼                 ▼
+                 server/tokenization  server/scheduler_client
+                           │                 │
+                           └────────┬────────┘
+                                    ▼
+                         server/streaming events
+                                    │
+                                    ▼
+                         server/transport writer
+```
+
+`server/transport` may depend on Beast, Asio, Folly coroutine primitives, and
+generic request handlers. It must not depend on `Engine`, CUDA, a model class,
+the scheduler implementation, OpenAI domain structs, authentication policy,
+or tokenization. Conversely, no module outside `server/transport` may initiate
+a Beast parser, serializer, socket, or timer operation.
+
+Split CMake targets so host-only code is built even when
+`INFERX_CUDA_MEETS_FLOOR` is false:
+
+- `inferx::http_transport`: Beast/Folly adapter, I/O runtime, listener,
+  session, response writer, routing primitives, and SSE byte writer;
+- `inferx::server_protocol`: server API parsing/encoding and error mapping,
+  linking the existing `inferx::api` during migration;
+- `inferx::request_runtime`: request context/state machine, admission,
+  streaming buffer, auth contracts, registry contracts, and handler pipeline;
+- `inferx::engine_client`: the in-process adapter from the scheduler-client and
+  tokenizer-service contracts to the existing `Engine`; and
+- `inferx::server`: the CUDA-gated composition root and executable support.
+
+Upstream Boost and Folly targets must remain private behind the two existing
+InferX aliases. CUDA libraries must appear only below `inferx::engine_client`
+or the final composition target. Add a configure-time or link-time test that a
+host-only build can compile protocol, lifecycle, admission, streaming, and
+transport unit tests without `inferx::model` or `inferx::kernels`.
+
+### 17.3 Phase 0: establish tests and capture current wire behavior
+
+Before moving production code, add `tests/CMakeLists.txt`, enable it through
+`include(CTest)`/`BUILD_TESTING`, and provide small host-only test executables
+using the repository's pinned GoogleTest. Start with:
+
+- `tests/unit/api/openai_test.cc`: valid and invalid chat/completion parsing,
+  field type failures, sampling bounds, JSON escaping, usage chunks, multiline
+  SSE framing, UTF-8 stop-string boundaries, and exact response fixtures;
+- `tests/unit/scheduler/scheduler_test.cc`: admission, mixed prefill/decode,
+  cancellation in waiting and running states, completion reasons, preemption,
+  prefix-cache accounting, context limits, and KV no-leak invariants;
+- `tests/unit/transport/beast_folly_adapter_test.cc`: synchronous completion,
+  asynchronous completion, initiation exception, Asio error, cancellation
+  before initiation, completion/cancellation races, and late callback lifetime;
+  and
+- `tests/integration/http_compat_test.cc`: start the existing server on port
+  zero with a lightweight fake execution seam introduced solely for the test,
+  then capture status, headers, JSON, keep-alive, body-limit, method handling,
+  authentication, SSE chunks, `[DONE]`, usage, timeout, and disconnect behavior.
+
+If a fake cannot be introduced without prematurely redesigning `HttpServer`,
+first extract the minimal `GenerationBackend` interface described in phase 3
+and keep `Engine` as its only production implementation. Do not make HTTP
+compatibility tests require a checkpoint or GPU.
+
+Exit criteria:
+
+- `ctest` discovers and runs the new host-only suites;
+- existing OpenAI behavior is represented by checked-in semantic fixtures,
+  not fragile comparisons of JSON object member order unless order is part of
+  a deliberate compatibility promise; and
+- ASan/UBSan can run the host-only tests with `INFERX_ENABLE_ASAN=ON`.
+
+### 17.4 Phase 1: finish and verify the asynchronous transport core
+
+Implement the private transport files:
+
+```text
+src/server/transport/
+  io_runtime.cc
+  beast_listener.cc
+  beast_session.cc
+  beast_folly_adapter.cc
+  routes.cc
+  sse_writer.cc
+```
+
+Define corresponding public or private headers as appropriate. Keep adapter
+details private; only `ResponseWriter`, `RequestHandler`, server configuration,
+and lifecycle controls should be public contracts.
+
+Required changes:
+
+1. Extend `AwaitAsio` to support operations with no result and ensure the
+   cancellation callback cannot post after the owning Asio executor has begun
+   shutdown. Preserve the single atomic winner and shared late-callback state.
+2. Implement a concrete Beast `ResponseWriter`. It owns serializer and chunk
+   state on the connection strand, rejects overlapping writes, and maps closed
+   sockets and timeout errors into stable `Status` values.
+3. Implement `IoRuntime` as explicit I/O shards. A connection is assigned once
+   and remains on one strand/executor for its lifetime.
+4. Move accept, incremental read, body limit, keep-alive loop, shutdown, and
+   session registry out of `http_server.cc` without changing route behavior.
+5. Express each connection as a coroutine that serializes HTTP/1.1 requests.
+   Do not support concurrent pipelined responses in the first implementation.
+6. Replace every `std::promise`, `std::future::get`, synchronous Beast call,
+   and blocking write path with `co_await` through the adapter.
+7. Make header-read, body-read, response-write, and idle keep-alive timeouts
+   separate configuration values and cancellation sources.
+
+Exit criteria:
+
+- transport tests cover fragmented input, malformed/chunked bodies, body
+  limits, keep-alive, peer shutdown, write failure, timer expiry, and server
+  shutdown with active sessions;
+- ThreadSanitizer or deterministic stress tests execute at least 100,000
+  completion-versus-cancellation races without double resume, use-after-free,
+  or hung task; and
+- source checks find no `blockingWait`, `.get()` on a future, synchronous
+  socket read/write, or direct Beast operation outside `server/transport`.
+
+### 17.5 Phase 2: extract routing and the protocol layer
+
+Move route selection out of the session. `routes.cc` should match method and
+normalized path, apply route metadata such as body limits and authentication
+requirements, and dispatch a `RequestHandler`. It must not parse OpenAI JSON.
+
+Split the current `inferx::api` implementation along the design boundaries
+without breaking its existing callers:
+
+- `server/api/openai_types`: request, response, usage, finish-reason, and
+  stream-option domain types;
+- `server/api/request_parser`: JSON-to-domain conversion and syntactic field
+  validation;
+- `server/api/response_encoder`: JSON and SSE payload generation;
+- `server/api/error_mapping`: `Status`/typed request error to HTTP status,
+  OpenAI error type, parameter, code, `Retry-After`, and request ID.
+
+Initially, `include/inferx/api/openai.h` may be a compatibility facade over
+these smaller contracts. Preserve current chat/text/tokenize behavior while
+adding parser support for all documented fields. Unsupported combinations
+must return a typed 422 error; they must never be silently ignored. In
+particular, reject completion prompt arrays until batch-prompt execution is
+implemented. Add `/v1/embeddings` types and parser now, but leave the route
+disabled until phase 9 supplies execution.
+
+Exit criteria:
+
+- protocol tests need neither Beast nor CUDA;
+- transport tests use a trivial fake handler and know nothing about OpenAI;
+- every documented error path has a stable `param` and `code`; and
+- compatibility tests show no unintended regression in existing endpoints.
+
+### 17.6 Phase 3: define execution-neutral request and event contracts
+
+Introduce strong request identifiers and lifecycle types under
+`server/request`:
+
+- `RequestId`, generated as a standards-compliant UUIDv7 or equivalently
+  sortable 128-bit identifier and formatted with the `req_` prefix;
+- distinct `TenantId`, `PrincipalId`, `ApiKeyId`, `ModelId`, and
+  `ModelVersion` types to prevent accidental interchange;
+- `RequestContext` containing identity, immutable resolved model/version,
+  workload class, priority, absolute deadline, timestamps, accounting,
+  cancellation source, trace context, and state;
+- `RequestState` and a checked transition table; and
+- `RequestSnapshot`, `CancellationReason`, and terminal status.
+
+Then introduce the execution seam under `scheduler_client`:
+
+```cpp
+class SchedulerClient {
+ public:
+  virtual folly::coro::Task<StatusOr<SubmitResult>> Submit(
+      ScheduledRequest, folly::CancellationToken) = 0;
+  virtual folly::coro::AsyncGenerator<GenerationEvent&&> Events(
+      RequestId, folly::CancellationToken) = 0;
+  virtual folly::coro::Task<Status> Cancel(
+      RequestId, CancellationReason) = 0;
+  virtual folly::coro::Task<StatusOr<RequestSnapshot>> GetStatus(
+      RequestId, folly::CancellationToken) = 0;
+  virtual folly::coro::Task<Status> UpdatePriority(
+      RequestId, PriorityClass, folly::CancellationToken) = 0;
+};
+```
+
+`GenerationEvent` must include request ID, monotonically increasing sequence
+number, text delta or embedding result, generated token count, terminal reason,
+usage, and typed error. Blocking and streaming HTTP responses must consume this
+same event type.
+
+Add `InProcessSchedulerClient` as a compatibility adapter around the current
+`Engine::Submit` and `Generation` APIs. During this phase it may use a bounded
+CPU executor to wait on `Generation::Next`, but it must copy events into the
+new bounded event path and propagate cancellation. This isolates the temporary
+blocking bridge; handlers and transport must not call `Engine` or `Generation`
+directly.
+
+Exit criteria:
+
+- `HttpServer::Create` accepts abstract service dependencies (or a single
+  service bundle), while the executable composes the in-process adapter;
+- fake scheduler and tokenizer implementations can drive a complete HTTP
+  request without CUDA; and
+- event sequence gaps, duplicates, terminal-after-terminal, and events after
+  cancellation are detected and tested.
+
+### 17.7 Phase 4: implement Request Manager and structured lifecycle
+
+Implement `RequestManager` as the sole owner of externally visible request
+state. Use a sharded map or otherwise bounded concurrent registry; completed
+snapshots need a configured retention time and maximum count.
+
+For each request:
+
+1. create and register the context at ingress;
+2. transition through validation, authentication, admission, queueing, and
+   generation using checked methods rather than direct state writes;
+3. run one structured coroutine whose children are joined or cancelled before
+   context destruction;
+4. race operations against the context's absolute deadline with
+   `WithDeadline`, never detached timer tasks;
+5. make `Cancel` and terminal finalization idempotent;
+6. submit scheduler cancellation once, asynchronously, on disconnect,
+   deadline, shutdown, or policy cancellation; and
+7. erase prompt text and bearer-token material as soon as parsing/tokenization
+   no longer needs them.
+
+Use one cleanup guard to reconcile admission/accounting, close the event
+buffer, cancel unfinished scheduler work, record terminal metrics, and retain
+the final snapshot. Connection shutdown requests cancellation but does not own
+the remaining scheduler/KV cleanup lifetime.
+
+Exit criteria:
+
+- table-driven tests cover every legal and illegal state transition;
+- cancellation is idempotent from every non-terminal state;
+- deadline tests use a controllable clock and cover queue, first-token,
+  inter-token, total, and write timeouts; and
+- concurrent `Cancel`, terminal event, and disconnect always produce exactly
+  one terminal state and one accounting reconciliation.
+
+### 17.8 Phase 5: implement model-aware tokenization
+
+Define a `TokenizationService` contract that receives immutable
+`ModelVersion`, not an `Engine` reference. Implement a registry of immutable
+tokenizer/template bundles loaded during model registration. Each bundle owns
+the tokenizer artifact revision, chat-template identity, special tokens,
+context limit, and capabilities.
+
+Adapt the existing tokenizer code rather than duplicating it:
+
+- continue cloning `tokenizer::Tokenizer` when the backend requires
+  request-confined state;
+- move hard-coded `ApplyQwen2ChatTemplate` selection out of HTTP handlers;
+- validate prompt plus reserved output tokens against the selected model
+  version before scheduler submission;
+- return exact prompt-token accounting with the tokenized command; and
+- preserve the distinction between user text (`kAsText`) and trusted template
+  control tokens (`kAsControl`).
+
+Cache only immutable loaded artifacts and bounded reusable clones. Do not
+cache tenant prompt text or formatted chats by default.
+
+Exit criteria:
+
+- completion and chat tokenization tests run without the model engine;
+- two model versions can select different templates/tokenizer revisions;
+- special-token injection, empty prompts, malformed UTF-8, context overflow,
+  and tokenizer failure have stable API errors; and
+- HTTP handlers contain no template or tokenizer calls.
+
+### 17.9 Phase 6: bounded streaming and slow-client handling
+
+Replace the unbounded `Generation::events_` exposure with `EventBuffer` in the
+request layer. The initial implementation should use both an event-count and a
+byte-count bound, coalesce adjacent text deltas, and expose an asynchronous
+`Next` operation supporting Folly cancellation.
+
+`EventRouter` validates request ID and sequence number and performs a
+non-blocking `TryPush`. `BackpressureController` records the first-full time,
+requests upstream pause if the backend supports it, and cancels the request
+after `slow_consumer_timeout`. Until upstream pause exists, the explicit policy
+is to cancel rather than discard text.
+
+Implement `SseWriter` on top of `ResponseWriter`:
+
+- send the current headers plus `Connection: keep-alive` where valid;
+- emit an initial assistant role for chat;
+- consume generation events and encode deltas;
+- emit a terminal choice, optional usage chunk, and `[DONE]` exactly once;
+- emit periodic `: keepalive` comments while queued or while an allowed
+  upstream idle period is in progress; and
+- cancel immediately on failed or expired writes.
+
+Non-streaming collection must use the same buffer and enforce a configured
+maximum response size rather than appending without bound.
+
+Exit criteria:
+
+- tests exercise full-by-count, full-by-bytes, coalescing, slow-consumer
+  timeout, upstream close, duplicate terminal, disconnect during write, and
+  cancellation while waiting for an event;
+- generated text is never silently dropped; and
+- a synthetic stalled client does not consume an application thread or delay
+  event delivery to another request.
+
+### 17.10 Phase 7: authentication, authorization, and admission
+
+Extract the current SHA-256 key comparison into `ApiKeyStore` and return a
+`Principal`. Keep constant-time comparison and never log raw tokens or full
+hashes. Add an atomic snapshot-based key configuration so rotation does not
+interrupt active requests.
+
+Add middleware in this order:
+
+```text
+request ID → tracing context → authentication → authorization
+           → syntactic parsing → model resolution → semantic validation
+           → quota/rate checks → capacity admission
+```
+
+Implement local, interface-driven versions first:
+
+- RBAC and scopes per route;
+- token-bucket request/token rate limits per tenant and API key;
+- concurrency reservations released by the Request Manager cleanup guard;
+- prompt plus maximum-output token reservations reconciled with actual usage;
+  and
+- a capacity policy using queue depth, event-buffer memory, scheduler health,
+  and model readiness.
+
+The global `max_active_requests` remains a final process safety limit but is no
+longer the tenant policy. Decisions must return a stable reason and retry
+advice. Define distributed quota interfaces now; add a remote implementation
+only when multi-replica deployment requires it.
+
+Exit criteria:
+
+- authentication bypass is limited to an explicit development configuration;
+- route scope, tenant isolation, key rotation, rate refill, concurrent
+  reservation races, rejection rollback, and usage reconciliation are tested;
+- retryable 429/503 responses include bounded `Retry-After`; and
+- metrics do not use tenant, API-key, model alias, or request ID as unbounded
+  labels.
+
+### 17.11 Phase 8: switch all existing routes to thin coroutine handlers
+
+Implement handlers for health, readiness, models, tokenize, chat completions,
+text completions, metrics, and the legacy stats endpoint. The chat/text
+handlers should only:
+
+1. authenticate through middleware-provided context;
+2. parse and validate a protocol request;
+3. resolve a model version;
+4. ask the request service to create/submit the request; and
+5. select streaming or collection response presentation.
+
+Keep `/stats` as a documented legacy route during migration. Health routes
+must not require authentication. Readiness must incorporate listener state,
+configuration validity, scheduler connectivity, and at least one ready model;
+liveness must not fail merely because a model is unavailable.
+
+Run old and new handler implementations behind an internal configuration flag
+for compatibility testing. Do not expose two public ports or route prefixes.
+After semantic fixture equivalence and load acceptance, remove the old
+`HttpServer::Impl::Session` handler methods and make the coroutine path the
+only path.
+
+Exit criteria:
+
+- `src/server/http_server.cc` is reduced to composition/lifecycle code or
+  removed;
+- no handler includes `engine.h`, scheduler implementation headers, tokenizer
+  backend headers, OpenSSL, Asio, or Beast operation headers; and
+- all current endpoints retain intentional wire behavior, with documented
+  changes called out in release notes.
+
+### 17.12 Phase 9: embeddings and workload-aware scheduling
+
+Add embeddings only after the common lifecycle is stable. Extend the
+scheduler-client contract with a typed embedding command/result while keeping
+the HTTP handler independent of execution details. The model registry must
+advertise embedding capability, input limits, dimensions, and supported
+encoding formats.
+
+For the current in-process engine, either implement a genuine embedding model
+path and separate scheduler workload class or return a clear model-capability
+error. Never simulate embeddings from generation logits and never accept only
+the first item of a batch input.
+
+Exit criteria:
+
+- string and string-array inputs preserve indices and token accounting;
+- generation and embedding admission/batching policies are isolated; and
+- unsupported dimensions, encodings, models, and batch sizes return stable
+  errors.
+
+### 17.13 Phase 10: model registry and administrative plane
+
+Implement an in-memory registry first, populated from the model loaded by the
+existing executable. Store immutable versions, capabilities, tokenizer
+revision, lifecycle state, replicas, and tenant visibility. Model aliases are
+resolved to immutable versions before tokenization and admission.
+
+Then add `/admin/v1` on a separately configurable listener. Require a distinct
+administrative scope and default the listener to disabled. Load/unload APIs
+return operation IDs and update the state machine asynchronously. Unload first
+removes replicas from routing, then drains until a deadline, then cancels if
+policy permits, and only then releases model resources.
+
+The initial single-engine composition may expose one permanently loaded model
+and return `unimplemented` for load/unload, but the registry and handler
+contracts must not assume that limitation.
+
+Exit criteria:
+
+- tenant-filtered `/v1/models`, alias/version stability, lifecycle transitions,
+  drain behavior, operation lookup, and admin authorization are tested; and
+- no request can change resolved model version after admission.
+
+### 17.14 Phase 11: observability and configuration
+
+Move HTTP metrics out of ad hoc rendering in `http_server.cc` into
+`server/observability`. Reuse `inferx::observe` as the underlying registry.
+Instrument request count, active requests, queue duration, TTFT, inter-token
+latency, duration, response bytes, cancellation reasons, rejection reasons,
+event-buffer utilization, slow consumers, scheduler RPC state, and model
+readiness.
+
+Add structured JSON logs at ingress, admission, first token, terminal state,
+and exceptional cancellation. Default logs contain IDs and counts, not prompt,
+generated text, authorization headers, or raw client correlation values. Add
+OpenTelemetry behind a narrow tracing interface and propagate W3C trace
+context and the platform request ID through scheduler metadata.
+
+Replace direct command-line-only configuration assembly with a validated
+`ServerConfig` snapshot. Static listener/thread settings are startup-only;
+keys, quotas, route policies, registry state, and observability sampling may be
+atomically reloaded. Reject an invalid snapshot without partially applying it.
+
+Exit criteria:
+
+- metric names and bounded labels have unit tests;
+- log redaction tests use deliberately sensitive fixtures;
+- traces connect ingress, tokenization, admission, scheduler, first-token, and
+  response spans; and
+- invalid reloads preserve the last valid configuration.
+
+### 17.15 Phase 12: process-separated scheduler client
+
+Do this only after the in-process interface has stabilized through production
+use. Define `inference.scheduler.v1` Protobuf messages from the existing
+domain contracts; do not expose C++ implementation types. Carry the absolute
+deadline, request/attempt ID, tenant, immutable model version, workload,
+priority, tokenized prompt, sampling parameters, tokenizer contract revision,
+and trace context.
+
+Implement gRPC submission/control calls and a streamed event subscription.
+Reconnect with bounded exponential backoff and jitter. A request ID plus
+attempt number makes submission and cancellation idempotent. On an ambiguous
+submit result, query status before retrying. Event sequence numbers detect
+loss/replay; never silently splice event streams from different attempts.
+
+Keep `InProcessSchedulerClient` as a development and correctness-reference
+backend. Select the backend in the composition root; no handler or Request
+Manager code changes between them.
+
+Exit criteria:
+
+- contract compatibility tests run client and server at adjacent supported
+  protocol versions;
+- scheduler restart, stream interruption, duplicate submit/cancel, deadline
+  expiry, and gateway shutdown are tested; and
+- horizontal gateway replicas own no GPU, scheduler queue, or KV state.
+
+### 17.16 Final migration and removal criteria
+
+Remove temporary compatibility layers only when all of the following hold:
+
+1. The coroutine server passes protocol fixtures for all existing endpoints.
+2. Blocking and streaming generation consume the same bounded event
+   abstraction.
+3. No socket, I/O-executor thread, application-pool thread, or request context
+   is retained after completion/cancellation stress tests.
+4. Disconnect-to-scheduler-cancel latency and scheduler-cancel-to-KV-release
+   latency are measured separately and meet an agreed operational SLO.
+5. Host-only protocol, transport, lifecycle, auth, admission, registry, and
+   fake-scheduler tests run in CI; GPU integration tests remain a separate
+   suite.
+6. The transport benchmark covers 10,000 idle keep-alive connections, 1,000
+   concurrent synthetic SSE streams, token-sized write throughput,
+   p50/p95/p99 event-to-write latency, memory per connection, disconnect
+   storms, and graceful shutdown.
+7. The Beast/Folly bridge stays within the section 16 CPU and p99 overhead
+   limits versus the Beast-native Asio-coroutine reference. Otherwise use the
+   approved native-Asio fallback behind unchanged higher-level contracts.
+8. Chat templates are selected by immutable model version, and HTTP handlers
+   contain no tokenizer, scheduler, or GPU logic.
+9. Cancellation, deadline, terminal transition, accounting reconciliation,
+   event-buffer close, and response completion are each idempotent.
+10. API keys, prompt text, generated text, and high-cardinality tenant/request
+    data do not leak into logs or metric labels.
+11. The old monolithic session handler, blocking `Generation::Next` bridge,
+    and any obsolete `cpp-httplib` files/dependency references are removed.
+
+The recommended delivery units are phases 0 through 8, in order. Phases 9
+through 12 add new product capabilities and deployment topology and should not
+delay replacing the blocking per-stream application-thread behavior in the
+current server.

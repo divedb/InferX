@@ -13,6 +13,8 @@ project(inferx
   DESCRIPTION "High-performance C++20 LLM inference engine"
   LANGUAGES CXX)
 
+include(CTest)
+
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
   message(FATAL_ERROR
     "In-source builds are not allowed. Use: cmake -S . -B build")
@@ -52,6 +54,10 @@ endif()
 # Demos exercise FlashInfer kernel templates directly (no PyTorch/TVM-FFI layer).
 # Gated on both the CUDA floor and FlashInfer presence (see demo/CMakeLists.txt).
 add_subdirectory(demo)
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
 
 message(STATUS "")
 message(STATUS "==== InferX ${PROJECT_VERSION} ====")
