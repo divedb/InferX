@@ -52,6 +52,7 @@ add_subdirectory(src/server/tokenization)
 add_subdirectory(src/server/transport)
 add_subdirectory(src/server/middleware)
 add_subdirectory(src/server/observability)
+add_subdirectory(src/server/engine_client)
 add_subdirectory(src/server/handlers)
 
 # The server owns the model, so it needs device code; the wire format it speaks

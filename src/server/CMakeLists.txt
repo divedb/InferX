@@ -20,6 +20,9 @@ target_link_libraries(inferx_server
     inferx::api
     inferx::model
     inferx::observe
+    inferx::engine_client
+    inferx::scheduler_client
+    inferx::server_observability
     inferx::scheduler
     inferx::tokenizer
     inferx::flags
