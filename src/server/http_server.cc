@@ -17,6 +17,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/beast/core.hpp>
@@ -24,6 +25,7 @@
 
 #include "inferx/api/openai.h"
 #include "inferx/observe/metrics.h"
+#include "inferx/support/json.h"
 #include "inferx/tokenizer/chat_template.h"
 
 namespace inferx::server {
@@ -49,6 +51,47 @@ std::string MakeId(std::string_view prefix) {
          std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
+// Sortable by ingress time and collision-resistant across processes. The
+// random process nonce keeps independently started gateways in separate ID
+// spaces; the counter orders requests received within the same millisecond.
+std::string MakeRequestId() {
+  static const uint32_t process_nonce = [] {
+    const auto now = std::chrono::high_resolution_clock::now()
+                         .time_since_epoch()
+                         .count();
+    const auto address = reinterpret_cast<uintptr_t>(&MakeRequestId);
+    return static_cast<uint32_t>(now ^ (now >> 32) ^ address);
+  }();
+  static std::atomic<uint32_t> counter{0};
+  const uint64_t milliseconds =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  char id[5 + 12 + 8 + 8 + 1];
+  std::snprintf(id, sizeof(id), "req_%012llx%08x%08x",
+                static_cast<unsigned long long>(milliseconds), process_nonce,
+                counter.fetch_add(1, std::memory_order_relaxed));
+  return id;
+}
+
+std::string ErrorJson(std::string_view message, std::string_view type,
+                      std::string_view code, std::string_view request_id) {
+  std::string out = "{\"error\":{\"message\":";
+  AppendJsonString(message, &out);
+  out += ",\"type\":";
+  AppendJsonString(type, &out);
+  out += ",\"param\":null,\"code\":";
+  if (code.empty()) {
+    out += "null";
+  } else {
+    AppendJsonString(code, &out);
+  }
+  out += ",\"request_id\":";
+  AppendJsonString(request_id, &out);
+  out += "}}";
+  return out;
+}
+
 FinishReason ToApiReason(scheduler::FinishReason reason) {
   return reason == scheduler::FinishReason::kStopToken ? FinishReason::kStop
                                                        : FinishReason::kLength;
@@ -68,14 +111,22 @@ scheduler::SamplingParams ToSchedulerParams(const SamplingRequest& request) {
 
 int StatusToHttp(const Status& status) {
   switch (status.code()) {
+    case absl::StatusCode::kUnauthenticated:
+      return 401;
+    case absl::StatusCode::kPermissionDenied:
+      return 403;
     case absl::StatusCode::kInvalidArgument:
       return 400;
     case absl::StatusCode::kUnimplemented:
-      return 501;
+      return 422;
     case absl::StatusCode::kResourceExhausted:
       return 429;
     case absl::StatusCode::kNotFound:
       return 404;
+    case absl::StatusCode::kAlreadyExists:
+    case absl::StatusCode::kFailedPrecondition:
+    case absl::StatusCode::kAborted:
+      return 409;
     case absl::StatusCode::kUnavailable:
       return 503;
     case absl::StatusCode::kDeadlineExceeded:
@@ -198,11 +249,16 @@ struct HttpServer::Impl::Session
   std::unique_ptr<http::request_parser<http::string_body>> parser;
   std::shared_ptr<Generation> generation;
   std::mutex generation_mutex;
+  asio::steady_timer request_timer;
   bool keep_alive = false;
   bool closed = false;
+  std::string request_id;
+  std::string client_request_id;
 
   Session(Impl* value, tcp::socket socket)
-      : owner(value), stream(std::move(socket)) {
+      : owner(value),
+        stream(std::move(socket)),
+        request_timer(stream.get_executor()) {
   }
 
   void Run() {
@@ -230,6 +286,13 @@ struct HttpServer::Impl::Session
     if (error) return Close();
     http::request<http::string_body> request = parser->release();
     keep_alive = request.keep_alive();
+    request_id = MakeRequestId();
+    if (const auto supplied = request.find("X-Request-ID");
+        supplied != request.end()) {
+      client_request_id = supplied->value();
+    } else {
+      client_request_id.clear();
+    }
     auto self = shared_from_this();
     asio::post(owner->application_pool,
                [self, request = std::move(request)]() mutable {
@@ -272,6 +335,12 @@ struct HttpServer::Impl::Session
         return HandleCompletion(request.body(),
                                 target == "/v1/chat/completions");
       }
+      if (target == "/v1/chat/completions" ||
+          target == "/v1/completions") {
+        keep_alive = request.keep_alive();
+        return WriteError(405, "method not allowed", "invalid_request_error",
+                          keep_alive, "method_not_allowed");
+      }
       WriteError(404, "route not found", "invalid_request_error", keep_alive);
     } catch (...) {
       WriteError(500, "internal error", "server_error", keep_alive);
@@ -284,6 +353,11 @@ struct HttpServer::Impl::Session
     if (chat) {
       auto parsed = api::ParseChatCompletionRequest(body);
       if (!parsed.ok()) return WriteStatusError(parsed.status());
+      if (parsed->model != owner->engine->model_name()) {
+        return WriteError(404, "model is not available: " + parsed->model,
+                          "invalid_request_error", keep_alive,
+                          "model_not_found");
+      }
       auto prompt = tokenizer::ApplyQwen2ChatTemplate(
           parsed->messages, /*add_generation_prompt=*/true);
       if (!prompt.ok()) return WriteStatusError(prompt.status());
@@ -300,6 +374,11 @@ struct HttpServer::Impl::Session
     } else {
       auto parsed = api::ParseCompletionRequest(body);
       if (!parsed.ok()) return WriteStatusError(parsed.status());
+      if (parsed->model != owner->engine->model_name()) {
+        return WriteError(404, "model is not available: " + parsed->model,
+                          "invalid_request_error", keep_alive,
+                          "model_not_found");
+      }
       auto request_tokenizer = owner->engine->tokenizer().Clone();
       if (!request_tokenizer.ok())
         return WriteError(500, request_tokenizer.status().message(),
@@ -321,6 +400,7 @@ struct HttpServer::Impl::Session
       std::lock_guard lock(generation_mutex);
       generation = *submitted;
     }
+    ArmRequestDeadline(*submitted);
     if (sampling.stream) {
       Stream(sampling, chat, *submitted);
     } else {
@@ -405,22 +485,49 @@ struct HttpServer::Impl::Session
   }
 
   void ClearGeneration() {
-    std::lock_guard lock(generation_mutex);
-    generation.reset();
+    {
+      std::lock_guard lock(generation_mutex);
+      generation.reset();
+    }
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self] {
+      self->request_timer.cancel();
+    });
+  }
+
+  void ArmRequestDeadline(const std::shared_ptr<Generation>& current) {
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self, current] {
+      self->request_timer.expires_after(std::chrono::seconds(
+          self->owner->config.request_timeout_seconds));
+      self->request_timer.async_wait([self, current](beast::error_code error) {
+        if (!error) current->Cancel();
+      });
+    });
   }
 
   void WriteStatusError(const Status& status) {
+    std::string_view code = "internal_error";
+    if (status.code() == absl::StatusCode::kInvalidArgument) {
+      code = "invalid_request";
+    } else if (status.code() == absl::StatusCode::kResourceExhausted) {
+      code = "capacity_exceeded";
+    } else if (status.code() == absl::StatusCode::kUnavailable) {
+      code = "model_unavailable";
+    } else if (status.code() == absl::StatusCode::kDeadlineExceeded) {
+      code = "inference_timeout";
+    }
     WriteError(StatusToHttp(status), status.message(),
                status.code() == absl::StatusCode::kResourceExhausted
                    ? "rate_limit_error"
                    : "invalid_request_error",
-               keep_alive);
+               keep_alive, code);
   }
 
   void WriteError(int status, std::string_view message, std::string_view type,
-                  bool preserve_connection) {
+                  bool preserve_connection, std::string_view code = {}) {
     keep_alive = preserve_connection;
-    WriteJson(status, api::ErrorJson(message, type));
+    WriteJson(status, ErrorJson(message, type, code, request_id));
   }
 
   void WriteJson(int status, std::string body) {
@@ -432,6 +539,7 @@ struct HttpServer::Impl::Session
         static_cast<http::status>(status), 11);
     response->set(http::field::server, "InferX");
     response->set(http::field::content_type, std::move(content_type));
+    response->set("X-Request-ID", request_id);
     if (status == 429 || status == 503) response->set(http::field::retry_after, "1");
     response->keep_alive(keep_alive && !owner->stopping);
     response->body() = std::move(body);
@@ -455,6 +563,7 @@ struct HttpServer::Impl::Session
         http::status::ok, 11);
     head->set(http::field::server, "InferX");
     head->set(http::field::content_type, "text/event-stream");
+    head->set("X-Request-ID", request_id);
     head->set(http::field::cache_control, "no-cache");
     head->set("X-Accel-Buffering", "no");
     head->keep_alive(keep_alive && !owner->stopping);
@@ -518,6 +627,7 @@ struct HttpServer::Impl::Session
       generation.reset();
     }
     beast::error_code ignored;
+    request_timer.cancel();
     stream.socket().shutdown(tcp::socket::shutdown_both, ignored);
     stream.socket().close(ignored);
   }
@@ -598,7 +708,8 @@ StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
     return InvalidArgumentError("port must be in [0, 65535]");
   if (config.max_request_bytes == 0)
     return InvalidArgumentError("max_request_bytes must be positive");
-  if (config.read_timeout_seconds <= 0 || config.write_timeout_seconds <= 0)
+  if (config.read_timeout_seconds <= 0 || config.write_timeout_seconds <= 0 ||
+      config.request_timeout_seconds <= 0)
     return InvalidArgumentError("HTTP timeouts must be positive");
   return std::unique_ptr<HttpServer>(
       new HttpServer(std::make_unique<Impl>(engine, config)));

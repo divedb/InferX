@@ -124,10 +124,10 @@ StatusOr<ChatCompletionRequest> ParseChatCompletionRequest(
 
   ChatCompletionRequest request;
 
-  if (const JsonValue* model = root.Find("model"); model != nullptr) {
-    INFERX_ASSIGN_OR_RETURN(const std::string_view name, model->AsString());
-    request.model = std::string(name);
-  }
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
 
   const JsonValue* messages = root.Find("messages");
 
@@ -170,10 +170,10 @@ StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body) {
 
   CompletionRequest request;
 
-  if (const JsonValue* model = root.Find("model"); model != nullptr) {
-    INFERX_ASSIGN_OR_RETURN(const std::string_view name, model->AsString());
-    request.model = std::string(name);
-  }
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
 
   const JsonValue* prompt = root.Find("prompt");
 

@@ -25,6 +25,10 @@ struct HttpServerConfig {
   /// mid-answer.
   int write_timeout_seconds = 600;
 
+  /// Total generation deadline after scheduler submission. Expiry requests
+  /// cancellation; engine cleanup remains asynchronous.
+  int request_timeout_seconds = 600;
+
   /// Socket event-loop threads. Zero selects a small hardware-based default.
   size_t io_threads = 0;
 
