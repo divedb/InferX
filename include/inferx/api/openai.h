@@ -69,6 +69,13 @@ struct CompletionRequest {
   SamplingRequest sampling;
 };
 
+/// \brief A parsed `POST /v1/tokenize` body.
+struct TokenizeRequest {
+  std::string model;
+  std::string text;
+  bool add_special_tokens = false;
+};
+
 /// \brief Parses a chat completion body.
 ///
 /// Every failure is InvalidArgument with a message naming the offending field,
@@ -78,6 +85,8 @@ StatusOr<ChatCompletionRequest> ParseChatCompletionRequest(
 
 /// \brief Parses a text completion body.
 StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body);
+
+StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body);
 
 /// \brief Token accounting returned with every response.
 struct Usage {
@@ -149,6 +158,10 @@ std::string UsageChunkJson(std::string_view id, std::string_view model,
 
 /// \brief Builds a `GET /v1/models` listing with a single entry.
 std::string ModelsJson(std::string_view model, int64_t created);
+
+/// \brief Builds a tokenize response with exact token IDs and count.
+std::string TokenizeJson(std::string_view model,
+                         const std::vector<int32_t>& token_ids);
 
 /// \brief Builds an OpenAI-shaped error body.
 std::string ErrorJson(std::string_view message, std::string_view type);

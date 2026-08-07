@@ -198,6 +198,26 @@ StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body) {
   return request;
 }
 
+StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body) {
+  INFERX_ASSIGN_OR_RETURN(const JsonValue root, ParseJson(body));
+  if (!root.IsObject()) {
+    return InvalidArgumentError("request body must be a JSON object, got ",
+                                root.KindName());
+  }
+  TokenizeRequest request;
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
+  INFERX_ASSIGN_OR_RETURN(const std::string_view text,
+                          root.RequiredString("text"));
+  request.text = std::string(text);
+  INFERX_ASSIGN_OR_RETURN(
+      request.add_special_tokens,
+      root.OptionalBool("add_special_tokens", false));
+  return request;
+}
+
 std::string ChatCompletionJson(std::string_view id, std::string_view model,
                                std::string_view content, FinishReason reason,
                                const Usage& usage, int64_t created,
@@ -358,6 +378,21 @@ std::string ModelsJson(std::string_view model, int64_t created) {
   out += std::to_string(created);
   out += ",\"owned_by\":\"inferx\"}]}";
 
+  return out;
+}
+
+std::string TokenizeJson(std::string_view model,
+                         const std::vector<int32_t>& token_ids) {
+  std::string out = "{\"model\":";
+  AppendJsonString(model, &out);
+  out += ",\"token_ids\":[";
+  for (size_t index = 0; index < token_ids.size(); ++index) {
+    if (index != 0) out.push_back(',');
+    out += std::to_string(token_ids[index]);
+  }
+  out += "],\"token_count\":";
+  out += std::to_string(token_ids.size());
+  out += "}";
   return out;
 }
 

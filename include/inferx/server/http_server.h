@@ -57,6 +57,7 @@ struct HttpServerConfig {
 ///
 ///   POST /v1/chat/completions   blocking and SSE
 ///   POST /v1/completions        blocking and SSE
+///   POST /v1/tokenize           exact token IDs and count
 ///   GET  /v1/models
 ///   GET  /health
 ///   GET  /metrics               Prometheus text exposition

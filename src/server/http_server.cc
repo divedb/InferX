@@ -381,8 +381,11 @@ struct HttpServer::Impl::Session
         return HandleCompletion(request.body(),
                                 target == "/v1/chat/completions");
       }
+      if (request.method() == http::verb::post && target == "/v1/tokenize") {
+        return HandleTokenize(request.body());
+      }
       if (target == "/v1/chat/completions" ||
-          target == "/v1/completions") {
+          target == "/v1/completions" || target == "/v1/tokenize") {
         keep_alive = request.keep_alive();
         return WriteError(405, "method not allowed", "invalid_request_error",
                           keep_alive, "method_not_allowed");
@@ -391,6 +394,27 @@ struct HttpServer::Impl::Session
     } catch (...) {
       WriteError(500, "internal error", "server_error", keep_alive);
     }
+  }
+
+  void HandleTokenize(const std::string& body) {
+    auto parsed = api::ParseTokenizeRequest(body);
+    if (!parsed.ok()) return WriteStatusError(parsed.status());
+    if (parsed->model != owner->engine->model_name()) {
+      return WriteError(404, "model is not available: " + parsed->model,
+                        "invalid_request_error", keep_alive,
+                        "model_not_found");
+    }
+    auto request_tokenizer = owner->engine->tokenizer().Clone();
+    if (!request_tokenizer.ok()) {
+      return WriteError(500, request_tokenizer.status().message(),
+                        "server_error", keep_alive, "tokenizer_unavailable");
+    }
+    tokenizer::EncodeOptions options;
+    options.add_post_processor_tokens = parsed->add_special_tokens;
+    auto encoded =
+        (*request_tokenizer)->EncodeWithOptions(parsed->text, options);
+    if (!encoded.ok()) return WriteStatusError(encoded.status());
+    WriteJson(200, api::TokenizeJson(parsed->model, *encoded));
   }
 
   bool Authenticate(const http::request<http::string_body>& request) const {
