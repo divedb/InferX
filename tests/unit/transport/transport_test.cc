@@ -35,6 +35,7 @@
 #include "inferx/server/middleware/authentication.h"
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/handlers/embeddings_handler.h"
+#include "inferx/server/handlers/api_routes.h"
 #include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
@@ -1049,6 +1050,53 @@ TEST(TokenizeHandlerTest, EnforcesExactTokenContextLimit) {
       std::move(request), std::move(context), writer, {}));
   EXPECT_EQ(writer.status, 400);
   EXPECT_NE(writer.body.find("context limit"), std::string::npos);
+}
+
+TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
+  auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
+  ::inferx::server::auth::Principal principal{"tenant-a", "user", "key"};
+  principal.scopes.insert("models.read");
+  principal.scopes.insert("inference.invoke");
+  ASSERT_TRUE(
+      store
+          ->AddHash(
+              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+              principal)
+          .ok());
+  auto authenticator =
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
+  auto guard = std::make_shared<
+      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+  ::inferx::server::handlers::HealthState health;
+  ::inferx::server::model_registry::Registry registry;
+  FakeTokenizationService tokenization;
+  auto built = ::inferx::server::handlers::BuildApiRoutes(
+      {.health = &health,
+       .models = &registry,
+       .tokenization = &tokenization,
+       .guard = guard,
+       .max_inference_body_bytes = 64});
+  ASSERT_TRUE(built.ok()) << built.status();
+
+  CapturingWriter live_writer;
+  HttpRequest live{http::verb::get, "/health/live", 11};
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(live), {}, live_writer, {}));
+  EXPECT_EQ(live_writer.status, 200);
+
+  CapturingWriter denied_writer;
+  HttpRequest denied{http::verb::get, "/v1/models", 11};
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(denied), {}, denied_writer, {}));
+  EXPECT_EQ(denied_writer.status, 401);
+
+  CapturingWriter models_writer;
+  HttpRequest models{http::verb::get, "/v1/models", 11};
+  models.set(http::field::authorization, "Bearer secret");
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(models), {}, models_writer, {}));
+  EXPECT_EQ(models_writer.status, 200);
+  EXPECT_EQ(models_writer.body, "{\"object\":\"list\",\"data\":[]}");
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

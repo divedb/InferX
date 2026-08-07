@@ -1,4 +1,5 @@
 add_library(inferx_request_handlers
+  api_routes.cc
   embeddings_handler.cc
   health_handler.cc
   models_handler.cc
