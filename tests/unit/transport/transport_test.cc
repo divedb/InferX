@@ -598,12 +598,42 @@ TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
   EXPECT_FALSE(registry.Resolve("current").ok());
   ASSERT_TRUE(registry.SetState(
                            "model", "v1",
+                           ::inferx::server::model_registry::ModelState::kWarming)
+                  .ok());
+  ASSERT_TRUE(registry.SetState(
+                           "model", "v1",
                            ::inferx::server::model_registry::ModelState::kReady)
                   .ok());
   auto resolved = registry.Resolve("current");
   ASSERT_TRUE(resolved.ok()) << resolved.status();
   EXPECT_EQ(resolved->version, "v1");
   EXPECT_EQ(registry.ReadyModels().size(), 1);
+}
+
+TEST(ModelRegistryTest, EnforcesLifecycleCapabilitiesAndTenantVisibility) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord record;
+  record.id = "embedding";
+  record.version = "v2";
+  record.alias = "embedding-current";
+  record.supports_generation = false;
+  record.supports_embeddings = true;
+  record.embedding_dimensions = 768;
+  record.visible_tenants.insert("tenant_a");
+  ASSERT_TRUE(registry.Register(record).ok());
+  EXPECT_FALSE(registry.SetState("embedding", "v2", ModelState::kReady).ok());
+  ASSERT_TRUE(
+      registry.SetState("embedding", "v2", ModelState::kLoading).ok());
+  ASSERT_TRUE(
+      registry.SetState("embedding", "v2", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("embedding", "v2", ModelState::kReady).ok());
+  auto visible = registry.Resolve("embedding-current", "tenant_a");
+  ASSERT_TRUE(visible.ok()) << visible.status();
+  EXPECT_TRUE(visible->supports_embeddings);
+  EXPECT_EQ(visible->embedding_dimensions, 768);
+  EXPECT_FALSE(registry.Resolve("embedding-current", "tenant_b").ok());
+  EXPECT_EQ(registry.ReadyModels("tenant_b").size(), 0);
 }
 
 TEST(TokenizationContractTest, CarriesImmutableModelVersionAndAccounting) {
