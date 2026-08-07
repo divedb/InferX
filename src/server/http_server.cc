@@ -1,6 +1,7 @@
 #include "inferx/server/http_server.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +23,8 @@
 #include <boost/asio/write.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
 
 #include "inferx/api/openai.h"
 #include "inferx/observe/metrics.h"
@@ -201,6 +204,25 @@ size_t DefaultThreads(size_t requested, size_t maximum) {
       std::max(1u, std::thread::hardware_concurrency())));
 }
 
+bool DecodeSha256(
+    std::string_view hex,
+    std::array<unsigned char, SHA256_DIGEST_LENGTH>* out) {
+  if (hex.size() != SHA256_DIGEST_LENGTH * 2) return false;
+  auto digit = [](char value) -> int {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+  };
+  for (size_t index = 0; index < out->size(); ++index) {
+    const int high = digit(hex[index * 2]);
+    const int low = digit(hex[index * 2 + 1]);
+    if (high < 0 || low < 0) return false;
+    (*out)[index] = static_cast<unsigned char>((high << 4) | low);
+  }
+  return true;
+}
+
 }  // namespace
 
 struct HttpServer::Impl {
@@ -215,6 +237,7 @@ struct HttpServer::Impl {
   std::atomic<int> bound_port{0};
   std::atomic<bool> stopping{false};
   std::atomic<size_t> active_requests{0};
+  std::vector<std::array<unsigned char, SHA256_DIGEST_LENGTH>> api_key_hashes;
   std::mutex ready_mutex;
   std::condition_variable ready_cv;
   bool ready = false;
@@ -224,7 +247,14 @@ struct HttpServer::Impl {
   Impl(Engine* value, HttpServerConfig settings)
       : engine(value),
         config(std::move(settings)),
-        application_pool(DefaultThreads(config.application_threads, 32)) {}
+        application_pool(DefaultThreads(config.application_threads, 32)) {
+    api_key_hashes.reserve(config.api_key_sha256.size());
+    for (const std::string& encoded : config.api_key_sha256) {
+      std::array<unsigned char, SHA256_DIGEST_LENGTH> decoded{};
+      DecodeSha256(encoded, &decoded);
+      api_key_hashes.push_back(decoded);
+    }
+  }
 
   ~Impl() {
     Stop();
@@ -328,6 +358,11 @@ struct HttpServer::Impl::Session
       if (request.method() == http::verb::get && target == "/health/startup") {
         return WriteJson(200, "{\"status\":\"started\"}");
       }
+      if (!Authenticate(request)) {
+        return WriteError(401, "missing or invalid bearer token",
+                          "authentication_error", keep_alive,
+                          "invalid_api_key");
+      }
       if (request.method() == http::verb::get && target == "/v1/models") {
         return WriteJson(200, api::ModelsJson(owner->engine->model_name(),
                                                NowSeconds()));
@@ -356,6 +391,27 @@ struct HttpServer::Impl::Session
     } catch (...) {
       WriteError(500, "internal error", "server_error", keep_alive);
     }
+  }
+
+  bool Authenticate(const http::request<http::string_body>& request) const {
+    if (owner->api_key_hashes.empty()) return true;
+    const auto authorization = request.find(http::field::authorization);
+    if (authorization == request.end()) return false;
+    const beast::string_view value = authorization->value();
+    constexpr std::string_view prefix = "Bearer ";
+    if (value.size() <= prefix.size() ||
+        std::string_view(value.data(), prefix.size()) != prefix) {
+      return false;
+    }
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(reinterpret_cast<const unsigned char*>(value.data() + prefix.size()),
+           value.size() - prefix.size(), digest.data());
+    unsigned int matched = 0;
+    for (const auto& accepted : owner->api_key_hashes) {
+      matched |= static_cast<unsigned int>(
+          CRYPTO_memcmp(digest.data(), accepted.data(), digest.size()) == 0);
+    }
+    return matched != 0;
   }
 
   void HandleCompletion(const std::string& body, bool chat) {
@@ -557,6 +613,9 @@ struct HttpServer::Impl::Session
     response->set(http::field::server, "InferX");
     response->set(http::field::content_type, std::move(content_type));
     response->set("X-Request-ID", request_id);
+    if (status == 401) {
+      response->set(http::field::www_authenticate, "Bearer");
+    }
     if (status == 429 || status == 503) response->set(http::field::retry_after, "1");
     response->keep_alive(keep_alive && !owner->stopping);
     response->body() = std::move(body);
@@ -730,6 +789,14 @@ StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
     return InvalidArgumentError("max_request_bytes must be positive");
   if (config.max_active_requests == 0)
     return InvalidArgumentError("max_active_requests must be positive");
+  for (const std::string& encoded : config.api_key_sha256) {
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> decoded{};
+    if (!DecodeSha256(encoded, &decoded)) {
+      return InvalidArgumentError(
+          "api_key_sha256 entries must contain exactly 64 hexadecimal "
+          "characters");
+    }
+  }
   if (config.read_timeout_seconds <= 0 || config.write_timeout_seconds <= 0 ||
       config.request_timeout_seconds <= 0)
     return InvalidArgumentError("HTTP timeouts must be positive");

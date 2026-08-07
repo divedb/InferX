@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "inferx/core/status.h"
 #include "inferx/server/engine.h"
@@ -40,6 +41,10 @@ struct HttpServerConfig {
   /// Hard cap across queued, tokenizing, generating, and streaming requests.
   /// Admission happens before work enters the application executor.
   size_t max_active_requests = 1024;
+
+  /// Lower- or upper-case SHA-256 hex digests of accepted bearer tokens.
+  /// Empty keeps authentication disabled for local deployments.
+  std::vector<std::string> api_key_sha256;
 };
 
 /// \brief An OpenAI-compatible HTTP front end for an `Engine`.

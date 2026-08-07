@@ -11,6 +11,8 @@ add_library(inferx_server
 )
 add_library(inferx::server ALIAS inferx_server)
 
+find_package(OpenSSL REQUIRED)
+
 target_link_libraries(inferx_server
   PUBLIC
     inferx::core
@@ -23,6 +25,7 @@ target_link_libraries(inferx_server
     inferx::flags
   PRIVATE
     inferx::beast
+    OpenSSL::Crypto
 )
 
 # Threads, for the engine loop and the bounded HTTP executors.

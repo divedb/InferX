@@ -32,6 +32,7 @@ void PrintUsage(const char* argv0) {
       "  --host <addr>          bind address (default 127.0.0.1)\n"
       "  --port <n>             bind port (default 8000)\n"
       "  --served-model-name <s>  name reported in responses\n"
+      "  --api-key-sha256 <hex>  accepted bearer-token hash (repeatable)\n"
       "  --max-running <n>      concurrent sequences (default 8)\n"
       "  --max-seq-len <n>      prompt + generation cap (default 2048)\n"
       "  --kv-blocks <n>        KV cache blocks (default 4096)\n"
@@ -110,6 +111,9 @@ int main(int argc, char** argv) {
                      &engine_config.served_model_name)) {
         return 2;
       }
+    } else if (arg == "--api-key-sha256") {
+      if (!NextValue(argc, argv, &i, "--api-key-sha256", &value)) return 2;
+      http_config.api_key_sha256.push_back(value);
     } else if (arg == "--max-running") {
       if (!NextValue(argc, argv, &i, "--max-running", &value)) return 2;
       engine_config.scheduler.max_running = std::atoll(value.c_str());

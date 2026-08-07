@@ -28,6 +28,23 @@ Both GPUs must be in the same machine and visible to the process. Record
 performance. The complete rental-host acceptance procedure is in
 [TP_VALIDATION.md](TP_VALIDATION.md).
 
+### API-key authentication
+
+Authentication is optional for local development. Production launches should
+pass one or more SHA-256 API-key digests; raw keys are never stored in server
+configuration:
+
+```bash
+key_hash="$(printf %s "$INFERX_API_KEY" | sha256sum | cut -d' ' -f1)"
+./build/src/server/inferx-serve \
+  --model /path/to/checkpoint \
+  --api-key-sha256 "$key_hash"
+```
+
+Clients send `Authorization: Bearer <key>`. Health endpoints remain public for
+orchestrator probes. Models, completions, metrics, and legacy stats require a
+valid key whenever at least one hash is configured.
+
 ### Why CUDA 13.x
 
 The M0 core only uses CUDA runtime calls that are stable across 12.x and 13.x,
