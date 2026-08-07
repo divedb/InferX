@@ -29,4 +29,22 @@ class TokenizationService {
       const std::vector<tokenizer::ChatMessage>& messages) = 0;
 };
 
+/// Compatibility adapter for the currently loaded in-process model.
+class InProcessTokenizationService final : public TokenizationService {
+ public:
+  InProcessTokenizationService(tokenizer::Tokenizer* tokenizer,
+                               request::ModelVersion model_version);
+
+  StatusOr<TokenizedPrompt> TokenizeCompletion(
+      const request::ModelVersion& model_version,
+      std::string_view prompt) override;
+  StatusOr<TokenizedPrompt> TokenizeChat(
+      const request::ModelVersion& model_version,
+      const std::vector<tokenizer::ChatMessage>& messages) override;
+
+ private:
+  tokenizer::Tokenizer* tokenizer_;
+  request::ModelVersion model_version_;
+};
+
 }  // namespace inferx::server::tokenization
