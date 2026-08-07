@@ -32,6 +32,7 @@
 #include "inferx/server/auth/authenticator.h"
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
+#include "inferx/server/middleware/authentication.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
 
@@ -658,6 +659,51 @@ TEST(AuthTest, DevelopmentBypassMustBeExplicit) {
   auto principal = development.Authenticate("");
   ASSERT_TRUE(principal.ok()) << principal.status();
   EXPECT_EQ(principal->tenant_id, "development");
+}
+
+TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
+  auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
+  ::inferx::server::auth::Principal principal{"tenant", "user", "key"};
+  principal.scopes.insert("inference.invoke");
+  ASSERT_TRUE(
+      store
+          ->AddHash(
+              "2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b",
+              principal)
+          .ok());
+  auto authenticator =
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(store.get());
+  auto guard = std::make_shared<
+      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+  Routes routes(guard);
+  ASSERT_TRUE(routes.Add(http::verb::post, "/invoke",
+                         {.authentication_required = true,
+                          .required_scope = "inference.invoke"},
+                         std::make_shared<OkHandler>())
+                  .ok());
+  ASSERT_TRUE(routes.Add(http::verb::get, "/health",
+                         {.authentication_required = false},
+                         std::make_shared<OkHandler>())
+                  .ok());
+
+  CapturingWriter missing_writer;
+  HttpRequest missing{http::verb::post, "/invoke", 11};
+  folly::coro::blockingWait(
+      routes.Handle(std::move(missing), missing_writer, {}));
+  EXPECT_EQ(missing_writer.status, 401);
+
+  CapturingWriter allowed_writer;
+  HttpRequest allowed{http::verb::post, "/invoke", 11};
+  allowed.set(http::field::authorization, "Bearer secret");
+  folly::coro::blockingWait(
+      routes.Handle(std::move(allowed), allowed_writer, {}));
+  EXPECT_EQ(allowed_writer.status, 200);
+
+  CapturingWriter health_writer;
+  HttpRequest health{http::verb::get, "/health", 11};
+  folly::coro::blockingWait(
+      routes.Handle(std::move(health), health_writer, {}));
+  EXPECT_EQ(health_writer.status, 200);
 }
 
 TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {

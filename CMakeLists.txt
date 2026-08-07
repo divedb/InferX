@@ -48,6 +48,7 @@ add_subdirectory(src/server/scheduler_client)
 add_subdirectory(src/server/streaming)
 add_subdirectory(src/server/tokenization)
 add_subdirectory(src/server/transport)
+add_subdirectory(src/server/middleware)
 
 # The server owns the model, so it needs device code; the wire format it speaks
 # does not, which is why src/api is unconditional and this is not.
