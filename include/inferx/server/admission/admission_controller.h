@@ -45,6 +45,8 @@ struct AdmissionConfig {
 struct RateLimitDecision {
   bool allowed = false;
   std::chrono::milliseconds retry_after{0};
+  enum class Reason { kAllowed, kInvalidRequest, kTenantLimit, kApiKeyLimit };
+  Reason reason = Reason::kInvalidRequest;
 };
 
 struct RateLimitConfig {
@@ -52,12 +54,21 @@ struct RateLimitConfig {
   double request_refill_per_second = 100.0;
   double token_capacity = 100000.0;
   double token_refill_per_second = 100000.0;
+  double api_key_request_capacity = 100.0;
+  double api_key_request_refill_per_second = 100.0;
+  double api_key_token_capacity = 100000.0;
+  double api_key_token_refill_per_second = 100000.0;
 };
 
 class RateLimiter {
  public:
   explicit RateLimiter(RateLimitConfig config);
   RateLimitDecision Consume(const request::TenantId& tenant,
+                            uint32_t requested_tokens,
+                            std::chrono::steady_clock::time_point now =
+                                std::chrono::steady_clock::now());
+  RateLimitDecision Consume(const request::TenantId& tenant,
+                            std::string_view api_key_id,
                             uint32_t requested_tokens,
                             std::chrono::steady_clock::time_point now =
                                 std::chrono::steady_clock::now());
@@ -69,6 +80,10 @@ class RateLimiter {
                    uint32_t actual_tokens,
                    std::chrono::steady_clock::time_point now =
                        std::chrono::steady_clock::now());
+  Status Reconcile(const request::TenantId& tenant, std::string_view api_key_id,
+                   uint32_t reserved_tokens, uint32_t actual_tokens,
+                   std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now());
 
  private:
   struct Bucket {
@@ -78,7 +93,10 @@ class RateLimiter {
   };
   RateLimitConfig config_;
   std::mutex mutex_;
-  std::unordered_map<request::TenantId, Bucket> buckets_;
+  std::unordered_map<request::TenantId, Bucket> tenant_buckets_;
+  std::unordered_map<request::TenantId,
+                     std::unordered_map<std::string, Bucket>>
+      api_key_buckets_;
 };
 
 class AdmissionController {

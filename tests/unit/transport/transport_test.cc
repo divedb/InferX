@@ -366,6 +366,38 @@ TEST(RateLimiterTest, ReconcilesReservedTokensAgainstActualUsage) {
             absl::StatusCode::kFailedPrecondition);
 }
 
+TEST(RateLimiterTest, EnforcesTenantAndApiKeyBucketsAtomically) {
+  using Decision = ::inferx::server::admission::RateLimitDecision;
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::time_point(std::chrono::seconds(40));
+  ::inferx::server::admission::RateLimiter limiter(
+      {.request_capacity = 3,
+       .request_refill_per_second = 1,
+       .token_capacity = 100,
+       .token_refill_per_second = 1,
+       .api_key_request_capacity = 1,
+       .api_key_request_refill_per_second = 1,
+       .api_key_token_capacity = 100,
+       .api_key_token_refill_per_second = 1});
+
+  EXPECT_TRUE(limiter.Consume("tenant", "key_a", 10, start).allowed);
+  auto key_rejection = limiter.Consume("tenant", "key_a", 10, start);
+  EXPECT_FALSE(key_rejection.allowed);
+  EXPECT_EQ(key_rejection.reason, Decision::Reason::kApiKeyLimit);
+
+  // The rejected key_a attempt must not consume tenant capacity, leaving room
+  // for both other keys.
+  EXPECT_TRUE(limiter.Consume("tenant", "key_b", 10, start).allowed);
+  EXPECT_TRUE(limiter.Consume("tenant", "key_c", 10, start).allowed);
+  auto tenant_rejection = limiter.Consume("tenant", "key_d", 10, start);
+  EXPECT_FALSE(tenant_rejection.allowed);
+  EXPECT_EQ(tenant_rejection.reason, Decision::Reason::kTenantLimit);
+
+  ASSERT_TRUE(limiter.Reconcile("tenant", "key_a", 10, 5, start).ok());
+  EXPECT_EQ(limiter.Reconcile("tenant", "missing", 10, 5, start).code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
 TEST(AuthTest, StoresHashesAndEnforcesScopes) {
   ::inferx::server::auth::ApiKeyStore store;
   ::inferx::server::auth::Principal principal;
