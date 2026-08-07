@@ -25,6 +25,7 @@
 #include "inferx/server/admission/admission_controller.h"
 #include "inferx/server/auth/api_key_store.h"
 #include "inferx/server/auth/rbac.h"
+#include "inferx/server/model_registry/registry.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -281,6 +282,25 @@ TEST(AuthTest, StoresHashesAndEnforcesScopes) {
             absl::StatusCode::kPermissionDenied);
   EXPECT_EQ(store.LookupHash("missing").status().code(),
             absl::StatusCode::kUnauthenticated);
+}
+
+TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
+  ::inferx::server::model_registry::Registry registry;
+  ::inferx::server::model_registry::ModelRecord record;
+  record.id = "model";
+  record.version = "v1";
+  record.alias = "current";
+  record.state = ::inferx::server::model_registry::ModelState::kLoading;
+  ASSERT_TRUE(registry.Register(record).ok());
+  EXPECT_FALSE(registry.Resolve("current").ok());
+  ASSERT_TRUE(registry.SetState(
+                           "model", "v1",
+                           ::inferx::server::model_registry::ModelState::kReady)
+                  .ok());
+  auto resolved = registry.Resolve("current");
+  ASSERT_TRUE(resolved.ok()) << resolved.status();
+  EXPECT_EQ(resolved->version, "v1");
+  EXPECT_EQ(registry.ReadyModels().size(), 1);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
