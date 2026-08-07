@@ -124,12 +124,10 @@ git -C third_party/boost submodule update --init --depth 1
 cmake -S . -B build
 ```
 
-Folly's platform dependencies must be installed before configuring. To make a
-minimal build without this foundation, pass
-`-DINFERX_ENABLE_ASYNC_HTTP=OFF`. First-party code consumes the dependencies
-through the narrow `inferx::beast` and `inferx::folly_coro` targets; do not link
-upstream targets directly. See `http_server.md` for the transport decision and
-migration plan.
+Folly's platform dependencies must be installed before configuring.
+First-party code consumes the dependencies through the narrow `inferx::beast`
+and `inferx::folly_coro` targets; do not link upstream targets directly. See
+`http_server.md` for the transport decision and migration plan.
 
 ### Which CUDA gets used
 

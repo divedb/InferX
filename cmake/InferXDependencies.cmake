@@ -120,9 +120,8 @@ set(BUILD_TESTING ${_inferx_saved_build_testing} CACHE BOOL "" FORCE)
 # Asynchronous HTTP foundation -- Boost.Beast 1.91.0 + Folly 2026.08.03.00.
 #
 # These targets establish the dependency boundary for the active Beast server
-# and its coroutine-facing transport contracts. The dependencies are enabled
-# by default; set INFERX_ENABLE_ASYNC_HTTP=OFF for a minimal build without the
-# server. The gitlinks pin exact revisions; configuration performs no fetch.
+# and its coroutine-facing transport contracts. The gitlinks pin exact
+# revisions; configuration performs no fetch.
 #
 # Initialize once before the default configuration:
 #   git submodule update --init --checkout third_party/boost third_party/folly
@@ -137,9 +136,6 @@ add_library(inferx::folly_coro ALIAS inferx_folly_coro)
 set(INFERX_BOOST_PIN "1.91.0")
 set(INFERX_FOLLY_PIN "2026.08.03.00")
 set(INFERX_FAST_FLOAT_PIN "8.0.0")
-set(INFERX_HAVE_ASYNC_HTTP OFF)
-
-if(INFERX_ENABLE_ASYNC_HTTP)
   _inferx_require_submodule(boost)
   _inferx_require_submodule(folly)
   _inferx_require_submodule(fast_float)
@@ -215,14 +211,8 @@ if(INFERX_ENABLE_ASYNC_HTTP)
   target_compile_definitions(inferx_folly_coro INTERFACE
     INFERX_WITH_FOLLY_CORO=1)
 
-  set(INFERX_HAVE_ASYNC_HTTP ON)
-  message(STATUS
-    "Async HTTP foundation: Boost ${INFERX_BOOST_PIN}, "
-    "Folly ${INFERX_FOLLY_PIN}")
-else()
-  message(STATUS
-    "Async HTTP foundation: disabled (INFERX_ENABLE_ASYNC_HTTP=OFF)")
-endif()
+message(STATUS
+  "HTTP foundation: Boost ${INFERX_BOOST_PIN}, Folly ${INFERX_FOLLY_PIN}")
 
 # ---------------------------------------------------------------------------
 # tokenizers-cpp -- universal Hugging Face and SentencePiece backend.

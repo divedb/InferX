@@ -31,13 +31,6 @@ git -C third_party/boost submodule update \
 Configure using a fresh build directory:
 
 ```bash
-cmake -S . -B build-async-http
-cmake --build build-async-http -j"$(nproc)"
-```
-
-For a minimal build without Boost.Beast and Folly, explicitly disable the
-default HTTP foundation:
-
-```bash
-cmake -S . -B build-minimal -DINFERX_ENABLE_ASYNC_HTTP=OFF
+cmake -S . -B build
+cmake --build build -j"$(nproc)"
 ```

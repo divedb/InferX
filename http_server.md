@@ -1333,11 +1333,9 @@ Pinned source revisions:
 - Boost `boost-1.91.0` (`1a80576db6b70828803819fb6925132193bc5d0e`);
 - Folly `v2026.08.03.00` (`72f7ac6f84243a73f597fab286e3dd049511b344`).
 
-Both are enabled by default through `INFERX_ENABLE_ASYNC_HTTP`; minimal builds
-may explicitly disable the option until the Beast transport replaces the
-active server. InferX consumes them only through `inferx::beast` and
-`inferx::folly_coro`; application targets must not link the upstream targets
-directly.
+Both are required by the HTTP server. InferX consumes them only through
+`inferx::beast` and `inferx::folly_coro`; application targets must not link the
+upstream targets directly.
 
 HTTP/2 is not supplied by Beast itself. Initial scope remains HTTP/1.1 with SSE
 behind an ingress or load balancer that may terminate HTTP/2. Native end-to-end
