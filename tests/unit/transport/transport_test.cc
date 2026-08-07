@@ -36,6 +36,7 @@
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/handlers/embeddings_handler.h"
 #include "inferx/server/handlers/api_routes.h"
+#include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
@@ -154,6 +155,49 @@ class FakeTokenizationService final
   std::string seen_version;
   std::string seen_prompt;
   bool seen_add_special_tokens = false;
+};
+
+class FakeRequestService final
+    : public ::inferx::server::request::RequestService {
+ public:
+  folly::coro::Task<StatusOr<
+      ::inferx::server::scheduler_client::SubmitResult>>
+  Submit(::inferx::server::scheduler_client::ScheduledRequest request,
+         folly::CancellationToken) override {
+    submitted = std::move(request);
+    co_return ::inferx::server::scheduler_client::SubmitResult{
+        submitted.request_id, 0};
+  }
+
+  folly::coro::AsyncGenerator<
+      ::inferx::server::scheduler_client::GenerationEvent&&>
+  Events(::inferx::server::request::RequestId request_id,
+         folly::CancellationToken) override {
+    ::inferx::server::scheduler_client::GenerationEvent first;
+    first.request_id = request_id;
+    first.sequence_number = 1;
+    first.text_delta = "hello";
+    first.generated_tokens = 1;
+    co_yield std::move(first);
+    ::inferx::server::scheduler_client::GenerationEvent terminal;
+    terminal.request_id = request_id;
+    terminal.sequence_number = 2;
+    terminal.terminal = true;
+    terminal.finish_reason =
+        ::inferx::server::scheduler_client::FinishReason::kStop;
+    terminal.usage = {.prompt_tokens = 3, .completion_tokens = 1};
+    co_yield std::move(terminal);
+  }
+
+  folly::coro::Task<Status> Cancel(
+      ::inferx::server::request::RequestId,
+      ::inferx::server::request::CancellationReason) override {
+    cancelled = true;
+    co_return OkStatus();
+  }
+
+  ::inferx::server::scheduler_client::ScheduledRequest submitted;
+  bool cancelled = false;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -1070,10 +1114,12 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
   ::inferx::server::handlers::HealthState health;
   ::inferx::server::model_registry::Registry registry;
   FakeTokenizationService tokenization;
+  FakeRequestService requests;
   auto built = ::inferx::server::handlers::BuildApiRoutes(
       {.health = &health,
        .models = &registry,
        .tokenization = &tokenization,
+       .requests = &requests,
        .guard = guard,
        .max_inference_body_bytes = 64});
   ASSERT_TRUE(built.ok()) << built.status();
@@ -1097,6 +1143,75 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
       (*built)->Handle(std::move(models), {}, models_writer, {}));
   EXPECT_EQ(models_writer.status, 200);
   EXPECT_EQ(models_writer.body, "{\"object\":\"list\",\"data\":[]}");
+}
+
+TEST(CompletionHandlerTest, CollectsTypedEventsFromImmutableModelRequest) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "text";
+  model.version = "v4";
+  model.alias = "text-current";
+  model.context_limit = 8;
+  model.tokenizer_revision = "tok-v2";
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("text", "v4", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("text", "v4", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("text", "v4", ModelState::kReady).ok());
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text-current\",\"prompt\":\"input\","
+      "\"max_tokens\":2}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(writer.body.find("\"text\":\"hello\""), std::string::npos);
+  EXPECT_NE(writer.body.find("\"prompt_tokens\":3"), std::string::npos);
+  EXPECT_EQ(requests.submitted.model_version, "text@v4");
+  EXPECT_EQ(requests.submitted.tokenizer_revision, "tok-v2");
+  EXPECT_EQ(requests.submitted.tenant_id, "tenant-a");
+  EXPECT_EQ(requests.submitted.prompt_tokens.size(), 3);
+}
+
+TEST(CompletionHandlerTest, StreamsSameEventsWithUsageAndDoneMarker) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "text";
+  model.version = "v1";
+  model.context_limit = 8;
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("text", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("text", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("text", "v1", ModelState::kReady).ok());
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\","
+      "\"max_tokens\":2,\"stream\":true,"
+      "\"stream_options\":{\"include_usage\":true}}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_TRUE(writer.finished);
+  EXPECT_NE(writer.body.find("hello"), std::string::npos);
+  EXPECT_NE(writer.body.find("\"choices\":[]"), std::string::npos);
+  EXPECT_NE(writer.body.find("data: [DONE]"), std::string::npos);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

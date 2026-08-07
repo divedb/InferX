@@ -1,6 +1,7 @@
 #include "inferx/server/handlers/api_routes.h"
 
 #include "inferx/server/handlers/models_handler.h"
+#include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 
 namespace inferx::server::handlers {
@@ -30,6 +31,9 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
   if (dependencies.tokenization == nullptr) {
     return InvalidArgumentError("tokenization service is required");
   }
+  if (dependencies.requests == nullptr) {
+    return InvalidArgumentError("request service is required");
+  }
   if (dependencies.guard == nullptr) {
     return InvalidArgumentError("route guard is required");
   }
@@ -54,6 +58,15 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
        .authentication_required = true,
        .required_scope = "models.read"},
       std::make_shared<ModelsHandler>(dependencies.models)));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::post, "/v1/completions",
+      {.name = "completions",
+       .max_body_bytes = dependencies.max_inference_body_bytes,
+       .authentication_required = true,
+       .required_scope = "inference.invoke"},
+      std::make_shared<CompletionHandler>(
+          dependencies.models, dependencies.tokenization,
+          dependencies.requests)));
   INFERX_RETURN_IF_ERROR(routes->Add(
       boost::beast::http::verb::post, "/v1/tokenize",
       {.name = "tokenize",
