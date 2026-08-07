@@ -85,6 +85,19 @@ class OkHandler final : public RequestHandler {
   }
 };
 
+class ScopeGuard final : public RouteGuard {
+ public:
+  folly::coro::Task<Status> Check(
+      const HttpRequest&, const RouteMetadata& metadata,
+      folly::CancellationToken) override {
+    seen_scope = metadata.required_scope;
+    if (deny) co_return absl::PermissionDeniedError("scope denied");
+    co_return OkStatus();
+  }
+  bool deny = false;
+  std::string seen_scope;
+};
+
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
   asio::io_context io;
   auto work = asio::make_work_guard(io);
@@ -143,6 +156,35 @@ TEST(RoutesTest, DistinguishesNotFoundAndMethodNotAllowed) {
   folly::coro::blockingWait(
       routes.Handle(std::move(missing), missing_writer, {}));
   EXPECT_EQ(missing_writer.status, 404);
+}
+
+TEST(RoutesTest, AppliesMetadataBodyLimitAndGuardBeforeHandler) {
+  auto guard = std::make_shared<ScopeGuard>();
+  Routes routes(guard);
+  ASSERT_TRUE(routes.Add(http::verb::post, "/completion",
+                         {.name = "completion",
+                          .max_body_bytes = 4,
+                          .authentication_required = true,
+                          .required_scope = "inference.invoke"},
+                         std::make_shared<OkHandler>())
+                  .ok());
+
+  CapturingWriter oversized_writer;
+  HttpRequest oversized{http::verb::post, "/completion", 11};
+  oversized.body() = "12345";
+  folly::coro::blockingWait(
+      routes.Handle(std::move(oversized), oversized_writer, {}));
+  EXPECT_EQ(oversized_writer.status, 413);
+  EXPECT_TRUE(guard->seen_scope.empty());
+
+  guard->deny = true;
+  CapturingWriter denied_writer;
+  HttpRequest denied{http::verb::post, "/completion", 11};
+  denied.body() = "1234";
+  folly::coro::blockingWait(
+      routes.Handle(std::move(denied), denied_writer, {}));
+  EXPECT_EQ(denied_writer.status, 403);
+  EXPECT_EQ(guard->seen_scope, "inference.invoke");
 }
 
 TEST(SseWriterTest, FramesEventsCommentsAndFinishes) {
