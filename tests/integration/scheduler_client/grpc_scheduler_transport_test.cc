@@ -1,16 +1,21 @@
 #include "inferx/server/scheduler_client/grpc_scheduler_transport.h"
 
+#include <folly/coro/Task.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <grpcpp/create_channel.h>
 #include <grpcpp/security/credentials.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "inference/scheduler/v1/scheduler.grpc.pb.h"
 
@@ -34,9 +39,28 @@ class FakeSchedulerService final : public wire::Scheduler::Service {
   }
 
   grpc::Status Subscribe(
-      grpc::ServerContext*, const wire::SubscribeRequest* request,
+      grpc::ServerContext* context, const wire::SubscribeRequest* request,
       grpc::ServerWriter<wire::GenerationEvent>* writer) override {
     last_subscribe = *request;
+    subscribe_after.push_back(request->after_sequence_number());
+    const int call = ++subscribe_calls;
+    if (request->request_id() == "blocked") {
+      blocked_stream_started.store(true);
+      while (!context->IsCancelled()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      return grpc::Status(grpc::StatusCode::CANCELLED, "client stopped");
+    }
+    if (request->request_id() == "restart" && call > 1) {
+      wire::GenerationEvent terminal;
+      terminal.set_request_id(request->request_id());
+      terminal.set_attempt(request->attempt());
+      terminal.set_sequence_number(request->after_sequence_number() + 1);
+      terminal.set_terminal(true);
+      terminal.set_finish_reason(wire::FINISH_REASON_STOP);
+      writer->Write(terminal);
+      return grpc::Status::OK;
+    }
     wire::GenerationEvent delta;
     delta.set_request_id(request->request_id());
     delta.set_attempt(request->attempt());
@@ -49,6 +73,9 @@ class FakeSchedulerService final : public wire::Scheduler::Service {
     embedding->add_values(0.25F);
     embedding->add_values(0.75F);
     writer->Write(delta);
+    if (request->request_id() == "restart" && call == 1) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "scheduler restarted");
+    }
 
     wire::GenerationEvent terminal;
     terminal.set_request_id(request->request_id());
@@ -96,6 +123,9 @@ class FakeSchedulerService final : public wire::Scheduler::Service {
   int submit_calls = 0;
   int cancel_calls = 0;
   int priority_calls = 0;
+  std::atomic<int> subscribe_calls{0};
+  std::atomic<bool> blocked_stream_started{false};
+  std::vector<uint64_t> subscribe_after;
 };
 
 class GrpcSchedulerTransportTest : public ::testing::Test {
@@ -108,7 +138,7 @@ class GrpcSchedulerTransportTest : public ::testing::Test {
     server = builder.BuildAndStart();
     ASSERT_NE(server, nullptr);
     ASSERT_GT(port, 0);
-    transport = std::make_unique<GrpcSchedulerTransport>(
+    transport = std::make_shared<GrpcSchedulerTransport>(
         grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
                             grpc::InsecureChannelCredentials()));
   }
@@ -124,7 +154,7 @@ class GrpcSchedulerTransportTest : public ::testing::Test {
   FakeSchedulerService service;
   int port = 0;
   std::unique_ptr<grpc::Server> server;
-  std::unique_ptr<GrpcSchedulerTransport> transport;
+  std::shared_ptr<GrpcSchedulerTransport> transport;
 };
 
 TEST_F(GrpcSchedulerTransportTest, MapsSubmissionAndControlCalls) {
@@ -225,6 +255,60 @@ TEST_F(GrpcSchedulerTransportTest, EnforcesDeadlineAndShutdown) {
 
   transport->Shutdown();
   result = transport->Submit(request);
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kCancelled);
+}
+
+TEST_F(GrpcSchedulerTransportTest, RemoteClientResumesAfterSchedulerRestart) {
+  folly::CPUThreadPoolExecutor blocking(1);
+  folly::CPUThreadPoolExecutor coroutine(1);
+  RemoteSchedulerClient client(transport, &blocking,
+                               {.max_attempts = 3,
+                                .initial_backoff = std::chrono::milliseconds(0),
+                                .max_backoff = std::chrono::milliseconds(0),
+                                .sleep = [](std::chrono::milliseconds) {}});
+
+  auto task = [&]() -> folly::coro::Task<std::vector<GenerationEvent>> {
+    ScheduledRequest request;
+    request.request_id = "restart";
+    request.attempt = 6;
+    auto submitted = co_await client.Submit(request, {});
+    EXPECT_TRUE(submitted.ok()) << submitted.status();
+    if (!submitted.ok()) co_return std::vector<GenerationEvent>{};
+    std::vector<GenerationEvent> events;
+    auto stream = client.Events(request.request_id, {});
+    while (auto event = co_await stream.next()) {
+      events.push_back(std::move(*event));
+    }
+    co_return events;
+  };
+
+  auto future = folly::coro::co_withExecutor(&coroutine, task()).start();
+  auto events = std::move(future).get();
+  ASSERT_EQ(events.size(), 2);
+  EXPECT_EQ(events[0].sequence_number, 1);
+  EXPECT_EQ(events[0].text_delta, "hello");
+  EXPECT_EQ(events[1].sequence_number, 2);
+  EXPECT_TRUE(events[1].terminal);
+  EXPECT_EQ(service.subscribe_after, (std::vector<uint64_t>{0, 1}));
+}
+
+TEST_F(GrpcSchedulerTransportTest, ShutdownCancelsBlockedSubscription) {
+  auto opened = transport->Subscribe("blocked", 1, 0);
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  auto pending =
+      std::async(std::launch::async, [&opened] { return (*opened)->Next(); });
+  const auto start_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!service.blocked_stream_started.load() &&
+         std::chrono::steady_clock::now() < start_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(service.blocked_stream_started.load());
+
+  transport->Shutdown();
+  ASSERT_EQ(pending.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  auto result = pending.get();
   EXPECT_EQ(result.status().code(), absl::StatusCode::kCancelled);
 }
 
