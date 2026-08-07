@@ -31,6 +31,8 @@ void PrintUsage(const char* argv0) {
       "  --model <dir>          checkpoint directory (required)\n"
       "  --host <addr>          bind address (default 127.0.0.1)\n"
       "  --port <n>             bind port (default 8000)\n"
+      "  --scheduler-endpoint <target>  use a process-separated gRPC "
+      "scheduler\n"
       "  --served-model-name <s>  name reported in responses\n"
       "  --api-key-sha256 <hex>  accepted bearer-token hash (repeatable)\n"
       "  --max-running <n>      concurrent sequences (default 8)\n"
@@ -106,6 +108,11 @@ int main(int argc, char** argv) {
     } else if (arg == "--port") {
       if (!NextValue(argc, argv, &i, "--port", &value)) return 2;
       http_config.port = std::atoi(value.c_str());
+    } else if (arg == "--scheduler-endpoint") {
+      if (!NextValue(argc, argv, &i, "--scheduler-endpoint",
+                     &http_config.scheduler_endpoint)) {
+        return 2;
+      }
     } else if (arg == "--served-model-name") {
       if (!NextValue(argc, argv, &i, "--served-model-name",
                      &engine_config.served_model_name)) {

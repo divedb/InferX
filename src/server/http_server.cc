@@ -1,19 +1,19 @@
 #include "inferx/server/http_server.h"
 
+#include <folly/executors/CPUThreadPoolExecutor.h>
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
-#include <limits>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
-
-#include <folly/executors/CPUThreadPoolExecutor.h>
 
 #include "engine_adapters.h"
 #include "inferx/server/admission/admission_controller.h"
@@ -26,9 +26,17 @@
 #include "inferx/server/request/managed_request_service.h"
 #include "inferx/server/request/request_manager.h"
 #include "inferx/server/scheduler_client/in_process_scheduler_client.h"
+#include "inferx/server/scheduler_client/remote_scheduler_client.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/transport/beast_listener.h"
 #include "inferx/server/transport/io_runtime.h"
+
+#if defined(INFERX_WITH_GRPC_SCHEDULER)
+#include <grpcpp/create_channel.h>
+#include <grpcpp/security/credentials.h>
+
+#include "inferx/server/scheduler_client/grpc_scheduler_transport.h"
+#endif
 
 namespace inferx::server {
 namespace {
@@ -69,9 +77,11 @@ struct HttpServer::Impl {
   handlers::HealthState health;
   request::RequestManager request_manager;
   admission::AdmissionController admission;
-  EngineSchedulerBackend scheduler_backend;
-  scheduler_client::InProcessSchedulerClient scheduler;
-  request::ManagedRequestService requests;
+  std::unique_ptr<EngineSchedulerBackend> scheduler_backend;
+  std::shared_ptr<scheduler_client::RemoteSchedulerTransport>
+      scheduler_transport;
+  std::unique_ptr<scheduler_client::SchedulerClient> scheduler;
+  std::unique_ptr<request::ManagedRequestService> requests;
   tokenization::InProcessTokenizationService tokenization;
   EngineMetricsSource metrics;
   std::shared_ptr<transport::Routes> routes;
@@ -93,15 +103,30 @@ struct HttpServer::Impl {
         key_store(std::make_shared<auth::ApiKeyStore>()),
         admission({.max_active_requests =
                        static_cast<uint32_t>(config.max_active_requests),
-                   .max_reserved_tokens =
-                       std::numeric_limits<uint64_t>::max(),
+                   .max_reserved_tokens = std::numeric_limits<uint64_t>::max(),
                    .max_active_per_tenant =
                        static_cast<uint32_t>(config.max_active_requests)}),
-        scheduler_backend(engine),
-        scheduler(&scheduler_backend, blocking_executor.get()),
-        requests(&request_manager, &scheduler, &admission),
         tokenization(&engine->tokenizer(), engine->model_name() + "@loaded"),
-        metrics(engine) {}
+        metrics(engine) {
+    if (config.scheduler_endpoint.empty()) {
+      scheduler_backend = std::make_unique<EngineSchedulerBackend>(engine);
+      scheduler = std::make_unique<scheduler_client::InProcessSchedulerClient>(
+          scheduler_backend.get(), blocking_executor.get());
+    } else {
+#if defined(INFERX_WITH_GRPC_SCHEDULER)
+      scheduler_transport =
+          std::make_shared<scheduler_client::GrpcSchedulerTransport>(
+              grpc::CreateChannel(config.scheduler_endpoint,
+                                  grpc::InsecureChannelCredentials()));
+      scheduler = std::make_unique<scheduler_client::RemoteSchedulerClient>(
+          scheduler_transport, blocking_executor.get());
+#endif
+    }
+    if (scheduler != nullptr) {
+      requests = std::make_unique<request::ManagedRequestService>(
+          &request_manager, scheduler.get(), &admission);
+    }
+  }
 
   ~Impl() {
     Stop();
@@ -111,6 +136,10 @@ struct HttpServer::Impl {
   }
 
   Status Initialize() {
+    if (scheduler == nullptr) {
+      return FailedPreconditionError(
+          "scheduler_endpoint requires a build with protobuf and gRPC");
+    }
     std::vector<auth::ApiKeyRecord> records;
     records.reserve(config.api_key_sha256.size());
     for (size_t i = 0; i < config.api_key_sha256.size(); ++i) {
@@ -120,20 +149,19 @@ struct HttpServer::Impl {
     INFERX_RETURN_IF_ERROR(key_store->ReplaceAll(std::move(records)));
     authenticator = std::make_shared<auth::ApiKeyAuthenticator>(
         key_store.get(), config.api_key_sha256.empty());
-    route_guard =
-        std::make_shared<middleware::BearerRouteGuard>(authenticator);
+    route_guard = std::make_shared<middleware::BearerRouteGuard>(authenticator);
 
-    const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::system_clock::now()
-                                    .time_since_epoch())
-                                .count();
-    INFERX_RETURN_IF_ERROR(models.Register(
-        {.id = engine->model_name(),
-         .version = "loaded",
-         .created = created,
-         .state = model_registry::ModelState::kReady,
-         .supports_generation = true,
-         .supports_embeddings = false}));
+    const int64_t created =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    INFERX_RETURN_IF_ERROR(
+        models.Register({.id = engine->model_name(),
+                         .version = "loaded",
+                         .created = created,
+                         .state = model_registry::ModelState::kReady,
+                         .supports_generation = true,
+                         .supports_embeddings = false}));
 
     health.SetConfigurationLoaded(true);
     health.SetDependenciesLoaded(true);
@@ -145,7 +173,7 @@ struct HttpServer::Impl {
                     {.health = &health,
                      .models = &models,
                      .tokenization = &tokenization,
-                     .requests = &requests,
+                     .requests = requests.get(),
                      .metrics = &metrics,
                      .guard = route_guard,
                      .max_inference_body_bytes = config.max_request_bytes,
@@ -248,11 +276,10 @@ StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
   auto blocking =
       std::make_unique<folly::CPUThreadPoolExecutor>(application_threads);
   INFERX_ASSIGN_OR_RETURN(
-      auto runtime,
-      transport::IoRuntime::Create(
-          {.io_shards = DefaultThreads(config.io_threads, 8),
-           .threads_per_shard = 1,
-           .coroutine_threads = application_threads}));
+      auto runtime, transport::IoRuntime::Create(
+                        {.io_shards = DefaultThreads(config.io_threads, 8),
+                         .threads_per_shard = 1,
+                         .coroutine_threads = application_threads}));
   auto impl = std::make_unique<Impl>(engine, config, std::move(blocking),
                                      std::move(runtime));
   INFERX_RETURN_IF_ERROR(impl->Initialize());

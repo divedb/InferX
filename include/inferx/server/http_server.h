@@ -42,6 +42,10 @@ struct HttpServerConfig {
   /// Admission happens before work enters the application executor.
   size_t max_active_requests = 1024;
 
+  /// Empty selects the in-process scheduler. A non-empty gRPC target (for
+  /// example, "dns:///scheduler:50051") selects RemoteSchedulerClient.
+  std::string scheduler_endpoint;
+
   /// Lower- or upper-case SHA-256 hex digests of accepted bearer tokens.
   /// Empty keeps authentication disabled for local deployments.
   std::vector<std::string> api_key_sha256;

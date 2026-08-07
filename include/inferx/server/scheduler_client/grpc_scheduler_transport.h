@@ -16,8 +16,8 @@ class GrpcSchedulerTransport final : public RemoteSchedulerTransport {
   ~GrpcSchedulerTransport() override;
 
   StatusOr<SubmitResult> Submit(const ScheduledRequest& request) override;
-  StatusOr<RemoteRequestStatus> GetStatus(
-      const request::RequestId& request_id, uint32_t attempt) override;
+  StatusOr<RemoteRequestStatus> GetStatus(const request::RequestId& request_id,
+                                          uint32_t attempt) override;
   Status Cancel(const request::RequestId& request_id, uint32_t attempt,
                 request::CancellationReason reason) override;
   Status UpdatePriority(const request::RequestId& request_id, uint32_t attempt,

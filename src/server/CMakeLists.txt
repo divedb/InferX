@@ -39,6 +39,11 @@ target_link_libraries(inferx_server
     OpenSSL::Crypto
 )
 
+if(TARGET inferx_grpc_scheduler_transport)
+  target_link_libraries(inferx_server PRIVATE
+    inferx::grpc_scheduler_transport)
+endif()
+
 # Threads, for the engine loop and the bounded HTTP executors.
 find_package(Threads REQUIRED)
 target_link_libraries(inferx_server PUBLIC Threads::Threads)
