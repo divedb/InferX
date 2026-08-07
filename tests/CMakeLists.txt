@@ -29,3 +29,12 @@ target_link_libraries(inferx_remote_scheduler_client_test PRIVATE
   inferx::scheduler_client
   GTest::gtest_main)
 gtest_discover_tests(inferx_remote_scheduler_client_test)
+
+if(TARGET inferx_grpc_scheduler_transport)
+  add_executable(inferx_scheduler_contract_compatibility_test
+    unit/scheduler_client/scheduler_contract_compatibility_test.cc)
+  target_link_libraries(inferx_scheduler_contract_compatibility_test PRIVATE
+    inferx::grpc_scheduler_transport
+    GTest::gtest_main)
+  gtest_discover_tests(inferx_scheduler_contract_compatibility_test)
+endif()

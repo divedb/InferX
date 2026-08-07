@@ -57,6 +57,7 @@ Configure the shell and CMake to use that local prefix:
 export PATH="$PWD/.tools/grpc/usr/bin:$PATH"
 export CMAKE_PREFIX_PATH="$PWD/.tools/grpc/usr${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export PKG_CONFIG_PATH="$PWD/.tools/grpc/usr/lib/x86_64-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LIBRARY_PATH="$PWD/.tools/grpc/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$PWD/.tools/grpc/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
