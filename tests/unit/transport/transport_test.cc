@@ -34,6 +34,7 @@
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/middleware/authentication.h"
 #include "inferx/server/handlers/health_handler.h"
+#include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
 
@@ -831,6 +832,54 @@ TEST(HealthHandlerTest, ReadinessRequiresEveryServingDependency) {
   folly::coro::blockingWait(ready.Handle(
       std::move(second), {}, available, folly::CancellationToken{}));
   EXPECT_EQ(available.status, 200);
+}
+
+TEST(ModelsHandlerTest, ListsOnlyReadyModelsVisibleToAuthenticatedTenant) {
+  using ::inferx::server::handlers::ModelsHandler;
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord visible;
+  visible.id = "model-b";
+  visible.version = "v1";
+  visible.alias = "chat-current";
+  visible.created = 42;
+  visible.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(visible).ok());
+  ASSERT_TRUE(registry.SetState("model-b", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("model-b", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("model-b", "v1", ModelState::kReady).ok());
+  ModelRecord hidden;
+  hidden.id = "model-a";
+  hidden.version = "v2";
+  hidden.visible_tenants.insert("tenant-b");
+  ASSERT_TRUE(registry.Register(hidden).ok());
+  ASSERT_TRUE(registry.SetState("model-a", "v2", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("model-a", "v2", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("model-a", "v2", ModelState::kReady).ok());
+
+  ModelsHandler handler(&registry);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+  CapturingWriter writer;
+  HttpRequest request{http::verb::get, "/v1/models", 11};
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_EQ(writer.body,
+            "{\"object\":\"list\",\"data\":[{\"id\":\"chat-current\","
+            "\"object\":\"model\",\"created\":42,\"owned_by\":\"platform\","
+            "\"status\":\"ready\"}]}");
+}
+
+TEST(ModelsHandlerTest, RejectsMissingAuthenticatedContext) {
+  ::inferx::server::model_registry::Registry registry;
+  ::inferx::server::handlers::ModelsHandler handler(&registry);
+  CapturingWriter writer;
+  HttpRequest request{http::verb::get, "/v1/models", 11};
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), {}, writer, {}));
+  EXPECT_EQ(writer.status, 401);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

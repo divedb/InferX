@@ -1,7 +1,9 @@
-add_library(inferx_request_handlers health_handler.cc)
+add_library(inferx_request_handlers health_handler.cc models_handler.cc)
 add_library(inferx::request_handlers ALIAS inferx_request_handlers)
 target_include_directories(inferx_request_handlers PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_link_libraries(inferx_request_handlers PUBLIC
   inferx::http_transport
+  inferx::model_registry
+  inferx::support
   inferx::flags)
