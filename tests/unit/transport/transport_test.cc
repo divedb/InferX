@@ -299,6 +299,19 @@ TEST(AdmissionTest, EnforcesAndReleasesTenantReservations) {
   EXPECT_EQ(controller.active_requests(), 0);
 }
 
+TEST(RateLimiterTest, RefillsAndReportsRetryAdvice) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::time_point(std::chrono::seconds(20));
+  ::inferx::server::admission::RateLimiter limiter({1, 1, 10, 10});
+  EXPECT_TRUE(limiter.Consume("tenant_rate", 10, start).allowed);
+  auto rejected = limiter.Consume("tenant_rate", 1, start);
+  EXPECT_FALSE(rejected.allowed);
+  EXPECT_GT(rejected.retry_after.count(), 0);
+  EXPECT_TRUE(limiter.Consume("tenant_rate", 1,
+                             start + std::chrono::seconds(1))
+                  .allowed);
+}
+
 TEST(AuthTest, StoresHashesAndEnforcesScopes) {
   ::inferx::server::auth::ApiKeyStore store;
   ::inferx::server::auth::Principal principal;

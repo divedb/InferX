@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -33,6 +34,37 @@ struct AdmissionConfig {
   uint32_t max_active_requests = 1024;
   uint64_t max_reserved_tokens = 1u << 20;
   uint32_t max_active_per_tenant = 128;
+};
+
+struct RateLimitDecision {
+  bool allowed = false;
+  std::chrono::milliseconds retry_after{0};
+};
+
+struct RateLimitConfig {
+  double request_capacity = 100.0;
+  double request_refill_per_second = 100.0;
+  double token_capacity = 100000.0;
+  double token_refill_per_second = 100000.0;
+};
+
+class RateLimiter {
+ public:
+  explicit RateLimiter(RateLimitConfig config);
+  RateLimitDecision Consume(const request::TenantId& tenant,
+                            uint32_t requested_tokens,
+                            std::chrono::steady_clock::time_point now =
+                                std::chrono::steady_clock::now());
+
+ private:
+  struct Bucket {
+    double requests;
+    double tokens;
+    std::chrono::steady_clock::time_point updated;
+  };
+  RateLimitConfig config_;
+  std::mutex mutex_;
+  std::unordered_map<request::TenantId, Bucket> buckets_;
 };
 
 class AdmissionController {
