@@ -13,6 +13,7 @@ target_link_libraries(inferx_transport_test PRIVATE
   inferx::model_registry
   inferx::tokenization_service
   inferx::request_runtime
+  inferx::managed_request_service
   inferx::streaming
   inferx::server_middleware
   inferx::request_handlers

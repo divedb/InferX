@@ -23,6 +23,7 @@
 #include "inferx/server/request/request_context.h"
 #include "inferx/server/request/request_manager.h"
 #include "inferx/server/request/request_id.h"
+#include "inferx/server/request/managed_request_service.h"
 #include "inferx/server/streaming/event_buffer.h"
 #include "inferx/server/streaming/backpressure_controller.h"
 #include "inferx/server/streaming/event_router.h"
@@ -203,6 +204,53 @@ class FakeRequestService final
 
   ::inferx::server::scheduler_client::ScheduledRequest submitted;
   bool cancelled = false;
+};
+
+class FakeSchedulerClient final
+    : public ::inferx::server::scheduler_client::SchedulerClient {
+ public:
+  folly::coro::Task<StatusOr<
+      ::inferx::server::scheduler_client::SubmitResult>>
+  Submit(::inferx::server::scheduler_client::ScheduledRequest request,
+         folly::CancellationToken) override {
+    submitted = request;
+    co_return ::inferx::server::scheduler_client::SubmitResult{
+        request.request_id, 0};
+  }
+  folly::coro::AsyncGenerator<
+      ::inferx::server::scheduler_client::GenerationEvent&&>
+  Events(::inferx::server::request::RequestId request_id,
+         folly::CancellationToken) override {
+    ::inferx::server::scheduler_client::GenerationEvent event;
+    event.request_id = request_id;
+    event.sequence_number = 1;
+    event.terminal = true;
+    event.finish_reason =
+        ::inferx::server::scheduler_client::FinishReason::kStop;
+    event.usage = {.prompt_tokens = 2, .completion_tokens = 1};
+    co_yield std::move(event);
+  }
+  folly::coro::Task<Status> Cancel(
+      ::inferx::server::request::RequestId,
+      ::inferx::server::request::CancellationReason) override {
+    ++cancel_count;
+    co_return OkStatus();
+  }
+  folly::coro::Task<StatusOr<
+      ::inferx::server::request::RequestSnapshot>>
+  GetStatus(::inferx::server::request::RequestId,
+            folly::CancellationToken) override {
+    co_return UnimplementedError("not used");
+  }
+  folly::coro::Task<Status> UpdatePriority(
+      ::inferx::server::request::RequestId,
+      ::inferx::server::scheduler_client::PriorityClass,
+      folly::CancellationToken) override {
+    co_return OkStatus();
+  }
+
+  ::inferx::server::scheduler_client::ScheduledRequest submitted;
+  int cancel_count = 0;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -888,6 +936,76 @@ TEST(SchedulerContractTest, CarriesTypedTerminalUsageAndEmbeddings) {
   event.embeddings.push_back({.index = 0, .values = {0.25f, -0.5f}});
   EXPECT_EQ(event.usage.prompt_tokens, 4);
   EXPECT_EQ(event.embeddings.front().values.size(), 2);
+}
+
+TEST(ManagedRequestServiceTest, OwnsLifecycleAdmissionAndFinalization) {
+  ::inferx::server::request::RequestManager manager;
+  FakeSchedulerClient scheduler;
+  ::inferx::server::admission::AdmissionController admission(
+      {.max_active_requests = 1,
+       .max_reserved_tokens = 16,
+       .max_active_per_tenant = 1});
+  ::inferx::server::request::ManagedRequestService service(
+      &manager, &scheduler, &admission);
+  ::inferx::server::scheduler_client::ScheduledRequest command;
+  command.request_id = "req_managed";
+  command.tenant_id = "tenant";
+  command.model_version = "model@v1";
+  command.prompt_tokens = {1, 2};
+  command.sampling.max_tokens = 3;
+  command.deadline = std::chrono::steady_clock::now() +
+                     std::chrono::seconds(10);
+  auto submitted = folly::coro::blockingWait(service.Submit(command, {}));
+  ASSERT_TRUE(submitted.ok()) << submitted.status();
+  EXPECT_EQ(admission.active_requests(), 1);
+  EXPECT_EQ(manager.active_count(), 1);
+  auto queued = manager.GetStatus("req_managed");
+  ASSERT_TRUE(queued.ok()) << queued.status();
+  EXPECT_EQ(queued->state,
+            ::inferx::server::request::RequestState::kQueued);
+
+  auto consume = [&]() -> folly::coro::Task<void> {
+    auto events = service.Events("req_managed", {});
+    while (co_await events.next()) {
+    }
+  };
+  folly::coro::blockingWait(consume());
+  EXPECT_EQ(admission.active_requests(), 0);
+  EXPECT_EQ(manager.active_count(), 0);
+  EXPECT_EQ(manager.completed_count(), 1);
+  auto completed = manager.GetStatus("req_managed");
+  ASSERT_TRUE(completed.ok()) << completed.status();
+  EXPECT_EQ(completed->state,
+            ::inferx::server::request::RequestState::kCompleted);
+}
+
+TEST(ManagedRequestServiceTest, CancellationIsIdempotentAcrossCleanup) {
+  ::inferx::server::request::RequestManager manager;
+  FakeSchedulerClient scheduler;
+  ::inferx::server::admission::AdmissionController admission({});
+  ::inferx::server::request::ManagedRequestService service(
+      &manager, &scheduler, &admission);
+  ::inferx::server::scheduler_client::ScheduledRequest command;
+  command.request_id = "req_cancel";
+  command.tenant_id = "tenant";
+  command.model_version = "model@v1";
+  command.prompt_tokens = {1};
+  command.sampling.max_tokens = 1;
+  command.deadline = std::chrono::steady_clock::now() +
+                     std::chrono::seconds(10);
+  ASSERT_TRUE(folly::coro::blockingWait(service.Submit(command, {})).ok());
+  EXPECT_TRUE(folly::coro::blockingWait(service.Cancel(
+      "req_cancel",
+      ::inferx::server::request::CancellationReason::kAdministrative)).ok());
+  EXPECT_TRUE(folly::coro::blockingWait(service.Cancel(
+      "req_cancel",
+      ::inferx::server::request::CancellationReason::kAdministrative)).ok());
+  EXPECT_EQ(scheduler.cancel_count, 1);
+  EXPECT_EQ(admission.active_requests(), 0);
+  auto snapshot = manager.GetStatus("req_cancel");
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status();
+  EXPECT_EQ(snapshot->state,
+            ::inferx::server::request::RequestState::kCancelled);
 }
 
 TEST(HealthHandlerTest, LivenessDoesNotDependOnModelAvailability) {
