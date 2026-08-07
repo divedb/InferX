@@ -39,6 +39,8 @@ struct ScheduledRequest {
   std::vector<int32_t> prompt_tokens;
   SamplingParams sampling;
   std::chrono::steady_clock::time_point deadline;
+  std::string traceparent;
+  std::string tracestate;
 };
 
 struct SubmitResult {
@@ -58,6 +60,7 @@ struct EmbeddingResult {
 
 struct GenerationEvent {
   request::RequestId request_id;
+  uint32_t attempt = 0;
   uint64_t sequence_number = 0;
   std::string text_delta;
   std::vector<int32_t> token_ids;

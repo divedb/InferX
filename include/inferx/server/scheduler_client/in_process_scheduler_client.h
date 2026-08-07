@@ -44,9 +44,14 @@ class InProcessSchedulerClient final : public SchedulerClient {
       request::RequestId request_id, PriorityClass priority,
       folly::CancellationToken cancellation) override;
  private:
+  struct ActiveGeneration {
+    std::shared_ptr<LegacyGeneration> generation;
+    uint32_t attempt = 0;
+  };
+
   LegacyEngineBackend* backend_;
   folly::Executor* blocking_executor_;
   std::mutex mutex_;
-  std::unordered_map<request::RequestId, std::shared_ptr<LegacyGeneration>> generations_;
+  std::unordered_map<request::RequestId, ActiveGeneration> generations_;
 };
 }  // namespace inferx::server::scheduler_client

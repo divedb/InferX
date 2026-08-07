@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package inference.scheduler.v1;
+
+service Scheduler {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream GenerationEvent);
+  rpc Cancel(CancelRequest) returns (OperationResponse);
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+  rpc UpdatePriority(UpdatePriorityRequest) returns (OperationResponse);
+}
+
+enum WorkloadClass {
+  WORKLOAD_CLASS_UNSPECIFIED = 0;
+  WORKLOAD_CLASS_GENERATION = 1;
+  WORKLOAD_CLASS_EMBEDDING = 2;
+}
+
+enum PriorityClass {
+  PRIORITY_CLASS_UNSPECIFIED = 0;
+  PRIORITY_CLASS_INTERACTIVE = 1;
+  PRIORITY_CLASS_BATCH = 2;
+  PRIORITY_CLASS_BACKGROUND = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_CANCELLED = 3;
+  FINISH_REASON_FAILED = 4;
+}
+
+message TraceContext {
+  string traceparent = 1;
+  string tracestate = 2;
+}
+
+message SamplingParams {
+  int32 max_tokens = 1;
+  float temperature = 2;
+  float top_p = 3;
+  uint64 seed = 4;
+  repeated string stop = 5;
+}
+
+message SubmitRequest {
+  string request_id = 1;
+  uint32 attempt = 2;
+  string tenant_id = 3;
+  string model_version = 4;
+  WorkloadClass workload = 5;
+  PriorityClass priority = 6;
+  repeated int32 prompt_tokens = 7;
+  SamplingParams sampling = 8;
+  string tokenizer_revision = 9;
+  int64 deadline_unix_millis = 10;
+  TraceContext trace = 11;
+}
+
+message SubmitResponse {
+  string request_id = 1;
+  uint32 attempt = 2;
+}
+
+message SubscribeRequest {
+  string request_id = 1;
+  uint32 attempt = 2;
+  uint64 after_sequence_number = 3;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+}
+
+message EmbeddingResult {
+  uint32 index = 1;
+  repeated float values = 2;
+}
+
+message RpcError {
+  int32 code = 1;
+  string message = 2;
+}
+
+message GenerationEvent {
+  string request_id = 1;
+  uint32 attempt = 2;
+  uint64 sequence_number = 3;
+  bytes text_delta = 4;
+  repeated int32 token_ids = 5;
+  repeated EmbeddingResult embeddings = 6;
+  uint32 generated_tokens = 7;
+  bool terminal = 8;
+  FinishReason finish_reason = 9;
+  Usage usage = 10;
+  RpcError error = 11;
+}
+
+message CancelRequest {
+  string request_id = 1;
+  uint32 attempt = 2;
+  int32 reason = 3;
+}
+
+message GetStatusRequest {
+  string request_id = 1;
+  uint32 attempt = 2;
+}
+
+message StatusResponse {
+  bool found = 1;
+  string request_id = 2;
+  uint32 attempt = 3;
+  int32 state = 4;
+  int64 received_unix_millis = 5;
+  int64 deadline_unix_millis = 6;
+  int64 completed_unix_millis = 7;
+}
+
+message UpdatePriorityRequest {
+  string request_id = 1;
+  uint32 attempt = 2;
+  PriorityClass priority = 3;
+}
+
+message OperationResponse {}

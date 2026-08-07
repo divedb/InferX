@@ -52,18 +52,22 @@ folly::coro::Task<StatusOr<SubmitResult>> InProcessSchedulerClient::Submit(
     if (generations_.contains(request.request_id)) {
       co_return FailedPreconditionError("request already submitted");
     }
-    generations_.emplace(request.request_id, *generation);
+    generations_.emplace(
+        request.request_id,
+        ActiveGeneration{.generation = *generation, .attempt = request.attempt});
   }
   co_return SubmitResult{request.request_id, request.attempt};
 }
 folly::coro::AsyncGenerator<GenerationEvent&&> InProcessSchedulerClient::Events(
     request::RequestId request_id, folly::CancellationToken cancellation) {
   std::shared_ptr<LegacyGeneration> generation;
+  uint32_t attempt = 0;
   {
     std::lock_guard lock(mutex_);
     const auto found = generations_.find(request_id);
     if (found == generations_.end()) co_return;
-    generation = found->second;
+    generation = found->second.generation;
+    attempt = found->second.attempt;
   }
   uint64_t sequence = 1;
   while (!cancellation.isCancellationRequested()) {
@@ -71,6 +75,7 @@ folly::coro::AsyncGenerator<GenerationEvent&&> InProcessSchedulerClient::Events(
     if (!next.ok()) {
       GenerationEvent failed;
       failed.request_id = request_id;
+      failed.attempt = attempt;
       failed.sequence_number = sequence;
       failed.terminal = true;
       failed.finish_reason = FinishReason::kFailed;
@@ -81,6 +86,7 @@ folly::coro::AsyncGenerator<GenerationEvent&&> InProcessSchedulerClient::Events(
     if (!next->has_value()) break;
     GenerationEvent event;
     event.request_id = request_id;
+    event.attempt = attempt;
     event.sequence_number = sequence++;
     event.text_delta = std::move((*next)->text);
     event.generated_tokens = (*next)->generated_tokens;
@@ -103,7 +109,7 @@ folly::coro::Task<Status> InProcessSchedulerClient::Cancel(
     std::lock_guard lock(mutex_);
     const auto found = generations_.find(request_id);
     if (found == generations_.end()) co_return OkStatus();
-    generation = found->second;
+    generation = found->second.generation;
   }
   generation->Cancel();
   co_return OkStatus();
