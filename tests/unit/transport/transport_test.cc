@@ -312,6 +312,23 @@ TEST(RateLimiterTest, RefillsAndReportsRetryAdvice) {
                   .allowed);
 }
 
+TEST(RateLimiterTest, ReconcilesReservedTokensAgainstActualUsage) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::time_point(std::chrono::seconds(30));
+  ::inferx::server::admission::RateLimiter limiter({10, 1, 100, 1});
+
+  ASSERT_TRUE(limiter.Consume("tenant_reconcile", 80, start).allowed);
+  EXPECT_FALSE(limiter.Consume("tenant_reconcile", 30, start).allowed);
+
+  ASSERT_TRUE(limiter.Reconcile("tenant_reconcile", 80, 20, start).ok());
+  EXPECT_TRUE(limiter.Consume("tenant_reconcile", 30, start).allowed);
+
+  ASSERT_TRUE(limiter.Reconcile("tenant_reconcile", 30, 50, start).ok());
+  EXPECT_FALSE(limiter.Consume("tenant_reconcile", 31, start).allowed);
+  EXPECT_EQ(limiter.Reconcile("unknown", 1, 1, start).code(),
+            absl::StatusCode::kFailedPrecondition);
+}
+
 TEST(AuthTest, StoresHashesAndEnforcesScopes) {
   ::inferx::server::auth::ApiKeyStore store;
   ::inferx::server::auth::Principal principal;

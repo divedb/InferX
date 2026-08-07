@@ -55,6 +55,14 @@ class RateLimiter {
                             uint32_t requested_tokens,
                             std::chrono::steady_clock::time_point now =
                                 std::chrono::steady_clock::now());
+  /// Reconciles a prior maximum-token reservation with actual usage. Unused
+  /// tokens are returned to the tenant bucket; usage above the reservation is
+  /// charged as debt so a caller cannot bypass the token rate by under-
+  /// reserving. The request-rate token is deliberately not refunded.
+  Status Reconcile(const request::TenantId& tenant, uint32_t reserved_tokens,
+                   uint32_t actual_tokens,
+                   std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now());
 
  private:
   struct Bucket {

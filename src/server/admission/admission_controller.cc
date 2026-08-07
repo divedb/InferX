@@ -47,6 +47,38 @@ RateLimitDecision RateLimiter::Consume(
                     static_cast<int64_t>(std::ceil(wait * 1000.0)))};
 }
 
+Status RateLimiter::Reconcile(
+    const request::TenantId& tenant, uint32_t reserved_tokens,
+    uint32_t actual_tokens, std::chrono::steady_clock::time_point now) {
+  if (tenant.empty() || reserved_tokens == 0) {
+    return InvalidArgumentError(
+        "tenant ID and reserved tokens are required for reconciliation");
+  }
+
+  std::lock_guard lock(mutex_);
+  const auto it = buckets_.find(tenant);
+  if (it == buckets_.end()) {
+    return FailedPreconditionError(
+        "tenant has no token reservation to reconcile");
+  }
+
+  Bucket& bucket = it->second;
+  const double elapsed = std::max(
+      0.0, std::chrono::duration<double>(now - bucket.updated).count());
+  bucket.updated = now;
+  bucket.requests = std::min(
+      config_.request_capacity,
+      bucket.requests + elapsed * config_.request_refill_per_second);
+  bucket.tokens = std::min(
+      config_.token_capacity,
+      bucket.tokens + elapsed * config_.token_refill_per_second);
+
+  const double adjustment = static_cast<double>(reserved_tokens) -
+                            static_cast<double>(actual_tokens);
+  bucket.tokens = std::min(config_.token_capacity, bucket.tokens + adjustment);
+  return OkStatus();
+}
+
 AdmissionController::AdmissionController(AdmissionConfig config)
     : config_(config) {}
 
