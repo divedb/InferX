@@ -17,6 +17,7 @@
 #include "inferx/server/transport/io_runtime.h"
 #include "inferx/server/transport/routes.h"
 #include "inferx/server/transport/sse_writer.h"
+#include "inferx/api/openai.h"
 #include "inferx/server/api/error_mapping.h"
 #include "inferx/server/request/request_context.h"
 #include "inferx/server/request/request_manager.h"
@@ -164,6 +165,50 @@ TEST(ErrorMappingTest, MapsRetryableStatusAndEscapesFields) {
             "{\"error\":{\"message\":\"quota \\\"full\\\"\","
             "\"type\":\"rate_limit_error\",\"param\":\"max_tokens\","
             "\"code\":\"capacity_exceeded\",\"request_id\":\"req_1\"}}");
+}
+
+TEST(OpenAiProtocolTest, ValidatesExtendedSamplingParameters) {
+  auto parsed = ::inferx::api::ParseCompletionRequest(
+      R"({"model":"m","prompt":"p","stream":true,"stream_options":{"include_usage":true},"top_k":0,"repetition_penalty":1,"n":1,"seed":42})");
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  EXPECT_EQ(parsed->sampling.top_k, 0);
+  EXPECT_FLOAT_EQ(parsed->sampling.repetition_penalty, 1.0f);
+  EXPECT_TRUE(parsed->sampling.include_usage);
+
+  EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
+                   R"({"model":"m","prompt":"p","stream_options":{}})")
+                   .ok());
+  EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
+                   R"({"model":"m","prompt":"p","n":2})")
+                   .ok());
+  EXPECT_EQ(::inferx::api::ParseCompletionRequest(
+                R"({"model":"m","prompt":"p","top_k":40})")
+                .status()
+                .code(),
+            absl::StatusCode::kUnimplemented);
+  EXPECT_EQ(::inferx::api::ParseCompletionRequest(
+                R"({"model":"m","prompt":"p","repetition_penalty":1.1})")
+                .status()
+                .code(),
+            absl::StatusCode::kUnimplemented);
+  EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
+                   R"({"model":"m","prompt":"p","seed":-1})")
+                   .ok());
+  EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
+                   R"({"model":"m","prompt":"p","stop":[""]})")
+                   .ok());
+}
+
+TEST(OpenAiProtocolTest, ParsesEmbeddingInputsWithoutExecutingThem) {
+  auto parsed = ::inferx::api::ParseEmbeddingsRequest(
+      R"({"model":"embed","input":["one","two"],"encoding_format":"float","dimensions":128})");
+  ASSERT_TRUE(parsed.ok()) << parsed.status();
+  EXPECT_EQ(parsed->input.size(), 2);
+  EXPECT_TRUE(parsed->has_dimensions);
+  EXPECT_EQ(parsed->dimensions, 128);
+  EXPECT_FALSE(::inferx::api::ParseEmbeddingsRequest(
+                   R"({"model":"embed","input":[],"encoding_format":"hex"})")
+                   .ok());
 }
 
 TEST(RequestStateTest, EnforcesLifecycleAndIdempotentCancellation) {

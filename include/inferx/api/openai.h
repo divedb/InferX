@@ -43,6 +43,9 @@ struct SamplingRequest {
 
   /// Nucleus threshold; at or above 1 disables truncation.
   float top_p = 1.0f;
+  int32_t top_k = 0;
+  float repetition_penalty = 1.0f;
+  int32_t n = 1;
 
   /// Fixes the draw so a request is reproducible. Absent means the server
   /// picks one, which it also reports back.
@@ -76,6 +79,14 @@ struct TokenizeRequest {
   bool add_special_tokens = false;
 };
 
+struct EmbeddingsRequest {
+  std::string model;
+  std::vector<std::string> input;
+  std::string encoding_format = "float";
+  int32_t dimensions = 0;
+  bool has_dimensions = false;
+};
+
 /// \brief Parses a chat completion body.
 ///
 /// Every failure is InvalidArgument with a message naming the offending field,
@@ -87,6 +98,7 @@ StatusOr<ChatCompletionRequest> ParseChatCompletionRequest(
 StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body);
 
 StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body);
+StatusOr<EmbeddingsRequest> ParseEmbeddingsRequest(std::string_view body);
 
 /// \brief Token accounting returned with every response.
 struct Usage {

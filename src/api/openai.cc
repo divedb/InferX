@@ -1,6 +1,7 @@
 #include "inferx/api/openai.h"
 
 #include <algorithm>
+#include <limits>
 
 #include "inferx/support/json.h"
 
@@ -38,6 +39,10 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
 
     INFERX_ASSIGN_OR_RETURN(out->include_usage,
                             opts->OptionalBool("include_usage", false));
+    if (!out->stream) {
+      return InvalidArgumentError(
+          "stream_options is valid only when stream is true");
+    }
   }
 
   if (const JsonValue* t = root.Find("temperature");
@@ -61,10 +66,39 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
     out->top_p = static_cast<float>(value);
   }
 
+  INFERX_ASSIGN_OR_RETURN(const int64_t top_k,
+                          root.OptionalInt("top_k", out->top_k));
+  if (top_k < 0 || top_k > std::numeric_limits<int32_t>::max()) {
+    return InvalidArgumentError("top_k must be a non-negative 32-bit integer");
+  }
+  out->top_k = static_cast<int32_t>(top_k);
+  if (out->top_k != 0) {
+    return UnimplementedError("top_k is not supported by the current sampler");
+  }
+
+  if (const JsonValue* penalty = root.Find("repetition_penalty");
+      penalty != nullptr && !penalty->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, penalty->AsDouble());
+    if (value <= 0.0 || value > 2.0) {
+      return InvalidArgumentError(
+          "repetition_penalty must be in (0, 2], got ", value);
+    }
+    out->repetition_penalty = static_cast<float>(value);
+    if (out->repetition_penalty != 1.0f) {
+      return UnimplementedError(
+          "repetition_penalty is not supported by the current sampler");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(const int64_t n, root.OptionalInt("n", out->n));
+  if (n != 1) {
+    return UnimplementedError("n must be 1; multiple sequences are unsupported");
+  }
+
   if (const JsonValue* seed = root.Find("seed");
       seed != nullptr && !seed->IsNull()) {
     INFERX_ASSIGN_OR_RETURN(const int64_t value, seed->AsInt());
-
+    if (value < 0) return InvalidArgumentError("seed must be non-negative");
     out->seed = static_cast<uint64_t>(value);
     out->has_seed = true;
   }
@@ -75,6 +109,7 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
       stop != nullptr && !stop->IsNull()) {
     if (stop->kind() == JsonValue::Kind::kString) {
       INFERX_ASSIGN_OR_RETURN(const std::string_view value, stop->AsString());
+      if (value.empty()) return InvalidArgumentError("stop must not be empty");
       out->stop.emplace_back(value);
     } else if (stop->IsArray()) {
       INFERX_ASSIGN_OR_RETURN(const auto* list, stop->AsArray());
@@ -82,7 +117,10 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
       for (const JsonValue& entry : *list) {
         INFERX_ASSIGN_OR_RETURN(const std::string_view value,
                                 entry.AsString());
-        if (!value.empty()) out->stop.emplace_back(value);
+        if (value.empty()) {
+          return InvalidArgumentError("stop entries must not be empty");
+        }
+        out->stop.emplace_back(value);
       }
     } else {
       return InvalidArgumentError("stop must be a string or an array of "
@@ -215,6 +253,54 @@ StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body) {
   INFERX_ASSIGN_OR_RETURN(
       request.add_special_tokens,
       root.OptionalBool("add_special_tokens", false));
+  return request;
+}
+
+StatusOr<EmbeddingsRequest> ParseEmbeddingsRequest(std::string_view body) {
+  INFERX_ASSIGN_OR_RETURN(const JsonValue root, ParseJson(body));
+  if (!root.IsObject()) {
+    return InvalidArgumentError("request body must be a JSON object, got ",
+                                root.KindName());
+  }
+  EmbeddingsRequest request;
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
+
+  const JsonValue* input = root.Find("input");
+  if (input == nullptr) return InvalidArgumentError("missing required field \"input\"");
+  if (input->kind() == JsonValue::Kind::kString) {
+    INFERX_ASSIGN_OR_RETURN(const std::string_view text, input->AsString());
+    request.input.emplace_back(text);
+  } else if (input->IsArray()) {
+    INFERX_ASSIGN_OR_RETURN(const auto* values, input->AsArray());
+    if (values->empty()) return InvalidArgumentError("\"input\" is empty");
+    for (const JsonValue& value : *values) {
+      INFERX_ASSIGN_OR_RETURN(const std::string_view text, value.AsString());
+      request.input.emplace_back(text);
+    }
+  } else {
+    return InvalidArgumentError("input must be a string or array of strings");
+  }
+
+  if (const JsonValue* encoding = root.Find("encoding_format");
+      encoding != nullptr && !encoding->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const std::string_view value, encoding->AsString());
+    if (value != "float" && value != "base64") {
+      return InvalidArgumentError("encoding_format must be float or base64");
+    }
+    request.encoding_format = std::string(value);
+  }
+  if (const JsonValue* dimensions = root.Find("dimensions");
+      dimensions != nullptr && !dimensions->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t value, dimensions->AsInt());
+    if (value <= 0 || value > std::numeric_limits<int32_t>::max()) {
+      return InvalidArgumentError("dimensions must be a positive 32-bit integer");
+    }
+    request.dimensions = static_cast<int32_t>(value);
+    request.has_dimensions = true;
+  }
   return request;
 }
 
