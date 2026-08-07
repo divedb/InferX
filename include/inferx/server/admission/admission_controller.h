@@ -16,13 +16,19 @@ enum class AdmissionReason {
   kGlobalConcurrency,
   kTenantConcurrency,
   kTokenCapacity,
+  kQueueCapacity,
+  kEventBufferCapacity,
+  kSchedulerUnavailable,
+  kModelUnavailable,
   kInvalidRequest,
 };
 
 struct AdmissionDecision {
   AdmissionReason reason = AdmissionReason::kInvalidRequest;
   std::string message;
+  std::chrono::milliseconds retry_after{0};
   bool admitted() const { return reason == AdmissionReason::kAdmitted; }
+  bool retryable() const { return retry_after.count() > 0; }
 };
 
 struct AdmissionRequest {

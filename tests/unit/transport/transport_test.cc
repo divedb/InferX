@@ -24,6 +24,7 @@
 #include "inferx/server/streaming/backpressure_controller.h"
 #include "inferx/server/streaming/event_router.h"
 #include "inferx/server/admission/admission_controller.h"
+#include "inferx/server/admission/capacity_policy.h"
 #include "inferx/server/auth/api_key_store.h"
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
@@ -297,6 +298,42 @@ TEST(AdmissionTest, EnforcesAndReleasesTenantReservations) {
   EXPECT_EQ(controller.reserved_tokens(), 70);
   controller.Release(other);
   EXPECT_EQ(controller.active_requests(), 0);
+}
+
+TEST(CapacityPolicyTest, RejectsUnavailableAndExhaustedCapacity) {
+  using ::inferx::server::admission::AdmissionReason;
+  using ::inferx::server::admission::CapacityPolicy;
+  using ::inferx::server::admission::CapacitySnapshot;
+  CapacityPolicy policy({.max_queued_requests = 2,
+                         .max_event_buffer_bytes = 100,
+                         .overload_retry_after = std::chrono::milliseconds(250),
+                         .unavailable_retry_after =
+                             std::chrono::milliseconds(500)});
+
+  auto decision = policy.Evaluate({});
+  EXPECT_EQ(decision.reason, AdmissionReason::kSchedulerUnavailable);
+  EXPECT_EQ(decision.retry_after, std::chrono::milliseconds(500));
+
+  decision = policy.Evaluate({.scheduler_healthy = true});
+  EXPECT_EQ(decision.reason, AdmissionReason::kModelUnavailable);
+
+  decision = policy.Evaluate({.scheduler_healthy = true,
+                              .model_ready = true,
+                              .queued_requests = 2});
+  EXPECT_EQ(decision.reason, AdmissionReason::kQueueCapacity);
+  EXPECT_EQ(decision.retry_after, std::chrono::milliseconds(250));
+
+  decision = policy.Evaluate({.scheduler_healthy = true,
+                              .model_ready = true,
+                              .event_buffer_bytes = 100});
+  EXPECT_EQ(decision.reason, AdmissionReason::kEventBufferCapacity);
+
+  decision = policy.Evaluate({.scheduler_healthy = true,
+                              .model_ready = true,
+                              .queued_requests = 1,
+                              .event_buffer_bytes = 99});
+  EXPECT_TRUE(decision.admitted());
+  EXPECT_FALSE(decision.retryable());
 }
 
 TEST(RateLimiterTest, RefillsAndReportsRetryAdvice) {
