@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 
 #include "inferx/server/handlers/embeddings_handler.h"
@@ -22,6 +23,7 @@ struct ApiRouteDependencies {
   std::shared_ptr<EmbeddingsService> embeddings;
   std::shared_ptr<transport::RouteGuard> guard;
   size_t max_inference_body_bytes = 1u << 20;
+  std::chrono::seconds request_timeout{300};
 };
 
 /// Builds the public API route table. Authentication policy and body limits

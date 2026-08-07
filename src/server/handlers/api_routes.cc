@@ -44,8 +44,14 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
   if (dependencies.max_inference_body_bytes == 0) {
     return InvalidArgumentError("inference body limit must be positive");
   }
+  if (dependencies.request_timeout <= std::chrono::seconds::zero()) {
+    return InvalidArgumentError("request timeout must be positive");
+  }
 
   auto routes = std::make_shared<transport::Routes>(dependencies.guard);
+  INFERX_RETURN_IF_ERROR(AddPublicProbe(routes.get(), "/health", "health",
+                                       dependencies.health,
+                                       HealthProbe::kLive));
   INFERX_RETURN_IF_ERROR(AddPublicProbe(routes.get(), "/health/live",
                                        "health.live", dependencies.health,
                                        HealthProbe::kLive));
@@ -84,7 +90,7 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
        .required_scope = "inference.invoke"},
       std::make_shared<ChatCompletionHandler>(
           dependencies.models, dependencies.tokenization,
-          dependencies.requests)));
+          dependencies.requests, dependencies.request_timeout)));
   INFERX_RETURN_IF_ERROR(routes->Add(
       boost::beast::http::verb::post, "/v1/completions",
       {.name = "completions",
@@ -93,7 +99,7 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
        .required_scope = "inference.invoke"},
       std::make_shared<CompletionHandler>(
           dependencies.models, dependencies.tokenization,
-          dependencies.requests)));
+          dependencies.requests, dependencies.request_timeout)));
   INFERX_RETURN_IF_ERROR(routes->Add(
       boost::beast::http::verb::post, "/v1/tokenize",
       {.name = "tokenize",

@@ -87,7 +87,9 @@ StatusOr<Principal> ApiKeyAuthenticator::Authenticate(
     std::string_view authorization) const {
   if (store_ == nullptr) return InternalError("API-key store is unavailable");
   if (allow_anonymous_ && store_->size() == 0) {
-    return Principal{.tenant_id = "development", .subject = "anonymous"};
+    return Principal{.tenant_id = "development",
+                     .subject = "anonymous",
+                     .scopes = {"inference.invoke", "models.read"}};
   }
 
   constexpr std::string_view prefix = "Bearer ";

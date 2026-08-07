@@ -21,6 +21,14 @@ target_link_libraries(inferx_server
     inferx::model
     inferx::observe
     inferx::engine_client
+    inferx::admission
+    inferx::auth
+    inferx::http_transport
+    inferx::managed_request_service
+    inferx::model_registry
+    inferx::request_handlers
+    inferx::server_middleware
+    inferx::tokenization_service
     inferx::scheduler_client
     inferx::server_observability
     inferx::scheduler

@@ -5,7 +5,7 @@
 namespace inferx::server::tokenization {
 
 InProcessTokenizationService::InProcessTokenizationService(
-    tokenizer::Tokenizer* tokenizer, request::ModelVersion model_version)
+    const tokenizer::Tokenizer* tokenizer, request::ModelVersion model_version)
     : tokenizer_(tokenizer), model_version_(std::move(model_version)) {}
 
 StatusOr<TokenizedPrompt> InProcessTokenizationService::TokenizeCompletion(

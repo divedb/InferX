@@ -32,7 +32,7 @@ class TokenizationService {
 /// Compatibility adapter for the currently loaded in-process model.
 class InProcessTokenizationService final : public TokenizationService {
  public:
-  InProcessTokenizationService(tokenizer::Tokenizer* tokenizer,
+  InProcessTokenizationService(const tokenizer::Tokenizer* tokenizer,
                                request::ModelVersion model_version);
 
   StatusOr<TokenizedPrompt> TokenizeCompletion(
@@ -43,7 +43,7 @@ class InProcessTokenizationService final : public TokenizationService {
       const std::vector<tokenizer::ChatMessage>& messages) override;
 
  private:
-  tokenizer::Tokenizer* tokenizer_;
+  const tokenizer::Tokenizer* tokenizer_;
   request::ModelVersion model_version_;
 };
 

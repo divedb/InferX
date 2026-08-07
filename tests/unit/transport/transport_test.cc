@@ -932,6 +932,30 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
   EXPECT_EQ(health_writer.status, 200);
 }
 
+TEST(AuthMiddlewareTest, DevelopmentBypassAuthorizesConfiguredApiScopes) {
+  auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
+  auto authenticator =
+      std::make_shared<::inferx::server::auth::ApiKeyAuthenticator>(
+          store.get(), true);
+  auto guard = std::make_shared<
+      ::inferx::server::middleware::BearerRouteGuard>(authenticator);
+  Routes routes(guard);
+  auto handler = std::make_shared<OkHandler>();
+  ASSERT_TRUE(routes.Add(http::verb::post, "/invoke",
+                         {.authentication_required = true,
+                          .required_scope = "inference.invoke"},
+                         handler)
+                  .ok());
+
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/invoke", 11};
+  folly::coro::blockingWait(
+      routes.Handle(std::move(request), {}, writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_TRUE(handler->last_context.authenticated);
+  EXPECT_EQ(handler->last_context.tenant_id, "development");
+}
+
 TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
   ::inferx::server::model_registry::Registry registry;
   ::inferx::server::model_registry::ModelRecord record;
@@ -1365,6 +1389,12 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
   folly::coro::blockingWait(
       (*built)->Handle(std::move(live), {}, live_writer, {}));
   EXPECT_EQ(live_writer.status, 200);
+
+  CapturingWriter compatibility_writer;
+  HttpRequest compatibility{http::verb::get, "/health", 11};
+  folly::coro::blockingWait((*built)->Handle(
+      std::move(compatibility), {}, compatibility_writer, {}));
+  EXPECT_EQ(compatibility_writer.status, 200);
 
   CapturingWriter denied_writer;
   HttpRequest denied{http::verb::get, "/v1/models", 11};

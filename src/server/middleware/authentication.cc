@@ -23,11 +23,11 @@ folly::coro::Task<Status> BearerRouteGuard::Check(
     co_return InternalError("authentication middleware is not configured");
   }
   const auto header = request.find(boost::beast::http::field::authorization);
-  if (header == request.end()) {
-    co_return absl::UnauthenticatedError("Authorization header is required");
-  }
-  auto authenticated = authenticator_->Authenticate(std::string_view(
-      header->value().data(), header->value().size()));
+  const std::string_view authorization =
+      header == request.end()
+          ? std::string_view{}
+          : std::string_view(header->value().data(), header->value().size());
+  auto authenticated = authenticator_->Authenticate(authorization);
   if (!authenticated.ok()) co_return authenticated.status();
   Status authorized = auth::Authorize(*authenticated, metadata.required_scope);
   if (!authorized.ok()) co_return authorized;
