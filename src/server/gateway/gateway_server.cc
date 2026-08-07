@@ -63,7 +63,9 @@ class GatewayMetrics final : public observability::MetricsSource {
   observability::MetricsSnapshot Snapshot() const override { return {}; }
 };
 
-Status Validate(const GatewayServerConfig& config) {
+}  // namespace
+
+Status ValidateGatewayServerConfig(const GatewayServerConfig& config) {
   if (config.port < 0 || config.port > 65535) {
     return InvalidArgumentError("port must be in [0, 65535]");
   }
@@ -93,8 +95,6 @@ Status Validate(const GatewayServerConfig& config) {
   }
   return OkStatus();
 }
-
-}  // namespace
 
 struct GatewayServer::Impl {
   GatewayServerConfig config;
@@ -268,7 +268,7 @@ GatewayServer::~GatewayServer() = default;
 
 StatusOr<std::unique_ptr<GatewayServer>> GatewayServer::Create(
     const GatewayServerConfig& config) {
-  INFERX_RETURN_IF_ERROR(Validate(config));
+  INFERX_RETURN_IF_ERROR(ValidateGatewayServerConfig(config));
   INFERX_ASSIGN_OR_RETURN(auto tokenizer, tokenizer::Tokenizer::LoadFrom(
                                               config.tokenizer_directory));
   const size_t application_threads =

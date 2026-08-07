@@ -28,6 +28,8 @@ struct GatewayServerConfig {
   std::vector<std::string> api_key_sha256;
 };
 
+Status ValidateGatewayServerConfig(const GatewayServerConfig& config);
+
 /// Host-only HTTP gateway. It owns no Engine, CUDA context, scheduler queue,
 /// model weights, or KV cache; all inference work crosses the scheduler RPC.
 class GatewayServer {

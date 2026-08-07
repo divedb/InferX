@@ -45,3 +45,12 @@ if(TARGET inferx_grpc_scheduler_transport)
     GTest::gtest_main)
   gtest_discover_tests(inferx_grpc_scheduler_transport_test)
 endif()
+
+if(TARGET inferx_gateway_server)
+  add_executable(inferx_gateway_config_test
+    unit/gateway/gateway_config_test.cc)
+  target_link_libraries(inferx_gateway_config_test PRIVATE
+    inferx::gateway_server
+    GTest::gtest_main)
+  gtest_discover_tests(inferx_gateway_config_test)
+endif()
