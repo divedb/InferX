@@ -40,6 +40,7 @@
 #include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/chat_completion_handler.h"
 #include "inferx/server/handlers/models_handler.h"
+#include "inferx/server/handlers/metrics_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
@@ -251,6 +252,25 @@ class FakeSchedulerClient final
 
   ::inferx::server::scheduler_client::ScheduledRequest submitted;
   int cancel_count = 0;
+};
+
+class FakeMetricsSource final
+    : public ::inferx::server::observability::MetricsSource {
+ public:
+  ::inferx::server::observability::MetricsSnapshot Snapshot() const override {
+    return {.running = 2,
+            .waiting = 1,
+            .blocks_in_use = 3,
+            .blocks_total = 8,
+            .steps = 9,
+            .tokens_generated = 10,
+            .last_step_ms = 4.5,
+            .preemptions = 1,
+            .cached_blocks = 2,
+            .prefix_hit_tokens = 11,
+            .prefix_miss_tokens = 12,
+            .evicted_blocks = 13};
+  }
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -1238,11 +1258,13 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
   ::inferx::server::model_registry::Registry registry;
   FakeTokenizationService tokenization;
   FakeRequestService requests;
+  FakeMetricsSource metrics;
   auto built = ::inferx::server::handlers::BuildApiRoutes(
       {.health = &health,
        .models = &registry,
        .tokenization = &tokenization,
        .requests = &requests,
+       .metrics = &metrics,
        .guard = guard,
        .max_inference_body_bytes = 64});
   ASSERT_TRUE(built.ok()) << built.status();
@@ -1266,6 +1288,36 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
       (*built)->Handle(std::move(models), {}, models_writer, {}));
   EXPECT_EQ(models_writer.status, 200);
   EXPECT_EQ(models_writer.body, "{\"object\":\"list\",\"data\":[]}");
+}
+
+TEST(MetricsHandlerTest, RendersPrometheusAndLegacyStatsFromSameSnapshot) {
+  FakeMetricsSource source;
+  ::inferx::server::handlers::MetricsHandler metrics(
+      &source,
+      ::inferx::server::handlers::MetricsPresentation::kPrometheus);
+  CapturingWriter metrics_writer;
+  HttpRequest metrics_request{http::verb::get, "/metrics", 11};
+  folly::coro::blockingWait(metrics.Handle(
+      std::move(metrics_request), {}, metrics_writer, {}));
+  EXPECT_EQ(metrics_writer.status, 200);
+  EXPECT_NE(metrics_writer.body.find("inferx_requests_running 2"),
+            std::string::npos);
+  EXPECT_NE(metrics_writer.body.find(
+                "inferx_kv_blocks{state=\"free\"} 5"),
+            std::string::npos);
+  EXPECT_EQ(metrics_writer.body.find("tenant"), std::string::npos);
+
+  ::inferx::server::handlers::MetricsHandler stats(
+      &source,
+      ::inferx::server::handlers::MetricsPresentation::kLegacyJson);
+  CapturingWriter stats_writer;
+  HttpRequest stats_request{http::verb::get, "/stats", 11};
+  folly::coro::blockingWait(
+      stats.Handle(std::move(stats_request), {}, stats_writer, {}));
+  EXPECT_EQ(stats_writer.status, 200);
+  EXPECT_NE(stats_writer.body.find("\"running\":2"), std::string::npos);
+  EXPECT_NE(stats_writer.body.find("\"tokens_generated\":10"),
+            std::string::npos);
 }
 
 TEST(CompletionHandlerTest, CollectsTypedEventsFromImmutableModelRequest) {

@@ -6,6 +6,7 @@
 #include "inferx/server/handlers/chat_completion_handler.h"
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/model_registry/registry.h"
+#include "inferx/server/observability/metrics_snapshot.h"
 #include "inferx/server/request/request_service.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/transport/routes.h"
@@ -17,6 +18,7 @@ struct ApiRouteDependencies {
   const model_registry::Registry* models = nullptr;
   tokenization::TokenizationService* tokenization = nullptr;
   request::RequestService* requests = nullptr;
+  const observability::MetricsSource* metrics = nullptr;
   std::shared_ptr<EmbeddingsService> embeddings;
   std::shared_ptr<transport::RouteGuard> guard;
   size_t max_inference_body_bytes = 1u << 20;

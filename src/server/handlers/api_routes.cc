@@ -1,6 +1,7 @@
 #include "inferx/server/handlers/api_routes.h"
 
 #include "inferx/server/handlers/models_handler.h"
+#include "inferx/server/handlers/metrics_handler.h"
 #include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 
@@ -34,6 +35,9 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
   if (dependencies.requests == nullptr) {
     return InvalidArgumentError("request service is required");
   }
+  if (dependencies.metrics == nullptr) {
+    return InvalidArgumentError("metrics source is required");
+  }
   if (dependencies.guard == nullptr) {
     return InvalidArgumentError("route guard is required");
   }
@@ -51,6 +55,20 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
   INFERX_RETURN_IF_ERROR(AddPublicProbe(routes.get(), "/health/startup",
                                        "health.startup", dependencies.health,
                                        HealthProbe::kStartup));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::get, "/metrics",
+      {.name = "metrics",
+       .max_body_bytes = 1,
+       .authentication_required = false},
+      std::make_shared<MetricsHandler>(dependencies.metrics,
+                                       MetricsPresentation::kPrometheus)));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::get, "/stats",
+      {.name = "legacy.stats",
+       .max_body_bytes = 1,
+       .authentication_required = false},
+      std::make_shared<MetricsHandler>(dependencies.metrics,
+                                       MetricsPresentation::kLegacyJson)));
   INFERX_RETURN_IF_ERROR(routes->Add(
       boost::beast::http::verb::get, "/v1/models",
       {.name = "models.list",
