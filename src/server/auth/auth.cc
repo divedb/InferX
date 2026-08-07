@@ -3,39 +3,67 @@
 
 namespace inferx::server::auth {
 
+ApiKeyStore::ApiKeyStore() : entries_(std::make_shared<const Entries>()) {}
+
 bool HasScope(const Principal& principal, std::string_view scope) {
   return principal.scopes.find(std::string(scope)) != principal.scopes.end();
 }
 
 Status ApiKeyStore::AddHash(std::string hash_hex, Principal principal) {
-  if (hash_hex.empty() || principal.tenant_id.empty() ||
-      principal.subject.empty()) {
-    return InvalidArgumentError("hash and principal identity are required");
-  }
-  std::lock_guard lock(mutex_);
-  if (entries_.contains(hash_hex)) {
+  INFERX_RETURN_IF_ERROR(Validate(hash_hex, principal));
+  std::lock_guard lock(writer_mutex_);
+  auto updated = std::make_shared<Entries>(*entries_.load());
+  if (updated->contains(hash_hex)) {
     return FailedPreconditionError("API-key hash already exists");
   }
-  entries_.emplace(std::move(hash_hex), std::move(principal));
+  updated->emplace(std::move(hash_hex), std::move(principal));
+  entries_.store(std::move(updated));
   return OkStatus();
 }
 
 Status ApiKeyStore::RemoveHash(std::string_view hash_hex) {
-  std::lock_guard lock(mutex_);
-  entries_.erase(std::string(hash_hex));
+  std::lock_guard lock(writer_mutex_);
+  auto updated = std::make_shared<Entries>(*entries_.load());
+  updated->erase(std::string(hash_hex));
+  entries_.store(std::move(updated));
+  return OkStatus();
+}
+
+Status ApiKeyStore::ReplaceAll(std::vector<ApiKeyRecord> records) {
+  auto updated = std::make_shared<Entries>();
+  updated->reserve(records.size());
+  for (auto& record : records) {
+    INFERX_RETURN_IF_ERROR(Validate(record.hash_hex, record.principal));
+    const auto [unused, inserted] = updated->emplace(
+        std::move(record.hash_hex), std::move(record.principal));
+    if (!inserted) {
+      return InvalidArgumentError("duplicate API-key hash in snapshot");
+    }
+  }
+
+  std::lock_guard lock(writer_mutex_);
+  entries_.store(std::move(updated));
   return OkStatus();
 }
 
 StatusOr<Principal> ApiKeyStore::LookupHash(std::string_view hash_hex) const {
-  std::lock_guard lock(mutex_);
-  const auto it = entries_.find(std::string(hash_hex));
-  if (it == entries_.end()) return absl::UnauthenticatedError("invalid API key");
+  const std::shared_ptr<const Entries> snapshot = entries_.load();
+  const auto it = snapshot->find(std::string(hash_hex));
+  if (it == snapshot->end()) {
+    return absl::UnauthenticatedError("invalid API key");
+  }
   return it->second;
 }
 
-size_t ApiKeyStore::size() const {
-  std::lock_guard lock(mutex_);
-  return entries_.size();
+size_t ApiKeyStore::size() const { return entries_.load()->size(); }
+
+Status ApiKeyStore::Validate(std::string_view hash_hex,
+                             const Principal& principal) {
+  if (hash_hex.empty() || principal.tenant_id.empty() ||
+      principal.subject.empty()) {
+    return InvalidArgumentError("hash and principal identity are required");
+  }
+  return OkStatus();
 }
 
 Status Authorize(const Principal& principal, std::string_view required_scope) {

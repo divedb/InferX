@@ -346,6 +346,31 @@ TEST(AuthTest, StoresHashesAndEnforcesScopes) {
             absl::StatusCode::kUnauthenticated);
 }
 
+TEST(AuthTest, RotatesCompleteKeySnapshotAtomically) {
+  using ::inferx::server::auth::ApiKeyRecord;
+  using ::inferx::server::auth::ApiKeyStore;
+  using ::inferx::server::auth::Principal;
+  ApiKeyStore store;
+  ASSERT_TRUE(store.AddHash("old", Principal{"tenant", "old_user"}).ok());
+
+  std::vector<ApiKeyRecord> replacement{
+      {"new_a", Principal{"tenant", "user_a"}},
+      {"new_b", Principal{"tenant", "user_b"}}};
+  ASSERT_TRUE(store.ReplaceAll(std::move(replacement)).ok());
+  EXPECT_EQ(store.size(), 2);
+  EXPECT_EQ(store.LookupHash("old").status().code(),
+            absl::StatusCode::kUnauthenticated);
+  EXPECT_EQ(store.LookupHash("new_a")->subject, "user_a");
+
+  std::vector<ApiKeyRecord> invalid{
+      {"duplicate", Principal{"tenant", "first"}},
+      {"duplicate", Principal{"tenant", "second"}}};
+  EXPECT_EQ(store.ReplaceAll(std::move(invalid)).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(store.size(), 2);
+  EXPECT_TRUE(store.LookupHash("new_b").ok());
+}
+
 TEST(ModelRegistryTest, ResolvesReadyAliasOnly) {
   ::inferx::server::model_registry::Registry registry;
   ::inferx::server::model_registry::ModelRecord record;
