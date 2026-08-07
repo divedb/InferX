@@ -18,8 +18,10 @@ bool HealthState::ready() const {
 }
 
 folly::coro::Task<void> HealthHandler::Handle(
-    transport::HttpRequest request, transport::ResponseWriter& response,
+    transport::HttpRequest request, transport::RequestContext context,
+    transport::ResponseWriter& response,
     folly::CancellationToken cancellation) {
+  (void)context;
   bool healthy = false;
   std::string_view probe;
   switch (probe_) {

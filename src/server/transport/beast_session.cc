@@ -237,7 +237,7 @@ class BeastSession : public std::enable_shared_from_this<BeastSession> {
       BeastResponseWriter writer(&stream_, config_.write_timeout_seconds);
       bool handler_failed = false;
       try {
-        co_await handler_->Handle(std::move(request), writer,
+        co_await handler_->Handle(std::move(request), RequestContext{}, writer,
                                   cancel_.getToken());
       } catch (...) {
         handler_failed = true;

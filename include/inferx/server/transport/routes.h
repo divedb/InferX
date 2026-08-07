@@ -23,6 +23,7 @@ class RouteGuard {
   virtual ~RouteGuard() = default;
   virtual folly::coro::Task<Status> Check(
       const HttpRequest& request, const RouteMetadata& metadata,
+      RequestContext& context,
       folly::CancellationToken cancellation) = 0;
 };
 
@@ -37,7 +38,7 @@ class Routes final : public RequestHandler {
              std::shared_ptr<RequestHandler> handler);
 
   folly::coro::Task<void> Handle(
-      HttpRequest request, ResponseWriter& response,
+      HttpRequest request, RequestContext context, ResponseWriter& response,
       folly::CancellationToken cancellation) override;
 
  private:

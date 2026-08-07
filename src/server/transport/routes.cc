@@ -71,7 +71,7 @@ Status Routes::Add(boost::beast::http::verb method, std::string path,
 }
 
 folly::coro::Task<void> Routes::Handle(
-    HttpRequest request, ResponseWriter& response,
+    HttpRequest request, RequestContext context, ResponseWriter& response,
     folly::CancellationToken cancellation) {
   bool path_exists = false;
   for (const Route& route : routes_) {
@@ -87,7 +87,8 @@ folly::coro::Task<void> Routes::Handle(
       }
       if (guard_ != nullptr) {
         const Status guarded =
-            co_await guard_->Check(request, route.metadata, cancellation);
+            co_await guard_->Check(request, route.metadata, context,
+                                   cancellation);
         if (!guarded.ok()) {
           co_await WriteRouteError(response, request.version(),
                                    request.keep_alive(), GuardStatus(guarded),
@@ -101,7 +102,8 @@ folly::coro::Task<void> Routes::Handle(
                                  "route guard is not configured", cancellation);
         co_return;
       }
-      co_await route.handler->Handle(std::move(request), response, cancellation);
+      co_await route.handler->Handle(std::move(request), std::move(context),
+                                     response, cancellation);
       co_return;
     }
   }

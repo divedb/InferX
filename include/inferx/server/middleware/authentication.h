@@ -15,6 +15,7 @@ class BearerRouteGuard final : public transport::RouteGuard {
   folly::coro::Task<Status> Check(
       const transport::HttpRequest& request,
       const transport::RouteMetadata& metadata,
+      transport::RequestContext& context,
       folly::CancellationToken cancellation) override;
 
  private:

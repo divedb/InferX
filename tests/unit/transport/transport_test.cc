@@ -76,8 +76,9 @@ class CapturingWriter final : public ResponseWriter {
 class OkHandler final : public RequestHandler {
  public:
   folly::coro::Task<void> Handle(
-      HttpRequest request, ResponseWriter& writer,
+      HttpRequest request, RequestContext context, ResponseWriter& writer,
       folly::CancellationToken cancellation) override {
+    last_context = std::move(context);
     HttpResponse response{http::status::ok, request.version()};
     response.set(http::field::content_type, "application/json");
     response.keep_alive(request.keep_alive());
@@ -85,12 +86,14 @@ class OkHandler final : public RequestHandler {
     response.prepare_payload();
     (void)co_await writer.WriteResponse(std::move(response), cancellation);
   }
+  RequestContext last_context;
 };
 
 class ScopeGuard final : public RouteGuard {
  public:
   folly::coro::Task<Status> Check(
       const HttpRequest&, const RouteMetadata& metadata,
+      RequestContext&,
       folly::CancellationToken) override {
     seen_scope = metadata.required_scope;
     if (deny) co_return absl::PermissionDeniedError("scope denied");
@@ -150,13 +153,13 @@ TEST(RoutesTest, DistinguishesNotFoundAndMethodNotAllowed) {
   CapturingWriter writer;
   HttpRequest wrong_method{http::verb::post, "/ready", 11};
   folly::coro::blockingWait(
-      routes.Handle(std::move(wrong_method), writer, {}));
+      routes.Handle(std::move(wrong_method), {}, writer, {}));
   EXPECT_EQ(writer.status, 405);
 
   CapturingWriter missing_writer;
   HttpRequest missing{http::verb::get, "/missing", 11};
   folly::coro::blockingWait(
-      routes.Handle(std::move(missing), missing_writer, {}));
+      routes.Handle(std::move(missing), {}, missing_writer, {}));
   EXPECT_EQ(missing_writer.status, 404);
 }
 
@@ -175,7 +178,7 @@ TEST(RoutesTest, AppliesMetadataBodyLimitAndGuardBeforeHandler) {
   HttpRequest oversized{http::verb::post, "/completion", 11};
   oversized.body() = "12345";
   folly::coro::blockingWait(
-      routes.Handle(std::move(oversized), oversized_writer, {}));
+      routes.Handle(std::move(oversized), {}, oversized_writer, {}));
   EXPECT_EQ(oversized_writer.status, 413);
   EXPECT_TRUE(guard->seen_scope.empty());
 
@@ -184,7 +187,7 @@ TEST(RoutesTest, AppliesMetadataBodyLimitAndGuardBeforeHandler) {
   HttpRequest denied{http::verb::post, "/completion", 11};
   denied.body() = "1234";
   folly::coro::blockingWait(
-      routes.Handle(std::move(denied), denied_writer, {}));
+      routes.Handle(std::move(denied), {}, denied_writer, {}));
   EXPECT_EQ(denied_writer.status, 403);
   EXPECT_EQ(guard->seen_scope, "inference.invoke");
 }
@@ -677,10 +680,11 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
   auto guard = std::make_shared<
       ::inferx::server::middleware::BearerRouteGuard>(authenticator);
   Routes routes(guard);
+  auto invoke_handler = std::make_shared<OkHandler>();
   ASSERT_TRUE(routes.Add(http::verb::post, "/invoke",
                          {.authentication_required = true,
                           .required_scope = "inference.invoke"},
-                         std::make_shared<OkHandler>())
+                         invoke_handler)
                   .ok());
   ASSERT_TRUE(routes.Add(http::verb::get, "/health",
                          {.authentication_required = false},
@@ -690,20 +694,26 @@ TEST(AuthMiddlewareTest, EnforcesPerRouteAuthenticationAndScope) {
   CapturingWriter missing_writer;
   HttpRequest missing{http::verb::post, "/invoke", 11};
   folly::coro::blockingWait(
-      routes.Handle(std::move(missing), missing_writer, {}));
+      routes.Handle(std::move(missing), {}, missing_writer, {}));
   EXPECT_EQ(missing_writer.status, 401);
 
   CapturingWriter allowed_writer;
   HttpRequest allowed{http::verb::post, "/invoke", 11};
   allowed.set(http::field::authorization, "Bearer secret");
   folly::coro::blockingWait(
-      routes.Handle(std::move(allowed), allowed_writer, {}));
+      routes.Handle(std::move(allowed), {}, allowed_writer, {}));
   EXPECT_EQ(allowed_writer.status, 200);
+  EXPECT_TRUE(invoke_handler->last_context.authenticated);
+  EXPECT_EQ(invoke_handler->last_context.tenant_id, "tenant");
+  EXPECT_EQ(invoke_handler->last_context.subject, "user");
+  EXPECT_EQ(invoke_handler->last_context.api_key_id, "key");
+  EXPECT_TRUE(
+      invoke_handler->last_context.scopes.contains("inference.invoke"));
 
   CapturingWriter health_writer;
   HttpRequest health{http::verb::get, "/health", 11};
   folly::coro::blockingWait(
-      routes.Handle(std::move(health), health_writer, {}));
+      routes.Handle(std::move(health), {}, health_writer, {}));
   EXPECT_EQ(health_writer.status, 200);
 }
 
@@ -792,7 +802,7 @@ TEST(HealthHandlerTest, LivenessDoesNotDependOnModelAvailability) {
   CapturingWriter writer;
   HttpRequest request{http::verb::get, "/health/live", 11};
   folly::coro::blockingWait(
-      live.Handle(std::move(request), writer, folly::CancellationToken{}));
+      live.Handle(std::move(request), {}, writer, folly::CancellationToken{}));
   EXPECT_EQ(writer.status, 200);
   EXPECT_EQ(writer.body, "{\"status\":\"ok\",\"probe\":\"live\"}");
   EXPECT_FALSE(state.ready());
@@ -812,14 +822,14 @@ TEST(HealthHandlerTest, ReadinessRequiresEveryServingDependency) {
   CapturingWriter unavailable;
   HttpRequest first{http::verb::get, "/health/ready", 11};
   folly::coro::blockingWait(ready.Handle(
-      std::move(first), unavailable, folly::CancellationToken{}));
+      std::move(first), {}, unavailable, folly::CancellationToken{}));
   EXPECT_EQ(unavailable.status, 503);
 
   state.SetReadyModelAvailable(true);
   CapturingWriter available;
   HttpRequest second{http::verb::get, "/health/ready", 11};
   folly::coro::blockingWait(ready.Handle(
-      std::move(second), available, folly::CancellationToken{}));
+      std::move(second), {}, available, folly::CancellationToken{}));
   EXPECT_EQ(available.status, 200);
 }
 

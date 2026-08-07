@@ -45,7 +45,8 @@ class HealthHandler final : public transport::RequestHandler {
       : state_(state), probe_(probe) {}
 
   folly::coro::Task<void> Handle(
-      transport::HttpRequest request, transport::ResponseWriter& response,
+      transport::HttpRequest request, transport::RequestContext context,
+      transport::ResponseWriter& response,
       folly::CancellationToken cancellation) override;
 
  private:

@@ -5,6 +5,7 @@
 
 #include <boost/beast/http.hpp>
 #include <string>
+#include <unordered_set>
 
 #include "inferx/core/status.h"
 
@@ -15,6 +16,17 @@ namespace http = boost::beast::http;
 using HttpRequest = http::request<http::string_body>;
 using HttpResponse = http::response<http::string_body>;
 using HttpStreamHead = http::response<http::empty_body>;
+
+/// Transport-neutral attributes established while a request passes through
+/// middleware. Credentials are deliberately absent: handlers receive only the
+/// authenticated identity and authorization facts they need.
+struct RequestContext {
+  std::string tenant_id;
+  std::string subject;
+  std::string api_key_id;
+  std::unordered_set<std::string> scopes;
+  bool authenticated = false;
+};
 
 /// Inference-specific asynchronous response sink implemented by the Beast
 /// transport adapter.
@@ -49,7 +61,7 @@ class RequestHandler {
  public:
   virtual ~RequestHandler() = default;
   virtual folly::coro::Task<void> Handle(
-      HttpRequest request, ResponseWriter& response,
+      HttpRequest request, RequestContext context, ResponseWriter& response,
       folly::CancellationToken cancellation) = 0;
 };
 

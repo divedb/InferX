@@ -13,6 +13,7 @@ BearerRouteGuard::BearerRouteGuard(
 folly::coro::Task<Status> BearerRouteGuard::Check(
     const transport::HttpRequest& request,
     const transport::RouteMetadata& metadata,
+    transport::RequestContext& context,
     folly::CancellationToken cancellation) {
   if (!metadata.authentication_required) co_return OkStatus();
   if (cancellation.isCancellationRequested()) {
@@ -28,7 +29,14 @@ folly::coro::Task<Status> BearerRouteGuard::Check(
   auto authenticated = authenticator_->Authenticate(std::string_view(
       header->value().data(), header->value().size()));
   if (!authenticated.ok()) co_return authenticated.status();
-  co_return auth::Authorize(*authenticated, metadata.required_scope);
+  Status authorized = auth::Authorize(*authenticated, metadata.required_scope);
+  if (!authorized.ok()) co_return authorized;
+  context.tenant_id = authenticated->tenant_id;
+  context.subject = authenticated->subject;
+  context.api_key_id = authenticated->key_id;
+  context.scopes = authenticated->scopes;
+  context.authenticated = true;
+  co_return OkStatus();
 }
 
 }  // namespace inferx::server::middleware
