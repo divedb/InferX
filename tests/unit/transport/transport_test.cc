@@ -45,6 +45,7 @@
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
+#include "inferx/server/scheduler_client/in_process_scheduler_client.h"
 #include "inferx/server/config/server_config.h"
 
 namespace inferx::server::transport {
@@ -273,6 +274,48 @@ class FakeMetricsSource final
             .prefix_miss_tokens = 12,
             .evicted_blocks = 13};
   }
+};
+
+class FakeLegacyGeneration final
+    : public ::inferx::server::scheduler_client::LegacyGeneration {
+ public:
+  bool Next(
+      ::inferx::server::scheduler_client::LegacyGenerationEvent* event) override {
+    next_thread = std::this_thread::get_id();
+    if (index == 0) {
+      *event = {.text = "delta", .generated_tokens = 1};
+    } else if (index == 1) {
+      *event = {.terminal = true,
+                .finish_reason =
+                    ::inferx::server::scheduler_client::FinishReason::kStop,
+                .generated_tokens = 1};
+    } else {
+      return false;
+    }
+    ++index;
+    return true;
+  }
+  void Cancel() override { cancelled = true; }
+  uint32_t prompt_tokens() const override { return 3; }
+  size_t index = 0;
+  bool cancelled = false;
+  std::thread::id next_thread;
+};
+
+class FakeLegacyBackend final
+    : public ::inferx::server::scheduler_client::LegacyEngineBackend {
+ public:
+  StatusOr<std::shared_ptr<
+      ::inferx::server::scheduler_client::LegacyGeneration>>
+  Submit(const ::inferx::server::scheduler_client::ScheduledRequest& request)
+      override {
+    seen_version = request.model_version;
+    generation = std::make_shared<FakeLegacyGeneration>();
+    return std::static_pointer_cast<
+        ::inferx::server::scheduler_client::LegacyGeneration>(generation);
+  }
+  std::string seen_version;
+  std::shared_ptr<FakeLegacyGeneration> generation;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -958,6 +1001,52 @@ TEST(SchedulerContractTest, CarriesTypedTerminalUsageAndEmbeddings) {
   event.embeddings.push_back({.index = 0, .values = {0.25f, -0.5f}});
   EXPECT_EQ(event.usage.prompt_tokens, 4);
   EXPECT_EQ(event.embeddings.front().values.size(), 2);
+}
+
+TEST(InProcessSchedulerClientTest, BridgesBlockingEventsOnDedicatedExecutor) {
+  FakeLegacyBackend backend;
+  folly::CPUThreadPoolExecutor blocking_executor(1);
+  folly::CPUThreadPoolExecutor coroutine_executor(1);
+  ::inferx::server::scheduler_client::InProcessSchedulerClient client(
+      &backend, &blocking_executor);
+  const std::thread::id caller = std::this_thread::get_id();
+  auto task = [&]() -> folly::coro::Task<std::vector<
+      ::inferx::server::scheduler_client::GenerationEvent>> {
+    ::inferx::server::scheduler_client::ScheduledRequest command;
+    command.request_id = "req_bridge";
+    command.model_version = "model@v3";
+    auto submitted = co_await client.Submit(command, {});
+    EXPECT_TRUE(submitted.ok()) << submitted.status();
+    std::vector<::inferx::server::scheduler_client::GenerationEvent> events;
+    auto stream = client.Events("req_bridge", {});
+    while (auto next = co_await stream.next()) {
+      events.push_back(std::move(*next));
+    }
+    co_return events;
+  };
+  auto future = folly::coro::co_withExecutor(&coroutine_executor, task()).start();
+  auto events = std::move(future).get();
+  ASSERT_EQ(events.size(), 2);
+  EXPECT_EQ(events[0].sequence_number, 1);
+  EXPECT_EQ(events[0].text_delta, "delta");
+  EXPECT_EQ(events[1].sequence_number, 2);
+  EXPECT_TRUE(events[1].terminal);
+  EXPECT_EQ(events[1].usage.prompt_tokens, 3);
+  EXPECT_EQ(backend.seen_version, "model@v3");
+  EXPECT_NE(backend.generation->next_thread, caller);
+}
+
+TEST(InProcessSchedulerClientTest, RejectsEmbeddingWorkloadExplicitly) {
+  FakeLegacyBackend backend;
+  folly::CPUThreadPoolExecutor blocking_executor(1);
+  ::inferx::server::scheduler_client::InProcessSchedulerClient client(
+      &backend, &blocking_executor);
+  ::inferx::server::scheduler_client::ScheduledRequest command;
+  command.request_id = "req_embedding";
+  command.workload =
+      ::inferx::server::scheduler_client::WorkloadClass::kEmbedding;
+  auto result = folly::coro::blockingWait(client.Submit(command, {}));
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kUnimplemented);
 }
 
 TEST(ManagedRequestServiceTest, OwnsLifecycleAdmissionAndFinalization) {
