@@ -25,7 +25,9 @@ EventBuffer::EventBuffer(Generator generator, Pipe pipe, size_t max_events,
 size_t EventBuffer::EventBytes(
     const scheduler_client::GenerationEvent& event) {
   return sizeof(event.sequence_number) + sizeof(event.generated_tokens) +
-         event.text_delta.size() + event.finish_reason.size() + 1;
+         event.text_delta.size() +
+         event.token_ids.size() * sizeof(event.token_ids.front()) +
+         sizeof(event.finish_reason) + sizeof(event.usage) + 1;
 }
 
 EventBuffer::~EventBuffer() { Close(); }

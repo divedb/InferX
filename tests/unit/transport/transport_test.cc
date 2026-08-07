@@ -318,11 +318,11 @@ TEST(EventBufferTest, BoundsAndDeliversEvents) {
 }
 
 TEST(EventBufferTest, EnforcesByteBudgetAndAccountsConsumption) {
-  auto result = ::inferx::server::streaming::EventBuffer::Create(4, 64);
+  auto result = ::inferx::server::streaming::EventBuffer::Create(4, 128);
   ASSERT_TRUE(result.ok()) << result.status();
   auto buffer = std::move(*result);
   ::inferx::server::scheduler_client::GenerationEvent event;
-  event.text_delta = std::string(50, 'x');
+  event.text_delta = std::string(100, 'x');
   EXPECT_EQ(buffer->TryPush(event),
             ::inferx::server::streaming::PushResult::kQueued);
   EXPECT_GT(buffer->queued_bytes(), 0u);
@@ -613,6 +613,19 @@ TEST(TokenizationContractTest, CarriesImmutableModelVersionAndAccounting) {
   prompt.prompt_tokens = static_cast<uint32_t>(prompt.token_ids.size());
   EXPECT_EQ(prompt.model_version, "model@v1");
   EXPECT_EQ(prompt.prompt_tokens, 3);
+}
+
+TEST(SchedulerContractTest, CarriesTypedTerminalUsageAndEmbeddings) {
+  ::inferx::server::scheduler_client::GenerationEvent event;
+  event.request_id = "req_contract";
+  event.sequence_number = 3;
+  event.terminal = true;
+  event.finish_reason =
+      ::inferx::server::scheduler_client::FinishReason::kStop;
+  event.usage = {.prompt_tokens = 4, .completion_tokens = 2};
+  event.embeddings.push_back({.index = 0, .values = {0.25f, -0.5f}});
+  EXPECT_EQ(event.usage.prompt_tokens, 4);
+  EXPECT_EQ(event.embeddings.front().values.size(), 2);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {
