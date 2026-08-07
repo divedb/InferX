@@ -36,6 +36,7 @@
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/handlers/embeddings_handler.h"
 #include "inferx/server/handlers/models_handler.h"
+#include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
 
@@ -127,6 +128,31 @@ class FakeEmbeddingsService final
 
   std::string seen_model_version;
   std::string seen_tenant;
+};
+
+class FakeTokenizationService final
+    : public ::inferx::server::tokenization::TokenizationService {
+ public:
+  StatusOr<::inferx::server::tokenization::TokenizedPrompt>
+  TokenizeCompletion(
+      const ::inferx::server::request::ModelVersion& model_version,
+      std::string_view prompt, bool add_special_tokens) override {
+    seen_version = model_version;
+    seen_prompt = prompt;
+    seen_add_special_tokens = add_special_tokens;
+    return ::inferx::server::tokenization::TokenizedPrompt{
+        model_version, {11, 12, 13}, 3};
+  }
+
+  StatusOr<::inferx::server::tokenization::TokenizedPrompt> TokenizeChat(
+      const ::inferx::server::request::ModelVersion&,
+      const std::vector<::inferx::tokenizer::ChatMessage>&) override {
+    return UnimplementedError("not used");
+  }
+
+  std::string seen_version;
+  std::string seen_prompt;
+  bool seen_add_special_tokens = false;
 };
 
 TEST(BeastFollyAdapterTest, CompletesAndReturnsToFollyExecutor) {
@@ -965,6 +991,64 @@ TEST(EmbeddingsHandlerTest, RejectsUnsupportedCapabilityBeforeExecution) {
   EXPECT_EQ(writer.status, 422);
   EXPECT_NE(writer.body.find("does not support embedding workloads"),
             std::string::npos);
+}
+
+TEST(TokenizeHandlerTest, ResolvesVersionAndDelegatesSpecialTokenPolicy) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v7";
+  model.alias = "chat-current";
+  model.context_limit = 8;
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kReady).ok());
+  FakeTokenizationService service;
+  ::inferx::server::handlers::TokenizeHandler handler(&registry, &service);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/tokenize", 11};
+  request.body() =
+      "{\"model\":\"chat-current\",\"text\":\"hello\","
+      "\"add_special_tokens\":true}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_EQ(writer.body,
+            "{\"model\":\"chat-current\",\"token_ids\":[11,12,13],"
+            "\"token_count\":3}");
+  EXPECT_EQ(service.seen_version, "chat@v7");
+  EXPECT_EQ(service.seen_prompt, "hello");
+  EXPECT_TRUE(service.seen_add_special_tokens);
+}
+
+TEST(TokenizeHandlerTest, EnforcesExactTokenContextLimit) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "small";
+  model.version = "v1";
+  model.context_limit = 2;
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("small", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("small", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("small", "v1", ModelState::kReady).ok());
+  FakeTokenizationService service;
+  ::inferx::server::handlers::TokenizeHandler handler(&registry, &service);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/tokenize", 11};
+  request.body() = "{\"model\":\"small@v1\",\"text\":\"hello\"}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 400);
+  EXPECT_NE(writer.body.find("context limit"), std::string::npos);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

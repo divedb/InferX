@@ -9,15 +9,19 @@ InProcessTokenizationService::InProcessTokenizationService(
     : tokenizer_(tokenizer), model_version_(std::move(model_version)) {}
 
 StatusOr<TokenizedPrompt> InProcessTokenizationService::TokenizeCompletion(
-    const request::ModelVersion& model_version, std::string_view prompt) {
+    const request::ModelVersion& model_version, std::string_view prompt,
+    bool add_special_tokens) {
   if (tokenizer_ == nullptr) return FailedPreconditionError("tokenizer is null");
   if (model_version != model_version_) {
     return FailedPreconditionError("tokenization model version mismatch");
   }
   auto clone = tokenizer_->Clone();
   if (!clone.ok()) return clone.status();
+  tokenizer::EncodeOptions options;
+  options.special_tokens = tokenizer::SpecialTokenMode::kAsText;
+  options.add_post_processor_tokens = add_special_tokens;
   INFERX_ASSIGN_OR_RETURN(std::vector<tokenizer::TokenId> ids,
-                          (*clone)->EncodeWithOptions(prompt, {}));
+                          (*clone)->EncodeWithOptions(prompt, options));
   if (ids.empty()) return InvalidArgumentError("prompt encodes to no tokens");
   const uint32_t count = static_cast<uint32_t>(ids.size());
   return TokenizedPrompt{model_version_, std::move(ids), count};

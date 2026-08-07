@@ -23,7 +23,7 @@ class TokenizationService {
 
   virtual StatusOr<TokenizedPrompt> TokenizeCompletion(
       const request::ModelVersion& model_version,
-      std::string_view prompt) = 0;
+      std::string_view prompt, bool add_special_tokens = false) = 0;
   virtual StatusOr<TokenizedPrompt> TokenizeChat(
       const request::ModelVersion& model_version,
       const std::vector<tokenizer::ChatMessage>& messages) = 0;
@@ -37,7 +37,7 @@ class InProcessTokenizationService final : public TokenizationService {
 
   StatusOr<TokenizedPrompt> TokenizeCompletion(
       const request::ModelVersion& model_version,
-      std::string_view prompt) override;
+      std::string_view prompt, bool add_special_tokens = false) override;
   StatusOr<TokenizedPrompt> TokenizeChat(
       const request::ModelVersion& model_version,
       const std::vector<tokenizer::ChatMessage>& messages) override;
