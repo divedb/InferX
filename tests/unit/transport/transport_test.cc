@@ -33,6 +33,7 @@
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/middleware/authentication.h"
+#include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
 #include "inferx/server/coroutine/deadline.h"
 
@@ -775,6 +776,51 @@ TEST(SchedulerContractTest, CarriesTypedTerminalUsageAndEmbeddings) {
   event.embeddings.push_back({.index = 0, .values = {0.25f, -0.5f}});
   EXPECT_EQ(event.usage.prompt_tokens, 4);
   EXPECT_EQ(event.embeddings.front().values.size(), 2);
+}
+
+TEST(HealthHandlerTest, LivenessDoesNotDependOnModelAvailability) {
+  using ::inferx::server::handlers::HealthHandler;
+  using ::inferx::server::handlers::HealthProbe;
+  using ::inferx::server::handlers::HealthState;
+  HealthState state;
+  state.SetConfigurationLoaded(true);
+  state.SetDependenciesLoaded(true);
+  state.SetListenerAccepting(true);
+  state.SetSchedulerConnected(true);
+
+  HealthHandler live(&state, HealthProbe::kLive);
+  CapturingWriter writer;
+  HttpRequest request{http::verb::get, "/health/live", 11};
+  folly::coro::blockingWait(
+      live.Handle(std::move(request), writer, folly::CancellationToken{}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_EQ(writer.body, "{\"status\":\"ok\",\"probe\":\"live\"}");
+  EXPECT_FALSE(state.ready());
+}
+
+TEST(HealthHandlerTest, ReadinessRequiresEveryServingDependency) {
+  using ::inferx::server::handlers::HealthHandler;
+  using ::inferx::server::handlers::HealthProbe;
+  using ::inferx::server::handlers::HealthState;
+  HealthState state;
+  state.SetConfigurationLoaded(true);
+  state.SetDependenciesLoaded(true);
+  state.SetListenerAccepting(true);
+  state.SetSchedulerConnected(true);
+  HealthHandler ready(&state, HealthProbe::kReady);
+
+  CapturingWriter unavailable;
+  HttpRequest first{http::verb::get, "/health/ready", 11};
+  folly::coro::blockingWait(ready.Handle(
+      std::move(first), unavailable, folly::CancellationToken{}));
+  EXPECT_EQ(unavailable.status, 503);
+
+  state.SetReadyModelAvailable(true);
+  CapturingWriter available;
+  HttpRequest second{http::verb::get, "/health/ready", 11};
+  folly::coro::blockingWait(ready.Handle(
+      std::move(second), available, folly::CancellationToken{}));
+  EXPECT_EQ(available.status, 200);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

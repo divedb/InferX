@@ -15,6 +15,7 @@ target_link_libraries(inferx_transport_test PRIVATE
   inferx::request_runtime
   inferx::streaming
   inferx::server_middleware
+  inferx::request_handlers
   GTest::gtest_main)
 
 include(GoogleTest)
