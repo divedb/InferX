@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -23,22 +24,21 @@ struct HttpServerConfig {
   /// the whole generation and the default socket timeout would cut it off
   /// mid-answer.
   int write_timeout_seconds = 600;
+
+  /// Socket event-loop threads. Zero selects a small hardware-based default.
+  size_t io_threads = 0;
+
+  /// Fixed-size executor used for parsing/tokenization and the Engine's
+  /// blocking event interface. Keeping it separate ensures a slow inference
+  /// request can never stall accepts, reads, or response writes.
+  size_t application_threads = 0;
 };
 
 /// \brief An OpenAI-compatible HTTP front end for an `Engine`.
 ///
-/// ARCHITECTURE.md §9 nominates Boost.Beast, and §5.1 describes the I/O around
-/// an Asio `io_context` with C++20 coroutines. This uses cpp-httplib instead --
-/// a single vendored header, thread-per-connection -- because Beast would have
-/// meant fetching the Boost superproject to serve a handful of endpoints, and
-/// the interface here is small enough that swapping the implementation is
-/// contained.
-///
-/// What that defers is real and worth naming: thread-per-connection puts a
-/// ceiling on concurrent streams that an event loop would not have, and §5.1's
-/// coroutine design is not exercised at all. Neither binds at the concurrency a
-/// single 4080 SUPER can serve, since the batch is capped by `max_running`
-/// long before the connection count is. When it does bind, Beast is the answer.
+/// Boost.Beast owns HTTP parsing and serialization and Boost.Asio owns socket
+/// execution. Blocking application work is isolated on a bounded executor;
+/// sockets and Beast message state never leave their owning I/O executor.
 ///
 /// Endpoints:
 ///

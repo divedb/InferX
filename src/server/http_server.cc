@@ -1,10 +1,27 @@
 #include "inferx/server/http_server.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
+#include <condition_variable>
+#include <cstdint>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
-#include "httplib.h"
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/thread_pool.hpp>
+#include <boost/asio/write.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+
 #include "inferx/api/openai.h"
 #include "inferx/observe/metrics.h"
 #include "inferx/tokenizer/chat_template.h"
@@ -12,6 +29,10 @@
 namespace inferx::server {
 namespace {
 
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
 using api::FinishReason;
 using api::SamplingRequest;
 using api::Usage;
@@ -22,56 +43,29 @@ int64_t NowSeconds() {
       .count();
 }
 
-// Response ids are informational, so a counter is enough -- they need to be
-// distinct within a process, not unguessable.
 std::string MakeId(std::string_view prefix) {
   static std::atomic<uint64_t> counter{0};
-
   return std::string(prefix) + "-" +
          std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
 }
 
 FinishReason ToApiReason(scheduler::FinishReason reason) {
-  switch (reason) {
-    case scheduler::FinishReason::kStopToken:
-      return FinishReason::kStop;
-    case scheduler::FinishReason::kMaxTokens:
-    case scheduler::FinishReason::kOutOfMemory:
-    case scheduler::FinishReason::kContextLimit:
-    case scheduler::FinishReason::kCancelled:
-    case scheduler::FinishReason::kNotFinished:
-      // Everything that is not a clean stop is truncation from the client's
-      // side, and `length` is the only word the API has for that.
-      return FinishReason::kLength;
-  }
-
-  return FinishReason::kLength;
+  return reason == scheduler::FinishReason::kStopToken ? FinishReason::kStop
+                                                       : FinishReason::kLength;
 }
 
-// The API's view of sampling, as the scheduler wants it. A seed the caller did
-// not pin is derived per request rather than left at zero, so two concurrent
-// requests at the same temperature do not draw identically.
-scheduler::SamplingParams ToSchedulerParams(const SamplingRequest& s) {
+scheduler::SamplingParams ToSchedulerParams(const SamplingRequest& request) {
   static std::atomic<uint64_t> counter{0x243f6a8885a308d3ULL};
-
   scheduler::SamplingParams params;
-  params.temperature = s.temperature;
-  params.top_p = s.top_p;
-  params.seed = s.has_seed ? s.seed
-                           : counter.fetch_add(0x9e3779b97f4a7c15ULL,
-                                               std::memory_order_relaxed);
-
+  params.temperature = request.temperature;
+  params.top_p = request.top_p;
+  params.seed = request.has_seed
+                    ? request.seed
+                    : counter.fetch_add(0x9e3779b97f4a7c15ULL,
+                                        std::memory_order_relaxed);
   return params;
 }
 
-void SendError(httplib::Response* response, int code, std::string_view message,
-               std::string_view type) {
-  response->status = code;
-  response->set_content(api::ErrorJson(message, type), "application/json");
-}
-
-// Maps a Status onto the HTTP code a client should see. InvalidArgument is the
-// caller's fault; everything else is ours.
 int StatusToHttp(const Status& status) {
   switch (status.code()) {
     case absl::StatusCode::kInvalidArgument:
@@ -82,6 +76,10 @@ int StatusToHttp(const Status& status) {
       return 429;
     case absl::StatusCode::kNotFound:
       return 404;
+    case absl::StatusCode::kUnavailable:
+      return 503;
+    case absl::StatusCode::kDeadlineExceeded:
+      return 504;
     default:
       return 500;
   }
@@ -97,7 +95,6 @@ std::string RenderMetrics(const Engine::Stats& stats) {
   auto counter = [&](std::string name, std::string help, uint64_t value) {
     registry.AddCounter(std::move(name), std::move(help))->Increment(value);
   };
-
   gauge("inferx_requests_running", "Requests currently executing.",
         stats.running);
   gauge("inferx_requests_waiting", "Requests waiting for admission.",
@@ -147,375 +144,474 @@ std::string RenderStatsJson(const Engine::Stats& stats) {
          ",\"evicted_blocks\":" + std::to_string(stats.evicted_blocks) + "}";
 }
 
+size_t DefaultThreads(size_t requested, size_t maximum) {
+  if (requested != 0) return requested;
+  return std::max<size_t>(1, std::min<size_t>(maximum,
+      std::max(1u, std::thread::hardware_concurrency())));
+}
+
 }  // namespace
 
 struct HttpServer::Impl {
+  struct Session;
+
   Engine* engine;
   HttpServerConfig config;
-  httplib::Server server;
-
-  // The port actually bound, which differs from the configured one when that
-  // was 0 and the kernel chose. Atomic because a test binds on one thread and
-  // reads the port from another.
+  asio::io_context io;
+  tcp::acceptor acceptor{io};
+  asio::thread_pool application_pool;
+  std::vector<std::thread> io_workers;
   std::atomic<int> bound_port{0};
+  std::atomic<bool> stopping{false};
+  std::mutex ready_mutex;
+  std::condition_variable ready_cv;
+  bool ready = false;
+  std::mutex sessions_mutex;
+  std::vector<std::weak_ptr<Session>> sessions;
 
-  Impl(Engine* e, HttpServerConfig c) : engine(e), config(std::move(c)) {}
+  Impl(Engine* value, HttpServerConfig settings)
+      : engine(value),
+        config(std::move(settings)),
+        application_pool(DefaultThreads(config.application_threads, 32)) {}
 
-  // Runs a request to completion and returns the whole body at once.
-  void ServeBlocking(const SamplingRequest& sampling,
-                     std::vector<int32_t> prompt, bool chat,
-                     httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation =
-        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop,
-                       ToSchedulerParams(sampling));
+  ~Impl() {
+    Stop();
+    application_pool.join();
+  }
 
-    if (!generation.ok()) {
-      SendError(response, StatusToHttp(generation.status()),
-                generation.status().message(), "invalid_request_error");
-      return;
+  void Accept();
+  Status Listen();
+
+  void Register(const std::shared_ptr<Session>& session) {
+    std::lock_guard lock(sessions_mutex);
+    sessions.emplace_back(session);
+  }
+
+  void Stop();
+};
+
+struct HttpServer::Impl::Session
+    : std::enable_shared_from_this<HttpServer::Impl::Session> {
+  Impl* owner;
+  beast::tcp_stream stream;
+  beast::flat_buffer buffer;
+  std::unique_ptr<http::request_parser<http::string_body>> parser;
+  std::shared_ptr<Generation> generation;
+  std::mutex generation_mutex;
+  bool keep_alive = false;
+  bool closed = false;
+
+  Session(Impl* value, tcp::socket socket)
+      : owner(value), stream(std::move(socket)) {
+  }
+
+  void Run() {
+    beast::error_code error;
+    stream.socket().set_option(tcp::no_delay(true), error);
+    Read();
+  }
+
+  void Read() {
+    if (owner->stopping || closed) return Close();
+    parser = std::make_unique<http::request_parser<http::string_body>>();
+    parser->body_limit(owner->config.max_request_bytes);
+    stream.expires_after(std::chrono::seconds(owner->config.read_timeout_seconds));
+    http::async_read(stream, buffer, *parser,
+                     beast::bind_front_handler(&Session::OnRead,
+                                               shared_from_this()));
+  }
+
+  void OnRead(beast::error_code error, size_t) {
+    if (error == http::error::end_of_stream) return Close();
+    if (error == http::error::body_limit) {
+      return WriteError(413, "request body too large", "invalid_request_error",
+                        false);
+    }
+    if (error) return Close();
+    http::request<http::string_body> request = parser->release();
+    keep_alive = request.keep_alive();
+    auto self = shared_from_this();
+    asio::post(owner->application_pool,
+               [self, request = std::move(request)]() mutable {
+                 self->Handle(std::move(request));
+               });
+  }
+
+  void Handle(http::request<http::string_body> request) {
+    try {
+      const std::string target(request.target());
+      if (request.method() == http::verb::get && target == "/health") {
+        return WriteJson(200, "{\"status\":\"ok\"}");
+      }
+      if (request.method() == http::verb::get && target == "/health/live") {
+        return WriteJson(200, "{\"status\":\"ok\"}");
+      }
+      if (request.method() == http::verb::get && target == "/health/ready") {
+        return WriteJson(owner->stopping ? 503 : 200,
+                         owner->stopping ? "{\"status\":\"not_ready\"}"
+                                         : "{\"status\":\"ready\"}");
+      }
+      if (request.method() == http::verb::get && target == "/health/startup") {
+        return WriteJson(200, "{\"status\":\"started\"}");
+      }
+      if (request.method() == http::verb::get && target == "/v1/models") {
+        return WriteJson(200, api::ModelsJson(owner->engine->model_name(),
+                                               NowSeconds()));
+      }
+      if (request.method() == http::verb::get && target == "/stats") {
+        return WriteJson(200, RenderStatsJson(owner->engine->stats()));
+      }
+      if (request.method() == http::verb::get && target == "/metrics") {
+        return WriteText(200, owner->engine->metrics() +
+                                  RenderMetrics(owner->engine->stats()),
+                         "text/plain; version=0.0.4; charset=utf-8");
+      }
+      if (request.method() == http::verb::post &&
+          (target == "/v1/chat/completions" ||
+           target == "/v1/completions")) {
+        return HandleCompletion(request.body(),
+                                target == "/v1/chat/completions");
+      }
+      WriteError(404, "route not found", "invalid_request_error", keep_alive);
+    } catch (...) {
+      WriteError(500, "internal error", "server_error", keep_alive);
+    }
+  }
+
+  void HandleCompletion(const std::string& body, bool chat) {
+    SamplingRequest sampling;
+    std::vector<int32_t> ids;
+    if (chat) {
+      auto parsed = api::ParseChatCompletionRequest(body);
+      if (!parsed.ok()) return WriteStatusError(parsed.status());
+      auto prompt = tokenizer::ApplyQwen2ChatTemplate(
+          parsed->messages, /*add_generation_prompt=*/true);
+      if (!prompt.ok()) return WriteStatusError(prompt.status());
+      auto request_tokenizer = owner->engine->tokenizer().Clone();
+      if (!request_tokenizer.ok())
+        return WriteError(500, request_tokenizer.status().message(),
+                          "server_error", keep_alive);
+      tokenizer::EncodeOptions options;
+      options.special_tokens = tokenizer::SpecialTokenMode::kAsControl;
+      auto encoded = (*request_tokenizer)->EncodeWithOptions(*prompt, options);
+      if (!encoded.ok()) return WriteStatusError(encoded.status());
+      sampling = parsed->sampling;
+      ids = std::move(*encoded);
+    } else {
+      auto parsed = api::ParseCompletionRequest(body);
+      if (!parsed.ok()) return WriteStatusError(parsed.status());
+      auto request_tokenizer = owner->engine->tokenizer().Clone();
+      if (!request_tokenizer.ok())
+        return WriteError(500, request_tokenizer.status().message(),
+                          "server_error", keep_alive);
+      auto encoded = (*request_tokenizer)->EncodeWithOptions(parsed->prompt, {});
+      if (!encoded.ok()) return WriteStatusError(encoded.status());
+      if (encoded->empty())
+        return WriteError(400, "prompt encodes to no tokens",
+                          "invalid_request_error", keep_alive);
+      sampling = parsed->sampling;
+      ids = std::move(*encoded);
     }
 
-    const bool sampled = sampling.temperature > 0.0f;
+    auto submitted = owner->engine->Submit(std::move(ids), sampling.max_tokens,
+                                            sampling.stop,
+                                            ToSchedulerParams(sampling));
+    if (!submitted.ok()) return WriteStatusError(submitted.status());
+    {
+      std::lock_guard lock(generation_mutex);
+      generation = *submitted;
+    }
+    if (sampling.stream) {
+      Stream(sampling, chat, *submitted);
+    } else {
+      Collect(sampling, chat, *submitted);
+    }
+  }
 
+  void Collect(const SamplingRequest& sampling, bool chat,
+               const std::shared_ptr<Generation>& current) {
     std::string text;
     Generation::Event event;
     scheduler::FinishReason reason = scheduler::FinishReason::kNotFinished;
     int32_t generated = 0;
-
-    while ((*generation)->Next(&event)) {
+    while (current->Next(&event)) {
       if (event.done) {
         reason = event.reason;
         generated = event.generated;
         break;
       }
-
       text += event.text;
       generated = event.generated;
     }
-
-    Usage usage;
-    usage.prompt_tokens = (*generation)->prompt_tokens();
-    usage.completion_tokens = generated;
-
+    Usage usage{current->prompt_tokens(), generated};
     const std::string id = MakeId(chat ? "chatcmpl" : "cmpl");
     const int64_t created = NowSeconds();
-
-    response->set_content(
-        chat
-            ? api::ChatCompletionJson(id, engine->model_name(), text,
-                                      ToApiReason(reason), usage, created,
-                                      sampled)
-            : api::CompletionJson(id, engine->model_name(), text,
-                                  ToApiReason(reason), usage, created, sampled),
-        "application/json");
-  }
-
-  // Streams a request as Server-Sent Events.
-  void ServeStreaming(const SamplingRequest& sampling,
-                      std::vector<int32_t> prompt, bool chat,
-                      httplib::Response* response) {
-    StatusOr<std::shared_ptr<Generation>> generation =
-        engine->Submit(std::move(prompt), sampling.max_tokens, sampling.stop,
-                       ToSchedulerParams(sampling));
-
-    if (!generation.ok()) {
-      SendError(response, StatusToHttp(generation.status()),
-                generation.status().message(), "invalid_request_error");
-      return;
-    }
-
     const bool sampled = sampling.temperature > 0.0f;
-    const std::string id = MakeId(chat ? "chatcmpl" : "cmpl");
-    const int64_t created = NowSeconds();
-    const std::string model = engine->model_name();
-
-    std::shared_ptr<Generation> stream = *generation;
-
-    // Buffering would defeat the point: the client is waiting to render tokens
-    // as they arrive, so the proxy hint goes out with the headers.
-    response->set_header("Cache-Control", "no-cache");
-    response->set_header("X-Accel-Buffering", "no");
-
-    const bool include_usage = sampling.include_usage;
-
-    response->set_chunked_content_provider(
-        "text/event-stream",
-        [this, stream, id, created, model, chat, sampled, include_usage](
-            size_t /*offset*/, httplib::DataSink& sink) {
-          // The first chunk announces the role and carries no content, which is
-          // what OpenAI's protocol specifies and what clients key on to open
-          // the message.
-          if (chat) {
-            const std::string first =
-                api::SseFrame(api::ChatCompletionChunkJson(
-                    id, model, "assistant", "", nullptr, created, sampled));
-
-            if (!sink.write(first.data(), first.size())) {
-              stream->Cancel();
-              return false;
-            }
-          }
-
-          Generation::Event event;
-
-          while (stream->Next(&event)) {
-            std::string frame;
-
-            if (event.done) {
-              const FinishReason reason = ToApiReason(event.reason);
-
-              frame = api::SseFrame(
-                  chat ? api::ChatCompletionChunkJson(id, model, "", "",
-                                                      &reason, created, sampled)
-                       : api::CompletionChunkJson(id, model, "", &reason,
-                                                  created, sampled));
-
-              // The accounting chunk goes between the finish reason and
-              // [DONE], which is where OpenAI puts it: a client that stops
-              // reading at the finish reason loses only the counts, and one
-              // that reads to [DONE] gets them without a second request.
-              if (include_usage) {
-                Usage usage;
-                usage.prompt_tokens = stream->prompt_tokens();
-                usage.completion_tokens = event.generated;
-
-                frame += api::SseFrame(api::UsageChunkJson(
-                    id, model, usage, created, chat, sampled));
-              }
-
-              frame += api::SseFrame("[DONE]");
-
-              sink.write(frame.data(), frame.size());
-              sink.done();
-
-              return true;
-            }
-
-            // An empty delta is normal -- a token can complete no character --
-            // and sending a chunk for it would be noise on the wire.
-            if (event.text.empty()) continue;
-
-            frame = api::SseFrame(
-                chat ? api::ChatCompletionChunkJson(id, model, "", event.text,
-                                                    nullptr, created, sampled)
-                     : api::CompletionChunkJson(id, model, event.text, nullptr,
-                                                created, sampled));
-
-            // A failed write means the client is gone. Cancelling here is what
-            // stops the engine generating into a socket nobody is reading --
-            // §4's step 10, and the only backpressure the server has.
-            if (!sink.write(frame.data(), frame.size())) {
-              stream->Cancel();
-              return false;
-            }
-          }
-
-          sink.done();
-          return true;
-        },
-        // Called when the connection ends for any reason, including one the
-        // provider above never observes because it is blocked in Next.
-        [stream](bool /*success*/) { stream->Cancel(); });
+    ClearGeneration();
+    WriteJson(200, chat ? api::ChatCompletionJson(
+                              id, owner->engine->model_name(), text,
+                              ToApiReason(reason), usage, created, sampled)
+                        : api::CompletionJson(id, owner->engine->model_name(),
+                                              text, ToApiReason(reason), usage,
+                                              created, sampled));
   }
 
-  void Route() {
-    server.Get(
-        "/health", [](const httplib::Request&, httplib::Response& response) {
-          response.set_content("{\"status\":\"ok\"}", "application/json");
-        });
+  void Stream(const SamplingRequest& sampling, bool chat,
+              const std::shared_ptr<Generation>& current) {
+    const std::string id = MakeId(chat ? "chatcmpl" : "cmpl");
+    const std::string model = owner->engine->model_name();
+    const int64_t created = NowSeconds();
+    const bool sampled = sampling.temperature > 0.0f;
+    if (!StartStream()) return current->Cancel();
+    if (chat && !WriteChunk(api::SseFrame(api::ChatCompletionChunkJson(
+                    id, model, "assistant", "", nullptr, created, sampled)))) {
+      return current->Cancel();
+    }
+    Generation::Event event;
+    while (current->Next(&event)) {
+      std::string frame;
+      if (event.done) {
+        const FinishReason reason = ToApiReason(event.reason);
+        frame = api::SseFrame(chat ? api::ChatCompletionChunkJson(
+                                        id, model, "", "", &reason, created,
+                                        sampled)
+                                  : api::CompletionChunkJson(
+                                        id, model, "", &reason, created,
+                                        sampled));
+        if (sampling.include_usage) {
+          Usage usage{current->prompt_tokens(), event.generated};
+          frame += api::SseFrame(api::UsageChunkJson(
+              id, model, usage, created, chat, sampled));
+        }
+        frame += api::SseFrame("[DONE]");
+        if (!WriteChunk(std::move(frame))) current->Cancel();
+        ClearGeneration();
+        FinishStream();
+        return;
+      }
+      if (!event.text.empty()) {
+        frame = api::SseFrame(chat ? api::ChatCompletionChunkJson(
+                                        id, model, "", event.text, nullptr,
+                                        created, sampled)
+                                  : api::CompletionChunkJson(
+                                        id, model, event.text, nullptr, created,
+                                        sampled));
+        if (!WriteChunk(std::move(frame))) return current->Cancel();
+      }
+    }
+    current->Cancel();
+    ClearGeneration();
+    FinishStream();
+  }
 
-    server.Get("/v1/models", [this](const httplib::Request&,
-                                    httplib::Response& response) {
-      response.set_content(api::ModelsJson(engine->model_name(), NowSeconds()),
-                           "application/json");
+  void ClearGeneration() {
+    std::lock_guard lock(generation_mutex);
+    generation.reset();
+  }
+
+  void WriteStatusError(const Status& status) {
+    WriteError(StatusToHttp(status), status.message(),
+               status.code() == absl::StatusCode::kResourceExhausted
+                   ? "rate_limit_error"
+                   : "invalid_request_error",
+               keep_alive);
+  }
+
+  void WriteError(int status, std::string_view message, std::string_view type,
+                  bool preserve_connection) {
+    keep_alive = preserve_connection;
+    WriteJson(status, api::ErrorJson(message, type));
+  }
+
+  void WriteJson(int status, std::string body) {
+    WriteText(status, std::move(body), "application/json");
+  }
+
+  void WriteText(int status, std::string body, std::string content_type) {
+    auto response = std::make_shared<http::response<http::string_body>>(
+        static_cast<http::status>(status), 11);
+    response->set(http::field::server, "InferX");
+    response->set(http::field::content_type, std::move(content_type));
+    if (status == 429 || status == 503) response->set(http::field::retry_after, "1");
+    response->keep_alive(keep_alive && !owner->stopping);
+    response->body() = std::move(body);
+    response->prepare_payload();
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self, response] {
+      self->stream.expires_after(
+          std::chrono::seconds(self->owner->config.write_timeout_seconds));
+      http::async_write(self->stream, *response,
+                        [self, response](beast::error_code error, size_t) {
+                          if (error || !response->keep_alive()) self->Close();
+                          else self->Read();
+                        });
     });
+  }
 
-    server.Get("/metrics", [this](const httplib::Request&,
-                                  httplib::Response& response) {
-      response.set_content(engine->metrics() + RenderMetrics(engine->stats()),
-                           "text/plain; version=0.0.4; charset=utf-8");
+  bool StartStream() {
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto future = promise->get_future();
+    auto head = std::make_shared<http::response<http::empty_body>>(
+        http::status::ok, 11);
+    head->set(http::field::server, "InferX");
+    head->set(http::field::content_type, "text/event-stream");
+    head->set(http::field::cache_control, "no-cache");
+    head->set("X-Accel-Buffering", "no");
+    head->keep_alive(keep_alive && !owner->stopping);
+    head->chunked(true);
+    auto serializer =
+        std::make_shared<http::response_serializer<http::empty_body>>(*head);
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self, head, serializer, promise] {
+      self->stream.expires_after(
+          std::chrono::seconds(self->owner->config.write_timeout_seconds));
+      http::async_write_header(
+          self->stream, *serializer,
+          [self, head, serializer, promise](beast::error_code error, size_t) {
+            if (error) self->Close();
+            promise->set_value(!error);
+          });
     });
+    return future.get();
+  }
 
-    server.Get("/stats",
-               [this](const httplib::Request&, httplib::Response& response) {
-                 response.set_content(RenderStatsJson(engine->stats()),
-                                      "application/json");
-               });
-
-    server.Post("/v1/chat/completions", [this](const httplib::Request& request,
-                                               httplib::Response& response) {
-      StatusOr<api::ChatCompletionRequest> parsed =
-          api::ParseChatCompletionRequest(request.body);
-
-      if (!parsed.ok()) {
-        SendError(&response, StatusToHttp(parsed.status()),
-                  parsed.status().message(), "invalid_request_error");
-        return;
-      }
-
-      const StatusOr<std::string> prompt = tokenizer::ApplyQwen2ChatTemplate(
-          parsed->messages, /*add_generation_prompt=*/true);
-
-      if (!prompt.ok()) {
-        SendError(&response, StatusToHttp(prompt.status()),
-                  prompt.status().message(), "invalid_request_error");
-        return;
-      }
-
-      // Encode, not EncodeOrdinary: the template's control tokens are meant as
-      // control tokens. The user's own text was already escaped into the
-      // template as data, and the template is the only thing that puts
-      // <|im_start|> in this string.
-      StatusOr<std::unique_ptr<tokenizer::Tokenizer>> request_tokenizer =
-          engine->tokenizer().Clone();
-      if (!request_tokenizer.ok()) {
-        SendError(&response, 500, request_tokenizer.status().message(),
-                  "server_error");
-        return;
-      }
-      tokenizer::EncodeOptions encode_options;
-      encode_options.special_tokens = tokenizer::SpecialTokenMode::kAsControl;
-      StatusOr<std::vector<int32_t>> encoded =
-          (*request_tokenizer)->EncodeWithOptions(*prompt, encode_options);
-      if (!encoded.ok()) {
-        SendError(&response, StatusToHttp(encoded.status()),
-                  encoded.status().message(), "invalid_request_error");
-        return;
-      }
-      std::vector<int32_t> ids = std::move(*encoded);
-
-      if (parsed->sampling.stream) {
-        ServeStreaming(parsed->sampling, std::move(ids), /*chat=*/true,
-                       &response);
-      } else {
-        ServeBlocking(parsed->sampling, std::move(ids), /*chat=*/true,
-                      &response);
-      }
+  bool WriteChunk(std::string data) {
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto future = promise->get_future();
+    auto payload = std::make_shared<std::string>(std::move(data));
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self, payload, promise] {
+      self->stream.expires_after(
+          std::chrono::seconds(self->owner->config.write_timeout_seconds));
+      asio::async_write(
+          self->stream.socket(), http::make_chunk(asio::buffer(*payload)),
+          [self, payload, promise](beast::error_code error, size_t) {
+            if (error) self->Close();
+            promise->set_value(!error);
+          });
     });
+    return future.get();
+  }
 
-    server.Post("/v1/completions", [this](const httplib::Request& request,
-                                          httplib::Response& response) {
-      StatusOr<api::CompletionRequest> parsed =
-          api::ParseCompletionRequest(request.body);
-
-      if (!parsed.ok()) {
-        SendError(&response, StatusToHttp(parsed.status()),
-                  parsed.status().message(), "invalid_request_error");
-        return;
-      }
-
-      // A raw completion prompt is user text all the way through, so control
-      // tokens in it are characters, not turn boundaries.
-      StatusOr<std::unique_ptr<tokenizer::Tokenizer>> request_tokenizer =
-          engine->tokenizer().Clone();
-      if (!request_tokenizer.ok()) {
-        SendError(&response, 500, request_tokenizer.status().message(),
-                  "server_error");
-        return;
-      }
-      StatusOr<std::vector<int32_t>> encoded =
-          (*request_tokenizer)->EncodeWithOptions(parsed->prompt, {});
-      if (!encoded.ok()) {
-        SendError(&response, StatusToHttp(encoded.status()),
-                  encoded.status().message(), "invalid_request_error");
-        return;
-      }
-      std::vector<int32_t> ids = std::move(*encoded);
-
-      if (ids.empty()) {
-        SendError(&response, 400, "prompt encodes to no tokens",
-                  "invalid_request_error");
-        return;
-      }
-
-      if (parsed->sampling.stream) {
-        ServeStreaming(parsed->sampling, std::move(ids), /*chat=*/false,
-                       &response);
-      } else {
-        ServeBlocking(parsed->sampling, std::move(ids), /*chat=*/false,
-                      &response);
-      }
+  void FinishStream() {
+    auto self = shared_from_this();
+    asio::post(stream.get_executor(), [self] {
+      asio::async_write(
+          self->stream.socket(), http::make_chunk_last(),
+          [self](beast::error_code error, size_t) {
+            if (error || !self->keep_alive || self->owner->stopping)
+              self->Close();
+            else
+              self->Read();
+          });
     });
+  }
 
-    server.set_exception_handler([](const httplib::Request&,
-                                    httplib::Response& response,
-                                    std::exception_ptr /*ep*/) {
-      SendError(&response, 500, "internal error", "server_error");
-    });
+  void Close() {
+    if (closed) return;
+    closed = true;
+    {
+      std::lock_guard lock(generation_mutex);
+      if (generation) generation->Cancel();
+      generation.reset();
+    }
+    beast::error_code ignored;
+    stream.socket().shutdown(tcp::socket::shutdown_both, ignored);
+    stream.socket().close(ignored);
   }
 };
 
-HttpServer::HttpServer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+void HttpServer::Impl::Stop() {
+  if (stopping.exchange(true)) return;
+  std::vector<std::shared_ptr<Session>> active;
+  {
+    std::lock_guard lock(sessions_mutex);
+    for (auto& weak : sessions) {
+      if (auto session = weak.lock()) active.emplace_back(std::move(session));
+    }
+  }
+  asio::post(io, [this, active = std::move(active)] {
+    beast::error_code ignored;
+    acceptor.cancel(ignored);
+    acceptor.close(ignored);
+    for (const auto& session : active) session->Close();
+  });
+  application_pool.stop();
+  ready_cv.notify_all();
+}
 
+void HttpServer::Impl::Accept() {
+  acceptor.async_accept(asio::make_strand(io), [this](beast::error_code error,
+                                                       tcp::socket socket) {
+    if (!error) {
+      auto session = std::make_shared<Session>(this, std::move(socket));
+      Register(session);
+      session->Run();
+    }
+    if (!stopping) Accept();
+  });
+}
+
+Status HttpServer::Impl::Listen() {
+  beast::error_code error;
+  const auto address = asio::ip::make_address(config.host, error);
+  if (error) return InvalidArgumentError("invalid listen address: ", config.host);
+  tcp::endpoint endpoint(address, static_cast<unsigned short>(config.port));
+  acceptor.open(endpoint.protocol(), error);
+  if (error) return InternalError("cannot open listener: ", error.message());
+  acceptor.set_option(asio::socket_base::reuse_address(true), error);
+  acceptor.bind(endpoint, error);
+  if (error) return InternalError("cannot bind to ", config.host, ":",
+                                  config.port, ": ", error.message());
+  acceptor.listen(asio::socket_base::max_listen_connections, error);
+  if (error) return InternalError("listen failed: ", error.message());
+  bound_port.store(acceptor.local_endpoint().port(), std::memory_order_release);
+  {
+    std::lock_guard lock(ready_mutex);
+    ready = true;
+  }
+  ready_cv.notify_all();
+  Accept();
+
+  const size_t count = DefaultThreads(config.io_threads, 8);
+  io_workers.reserve(count > 0 ? count - 1 : 0);
+  for (size_t index = 1; index < count; ++index) {
+    io_workers.emplace_back([this] { io.run(); });
+  }
+  io.run();
+  for (auto& worker : io_workers) {
+    if (worker.joinable()) worker.join();
+  }
+  io_workers.clear();
+  return OkStatus();
+}
+
+HttpServer::HttpServer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 HttpServer::~HttpServer() { Stop(); }
 
 StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
     Engine* engine, const HttpServerConfig& config) {
   if (engine == nullptr) return InvalidArgumentError("engine is null");
-
-  auto impl = std::make_unique<Impl>(engine, config);
-
-  impl->server.set_payload_max_length(config.max_request_bytes);
-  impl->server.set_read_timeout(config.read_timeout_seconds, 0);
-
-  // Nagle's algorithm and an SSE stream are a bad pair, and cpp-httplib leaves
-  // TCP_NODELAY off by default. Each token is one small write; Nagle holds it
-  // in the kernel until the previous small segment is acknowledged, and the
-  // peer's delayed ACK does not fire for ~40 ms. M10 measured exactly that: a
-  // TTFT floor of ~43 ms that did not move between a 6-token prompt and a
-  // 455-token one, because it was never prefill -- it was the socket. The
-  // engine's job is to put a token on the wire as soon as it exists, so the
-  // batching heuristic that helps bulk transfers is precisely wrong here.
-  impl->server.set_tcp_nodelay(true);
-
-  // Generation can take much longer than a default socket timeout, and a
-  // non-streaming request holds the connection open for all of it.
-  impl->server.set_write_timeout(config.write_timeout_seconds, 0);
-
-  impl->Route();
-
-  return std::unique_ptr<HttpServer>(new HttpServer(std::move(impl)));
+  if (config.port < 0 || config.port > 65535)
+    return InvalidArgumentError("port must be in [0, 65535]");
+  if (config.max_request_bytes == 0)
+    return InvalidArgumentError("max_request_bytes must be positive");
+  if (config.read_timeout_seconds <= 0 || config.write_timeout_seconds <= 0)
+    return InvalidArgumentError("HTTP timeouts must be positive");
+  return std::unique_ptr<HttpServer>(
+      new HttpServer(std::make_unique<Impl>(engine, config)));
 }
 
-Status HttpServer::Listen() {
-  // Port 0 means "any free port", which is how a test avoids colliding with
-  // whatever else is on the machine. The chosen port is published before the
-  // accept loop starts, so a caller that waits for readiness can read it.
-  if (impl_->config.port == 0) {
-    const int bound = impl_->server.bind_to_any_port(impl_->config.host);
-
-    if (bound < 0) {
-      return InternalError("cannot bind to ", impl_->config.host,
-                           " on any port");
-    }
-
-    impl_->bound_port.store(bound, std::memory_order_release);
-  } else {
-    if (!impl_->server.bind_to_port(impl_->config.host, impl_->config.port)) {
-      return InternalError("cannot bind to ", impl_->config.host, ":",
-                           impl_->config.port);
-    }
-
-    impl_->bound_port.store(impl_->config.port, std::memory_order_release);
-  }
-
-  if (!impl_->server.listen_after_bind()) {
-    return InternalError("listen failed");
-  }
-
-  return OkStatus();
-}
-
+Status HttpServer::Listen() { return impl_->Listen(); }
 void HttpServer::Stop() {
-  if (impl_ != nullptr) impl_->server.stop();
+  if (impl_) impl_->Stop();
 }
-
 bool HttpServer::WaitUntilReady() {
-  impl_->server.wait_until_ready();
-
-  return impl_->server.is_running();
+  std::unique_lock lock(impl_->ready_mutex);
+  impl_->ready_cv.wait(lock,
+                       [this] { return impl_->ready || impl_->stopping; });
+  return impl_->ready && !impl_->stopping;
 }
-
 int HttpServer::port() const {
   return impl_->bound_port.load(std::memory_order_acquire);
 }

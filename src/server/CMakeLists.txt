@@ -22,10 +22,10 @@ target_link_libraries(inferx_server
     inferx::tokenizer
     inferx::flags
   PRIVATE
-    inferx::cpp_httplib
+    inferx::beast
 )
 
-# Threads, for the engine loop and cpp-httplib's per-connection threads.
+# Threads, for the engine loop and the bounded HTTP executors.
 find_package(Threads REQUIRED)
 target_link_libraries(inferx_server PUBLIC Threads::Threads)
 
