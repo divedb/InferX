@@ -91,3 +91,31 @@ Configure using a fresh build directory:
 cmake -S . -B build
 cmake --build build -j"$(nproc)"
 ```
+
+## Host-only gateway
+
+When protobuf and gRPC are available, a CUDA-free configuration builds the
+process-separated HTTP gateway without model weights, an engine, a scheduler
+queue, or KV-cache state:
+
+```bash
+cmake -S . -B build-gateway \
+  -DINFERX_ENABLE_CUDA=OFF \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+cmake --build build-gateway --target inferx-gateway -j"$(nproc)"
+```
+
+The gateway loads only the CPU tokenizer artifacts from the checkpoint and
+sends tokenized requests to the scheduler endpoint:
+
+```bash
+./build-gateway/src/server/gateway/inferx-gateway \
+  --scheduler-endpoint dns:///scheduler:50051 \
+  --tokenizer /models/example \
+  --model example \
+  --model-version v1 \
+  --tokenizer-revision tokenizer-v1
+```
+
+The tokenizer dependency requires a working Rust `cargo` executable when its
+vendored static library has not already been built.

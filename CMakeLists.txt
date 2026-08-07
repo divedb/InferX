@@ -54,6 +54,9 @@ add_subdirectory(src/server/middleware)
 add_subdirectory(src/server/observability)
 add_subdirectory(src/server/engine_client)
 add_subdirectory(src/server/handlers)
+if(TARGET inferx_grpc_scheduler_transport)
+  add_subdirectory(src/server/gateway)
+endif()
 
 # The server owns the model, so it needs device code; the wire format it speaks
 # does not, which is why src/api is unconditional and this is not.
