@@ -19,6 +19,7 @@
 #include "inferx/server/transport/sse_writer.h"
 #include "inferx/server/api/error_mapping.h"
 #include "inferx/server/request/request_context.h"
+#include "inferx/server/request/request_manager.h"
 #include "inferx/server/streaming/event_buffer.h"
 
 namespace inferx::server::transport {
@@ -175,6 +176,27 @@ TEST(RequestStateTest, EnforcesLifecycleAndIdempotentCancellation) {
   cancelled.Cancel(::inferx::server::request::CancellationReason::kInternal);
   EXPECT_EQ(cancelled.state, RequestState::kCancelled);
   EXPECT_TRUE(cancelled.cancellation.isCancellationRequested());
+}
+
+TEST(RequestManagerTest, OwnsSnapshotsAndIdempotentTerminalCleanup) {
+  ::inferx::server::request::RequestManager manager;
+  ::inferx::server::request::RequestContext context;
+  context.request_id = "req_manager";
+  auto created = manager.Create(std::move(context));
+  ASSERT_TRUE(created.ok()) << created.status();
+  EXPECT_EQ(manager.active_count(), 1);
+  ASSERT_TRUE(manager.Cancel(
+                          "req_manager",
+                          ::inferx::server::request::CancellationReason::
+                              kClientDisconnected)
+                  .ok());
+  auto snapshot = manager.GetStatus("req_manager");
+  ASSERT_TRUE(snapshot.ok()) << snapshot.status();
+  EXPECT_EQ(snapshot->state,
+            ::inferx::server::request::RequestState::kCancelled);
+  EXPECT_TRUE(manager.Finalize("req_manager").ok());
+  EXPECT_TRUE(manager.Finalize("req_manager").ok());
+  EXPECT_EQ(manager.active_count(), 0);
 }
 
 TEST(EventBufferTest, BoundsAndDeliversEvents) {
