@@ -59,6 +59,15 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
        .required_scope = "models.read"},
       std::make_shared<ModelsHandler>(dependencies.models)));
   INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::post, "/v1/chat/completions",
+      {.name = "chat.completions",
+       .max_body_bytes = dependencies.max_inference_body_bytes,
+       .authentication_required = true,
+       .required_scope = "inference.invoke"},
+      std::make_shared<ChatCompletionHandler>(
+          dependencies.models, dependencies.tokenization,
+          dependencies.requests)));
+  INFERX_RETURN_IF_ERROR(routes->Add(
       boost::beast::http::verb::post, "/v1/completions",
       {.name = "completions",
        .max_body_bytes = dependencies.max_inference_body_bytes,

@@ -37,6 +37,7 @@
 #include "inferx/server/handlers/embeddings_handler.h"
 #include "inferx/server/handlers/api_routes.h"
 #include "inferx/server/handlers/completion_handler.h"
+#include "inferx/server/handlers/chat_completion_handler.h"
 #include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
 #include "inferx/server/tokenization/tokenization_service.h"
@@ -147,14 +148,18 @@ class FakeTokenizationService final
   }
 
   StatusOr<::inferx::server::tokenization::TokenizedPrompt> TokenizeChat(
-      const ::inferx::server::request::ModelVersion&,
-      const std::vector<::inferx::tokenizer::ChatMessage>&) override {
-    return UnimplementedError("not used");
+      const ::inferx::server::request::ModelVersion& model_version,
+      const std::vector<::inferx::tokenizer::ChatMessage>& messages) override {
+    seen_version = model_version;
+    seen_messages = messages.size();
+    return ::inferx::server::tokenization::TokenizedPrompt{
+        model_version, {21, 22, 23}, 3};
   }
 
   std::string seen_version;
   std::string seen_prompt;
   bool seen_add_special_tokens = false;
+  size_t seen_messages = 0;
 };
 
 class FakeRequestService final
@@ -1212,6 +1217,76 @@ TEST(CompletionHandlerTest, StreamsSameEventsWithUsageAndDoneMarker) {
   EXPECT_NE(writer.body.find("hello"), std::string::npos);
   EXPECT_NE(writer.body.find("\"choices\":[]"), std::string::npos);
   EXPECT_NE(writer.body.find("data: [DONE]"), std::string::npos);
+}
+
+TEST(ChatCompletionHandlerTest, UsesChatTokenizerAndCollectsAssistantMessage) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v2";
+  model.alias = "chat-current";
+  model.context_limit = 8;
+  model.tokenizer_revision = "chat-tok";
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v2", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v2", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v2", ModelState::kReady).ok());
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::ChatCompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/chat/completions", 11};
+  request.body() =
+      "{\"model\":\"chat-current\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"hi\"}],\"max_tokens\":2}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(writer.body.find("\"role\":\"assistant\""), std::string::npos);
+  EXPECT_NE(writer.body.find("\"content\":\"hello\""), std::string::npos);
+  EXPECT_EQ(tokenization.seen_version, "chat@v2");
+  EXPECT_EQ(tokenization.seen_messages, 1);
+  EXPECT_EQ(requests.submitted.tokenizer_revision, "chat-tok");
+}
+
+TEST(ChatCompletionHandlerTest, StreamsRoleBeforeContentAndUsage) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v1";
+  model.context_limit = 8;
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kReady).ok());
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::ChatCompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/chat/completions", 11};
+  request.body() =
+      "{\"model\":\"chat@v1\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"hi\"}],\"max_tokens\":2,\"stream\":true,"
+      "\"stream_options\":{\"include_usage\":true}}";
+  folly::coro::blockingWait(handler.Handle(
+      std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  const size_t role = writer.body.find("\"role\":\"assistant\"");
+  const size_t content = writer.body.find("hello");
+  ASSERT_NE(role, std::string::npos);
+  ASSERT_NE(content, std::string::npos);
+  EXPECT_LT(role, content);
+  EXPECT_NE(writer.body.find("\"choices\":[]"), std::string::npos);
+  EXPECT_NE(writer.body.find("data: [DONE]"), std::string::npos);
+  EXPECT_TRUE(writer.finished);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

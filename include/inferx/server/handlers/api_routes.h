@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "inferx/server/handlers/embeddings_handler.h"
+#include "inferx/server/handlers/chat_completion_handler.h"
 #include "inferx/server/handlers/health_handler.h"
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/request/request_service.h"

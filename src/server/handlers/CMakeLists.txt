@@ -1,5 +1,6 @@
 add_library(inferx_request_handlers
   api_routes.cc
+  chat_completion_handler.cc
   completion_handler.cc
   embeddings_handler.cc
   health_handler.cc
