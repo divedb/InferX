@@ -20,6 +20,7 @@
 #include "inferx/server/api/error_mapping.h"
 #include "inferx/server/request/request_context.h"
 #include "inferx/server/request/request_manager.h"
+#include "inferx/server/request/request_id.h"
 #include "inferx/server/streaming/event_buffer.h"
 #include "inferx/server/streaming/backpressure_controller.h"
 #include "inferx/server/streaming/event_router.h"
@@ -206,6 +207,47 @@ TEST(RequestManagerTest, OwnsSnapshotsAndIdempotentTerminalCleanup) {
   EXPECT_TRUE(manager.Finalize("req_manager").ok());
   EXPECT_TRUE(manager.Finalize("req_manager").ok());
   EXPECT_EQ(manager.active_count(), 0);
+  EXPECT_EQ(manager.completed_count(), 1);
+  EXPECT_TRUE(manager.GetStatus("req_manager").ok());
+}
+
+TEST(RequestIdTest, GeneratesPrefixedSortableUuidV7) {
+  using namespace std::chrono_literals;
+  const auto epoch = std::chrono::system_clock::time_point(1234567890ms);
+  const std::string first =
+      ::inferx::server::request::GenerateRequestId(epoch);
+  const std::string later =
+      ::inferx::server::request::GenerateRequestId(epoch + 1ms);
+  EXPECT_EQ(first.size(), 40);
+  EXPECT_EQ(first.substr(0, 4), "req_");
+  EXPECT_EQ(first[18], '7');
+  EXPECT_TRUE(first[23] == '8' || first[23] == '9' || first[23] == 'a' ||
+              first[23] == 'b');
+  EXPECT_LT(first, later);
+}
+
+TEST(RequestManagerTest, BoundsAndExpiresCompletedSnapshots) {
+  using Clock = std::chrono::steady_clock;
+  auto now = Clock::time_point(std::chrono::seconds(10));
+  ::inferx::server::request::RequestManager manager(
+      {.completed_retention = std::chrono::seconds(5),
+       .max_completed_snapshots = 1,
+       .now = [&] { return now; }});
+  for (const std::string id : {"req_one", "req_two"}) {
+    ::inferx::server::request::RequestContext context;
+    context.request_id = id;
+    auto created = manager.Create(std::move(context));
+    ASSERT_TRUE(created.ok()) << created.status();
+    ASSERT_TRUE(manager.Cancel(
+                           id, ::inferx::server::request::CancellationReason::
+                                   kAdministrative)
+                    .ok());
+    ASSERT_TRUE(manager.Finalize(id).ok());
+  }
+  EXPECT_EQ(manager.completed_count(), 1);
+  EXPECT_FALSE(manager.GetStatus("req_one").ok());
+  now += std::chrono::seconds(5);
+  EXPECT_EQ(manager.completed_count(), 0);
 }
 
 TEST(EventBufferTest, BoundsAndDeliversEvents) {

@@ -3,6 +3,13 @@
 
 namespace inferx::server::request {
 
+RequestManager::RequestManager(RequestManagerConfig config)
+    : config_(std::move(config)) {
+  if (!config_.now) {
+    config_.now = [] { return std::chrono::steady_clock::now(); };
+  }
+}
+
 const char* RequestStateName(RequestState state) {
   switch (state) {
     case RequestState::kReceived: return "received";
@@ -102,9 +109,12 @@ RequestSnapshot RequestManager::Snapshot(const RequestContext& context) {
 
 StatusOr<RequestSnapshot> RequestManager::GetStatus(const RequestId& id) const {
   std::lock_guard lock(mutex_);
+  PruneCompletedLocked(config_.now());
   const auto it = active_.find(id);
-  if (it == active_.end()) return NotFoundError("request not found: ", id);
-  return Snapshot(*it->second);
+  if (it != active_.end()) return Snapshot(*it->second);
+  const auto completed = completed_.find(id);
+  if (completed != completed_.end()) return completed->second;
+  return NotFoundError("request not found: ", id);
 }
 
 Status RequestManager::Finalize(const RequestId& id) {
@@ -114,13 +124,45 @@ Status RequestManager::Finalize(const RequestId& id) {
   if (!IsTerminal(it->second->state)) {
     return FailedPreconditionError("request is not terminal: ", id);
   }
+  const auto now = config_.now();
+  RequestSnapshot snapshot = Snapshot(*it->second);
+  if (snapshot.completed_at == std::chrono::steady_clock::time_point{}) {
+    snapshot.completed_at = now;
+  }
+  completed_.insert_or_assign(id, std::move(snapshot));
+  completion_order_.emplace_back(id, now);
   active_.erase(it);
+  PruneCompletedLocked(now);
   return OkStatus();
+}
+
+void RequestManager::PruneCompletedLocked(
+    std::chrono::steady_clock::time_point now) const {
+  while (!completion_order_.empty()) {
+    const auto found = completed_.find(completion_order_.front().first);
+    if (found == completed_.end()) {
+      completion_order_.pop_front();
+      continue;
+    }
+    const bool over_count = completed_.size() > config_.max_completed_snapshots;
+    const bool expired = config_.completed_retention.count() >= 0 &&
+                         now - completion_order_.front().second >=
+                             config_.completed_retention;
+    if (!over_count && !expired) break;
+    completed_.erase(found);
+    completion_order_.pop_front();
+  }
 }
 
 size_t RequestManager::active_count() const {
   std::lock_guard lock(mutex_);
   return active_.size();
+}
+
+size_t RequestManager::completed_count() const {
+  std::lock_guard lock(mutex_);
+  PruneCompletedLocked(config_.now());
+  return completed_.size();
 }
 
 }  // namespace inferx::server::request
