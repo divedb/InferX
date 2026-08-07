@@ -6,6 +6,7 @@
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Task.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/futures/ManualTimekeeper.h>
 
 #include <memory>
 #include <string>
@@ -32,6 +33,7 @@
 #include "inferx/server/auth/rbac.h"
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/tokenization/tokenization_service.h"
+#include "inferx/server/coroutine/deadline.h"
 
 namespace inferx::server::transport {
 namespace {
@@ -231,6 +233,35 @@ TEST(RequestStateTest, EnforcesLifecycleAndIdempotentCancellation) {
   cancelled.Cancel(::inferx::server::request::CancellationReason::kInternal);
   EXPECT_EQ(cancelled.state, RequestState::kCancelled);
   EXPECT_TRUE(cancelled.cancellation.isCancellationRequested());
+}
+
+TEST(DeadlineTest, ReturnsResultOrCancelsExpiredOperation) {
+  folly::CancellationSource success_cancellation;
+  folly::ManualTimekeeper timekeeper;
+  auto success = []() -> folly::coro::Task<StatusOr<int>> { co_return 7; };
+  auto result = folly::coro::blockingWait(
+      ::inferx::server::coroutine::WithDeadline(
+          success(), std::chrono::steady_clock::now() +
+                         std::chrono::seconds(1),
+          success_cancellation, &timekeeper));
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(*result, 7);
+  EXPECT_FALSE(success_cancellation.isCancellationRequested());
+
+  bool started = false;
+  folly::CancellationSource expired_cancellation;
+  auto expired = [&]() -> folly::coro::Task<StatusOr<int>> {
+    started = true;
+    co_return 9;
+  };
+  result = folly::coro::blockingWait(
+      ::inferx::server::coroutine::WithDeadline(
+          expired(), std::chrono::steady_clock::now() -
+                         std::chrono::milliseconds(1),
+          expired_cancellation));
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kDeadlineExceeded);
+  EXPECT_TRUE(expired_cancellation.isCancellationRequested());
+  EXPECT_FALSE(started);
 }
 
 TEST(RequestManagerTest, OwnsSnapshotsAndIdempotentTerminalCleanup) {
