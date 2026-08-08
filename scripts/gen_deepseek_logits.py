@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Generate reference logits for DeepSeek-V2-Lite — the §18.7 D5 oracle.
 
-The reference is HF's own DeepseekV2ForCausalLM (the checkpoint ships its
-modeling code, hence trust_remote_code), sharing nothing with the C++ side but
-the weights. Agreement means the MLA projections, the decoupled-RoPE
+The reference is transformers' native DeepseekV2ForCausalLM, sharing nothing
+with the C++ side but the weights. Native rather than the checkpoint's bundled
+modeling code (trust_remote_code): the bundled file is frozen against a 2024
+transformers API and no longer imports on current versions, while the native
+class is maintained -- and measured against the same weights they are the same
+model. Agreement means the MLA projections, the decoupled-RoPE
 convention, the YaRN frequency table and mscale softmax scale, the dense/MoE
 layer schedule, softmax/greedy routing and the ungated shared experts all
 match the definition rather than one reading of it.
@@ -58,7 +61,7 @@ def main() -> int:
     fp32 = "--fp32" in rest
     rest = [a for a in rest if a != "--fp32"]
 
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=False)
 
     if rest and rest[0] == "--prompt":
         ids = tokenizer(" ".join(rest[1:]) or DEFAULT_PROMPT)["input_ids"]
@@ -69,12 +72,12 @@ def main() -> int:
 
     if fp32:
         model = AutoModelForCausalLM.from_pretrained(
-            checkpoint, torch_dtype=torch.float32, trust_remote_code=True
+            checkpoint, torch_dtype=torch.float32, trust_remote_code=False
         )
         device = "cpu"
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            checkpoint, torch_dtype=torch.bfloat16, trust_remote_code=True,
+            checkpoint, torch_dtype=torch.bfloat16, trust_remote_code=False,
             device_map="cuda",
         )
         device = "cuda"

@@ -1,6 +1,8 @@
 #include "inferx/model/deepseek_v2.h"
 
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -507,6 +509,24 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
 
   impl->layers.resize(static_cast<size_t>(config.num_hidden_layers));
 
+  // A 31 GB load is minutes of silence without progress, and silence is
+  // indistinguishable from a hang. One line per layer to stderr, the same
+  // channel main.cc's "loading ..." uses; per-layer cost is measured because
+  // the MoE layers (hundreds of MB of experts each) dominate and a stall
+  // should name its layer.
+  const auto load_start = std::chrono::steady_clock::now();
+  const auto uploaded_bytes = [&impl] {
+    size_t total = 0;
+    for (const DeviceBuffer& buf : impl->weight_buffers) total += buf.size();
+    return total;
+  };
+  std::fprintf(stderr,
+               "deepseek-v2: loading %zu tensors, %.1f GB, %lld layers "
+               "(rope convention: %s)\n",
+               ckpt.size(), static_cast<double>(ckpt.TotalBytes()) / 1e9,
+               static_cast<long long>(config.num_hidden_layers),
+               RopeDeinterleaveRequested() ? "deinterleaved" : "half-split");
+
   // Reused host staging for the stacked expert tensors: the checkpoint stores
   // ~192 tensors per MoE layer, and packing them on the host first makes the
   // upload one cudaMemcpy per stacked tensor instead of one per expert.
@@ -515,6 +535,22 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) {
     LayerWeights& w = impl->layers[static_cast<size_t>(i)];
     const std::string p = absl::StrCat("model.layers.", i, ".");
+
+    const auto layer_start = std::chrono::steady_clock::now();
+    const size_t layer_before = uploaded_bytes();
+    const auto log_layer = [&](const char* kind) {
+      const auto now = std::chrono::steady_clock::now();
+      std::fprintf(
+          stderr, "deepseek-v2: layer %2lld/%lld (%s) %5.0f MB in %5lld ms, "
+                  "%5.1f GB total\n",
+          static_cast<long long>(i + 1),
+          static_cast<long long>(config.num_hidden_layers), kind,
+          static_cast<double>(uploaded_bytes() - layer_before) / 1e6,
+          static_cast<long long>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now - layer_start).count()),
+          static_cast<double>(uploaded_bytes()) / 1e9);
+    };
 
     auto up = [&](const std::string& name, const Shape& expected,
                   TensorView* out) -> Status {
@@ -605,6 +641,7 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
           UploadConcatenated(gate_up, &impl->weight_buffers));
       INFERX_RETURN_IF_ERROR(
           up("mlp.down_proj.weight", Shape({h, inter}), &w.dense_down));
+      log_layer("dense");
       continue;
     }
 
@@ -686,7 +723,15 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       INFERX_RETURN_IF_ERROR(up("mlp.shared_experts.down_proj.weight",
                                 Shape({h, shared_inter}), &w.shared_down));
     }
+
+    log_layer("moe");
   }
+
+  std::fprintf(
+      stderr, "deepseek-v2: loaded %.1f GB in %.1f s\n",
+      static_cast<double>(uploaded_bytes()) / 1e9,
+      std::chrono::duration_cast<std::chrono::duration<double>>(
+          std::chrono::steady_clock::now() - load_start).count());
 
   INFERX_ASSIGN_OR_RETURN(MlaAttentionLayer mla,
                           MlaAttentionLayer::Create(config, 1, 1));
