@@ -1,6 +1,7 @@
 #include "inferx/model/deepseek_v2.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -87,6 +88,76 @@ StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
 
   return TensorView::Create(keep->back().data(), parts.front().dtype(),
                             Shape({rows, cols}), DeviceId::Cuda(0));
+}
+
+// The RoPE-convention question (§18.4 D2, ARCHITECTURE.md's "unverified"
+// caveat), as a validation-time toggle. Our kernel rotates half-split pairs
+// (j, j+half); HF's DeepSeek code de-interleaves storage pairs (2j, 2j+1)
+// before the same rotation. If the checkpoint's rope output channels are laid
+// out interleaved, the fix is a load-time gather of the rope rows -- even
+// source rows first, then odd -- applied identically to the Q heads and the
+// shared key, so every dot product pairs permuted-with-permuted.
+//
+// An environment toggle rather than a constant, deliberately and temporarily:
+// the golden-logits test on a machine with real weights is the only arbiter,
+// and a toggle makes that session a re-run instead of a rebuild. Once
+// measured, the winning convention gets hardcoded and this env var removed --
+// it must not outlive validation (docs/DSV2_VALIDATION.md).
+bool RopeDeinterleaveRequested() {
+  const char* env = std::getenv("INFERX_DSV2_ROPE_DEINTERLEAVE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Uploads a 2-D host tensor with its rows permuted: destination row i reads
+// source row `row_map[i]`. Used only by the rope de-interleave above.
+StatusOr<TensorView> UploadRowPermuted(std::vector<DeviceBuffer>* keep,
+                                       const Tensor& host,
+                                       const std::vector<int64_t>& row_map) {
+  const int64_t rows = host.dim(0);
+  const int64_t cols = host.dim(1);
+  const size_t row_bytes = DataTypeByteSize(host.dtype(), cols);
+
+  if (static_cast<int64_t>(row_map.size()) != rows) {
+    return InvalidArgumentError("row_map covers ", row_map.size(), " of ",
+                                rows, " rows");
+  }
+
+  std::vector<std::byte> staged(static_cast<size_t>(rows) * row_bytes);
+  const auto* src = static_cast<const std::byte*>(host.data());
+  for (int64_t i = 0; i < rows; ++i) {
+    std::memcpy(staged.data() + static_cast<size_t>(i) * row_bytes,
+                src + static_cast<size_t>(row_map[static_cast<size_t>(i)]) *
+                          row_bytes,
+                row_bytes);
+  }
+
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceBuffer buf, DeviceBuffer::Allocate(staged.size(), DeviceId::Cuda(0)));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), staged.data(),
+                                         staged.size(),
+                                         cudaMemcpyHostToDevice));
+  keep->push_back(std::move(buf));
+
+  return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
+                            DeviceId::Cuda(0));
+}
+
+// Identity over `rows`, with each listed `rope`-wide block at `starts`
+// replaced by the de-interleaving gather: evens first, then odds.
+std::vector<int64_t> DeinterleaveMap(int64_t rows,
+                                     const std::vector<int64_t>& starts,
+                                     int64_t rope) {
+  std::vector<int64_t> map(static_cast<size_t>(rows));
+  for (int64_t i = 0; i < rows; ++i) map[static_cast<size_t>(i)] = i;
+
+  const int64_t half = rope / 2;
+  for (const int64_t start : starts) {
+    for (int64_t j = 0; j < half; ++j) {
+      map[static_cast<size_t>(start + j)] = start + 2 * j;
+      map[static_cast<size_t>(start + half + j)] = start + 2 * j + 1;
+    }
+  }
+  return map;
 }
 
 // One layer's device-resident weights. The FFN half is either dense or MoE,
@@ -459,21 +530,57 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
 
     // MLA projections. q_lora_rank 0 (V2-Lite's `null`) means one q_proj and
     // no q_a/q_a_norm -- exactly the branch MlaAttentionLayer takes when
-    // MlaWeights.q_a is undefined.
+    // MlaWeights.q_a is undefined. The rope output channels of the Q
+    // projection and of kv_a's shared key are the two places the
+    // de-interleave toggle applies (see RopeDeinterleaveRequested above).
+    const bool deinterleave = RopeDeinterleaveRequested();
+
+    // The rope block within each Q head's [nope | rope] output rows.
+    std::vector<int64_t> q_rope_starts;
+    for (int64_t head = 0; head < heads; ++head) {
+      q_rope_starts.push_back(head * qk + config.qk_nope_head_dim);
+    }
+
     if (config.q_lora_rank > 0) {
       INFERX_RETURN_IF_ERROR(up("self_attn.q_a_proj.weight",
                                 Shape({config.q_lora_rank, h}), &w.mla.q_a));
       INFERX_RETURN_IF_ERROR(up("self_attn.q_a_layernorm.weight",
                                 Shape({config.q_lora_rank}), &w.mla.q_a_norm));
-      INFERX_RETURN_IF_ERROR(up("self_attn.q_b_proj.weight",
-                                Shape({heads * qk, config.q_lora_rank}),
-                                &w.mla.q_b));
+      INFERX_ASSIGN_OR_RETURN(
+          const Tensor q_b,
+          get(p + "self_attn.q_b_proj.weight",
+              Shape({heads * qk, config.q_lora_rank})));
+      INFERX_ASSIGN_OR_RETURN(
+          w.mla.q_b,
+          deinterleave
+              ? UploadRowPermuted(&impl->weight_buffers, q_b,
+                                  DeinterleaveMap(heads * qk, q_rope_starts,
+                                                  rope))
+              : Upload(&impl->weight_buffers, q_b));
     } else {
-      INFERX_RETURN_IF_ERROR(
-          up("self_attn.q_proj.weight", Shape({heads * qk, h}), &w.mla.q_b));
+      INFERX_ASSIGN_OR_RETURN(
+          const Tensor q_proj,
+          get(p + "self_attn.q_proj.weight", Shape({heads * qk, h})));
+      INFERX_ASSIGN_OR_RETURN(
+          w.mla.q_b,
+          deinterleave
+              ? UploadRowPermuted(&impl->weight_buffers, q_proj,
+                                  DeinterleaveMap(heads * qk, q_rope_starts,
+                                                  rope))
+              : Upload(&impl->weight_buffers, q_proj));
     }
-    INFERX_RETURN_IF_ERROR(up("self_attn.kv_a_proj_with_mqa.weight",
-                              Shape({latent + rope, h}), &w.mla.kv_a));
+    {
+      INFERX_ASSIGN_OR_RETURN(const Tensor kv_a,
+                              get(p + "self_attn.kv_a_proj_with_mqa.weight",
+                                  Shape({latent + rope, h})));
+      INFERX_ASSIGN_OR_RETURN(
+          w.mla.kv_a,
+          deinterleave
+              ? UploadRowPermuted(&impl->weight_buffers, kv_a,
+                                  DeinterleaveMap(latent + rope, {latent},
+                                                  rope))
+              : Upload(&impl->weight_buffers, kv_a));
+    }
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_a_layernorm.weight",
                               Shape({latent}), &w.mla.kv_a_norm));
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_b_proj.weight",
