@@ -93,6 +93,12 @@ Status ValidateGatewayServerConfig(const GatewayServerConfig& config) {
           "api_key_sha256 entries must contain 64 hexadecimal characters");
     }
   }
+  if (config.chat_template != "qwen2" &&
+      config.chat_template != "deepseek-v2") {
+    return InvalidArgumentError(
+        "chat_template must be one of: qwen2, deepseek-v2; got '",
+        config.chat_template, "'");
+  }
   return OkStatus();
 }
 
@@ -146,7 +152,10 @@ struct GatewayServer::Impl {
             &request_manager, scheduler.get(), &admission)),
         tokenization(
             std::make_unique<tokenization::InProcessTokenizationService>(
-                tokenizer.get(), config.model_id + "@" + config.model_version)),
+                tokenizer.get(), config.model_id + "@" + config.model_version,
+                config.chat_template == "deepseek-v2"
+                    ? tokenizer::ChatTemplateKind::kDeepSeekV2
+                    : tokenizer::ChatTemplateKind::kQwen2)),
         key_store(std::make_shared<auth::ApiKeyStore>()) {}
 
   ~Impl() {

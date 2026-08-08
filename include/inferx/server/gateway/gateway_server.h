@@ -26,6 +26,12 @@ struct GatewayServerConfig {
   int request_timeout_seconds = 600;
   int scheduler_connect_timeout_seconds = 5;
   std::vector<std::string> api_key_sha256;
+
+  /// Which transcribed chat template `/v1/chat/completions` renders. The
+  /// gateway never loads a checkpoint, so unlike the in-process server this
+  /// cannot follow a declared architecture -- it is configuration, validated
+  /// against the known kinds ("qwen2", "deepseek-v2").
+  std::string chat_template = "qwen2";
 };
 
 Status ValidateGatewayServerConfig(const GatewayServerConfig& config);

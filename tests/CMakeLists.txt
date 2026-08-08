@@ -47,6 +47,7 @@ function(inferx_add_kernel_test name)
   )
 endfunction()
 
+inferx_add_test(chat_template_test     unit/chat_template_test.cc)
 inferx_add_test(safetensors_test       unit/safetensors_test.cc)
 inferx_add_test(config_test            unit/config_test.cc)
 inferx_add_test(scheduler_test         unit/scheduler_test.cc)

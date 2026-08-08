@@ -106,7 +106,13 @@ struct HttpServer::Impl {
                    .max_reserved_tokens = std::numeric_limits<uint64_t>::max(),
                    .max_active_per_tenant =
                        static_cast<uint32_t>(config.max_active_requests)}),
-        tokenization(&engine->tokenizer(), engine->model_name() + "@loaded"),
+        // The chat template follows the checkpoint's declared architecture --
+        // selected here, at composition, never sniffed from the conversation.
+        tokenization(&engine->tokenizer(), engine->model_name() + "@loaded",
+                     engine->architecture() ==
+                             model::Architecture::kDeepSeekV2
+                         ? tokenizer::ChatTemplateKind::kDeepSeekV2
+                         : tokenizer::ChatTemplateKind::kQwen2),
         metrics(engine) {
     if (config.scheduler_endpoint.empty()) {
       scheduler_backend = std::make_unique<EngineSchedulerBackend>(engine);

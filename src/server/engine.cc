@@ -12,6 +12,7 @@
 
 #include "inferx/api/openai.h"
 #include "inferx/model/forward_batch.h"
+#include "inferx/model/deepseek_v2.h"
 #include "inferx/model/gpt_oss.h"
 #include "inferx/observe/metrics.h"
 #include "qwen_runner.h"
@@ -236,6 +237,12 @@ struct Engine::Impl {
   // Phase 4 makes it fast.
   std::unique_ptr<QwenRunner> qwen2_model;
   std::unique_ptr<model::GptOssModel> gpt_oss_model;
+  std::unique_ptr<model::DeepseekV2Model> deepseek_model;
+
+  // The declared architecture, kept because composition needs it after Create
+  // (chat-template selection) and the populated pointer alone cannot
+  // distinguish the two synchronous models.
+  model::Architecture architecture = model::Architecture::kQwen2;
 
   // Null in the gpt-oss path, which does not continuous-batch. Held by pointer
   // rather than by value for the same reason the models are: the Qwen2 path
@@ -297,7 +304,23 @@ struct Engine::Impl {
 
   Impl() = default;
 
-  bool is_gpt_oss() const { return gpt_oss_model != nullptr; }
+  // The two synchronous models (Step to host logits, argmax here) against the
+  // Qwen2 async runner. One predicate and two forwarding helpers rather than a
+  // third serving loop: RunSyncModel is the only consumer.
+  bool is_sync_model() const {
+    return gpt_oss_model != nullptr || deepseek_model != nullptr;
+  }
+
+  Status StepSyncModel(const model::ForwardBatch& batch,
+                       std::vector<float>* logits) {
+    if (gpt_oss_model != nullptr) return gpt_oss_model->Step(batch, logits);
+    return deepseek_model->Step(batch, logits);
+  }
+
+  int64_t sync_model_vocab() const {
+    if (gpt_oss_model != nullptr) return gpt_oss_model->config().vocab_size;
+    return deepseek_model->config().vocab_size;
+  }
 
   // Routes one sampled token to its request: detokenize, apply stop sequences,
   // emit whatever is now safe to send.
@@ -472,8 +495,8 @@ struct Engine::Impl {
   }
 
   void Run() {
-    if (is_gpt_oss()) {
-      RunGptOss();
+    if (is_sync_model()) {
+      RunSyncModel();
     } else {
       RunQwen2();
     }
@@ -646,7 +669,7 @@ struct Engine::Impl {
   // Decode may replay a captured CUDA graph. Sampling remains on the host:
   // logits already come back for argmax, so device sampling is a separate
   // optimization rather than a graph prerequisite.
-  void RunGptOss() {
+  void RunSyncModel() {
     std::vector<float> logits;
     std::vector<int32_t> sampled;
     std::vector<TokenDelta> deltas;
@@ -732,9 +755,9 @@ struct Engine::Impl {
 
       // Synchronous step: logits come back to the host, argmax runs here, and
       // the sampled tokens go to the scheduler. The Qwen2 path's StepAsync /
-      // AwaitStep overlap does not apply -- the gpt-oss step's per-layer
-      // cudaDeviceSynchronize already serializes it.
-      const Status stepped = gpt_oss_model->Step(batch, &logits);
+      // AwaitStep overlap does not apply -- both synchronous models
+      // stream-synchronize inside Step.
+      const Status stepped = StepSyncModel(batch, &logits);
 
       if (!stepped.ok()) {
         FailAll(stepped);
@@ -744,7 +767,7 @@ struct Engine::Impl {
 
       // One argmax per requested logits row. The batch carries logits_indices
       // naming which rows to sample, and Step returns them in the same order.
-      const int64_t vocab = gpt_oss_model->config().vocab_size;
+      const int64_t vocab = sync_model_vocab();
       sampled.clear();
       sampled.reserve(batch.logits_indices.size());
       for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
@@ -854,13 +877,44 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
   auto impl = std::make_unique<Impl>();
   impl->config = config;
   impl->tokenizer = std::move(tok);
+  impl->architecture = model_config.architecture;
 
   impl->model_name =
       config.served_model_name.empty()
           ? std::filesystem::path(config.model_dir).filename().string()
           : config.served_model_name;
 
-  if (model_config.architecture == model::Architecture::kGptOss) {
+  if (model_config.architecture == model::Architecture::kDeepSeekV2) {
+    if (config.tensor_parallel_size != 1) {
+      return UnimplementedError(
+          "tensor parallel serving is currently implemented for Qwen2 only");
+    }
+    // Same synchronous serve as gpt-oss, with one difference worth naming:
+    // --capture-graphs is accepted and *skipped* rather than attempted. The
+    // unabsorbed MLA path sizes its scratch by context length, so
+    // CaptureDecodeGraph is Unimplemented by design (§18.7 D4), and failing
+    // startup over a documented limitation would be wrong. FP8/int4 flags are
+    // ignored the same way the gpt-oss arm ignores them.
+    INFERX_ASSIGN_OR_RETURN(model::DeepseekV2Model deepseek,
+                            model::DeepseekV2Model::Load(config.model_dir));
+
+    // The latent cache: 576 elements/token/layer for V2-Lite against a GQA
+    // model's thousands, so the same --kv-blocks buys ~14x the cached context.
+    INFERX_RETURN_IF_ERROR(
+        deepseek.AttachKvCache(config.kv_blocks, config.block_size));
+
+    INFERX_ASSIGN_OR_RETURN(
+        Scheduler scheduler,
+        Scheduler::Create(config.scheduler, deepseek.kv_pool()));
+
+    impl->deepseek_model =
+        std::make_unique<model::DeepseekV2Model>(std::move(deepseek));
+    impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
+    impl->stats.blocks_total = config.kv_blocks;
+
+    INFERX_RETURN_IF_ERROR(impl->deepseek_model->ReserveActivations(
+        config.scheduler.max_batch_tokens));
+  } else if (model_config.architecture == model::Architecture::kGptOss) {
     if (config.tensor_parallel_size != 1) {
       return UnimplementedError(
           "tensor parallel serving is currently implemented for Qwen2 only");
@@ -1043,6 +1097,8 @@ const tokenizer::Tokenizer& Engine::tokenizer() const {
 }
 
 const std::string& Engine::model_name() const { return impl_->model_name; }
+
+model::Architecture Engine::architecture() const { return impl_->architecture; }
 
 Engine::Stats Engine::stats() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);

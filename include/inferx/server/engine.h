@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "inferx/core/status.h"
+#include "inferx/model/config.h"
 #include "inferx/scheduler/scheduler.h"
 #include "inferx/tokenizer/tokenizer.h"
 
@@ -195,6 +196,13 @@ class Engine {
 
   /// \brief The name to report in responses.
   const std::string& model_name() const;
+
+  /// \brief The checkpoint's declared architecture.
+  ///
+  /// Composition reads this to select model-family behavior the engine does
+  /// not own -- today the chat template kind (§17.8's "selected by model
+  /// version" seam, at its single-model stage).
+  model::Architecture architecture() const;
 
   struct Stats {
     int64_t running = 0;

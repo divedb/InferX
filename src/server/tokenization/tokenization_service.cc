@@ -5,8 +5,11 @@
 namespace inferx::server::tokenization {
 
 InProcessTokenizationService::InProcessTokenizationService(
-    const tokenizer::Tokenizer* tokenizer, request::ModelVersion model_version)
-    : tokenizer_(tokenizer), model_version_(std::move(model_version)) {}
+    const tokenizer::Tokenizer* tokenizer, request::ModelVersion model_version,
+    tokenizer::ChatTemplateKind chat_template)
+    : tokenizer_(tokenizer),
+      model_version_(std::move(model_version)),
+      chat_template_(chat_template) {}
 
 StatusOr<TokenizedPrompt> InProcessTokenizationService::TokenizeCompletion(
     const request::ModelVersion& model_version, std::string_view prompt,
@@ -36,7 +39,8 @@ StatusOr<TokenizedPrompt> InProcessTokenizationService::TokenizeChat(
   }
   INFERX_ASSIGN_OR_RETURN(
       const std::string prompt,
-      tokenizer::ApplyQwen2ChatTemplate(messages, /*add_generation_prompt=*/true));
+      tokenizer::ApplyChatTemplate(chat_template_, messages,
+                                   /*add_generation_prompt=*/true));
   auto clone = tokenizer_->Clone();
   if (!clone.ok()) return clone.status();
   tokenizer::EncodeOptions options;

@@ -54,4 +54,55 @@ StatusOr<std::string> ApplyQwen2ChatTemplate(
   return out;
 }
 
+StatusOr<std::string> ApplyDeepSeekV2ChatTemplate(
+    const std::vector<ChatMessage>& messages, bool add_generation_prompt) {
+  for (const ChatMessage& message : messages) {
+    if (message.role != "system" && message.role != "user" &&
+        message.role != "assistant") {
+      return InvalidArgumentError(
+          "unsupported message role \"", message.role,
+          "\"; this template renders system, user and assistant turns only");
+    }
+  }
+
+  // The BOS sentinel, as text: chat tokenization runs with specials-as-control,
+  // which folds it to DeepSeek's bos_token_id.
+  std::string out = "<｜begin▁of▁sentence｜>";
+
+  // A direct transcription of the template's loop: system messages are bare
+  // text, wherever they appear, and there is no default system prompt.
+  for (const ChatMessage& message : messages) {
+    if (message.role == "system") {
+      out.append(message.content);
+      out.append("\n\n");
+    } else if (message.role == "user") {
+      out.append("User: ");
+      out.append(message.content);
+      out.append("\n\n");
+    } else {
+      out.append("Assistant: ");
+      out.append(message.content);
+      out.append("<｜end▁of▁sentence｜>");
+    }
+  }
+
+  // No trailing space: the template emits exactly `Assistant:` and the model
+  // was tuned to produce the space itself.
+  if (add_generation_prompt) out.append("Assistant:");
+
+  return out;
+}
+
+StatusOr<std::string> ApplyChatTemplate(ChatTemplateKind kind,
+                                        const std::vector<ChatMessage>& messages,
+                                        bool add_generation_prompt) {
+  switch (kind) {
+    case ChatTemplateKind::kQwen2:
+      return ApplyQwen2ChatTemplate(messages, add_generation_prompt);
+    case ChatTemplateKind::kDeepSeekV2:
+      return ApplyDeepSeekV2ChatTemplate(messages, add_generation_prompt);
+  }
+  return InvalidArgumentError("unknown chat template kind");
+}
+
 }  // namespace inferx::tokenizer

@@ -39,4 +39,41 @@ struct ChatMessage {
 StatusOr<std::string> ApplyQwen2ChatTemplate(
     const std::vector<ChatMessage>& messages, bool add_generation_prompt);
 
+/// \brief Renders `messages` into DeepSeek-V2-Chat's prompt format.
+///
+/// The second transcription this header warned would arrive. DeepSeek's
+/// template is not ChatML: the prompt opens with the BOS token, a system
+/// message is bare text followed by a blank line, and turns are
+/// `User: …\n\n` / `Assistant: …<｜end▁of▁sentence｜>`. Differences from the
+/// Qwen2 template worth naming because each would be silently wrong the other
+/// way:
+///
+///   * **no default system prompt** — a conversation without a system message
+///     starts straight at the first turn;
+///   * the generation prompt is `Assistant:` with **no trailing space or
+///     newline**; and
+///   * the assistant's EOS is DeepSeek's `<｜end▁of▁sentence｜>` sentinel
+///     (fullwidth bars, U+FF5C), emitted as text for the tokenizer's
+///     control-token pass to fold — using this template with a non-DeepSeek
+///     vocabulary produces garbage, which is why templates are selected by
+///     `ChatTemplateKind` rather than defaulted.
+StatusOr<std::string> ApplyDeepSeekV2ChatTemplate(
+    const std::vector<ChatMessage>& messages, bool add_generation_prompt);
+
+/// \brief Which transcribed template a model family uses.
+///
+/// Selected at composition time from the checkpoint's declared architecture
+/// (or the gateway's configuration), never sniffed from the conversation —
+/// the section 17.8 seam, forced early by DeepSeek being the first non-ChatML
+/// family served.
+enum class ChatTemplateKind {
+  kQwen2,
+  kDeepSeekV2,
+};
+
+/// \brief Renders through the selected template.
+StatusOr<std::string> ApplyChatTemplate(
+    ChatTemplateKind kind, const std::vector<ChatMessage>& messages,
+    bool add_generation_prompt);
+
 }  // namespace inferx::tokenizer

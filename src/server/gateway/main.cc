@@ -20,6 +20,7 @@ void Usage(const char* program) {
       "--model <id> [options]\n"
       "  --model-version <version>       default: loaded\n"
       "  --tokenizer-revision <revision> scheduler contract revision\n"
+      "  --chat-template <kind>          qwen2 (default) or deepseek-v2\n"
       "  --host <address>                default: 127.0.0.1\n"
       "  --port <number>                 default: 8000\n"
       "  --api-key-sha256 <hex>          repeatable bearer-token hash\n",
@@ -63,6 +64,10 @@ int main(int argc, char** argv) {
       }
     } else if (option == "--tokenizer-revision") {
       if (!Value(argc, argv, &i, option.c_str(), &config.tokenizer_revision)) {
+        return 2;
+      }
+    } else if (option == "--chat-template") {
+      if (!Value(argc, argv, &i, option.c_str(), &config.chat_template)) {
         return 2;
       }
     } else if (option == "--host") {

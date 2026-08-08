@@ -32,8 +32,14 @@ class TokenizationService {
 /// Compatibility adapter for the currently loaded in-process model.
 class InProcessTokenizationService final : public TokenizationService {
  public:
-  InProcessTokenizationService(const tokenizer::Tokenizer* tokenizer,
-                               request::ModelVersion model_version);
+  /// \param chat_template Which transcribed template `TokenizeChat` renders.
+  ///                      Chosen at composition from the model's architecture
+  ///                      (or the gateway's configuration); the default keeps
+  ///                      existing Qwen2 call sites unchanged.
+  InProcessTokenizationService(
+      const tokenizer::Tokenizer* tokenizer, request::ModelVersion model_version,
+      tokenizer::ChatTemplateKind chat_template =
+          tokenizer::ChatTemplateKind::kQwen2);
 
   StatusOr<TokenizedPrompt> TokenizeCompletion(
       const request::ModelVersion& model_version,
@@ -45,6 +51,7 @@ class InProcessTokenizationService final : public TokenizationService {
  private:
   const tokenizer::Tokenizer* tokenizer_;
   request::ModelVersion model_version_;
+  tokenizer::ChatTemplateKind chat_template_;
 };
 
 }  // namespace inferx::server::tokenization
