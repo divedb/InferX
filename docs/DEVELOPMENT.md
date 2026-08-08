@@ -186,7 +186,7 @@ runtime-API layer can be compile-checked on a machine that has not been upgraded
 yet. Do not use it for anything you intend to measure.
 
 Below the floor, **every target containing device code is skipped** —
-`src/kernels` and the kernel tests with it. The configure summary says so
+`csrc` and the kernel tests with it. The configure summary says so
 (`Device code : SKIPPED`). The reason is concrete rather than precautionary:
 nvcc 12.x cannot evaluate `std::source_location::current()`, which
 `absl/status/status.h` uses unconditionally, so any `.cu` that includes an
@@ -199,7 +199,7 @@ line of device code.
 ```
 include/inferx/     Public headers, mirroring src/
 src/core/           DType, Tensor, Status, arenas, allocators
-src/kernels/        .cu — device code. Needs CUDA >= 13.0 to build at all
+csrc/               .cu — device code. Needs CUDA >= 13.0 to build at all
 cmake/              Options, CUDA config, dependency wiring
 scripts/            Setup and bootstrap
 third_party/        Submodules, pinned
