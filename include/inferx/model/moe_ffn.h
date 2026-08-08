@@ -74,13 +74,13 @@ struct MoeWeights {
 ///      per token with their gate weights.
 ///   2. Group the `tokens·k` assignments by expert, so each expert's rows are
 ///      contiguous.
-///   3. **One GEMM per expert**, over that expert's slice. This is where a
-///      CUTLASS grouped GEMM belongs and is not: `E` cuBLASLt calls launch `E`
-///      kernels for what is one ragged problem, and at decode — where every
-///      expert sees a handful of rows — that is launch-bound rather than
-///      compute-bound. It is correct, it is what the correctness tests are
-///      written against, and §9 has always said grouped GEMM is the one place
-///      CUTLASS has no alternative. Replacing this loop changes no interface.
+///   3. **One ragged grouped GEMM per projection**, offsets on the device —
+///      `MoeGroupedGemmBf16` for stacked bf16 experts, `Mxfp4GroupedGemm` for
+///      gpt-oss's packed 4-bit ones. Neither path round-trips the expert
+///      counts to the host, so the FFN is graph-capturable and the launch
+///      count does not scale with E. A CUTLASS grouped GEMM remains the named
+///      upgrade for large prefill shapes (§9, T-CUTLASS) and would slot in
+///      behind the same call shape.
 ///   4. Combine each token's `k` outputs by gate weight, and add the shared
 ///      expert if the architecture has one.
 ///

@@ -3,6 +3,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <type_traits>
+
 #include "inferx/core/cuda_utils.h"
 
 namespace inferx::kernels {
@@ -285,6 +287,90 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
   return OkStatus();
 }
 
+// The bf16 sibling of Mxfp4GroupedKernel, and structurally its twin: one warp
+// owns one output column, grid.y walks the grouped rows, and the offsets are
+// read on the device -- which is the whole point, because the host round-trip
+// they replace was one D2H sync per MoE layer per step and the reason the
+// bf16 FFN could not be graph-captured. Decode (RowsPerChunk == 1) binary-
+// searches its expert; prefill chunks reuse each weight value across up to 16
+// routed rows. A CUTLASS grouped GEMM remains the named upgrade for large
+// prefill shapes (§9, T-CUTLASS); this kernel's job is removing the sync and
+// the per-expert launch storm, not winning at m in the hundreds.
+constexpr int kGroupedWarps = 4;
+constexpr int kGroupedMaxRows = 16;
+
+template <int RowsPerChunk>
+__global__ void GroupedGemmBf16Kernel(const bf16* __restrict__ x,
+                                      const int32_t* __restrict__ offsets,
+                                      const bf16* __restrict__ w,
+                                      const bf16* __restrict__ bias,
+                                      bf16* __restrict__ y, int experts, int n,
+                                      int k) {
+  const int warp = static_cast<int>(threadIdx.x) / 32;
+  const int lane = static_cast<int>(threadIdx.x) % 32;
+  const int j = static_cast<int>(blockIdx.x) * kGroupedWarps + warp;
+  if (j >= n) return;
+
+  int expert_first = 0;
+  int expert_last = experts;
+  if constexpr (RowsPerChunk == 1) {
+    int found = 0;
+    if (lane == 0) {
+      int lo = 0;
+      int hi = experts;
+      const int grouped_row = static_cast<int>(blockIdx.y);
+      while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= grouped_row)
+          lo = mid + 1;
+        else
+          hi = mid;
+      }
+      found = lo;
+    }
+    expert_first = __shfl_sync(~0u, found, 0);
+    expert_last = expert_first + 1;
+  }
+
+  for (int expert = expert_first; expert < expert_last; ++expert) {
+    const int begin = offsets[expert];
+    const int end = offsets[expert + 1];
+    const int row0 = RowsPerChunk == 1
+                         ? static_cast<int>(blockIdx.y)
+                         : begin + static_cast<int>(blockIdx.y) * RowsPerChunk;
+    if (row0 >= end) continue;
+    const int rows = min(RowsPerChunk, end - row0);
+
+    const bf16* wr = w + (static_cast<int64_t>(expert) * n + j) * k;
+
+    float acc[RowsPerChunk] = {};
+    for (int kk = lane; kk < k; kk += 32) {
+      const float wv = __bfloat162float(wr[kk]);
+#pragma unroll
+      for (int r = 0; r < RowsPerChunk; ++r) {
+        if (r < rows) {
+          acc[r] +=
+              __bfloat162float(x[static_cast<int64_t>(row0 + r) * k + kk]) *
+              wv;
+        }
+      }
+    }
+
+#pragma unroll
+    for (int r = 0; r < RowsPerChunk; ++r) {
+      if (r >= rows) break;
+      float v = acc[r];
+      for (int off = 16; off; off >>= 1) v += __shfl_xor_sync(~0u, v, off);
+      if (lane == 0) {
+        if (bias != nullptr) {
+          v += __bfloat162float(bias[static_cast<int64_t>(expert) * n + j]);
+        }
+        y[static_cast<int64_t>(row0 + r) * n + j] = __float2bfloat16(v);
+      }
+    }
+  }
+}
+
 }  // namespace
 
 Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
@@ -498,6 +584,66 @@ Status MoeAddSharedExpert(const TensorView& shared,
       static_cast<const bf16*>(gate_logits.Data()),
       static_cast<bf16*>(out.Data()), width);
 
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
+                          const TensorView& w, const TensorView& bias,
+                          const TensorView& y, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 2, "x"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(offsets, DataType::kInt32, 1, "offsets"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(w, DataType::kBFloat16, 3, "w"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(y, DataType::kBFloat16, 2, "y"));
+
+  const int64_t assignments = x.Dim(0);
+  const int64_t k = x.Dim(1);
+  const int64_t experts = w.Dim(0);
+  const int64_t n = w.Dim(1);
+
+  if (w.Dim(2) != k) {
+    return InvalidArgumentError("w is ", w.GetShape().ToString(),
+                                " against x of width ", k);
+  }
+  if (offsets.Dim(0) != experts + 1) {
+    return InvalidArgumentError("offsets holds ", offsets.Dim(0),
+                                " entries for ", experts, " experts");
+  }
+  if (y.Dim(0) != assignments || y.Dim(1) != n) {
+    return InvalidArgumentError("y is ", y.GetShape().ToString(),
+                                ", expected [", assignments, ", ", n, "]");
+  }
+  if (bias.IsDefined() &&
+      (bias.GetDataType() != DataType::kBFloat16 || bias.Rank() != 2 ||
+       bias.Dim(0) != experts || bias.Dim(1) != n)) {
+    return InvalidArgumentError("bias must be [", experts, ", ", n, "] bf16");
+  }
+
+  if (assignments == 0 || n == 0) return OkStatus();
+
+  const unsigned grid_x =
+      static_cast<unsigned>((n + kGroupedWarps - 1) / kGroupedWarps);
+  const auto launch = [&](auto rows_tag) {
+    constexpr int rows = decltype(rows_tag)::value;
+    const dim3 grid(grid_x,
+                    static_cast<unsigned>((assignments + rows - 1) / rows), 1);
+    GroupedGemmBf16Kernel<rows><<<grid, kGroupedWarps * 32, 0, stream>>>(
+        static_cast<const bf16*>(x.Data()),
+        static_cast<const int32_t*>(offsets.Data()),
+        static_cast<const bf16*>(w.Data()),
+        bias.IsDefined() ? static_cast<const bf16*>(bias.Data()) : nullptr,
+        static_cast<bf16*>(y.Data()), static_cast<int>(experts),
+        static_cast<int>(n), static_cast<int>(k));
+  };
+
+  // A decode step routes one token to a handful of experts; the single-row
+  // path skips the predicated 16-row FMA loop. Larger batches keep the
+  // weight-reuse chunking.
+  if (assignments <= 8) {
+    launch(std::integral_constant<int, 1>{});
+  } else {
+    launch(std::integral_constant<int, kGroupedMaxRows>{});
+  }
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }

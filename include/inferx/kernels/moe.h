@@ -103,6 +103,27 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
                       const TensorView& weights, const TensorView& out,
                       cudaStream_t stream = nullptr);
 
+/// \brief One ragged GEMM over stacked bf16 expert weights, offsets on the
+///        device.
+///
+/// The bf16 twin of `Mxfp4GroupedGemm`: rows of `x` are grouped by expert
+/// (from `MoeBuildDispatch`), `w` is the stacked `[E, n, k]` expert tensor,
+/// and each row multiplies its own expert's slice — with the expert ranges
+/// read from device memory, so nothing round-trips to the host and the launch
+/// count does not scale with E. This is what retired the per-expert cuBLASLt
+/// loop and its per-layer D2H sync, which was also the bf16 MoE path's
+/// graph-capture blocker. A CUTLASS grouped GEMM is the named upgrade for
+/// large prefill shapes; the shape of this call would be its operand layout.
+///
+/// \param x       `[assignments, k]` bf16, grouped by expert.
+/// \param offsets `[E + 1]` int32 on the device, from `MoeBuildDispatch`.
+/// \param w       `[E, n, k]` bf16, stacked expert weights.
+/// \param bias    `[E, n]` bf16 or undefined.
+/// \param y       `[assignments, n]` bf16, written.
+Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
+                          const TensorView& w, const TensorView& bias,
+                          const TensorView& y, cudaStream_t stream = nullptr);
+
 /// \brief `out = sigmoid(gate_logit) · shared`, elementwise over each row.
 ///
 /// Qwen2-MoE's shared expert: one FFN every token passes through, scaled by its
