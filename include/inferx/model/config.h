@@ -29,6 +29,13 @@ enum class Architecture {
   /// **YaRN** position scaling, and a clamped `(up+1)·gate·σ(αgate)` activation.
   /// Its expert weights are MXFP4 (\see kernels/mxfp4.h).
   kGptOss,
+  /// DeepSeek-V2: **MLA** attention over a compressed latent cache, and
+  /// DeepSeekMoE — routed experts behind the first `first_k_dense_replace`
+  /// dense layers, plus **ungated** always-on shared experts (Qwen2-MoE gates
+  /// its shared expert; DeepSeek adds it unconditionally). YaRN scaling with
+  /// the `mscale` softmax-scale correction. V2-Lite additionally has no Q
+  /// down-projection (`q_lora_rank` null).
+  kDeepSeekV2,
 };
 
 const char* ArchitectureName(Architecture arch);
@@ -84,11 +91,39 @@ struct ModelConfig {
   bool norm_topk_prob = true;
 
   /// Width of the always-on shared expert, which every token passes through in
-  /// addition to its routed ones, gated by its own sigmoid. 0 means none.
+  /// addition to its routed ones. Qwen2-MoE gates it by its own sigmoid;
+  /// DeepSeek adds it ungated — the convention follows the architecture, not a
+  /// config key. 0 means none. DeepSeek spells this as a *count*
+  /// (`n_shared_experts`); parsing multiplies by `moe_intermediate_size`.
   int64_t shared_expert_intermediate_size = 0;
+
+  /// The first `first_k_dense_replace` layers use a dense FFN of
+  /// `intermediate_size` even in a MoE model. DeepSeek-V2 sets 1; every other
+  /// MoE checkpoint here sets 0.
+  int64_t first_k_dense_replace = 0;
+
+  /// A layer past `first_k_dense_replace` is MoE when its index divides by
+  /// this. 1 — every checkpoint we serve — means all of them.
+  int64_t moe_layer_freq = 1;
+
+  /// Multiplies the routed experts' combined output. 1.0 everywhere except
+  /// some DeepSeek configs; read so those are not silently mis-scaled.
+  double routed_scaling_factor = 1.0;
 
   /// \brief Whether the FFN is a mixture of experts.
   bool is_moe() const { return num_experts > 0; }
+
+  /// \brief Whether layer `i`'s FFN is routed rather than dense.
+  ///
+  /// HF's DeepSeek reference gates on `layer >= first_k_dense_replace &&
+  /// layer % moe_layer_freq == 0`; this mirrors it exactly, including the
+  /// modulus being over the absolute index rather than the post-dense offset.
+  bool IsMoeLayer(int64_t layer) const {
+    if (!is_moe()) return false;
+    if (layer < 0 || layer >= num_hidden_layers) return false;
+    if (layer < first_k_dense_replace) return false;
+    return moe_layer_freq > 0 && layer % moe_layer_freq == 0;
+  }
 
   // --- Multi-head latent attention (§7.3). Zero `kv_lora_rank` means ordinary
   // GQA, which is what every field below degenerates to.
@@ -146,6 +181,14 @@ struct ModelConfig {
   int64_t yarn_original_max_position = 0;
   bool yarn_truncate = true;
 
+  /// DeepSeek's YaRN mscale pair. The attention softmax scale is multiplied by
+  /// `m(mscale)² / m(mscale_all_dim)`-style corrections where
+  /// `m(x) = 0.1·x·ln(factor) + 1`; when the two are equal (V2-Lite: both
+  /// 0.707) the cos/sin factor cancels to 1 and the whole effect lands in the
+  /// softmax scale. HF defaults: mscale 1, mscale_all_dim 0.
+  double yarn_mscale = 1.0;
+  double yarn_mscale_all_dim = 0.0;
+
   /// \brief Whether positions are YaRN-scaled.
   bool is_yarn() const { return yarn_factor > 0.0; }
 
@@ -177,10 +220,14 @@ struct ModelConfig {
                                    : 0;
   }
 
-  /// \brief Total width of the Q projection.
+  /// \brief Total width of the Q projection. **GQA only** — under MLA the
+  /// derived `head_dim` is meaningless (the real QK head is
+  /// `qk_nope_head_dim + qk_rope_head_dim` wide) and this must not be
+  /// consulted.
   int64_t q_dim() const { return num_attention_heads * head_dim; }
 
-  /// \brief Total width of each of the K and V projections.
+  /// \brief Total width of each of the K and V projections. **GQA only**, as
+  /// with `q_dim()`.
   int64_t kv_dim() const { return num_key_value_heads * head_dim; }
 
   /// \brief Checks the fields against each other.

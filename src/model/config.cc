@@ -42,6 +42,7 @@ StatusOr<Architecture> ParseArchitecture(std::string_view name) {
   if (name == "LlamaForCausalLM") return Architecture::kLlama;
   if (name == "Qwen2MoeForCausalLM") return Architecture::kQwen2Moe;
   if (name == "GptOssForCausalLM") return Architecture::kGptOss;
+  if (name == "DeepseekV2ForCausalLM") return Architecture::kDeepSeekV2;
 
   // Rejected rather than defaulted. Running an unread architecture through the
   // Llama path produces output that looks like text and is wrong, which is the
@@ -49,7 +50,7 @@ StatusOr<Architecture> ParseArchitecture(std::string_view name) {
   return UnimplementedError(
       "unsupported architecture '", name,
       "'; known: Qwen2ForCausalLM, LlamaForCausalLM, "
-      "Qwen2MoeForCausalLM, GptOssForCausalLM");
+      "Qwen2MoeForCausalLM, GptOssForCausalLM, DeepseekV2ForCausalLM");
 }
 
 StatusOr<DataType> ParseTorchDtype(std::string_view name) {
@@ -68,6 +69,7 @@ const char* ArchitectureName(Architecture arch) {
     case Architecture::kLlama: return "LlamaForCausalLM";
     case Architecture::kQwen2Moe: return "Qwen2MoeForCausalLM";
     case Architecture::kGptOss: return "GptOssForCausalLM";
+    case Architecture::kDeepSeekV2: return "DeepseekV2ForCausalLM";
   }
   return "?";
 }
@@ -140,6 +142,27 @@ Status ModelConfig::Validate() const {
       return InvalidArgumentError("moe_intermediate_size must be positive for "
                                   "a MoE model, got ", moe_intermediate_size);
     }
+    if (first_k_dense_replace < 0 || moe_layer_freq < 1) {
+      return InvalidArgumentError(
+          "invalid MoE layer schedule: first_k_dense_replace=",
+          first_k_dense_replace, " moe_layer_freq=", moe_layer_freq);
+    }
+    // A model declaring experts that no layer uses would run fully dense --
+    // the same silent failure as a zero expert count, caught the same way.
+    bool any_moe_layer = false;
+    for (int64_t i = 0; i < num_hidden_layers && !any_moe_layer; ++i) {
+      any_moe_layer = IsMoeLayer(i);
+    }
+    if (!any_moe_layer) {
+      return InvalidArgumentError(
+          "the model declares ", num_experts,
+          " experts but first_k_dense_replace=", first_k_dense_replace,
+          " and moe_layer_freq=", moe_layer_freq, " leave no MoE layer");
+    }
+    if (routed_scaling_factor <= 0.0) {
+      return InvalidArgumentError("routed_scaling_factor must be positive, got ",
+                                  routed_scaling_factor);
+    }
   } else if (num_experts_per_tok > 0) {
     return InvalidArgumentError("num_experts_per_tok is ", num_experts_per_tok,
                                 " but the model declares no experts");
@@ -161,6 +184,19 @@ Status ModelConfig::Validate() const {
   if (architecture == Architecture::kQwen2Moe && !is_moe()) {
     return InvalidArgumentError(
         "architecture is Qwen2MoeForCausalLM but num_experts is 0");
+  }
+
+  // DeepSeek-V2 without its two defining mechanisms is a mis-read checkpoint,
+  // not a configuration choice.
+  if (architecture == Architecture::kDeepSeekV2) {
+    if (!is_mla()) {
+      return InvalidArgumentError(
+          "architecture is DeepseekV2ForCausalLM but kv_lora_rank is 0");
+    }
+    if (!is_moe()) {
+      return InvalidArgumentError(
+          "architecture is DeepseekV2ForCausalLM but n_routed_experts is 0");
+    }
   }
 
   if (is_mla()) {
@@ -203,7 +239,16 @@ std::string ModelConfig::ToString() const {
                        shared_expert_intermediate_size > 0
                            ? absl::StrCat(" shared=",
                                           shared_expert_intermediate_size)
+                           : "",
+                       first_k_dense_replace > 0
+                           ? absl::StrCat(" first_dense=", first_k_dense_replace)
                            : "");
+  }
+
+  std::string mla;
+  if (is_mla()) {
+    mla = absl::StrCat(" mla=", kv_lora_rank, "/", qk_nope_head_dim, "+",
+                       qk_rope_head_dim, "/", v_head_dim);
   }
 
   return absl::StrCat(
@@ -214,7 +259,7 @@ std::string ModelConfig::ToString() const {
       " rope_theta=", rope_theta, " eps=", rms_norm_eps,
       " tied=", tie_word_embeddings ? "yes" : "no",
       " attn_bias=", attention_bias ? "yes" : "no",
-      " dtype=", DataTypeName(weight_dtype), moe, "}");
+      " dtype=", DataTypeName(weight_dtype), moe, mla, "}");
 }
 
 StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
@@ -326,6 +371,55 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
     }
   }
 
+  // DeepSeek's spellings. `n_routed_experts` is its `num_experts`, and
+  // `n_shared_experts` is a *count* of shared experts, each
+  // `moe_intermediate_size` wide, stored fused as one MLP -- so the width our
+  // field carries is the product. Left unread, a DeepSeek checkpoint would
+  // parse with zero experts and silently run dense, which is the plausible-
+  // nonsense failure this file exists to prevent.
+  if (c.num_experts == 0) {
+    INFERX_ASSIGN_OR_RETURN(c.num_experts,
+                            root.OptionalInt("n_routed_experts", 0));
+  }
+  if (c.shared_expert_intermediate_size == 0) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t n_shared,
+                            root.OptionalInt("n_shared_experts", 0));
+    if (n_shared > 0) {
+      c.shared_expert_intermediate_size = n_shared * c.moe_intermediate_size;
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(c.first_k_dense_replace,
+                          root.OptionalInt("first_k_dense_replace", 0));
+  INFERX_ASSIGN_OR_RETURN(c.moe_layer_freq, root.OptionalInt("moe_layer_freq", 1));
+
+  if (const JsonValue* v = root.Find("routed_scaling_factor");
+      v != nullptr && !v->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(c.routed_scaling_factor, v->AsDouble());
+  }
+
+  // Routing variants. Only softmax scoring with plain greedy top-k is
+  // implemented (\see kernels::MoeRouteTopK); DeepSeek-V3's sigmoid /
+  // `noaux_tc` and DeepSeek-V2-236B's `group_limited_greedy` select different
+  // experts, and running one as another routes tokens to the wrong experts
+  // with no error anywhere downstream.
+  if (const JsonValue* v = root.Find("scoring_func");
+      v != nullptr && !v->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const std::string_view scoring, v->AsString());
+    if (scoring != "softmax") {
+      return UnimplementedError("scoring_func '", scoring,
+                                "' is not implemented; only 'softmax' is");
+    }
+  }
+  if (const JsonValue* v = root.Find("topk_method");
+      v != nullptr && !v->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const std::string_view topk, v->AsString());
+    if (topk != "greedy") {
+      return UnimplementedError("topk_method '", topk,
+                                "' is not implemented; only 'greedy' is");
+    }
+  }
+
   INFERX_ASSIGN_OR_RETURN(c.sliding_window,
                           root.OptionalInt("sliding_window", 0));
 
@@ -358,8 +452,16 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
   // running one as another produces a model with no long-range coherence.
   if (const JsonValue* rope = root.Find("rope_scaling");
       rope != nullptr && !rope->IsNull()) {
+    // Transformers renamed the key from `type` to `rope_type`; checkpoints
+    // exist with either (DeepSeek-V2 writes `type`). Same value, same meaning.
+    const JsonValue* type_value = rope->Find("rope_type");
+    if (type_value == nullptr) type_value = rope->Find("type");
+    if (type_value == nullptr) {
+      return InvalidArgumentError(
+          "rope_scaling has neither 'rope_type' nor 'type'");
+    }
     INFERX_ASSIGN_OR_RETURN(const std::string_view rope_type,
-                            rope->RequiredString("rope_type"));
+                            type_value->AsString());
 
     if (rope_type != "yarn") {
       return UnimplementedError("rope_scaling.rope_type '", rope_type,
@@ -381,6 +483,16 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
                           c.max_position_embeddings));
     INFERX_ASSIGN_OR_RETURN(c.yarn_truncate,
                             rope->OptionalBool("truncate", true));
+
+    // DeepSeek's mscale pair. Read only inside rope_scaling, where DeepSeek
+    // puts it; the HF defaults (1, 0) leave the softmax scale untouched.
+    if (const JsonValue* v = rope->Find("mscale"); v != nullptr && !v->IsNull()) {
+      INFERX_ASSIGN_OR_RETURN(c.yarn_mscale, v->AsDouble());
+    }
+    if (const JsonValue* v = rope->Find("mscale_all_dim");
+        v != nullptr && !v->IsNull()) {
+      INFERX_ASSIGN_OR_RETURN(c.yarn_mscale_all_dim, v->AsDouble());
+    }
   }
 
   // MLA, read the same way and for the same reason: absent keys mean GQA.

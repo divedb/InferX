@@ -244,6 +244,194 @@ TEST(ModelConfig, RejectsALatentNarrowerThanTheHeadsItReconstructs) {
   EXPECT_FALSE(c.ok());
 }
 
+// The real DeepSeek-V2-Lite config, verbatim except for HF bookkeeping keys
+// (use_cache, transformers_version, ...) the parser ignores anyway.
+constexpr char kDeepSeekV2Lite[] = R"({
+  "architectures": ["DeepseekV2ForCausalLM"],
+  "attention_bias": false,
+  "aux_loss_alpha": 0.001,
+  "bos_token_id": 100000,
+  "eos_token_id": 100001,
+  "first_k_dense_replace": 1,
+  "hidden_act": "silu",
+  "hidden_size": 2048,
+  "initializer_range": 0.02,
+  "intermediate_size": 10944,
+  "kv_lora_rank": 512,
+  "max_position_embeddings": 163840,
+  "model_type": "deepseek_v2",
+  "moe_intermediate_size": 1408,
+  "moe_layer_freq": 1,
+  "n_group": 1,
+  "n_routed_experts": 64,
+  "n_shared_experts": 2,
+  "norm_topk_prob": false,
+  "num_attention_heads": 16,
+  "num_experts_per_tok": 6,
+  "num_hidden_layers": 27,
+  "num_key_value_heads": 16,
+  "q_lora_rank": null,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": {
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "factor": 40,
+    "mscale": 0.707,
+    "mscale_all_dim": 0.707,
+    "original_max_position_embeddings": 4096,
+    "type": "yarn"
+  },
+  "rope_theta": 10000,
+  "routed_scaling_factor": 1.0,
+  "scoring_func": "softmax",
+  "seq_aux": true,
+  "tie_word_embeddings": false,
+  "topk_group": 1,
+  "topk_method": "greedy",
+  "torch_dtype": "bfloat16",
+  "v_head_dim": 128,
+  "vocab_size": 102400
+})";
+
+TEST(ModelConfig, ParsesDeepSeekV2Lite) {
+  auto c = ModelConfig::FromJson(kDeepSeekV2Lite);
+  ASSERT_TRUE(c.ok()) << c.status();
+
+  EXPECT_EQ(c->architecture, Architecture::kDeepSeekV2);
+  EXPECT_EQ(c->hidden_size, 2048);
+  EXPECT_EQ(c->intermediate_size, 10944);
+  EXPECT_EQ(c->num_hidden_layers, 27);
+  EXPECT_EQ(c->num_attention_heads, 16);
+  EXPECT_EQ(c->vocab_size, 102400);
+  EXPECT_FALSE(c->tie_word_embeddings);
+  EXPECT_FALSE(c->attention_bias);
+  EXPECT_EQ(c->weight_dtype, DataType::kBFloat16);
+
+  // MLA, including the JSON-null q_lora_rank meaning "no Q down-projection".
+  EXPECT_TRUE(c->is_mla());
+  EXPECT_EQ(c->kv_lora_rank, 512);
+  EXPECT_EQ(c->q_lora_rank, 0);
+  EXPECT_EQ(c->qk_nope_head_dim, 128);
+  EXPECT_EQ(c->qk_rope_head_dim, 64);
+  EXPECT_EQ(c->v_head_dim, 128);
+  EXPECT_EQ(c->KvElementsPerTokenPerLayer(), 576);
+
+  // MoE under DeepSeek's spellings: n_routed_experts, and n_shared_experts as
+  // a count whose width is count x moe_intermediate_size.
+  EXPECT_TRUE(c->is_moe());
+  EXPECT_EQ(c->num_experts, 64);
+  EXPECT_EQ(c->num_experts_per_tok, 6);
+  EXPECT_EQ(c->moe_intermediate_size, 1408);
+  EXPECT_EQ(c->shared_expert_intermediate_size, 2816);
+  EXPECT_FALSE(c->norm_topk_prob);
+  EXPECT_DOUBLE_EQ(c->routed_scaling_factor, 1.0);
+
+  // Layer 0 is dense; every later layer is MoE.
+  EXPECT_EQ(c->first_k_dense_replace, 1);
+  EXPECT_EQ(c->moe_layer_freq, 1);
+  EXPECT_FALSE(c->IsMoeLayer(0));
+  EXPECT_TRUE(c->IsMoeLayer(1));
+  EXPECT_TRUE(c->IsMoeLayer(26));
+  EXPECT_FALSE(c->IsMoeLayer(27));  // out of range, not "the next layer"
+
+  // YaRN under the `type` spelling, with DeepSeek's mscale pair.
+  EXPECT_TRUE(c->is_yarn());
+  EXPECT_DOUBLE_EQ(c->yarn_factor, 40.0);
+  EXPECT_EQ(c->yarn_original_max_position, 4096);
+  EXPECT_DOUBLE_EQ(c->yarn_mscale, 0.707);
+  EXPECT_DOUBLE_EQ(c->yarn_mscale_all_dim, 0.707);
+  EXPECT_EQ(c->max_position_embeddings, 163840);
+}
+
+TEST(ModelConfig, RejectsRopeScalingWithNeitherTypeKey) {
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "rope_scaling": {"factor": 8.0}
+  })");
+
+  ASSERT_FALSE(c.ok());
+  EXPECT_EQ(c.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(ModelConfig, RejectsScoringFunctionsWeHaveNotImplemented) {
+  // DeepSeek-V3's sigmoid scoring selects different experts than softmax; run
+  // as softmax it routes wrongly with no error downstream.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "n_routed_experts": 8, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 32, "scoring_func": "sigmoid"
+  })");
+
+  ASSERT_FALSE(c.ok());
+  EXPECT_EQ(c.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(ModelConfig, RejectsTopKMethodsWeHaveNotImplemented) {
+  // DeepSeek-V2-236B's group_limited_greedy and V3's noaux_tc are not greedy
+  // top-k over all experts.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "n_routed_experts": 8, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 32, "topk_method": "group_limited_greedy"
+  })");
+
+  ASSERT_FALSE(c.ok());
+  EXPECT_EQ(c.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(ModelConfig, DeepSeekArchitectureRequiresMlaAndExperts) {
+  // Without MLA fields, DeepseekV2ForCausalLM is a mis-read checkpoint.
+  auto without_mla = ModelConfig::FromJson(R"({
+      "architectures": ["DeepseekV2ForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "n_routed_experts": 8, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 32
+  })");
+  ASSERT_FALSE(without_mla.ok());
+  EXPECT_NE(without_mla.status().message().find("kv_lora_rank"),
+            std::string_view::npos)
+      << without_mla.status();
+
+  // Without experts it would silently run dense -- the exact failure the
+  // n_routed_experts alias exists to prevent.
+  auto without_moe = ModelConfig::FromJson(R"({
+      "architectures": ["DeepseekV2ForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "kv_lora_rank": 32, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
+      "v_head_dim": 16
+  })");
+  ASSERT_FALSE(without_moe.ok());
+  EXPECT_NE(without_moe.status().message().find("n_routed_experts"),
+            std::string_view::npos)
+      << without_moe.status();
+}
+
+TEST(ModelConfig, RejectsAScheduleThatLeavesNoMoeLayer) {
+  // first_k_dense_replace >= num_hidden_layers makes every layer dense while
+  // still declaring experts -- the silent-dense failure, at one remove.
+  auto c = ModelConfig::FromJson(R"({
+      "architectures": ["LlamaForCausalLM"],
+      "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 2,
+      "num_attention_heads": 4, "vocab_size": 100,
+      "n_routed_experts": 8, "num_experts_per_tok": 2,
+      "moe_intermediate_size": 32, "first_k_dense_replace": 2
+  })");
+
+  ASSERT_FALSE(c.ok());
+  EXPECT_NE(c.status().message().find("no MoE layer"), std::string_view::npos)
+      << c.status();
+}
+
 TEST(ModelConfig, ParsesGptOss) {
   auto c = ModelConfig::FromJson(R"({
       "architectures": ["GptOssForCausalLM"],
