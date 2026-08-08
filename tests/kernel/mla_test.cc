@@ -865,5 +865,150 @@ TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
   }
 }
 
+TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
+  // The three absorbed kernels, called explicitly (so no path-selection logic
+  // can hide a dead branch), against MlaAttention fed host-reconstructed K/V
+  // from the same cache. Algebraically identical computations; the comparison
+  // pins the row bookkeeping -- W_UK/W_UV strides within kv_b, the paged walk,
+  // and the shared rope tail -- rather than the algebra.
+  constexpr int64_t heads = 3, nope = 8, rope = 4, vd = 8, latent_dim = 16;
+  constexpr int64_t context = 9, block_size = 4;
+  const int64_t width = latent_dim + rope;
+
+  ModelConfig c;
+  c.kv_lora_rank = latent_dim;
+  c.qk_rope_head_dim = rope;
+
+  auto pool = KvBlockPool::Create(1, 6, block_size,
+                                  MlaAttentionLayer::LayoutFor(c));
+  ASSERT_TRUE(pool.ok()) << pool.status();
+
+  std::vector<int32_t> blocks;
+  for (int64_t b = 0; b < 3; ++b) {
+    auto got = pool->AllocateBlock();
+    ASSERT_TRUE(got.ok());
+    blocks.push_back(*got);
+  }
+  std::swap(blocks[0], blocks[2]);  // out-of-order, as in the paging test
+
+  // Cache contents and the one decode query, all bf16-rounded.
+  const std::vector<float> latents =
+      RandomTensor(static_cast<size_t>(context * latent_dim), 0.7f);
+  const std::vector<float> rope_keys =
+      RandomTensor(static_cast<size_t>(context * rope), 1.9f);
+  const std::vector<float> q_nope =
+      RandomTensor(static_cast<size_t>(heads * nope), 2.3f);
+  const std::vector<float> q_rope =
+      RandomTensor(static_cast<size_t>(heads * rope), 2.9f);
+  const std::vector<float> kv_b =
+      RandomTensor(static_cast<size_t>(heads * (nope + vd) * latent_dim), 3.7f);
+
+  std::vector<int32_t> slots(static_cast<size_t>(context));
+  for (int64_t t = 0; t < context; ++t) {
+    slots[static_cast<size_t>(t)] =
+        blocks[static_cast<size_t>(t / block_size)] * block_size +
+        static_cast<int32_t>(t % block_size);
+  }
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView latents_v = Upload(
+      keep, ToBf16(latents), DataType::kBFloat16, Shape({context, latent_dim}));
+  const TensorView rope_keys_v = Upload(
+      keep, ToBf16(rope_keys), DataType::kBFloat16, Shape({context, rope}));
+  const TensorView slots_v =
+      Upload(keep, slots, DataType::kInt32, Shape({context}));
+  const TensorView table_v = Upload(
+      keep, blocks, DataType::kInt32,
+      Shape({static_cast<int64_t>(blocks.size())}));
+
+  auto cache = pool->KeyCache(0);
+  ASSERT_TRUE(cache.ok()) << cache.status();
+  ASSERT_TRUE(
+      kernels::MlaAppendLatent(latents_v, rope_keys_v, *cache, slots_v).ok());
+
+  const TensorView q_nope_v = Upload(keep, ToBf16(q_nope),
+                                     DataType::kBFloat16,
+                                     Shape({1, heads, nope}));
+  const TensorView q_rope_v = Upload(keep, ToBf16(q_rope),
+                                     DataType::kBFloat16,
+                                     Shape({1, heads, rope}));
+  const TensorView kv_b_v =
+      Upload(keep, ToBf16(kv_b), DataType::kBFloat16,
+             Shape({heads * (nope + vd), latent_dim}));
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(nope + rope));
+
+  // --- Absorbed: the three kernels ------------------------------------------
+  const TensorView q_lat =
+      Empty(keep, DataType::kBFloat16, Shape({1, heads, latent_dim}));
+  const TensorView attn_lat =
+      Empty(keep, DataType::kBFloat16, Shape({1, heads, latent_dim}));
+  const TensorView absorbed_out =
+      Empty(keep, DataType::kBFloat16, Shape({1, heads, vd}));
+
+  ASSERT_TRUE(kernels::MlaAbsorbQ(q_nope_v, kv_b_v, q_lat, vd).ok());
+  ASSERT_TRUE(kernels::MlaLatentAttention(q_lat, q_rope_v, *cache, table_v,
+                                          context, attn_lat, context - 1,
+                                          scale)
+                  .ok());
+  ASSERT_TRUE(
+      kernels::MlaUnabsorbOut(attn_lat, kv_b_v, absorbed_out, nope).ok());
+
+  // --- Unabsorbed: host-reconstructed K/V through MlaAttention --------------
+  const std::vector<float> kv =
+      MatMulT(latents, kv_b, context, latent_dim, heads * (nope + vd));
+
+  std::vector<float> k_nope(static_cast<size_t>(context * heads * nope));
+  std::vector<float> v(static_cast<size_t>(context * heads * vd));
+  for (int64_t t = 0; t < context; ++t) {
+    for (int64_t h = 0; h < heads; ++h) {
+      for (int64_t d = 0; d < nope; ++d) {
+        k_nope[static_cast<size_t>((t * heads + h) * nope + d)] =
+            kv[static_cast<size_t>(t * heads * (nope + vd) + h * (nope + vd) +
+                                   d)];
+      }
+      for (int64_t d = 0; d < vd; ++d) {
+        v[static_cast<size_t>((t * heads + h) * vd + d)] =
+            kv[static_cast<size_t>(t * heads * (nope + vd) + h * (nope + vd) +
+                                   nope + d)];
+      }
+    }
+  }
+
+  const TensorView k_nope_v = Upload(keep, ToBf16(k_nope),
+                                     DataType::kBFloat16,
+                                     Shape({context, heads, nope}));
+  const TensorView v_v = Upload(keep, ToBf16(v), DataType::kBFloat16,
+                                Shape({context, heads, vd}));
+  const TensorView unabsorbed_out =
+      Empty(keep, DataType::kBFloat16, Shape({1, heads, vd}));
+
+  ASSERT_TRUE(kernels::MlaAttention(q_nope_v, q_rope_v, k_nope_v, rope_keys_v,
+                                    v_v, unabsorbed_out, context - 1, scale)
+                  .ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  const auto absorbed = Download<bf16>(absorbed_out, heads * vd);
+  const auto unabsorbed = Download<bf16>(unabsorbed_out, heads * vd);
+
+  double out_scale = 0.0;
+  for (int64_t i = 0; i < heads * vd; ++i) {
+    out_scale = std::max<double>(
+        out_scale, std::abs(__bfloat162float(unabsorbed[static_cast<size_t>(i)])));
+  }
+  ASSERT_GT(out_scale, 0.0);
+
+  // Both are bf16 paths of the same computation; what differs is where the
+  // projections happen and therefore the rounding points. 3% relative, the
+  // layer-test bound.
+  for (int64_t i = 0; i < heads * vd; ++i) {
+    EXPECT_LT(std::abs(__bfloat162float(absorbed[static_cast<size_t>(i)]) -
+                       __bfloat162float(unabsorbed[static_cast<size_t>(i)])) /
+                  out_scale,
+              0.03)
+        << "element " << i;
+  }
+}
+
 }  // namespace
 }  // namespace inferx

@@ -56,14 +56,16 @@ struct MlaWeights {
 /// through `KeyCache()`. `ValueCache()` fails for this layout, deliberately:
 /// there is no separate V to return.
 ///
-/// **This is the unabsorbed form.** Every step reconstructs K and V for the
-/// whole context with one `kv_b` GEMM, then runs ordinary attention. That is
-/// correct and it is what the tests are written against, but it gives back
-/// most of what MLA is for at decode time: the reconstruction is O(context)
-/// work per step, where the absorbed form folds `kv_b` into the query once and
-/// attends against the latent directly, making a decode step O(context) in the
-/// *latent* width instead. Absorption is the next step and it changes no
-/// interface here — see §14, M9.
+/// **Two forms, selected by call shape.** A multi-token (prefill) call runs
+/// the unabsorbed form: reconstruct K and V for the whole context with one
+/// `kv_b` GEMM, then ordinary attention — the reconstruction amortizes over
+/// the chunk's queries. A single-token (decode) call runs the **absorbed**
+/// form: `kv_b` folds into the query and the output
+/// (\see kernels::MlaAbsorbQ), and attention reads the paged latent directly
+/// — no gather, no per-step reconstruction, no context-sized scratch. The two
+/// are the same computation with the projections hoisted, and the
+/// decode-equals-prefill test is precisely the assertion that they agree
+/// through the cache.
 ///
 /// Tensor parallelism is not implemented, and the shape MLA forces is worth
 /// stating because it is the opposite of GQA's: the latent is **replicated**

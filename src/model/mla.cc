@@ -56,6 +56,12 @@ struct MlaAttentionLayer::Impl {
   Scratch new_rope; // [tokens, qk_rope]
   Scratch attn;     // [tokens, heads, v_head_dim]
 
+  // The absorbed decode path's scratch: token-sized, never context-sized,
+  // which is the point — a decode step allocates nothing that grows with the
+  // sequence.
+  Scratch q_lat;    // [tokens, heads, kv_lora]
+  Scratch attn_lat; // [tokens, heads, kv_lora]
+
   // Context side, sized by how far back attention reaches.
   Scratch gathered;   // [context, kv_lora + qk_rope]
   Scratch ctx_latent; // [context, kv_lora]
@@ -106,6 +112,8 @@ Status MlaAttentionLayer::Impl::EnsureCapacity(int64_t tokens,
     INFERX_RETURN_IF_ERROR(Grow(&latent, sz * tokens * latent_dim));
     INFERX_RETURN_IF_ERROR(Grow(&new_rope, sz * tokens * rope));
     INFERX_RETURN_IF_ERROR(Grow(&attn, sz * tokens * heads * vd));
+    INFERX_RETURN_IF_ERROR(Grow(&q_lat, sz * tokens * heads * latent_dim));
+    INFERX_RETURN_IF_ERROR(Grow(&attn_lat, sz * tokens * heads * latent_dim));
     capacity_tokens = tokens;
   }
 
@@ -235,7 +243,18 @@ Status MlaAttentionLayer::Forward(const TensorView& x,
 
   if (tokens == 0) return OkStatus();
 
-  INFERX_RETURN_IF_ERROR(impl_->EnsureCapacity(tokens, context_len));
+  // Decode takes the absorbed path: fold kv_b into the query and the output
+  // and attend against the cached latent directly, skipping the gather and
+  // the O(context · heads · (nope+v)) reconstruction that the unabsorbed form
+  // pays every step. Prefill keeps the unabsorbed form, where one
+  // reconstruction amortizes over the whole chunk's queries and the narrower
+  // per-head K/V make the attention itself cheaper. The crossover is far
+  // above one token, but one token is the case that dominates serving and the
+  // rule stays predictable.
+  const bool absorbed = tokens == 1;
+
+  INFERX_RETURN_IF_ERROR(
+      impl_->EnsureCapacity(tokens, absorbed ? 1 : context_len));
 
   // --- Q: down-project, norm, up-project, then rotate its tail --------------
 
@@ -312,66 +331,86 @@ Status MlaAttentionLayer::Forward(const TensorView& x,
   INFERX_RETURN_IF_ERROR(kernels::MlaAppendLatent(latent_v, new_rope_v, cache,
                                                   slot_mapping, stream));
 
-  // --- Reconstruct K and V for the whole context ---------------------------
-  //
-  // The unabsorbed form, and the expensive part: every step re-projects every
-  // cached token. Absorption removes this entirely (see the class comment).
-
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView gathered_v,
-      impl_->gathered.View(kBf16, Shape({context_len, latent_dim + rope})));
-  INFERX_RETURN_IF_ERROR(kernels::MlaGatherLatents(cache, block_table,
-                                                   context_len, gathered_v,
-                                                   stream));
-
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView ctx_latent_v,
-      impl_->ctx_latent.View(kBf16, Shape({context_len, latent_dim})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView ctx_rope_v,
-      impl_->ctx_rope.View(kBf16, Shape({context_len, rope})));
-
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView gathered_3d,
-      gathered_v.Reshape(Shape({context_len, 1, latent_dim + rope})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView ctx_latent_3d,
-      ctx_latent_v.Reshape(Shape({context_len, 1, latent_dim})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView ctx_rope_3d,
-      ctx_rope_v.Reshape(Shape({context_len, 1, rope})));
-
-  INFERX_RETURN_IF_ERROR(kernels::SplitTrailing(gathered_3d, ctx_latent_3d,
-                                                ctx_rope_3d, stream));
-
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView kv_v,
-      impl_->kv.View(kBf16, Shape({context_len, heads * (nope + vd)})));
-  INFERX_RETURN_IF_ERROR(
-      gemm->LinearBF16(ctx_latent_v, weights.kv_b, kv_v, stream));
-
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView kv_heads_v,
-      kv_v.Reshape(Shape({context_len, heads, nope + vd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView k_nope_v,
-      impl_->k_nope.View(kBf16, Shape({context_len, heads, nope})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView v_v,
-      impl_->v.View(kBf16, Shape({context_len, heads, vd})));
-
-  INFERX_RETURN_IF_ERROR(
-      kernels::SplitTrailing(kv_heads_v, k_nope_v, v_v, stream));
-
-  // --- Attend, then project out --------------------------------------------
-
   INFERX_ASSIGN_OR_RETURN(
       const TensorView attn_v,
       impl_->attn.View(kBf16, Shape({tokens, heads, vd})));
 
-  INFERX_RETURN_IF_ERROR(kernels::MlaAttention(
-      q_nope_v, q_rope_v, k_nope_v, ctx_rope_v, v_v, attn_v,
-      context_len - tokens, impl_->softmax_scale, stream));
+  if (absorbed) {
+    // --- Absorbed: attend against the cached latent directly ---------------
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView q_lat_v,
+        impl_->q_lat.View(kBf16, Shape({tokens, heads, latent_dim})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView attn_lat_v,
+        impl_->attn_lat.View(kBf16, Shape({tokens, heads, latent_dim})));
+
+    INFERX_RETURN_IF_ERROR(
+        kernels::MlaAbsorbQ(q_nope_v, weights.kv_b, q_lat_v, vd, stream));
+    INFERX_RETURN_IF_ERROR(kernels::MlaLatentAttention(
+        q_lat_v, q_rope_v, cache, block_table, context_len, attn_lat_v,
+        context_len - tokens, impl_->softmax_scale, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::MlaUnabsorbOut(attn_lat_v, weights.kv_b, attn_v, nope,
+                                stream));
+  } else {
+    // --- Unabsorbed: reconstruct K and V for the whole context -------------
+    //
+    // One kv_b GEMM re-projects every cached token, amortized over the
+    // chunk's queries; the absorbed path above is how decode avoids it.
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView gathered_v,
+        impl_->gathered.View(kBf16, Shape({context_len, latent_dim + rope})));
+    INFERX_RETURN_IF_ERROR(kernels::MlaGatherLatents(cache, block_table,
+                                                     context_len, gathered_v,
+                                                     stream));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView ctx_latent_v,
+        impl_->ctx_latent.View(kBf16, Shape({context_len, latent_dim})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView ctx_rope_v,
+        impl_->ctx_rope.View(kBf16, Shape({context_len, rope})));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView gathered_3d,
+        gathered_v.Reshape(Shape({context_len, 1, latent_dim + rope})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView ctx_latent_3d,
+        ctx_latent_v.Reshape(Shape({context_len, 1, latent_dim})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView ctx_rope_3d,
+        ctx_rope_v.Reshape(Shape({context_len, 1, rope})));
+
+    INFERX_RETURN_IF_ERROR(kernels::SplitTrailing(gathered_3d, ctx_latent_3d,
+                                                  ctx_rope_3d, stream));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView kv_v,
+        impl_->kv.View(kBf16, Shape({context_len, heads * (nope + vd)})));
+    INFERX_RETURN_IF_ERROR(
+        gemm->LinearBF16(ctx_latent_v, weights.kv_b, kv_v, stream));
+
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView kv_heads_v,
+        kv_v.Reshape(Shape({context_len, heads, nope + vd})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView k_nope_v,
+        impl_->k_nope.View(kBf16, Shape({context_len, heads, nope})));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView v_v,
+        impl_->v.View(kBf16, Shape({context_len, heads, vd})));
+
+    INFERX_RETURN_IF_ERROR(
+        kernels::SplitTrailing(kv_heads_v, k_nope_v, v_v, stream));
+
+    INFERX_RETURN_IF_ERROR(kernels::MlaAttention(
+        q_nope_v, q_rope_v, k_nope_v, ctx_rope_v, v_v, attn_v,
+        context_len - tokens, impl_->softmax_scale, stream));
+  }
+
+  // --- Project out ----------------------------------------------------------
 
   INFERX_ASSIGN_OR_RETURN(const TensorView attn_2d,
                           attn_v.Reshape(Shape({tokens, heads * vd})));

@@ -232,6 +232,174 @@ __global__ void MlaAttentionKernel(const bf16* __restrict__ q_nope,
   }
 }
 
+// q_lat[t,h] = W_UK[h]^T · q_nope[t,h] — the absorption itself. kv_b's rows
+// interleave per head as [W_UK (nope rows) | W_UV (v rows)], so head h's W_UK
+// starts at row h·(nope+v). One block per (token, head); the q_nope row is
+// staged in shared memory once and every thread strides over latent columns.
+__global__ void AbsorbQKernel(const bf16* __restrict__ q_nope,
+                              const bf16* __restrict__ kv_b,
+                              bf16* __restrict__ q_lat, int64_t heads,
+                              int64_t nope_dim, int64_t v_dim,
+                              int64_t latent_dim) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+
+  extern __shared__ float qn[];  // nope_dim floats
+  const bf16* src = q_nope + (token * heads + head) * nope_dim;
+  for (int64_t d = threadIdx.x; d < nope_dim; d += blockDim.x) {
+    qn[d] = ToF32(src[d]);
+  }
+  __syncthreads();
+
+  const bf16* w = kv_b + head * (nope_dim + v_dim) * latent_dim;
+  bf16* dst = q_lat + (token * heads + head) * latent_dim;
+
+  for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t d = 0; d < nope_dim; ++d) {
+      acc += qn[d] * ToF32(w[d * latent_dim + l]);
+    }
+    dst[l] = ToBf16(acc);
+  }
+}
+
+// Attention directly against the paged latent cache — the absorbed form's
+// core, and the reason it exists: no gather, no per-step reconstruction. The
+// cached row is [latent | rope_key]; the score is q_lat against the latent
+// part plus q_rope against the tail, and the "V" accumulated is the latent
+// itself. Same two-pass score-recomputing shape as MlaAttentionKernel, for
+// the same correctness-first reason.
+__global__ void LatentAttentionKernel(const bf16* __restrict__ q_lat,
+                                      const bf16* __restrict__ q_rope,
+                                      const bf16* __restrict__ cache,
+                                      const int32_t* __restrict__ block_table,
+                                      bf16* __restrict__ out_lat,
+                                      int64_t heads, int64_t latent_dim,
+                                      int64_t rope_dim, int64_t block_size,
+                                      int64_t query_base, float scale) {
+  const int64_t query = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t width = latent_dim + rope_dim;
+
+  const int64_t visible = query_base + query + 1;
+
+  const bf16* ql = q_lat + (query * heads + head) * latent_dim;
+  const bf16* qr = q_rope + (query * heads + head) * rope_dim;
+
+  const auto row = [&](int64_t j) -> const bf16* {
+    const int64_t block = block_table[j / block_size];
+    return cache + (block * block_size + j % block_size) * width;
+  };
+
+  __shared__ float reduce[kBlock];
+
+  // Pass 1: the maximum score.
+  float local_max = -INFINITY;
+  for (int64_t j = threadIdx.x; j < visible; j += blockDim.x) {
+    const bf16* key = row(j);
+
+    float dot = 0.0f;
+    for (int64_t l = 0; l < latent_dim; ++l) {
+      dot += ToF32(ql[l]) * ToF32(key[l]);
+    }
+    for (int64_t d = 0; d < rope_dim; ++d) {
+      dot += ToF32(qr[d]) * ToF32(key[latent_dim + d]);
+    }
+
+    local_max = fmaxf(local_max, dot * scale);
+  }
+
+  reduce[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduce[threadIdx.x] =
+          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float row_max = reduce[0];
+  __syncthreads();
+
+  // Pass 2: denominator and the weighted latent, accumulated together.
+  float local_sum = 0.0f;
+
+  extern __shared__ float acc[];  // latent_dim floats
+  for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) acc[l] = 0.0f;
+  __syncthreads();
+
+  for (int64_t j = 0; j < visible; ++j) {
+    const bf16* key = row(j);
+
+    float dot = 0.0f;
+    for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) {
+      dot += ToF32(ql[l]) * ToF32(key[l]);
+    }
+    for (int64_t d = threadIdx.x; d < rope_dim; d += blockDim.x) {
+      dot += ToF32(qr[d]) * ToF32(key[latent_dim + d]);
+    }
+
+    reduce[threadIdx.x] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+
+    const float weight = __expf(reduce[0] * scale - row_max);
+    __syncthreads();
+
+    if (threadIdx.x == 0) local_sum += weight;
+
+    for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) {
+      acc[l] += weight * ToF32(key[l]);
+    }
+    __syncthreads();
+  }
+
+  __shared__ float denom;
+  if (threadIdx.x == 0) denom = local_sum;
+  __syncthreads();
+
+  const float inv = 1.0f / denom;
+  bf16* dst = out_lat + (query * heads + head) * latent_dim;
+  for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) {
+    dst[l] = ToBf16(acc[l] * inv);
+  }
+}
+
+// out[t,h] = W_UV[h] · attn_lat[t,h] — the other half of absorption, folding
+// the value up-projection over the attended latent. Head h's W_UV is kv_b's
+// rows [h·(nope+v)+nope, h·(nope+v)+nope+v).
+__global__ void UnabsorbOutKernel(const bf16* __restrict__ attn_lat,
+                                  const bf16* __restrict__ kv_b,
+                                  bf16* __restrict__ out, int64_t heads,
+                                  int64_t nope_dim, int64_t v_dim,
+                                  int64_t latent_dim) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+
+  extern __shared__ float lat[];  // latent_dim floats
+  const bf16* src = attn_lat + (token * heads + head) * latent_dim;
+  for (int64_t l = threadIdx.x; l < latent_dim; l += blockDim.x) {
+    lat[l] = ToF32(src[l]);
+  }
+  __syncthreads();
+
+  const bf16* w = kv_b + (head * (nope_dim + v_dim) + nope_dim) * latent_dim;
+  bf16* dst = out + (token * heads + head) * v_dim;
+
+  for (int64_t d = threadIdx.x; d < v_dim; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int64_t l = 0; l < latent_dim; ++l) {
+      acc += ToF32(w[d * latent_dim + l]) * lat[l];
+    }
+    dst[d] = ToBf16(acc);
+  }
+}
+
 Status CheckTensor(const TensorView& t, DataType dtype, int rank,
                    const char* name) {
   if (!t.IsDefined()) return InvalidArgumentError(name, " is undefined");
@@ -512,6 +680,153 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
       static_cast<const bf16*>(k_rope.Data()),
       static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()),
       heads, nope_dim, rope_dim, v_dim, context, query_base, scale);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
+                  const TensorView& q_lat, int64_t v_head_dim,
+                  cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_nope, DataType::kBFloat16, 3, "q_nope"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(kv_b, DataType::kBFloat16, 2, "kv_b"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_lat, DataType::kBFloat16, 3, "q_lat"));
+
+  const int64_t tokens = q_nope.Dim(0);
+  const int64_t heads = q_nope.Dim(1);
+  const int64_t nope_dim = q_nope.Dim(2);
+  const int64_t latent_dim = kv_b.Dim(1);
+
+  if (v_head_dim <= 0 ||
+      kv_b.Dim(0) != heads * (nope_dim + v_head_dim)) {
+    return InvalidArgumentError("kv_b is ", kv_b.GetShape().ToString(),
+                                ", expected [", heads, " * (", nope_dim, " + ",
+                                v_head_dim, "), latent]");
+  }
+
+  if (q_lat.Dim(0) != tokens || q_lat.Dim(1) != heads ||
+      q_lat.Dim(2) != latent_dim) {
+    return InvalidArgumentError("q_lat is ", q_lat.GetShape().ToString(),
+                                ", expected [", tokens, ", ", heads, ", ",
+                                latent_dim, "]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
+  const size_t shared = static_cast<size_t>(nope_dim) * sizeof(float);
+
+  AbsorbQKernel<<<grid, kBlock, shared, stream>>>(
+      static_cast<const bf16*>(q_nope.Data()),
+      static_cast<const bf16*>(kv_b.Data()),
+      static_cast<bf16*>(q_lat.Data()), heads, nope_dim, v_head_dim,
+      latent_dim);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
+                          const TensorView& cache,
+                          const TensorView& block_table, int64_t context_len,
+                          const TensorView& out_lat, int64_t query_base,
+                          float scale, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_lat, DataType::kBFloat16, 3, "q_lat"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(q_rope, DataType::kBFloat16, 3, "q_rope"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(cache, DataType::kBFloat16, 4, "cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(block_table, DataType::kInt32, 1, "block_table"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(out_lat, DataType::kBFloat16, 3, "out_lat"));
+
+  const int64_t tokens = q_lat.Dim(0);
+  const int64_t heads = q_lat.Dim(1);
+  const int64_t latent_dim = q_lat.Dim(2);
+  const int64_t rope_dim = q_rope.Dim(2);
+  const int64_t block_size = cache.Dim(1);
+
+  if (cache.Dim(2) != 1 || cache.Dim(3) != latent_dim + rope_dim) {
+    return InvalidArgumentError(
+        "cache is ", cache.GetShape().ToString(),
+        ", expected [*, block_size, 1, ", latent_dim + rope_dim, "]");
+  }
+
+  if (q_rope.Dim(0) != tokens || q_rope.Dim(1) != heads ||
+      out_lat.Dim(0) != tokens || out_lat.Dim(1) != heads ||
+      out_lat.Dim(2) != latent_dim) {
+    return InvalidArgumentError("q_lat ", q_lat.GetShape().ToString(),
+                                ", q_rope ", q_rope.GetShape().ToString(),
+                                " and out_lat ", out_lat.GetShape().ToString(),
+                                " disagree");
+  }
+
+  if (context_len <= 0 || query_base < 0 ||
+      query_base + tokens > context_len) {
+    return InvalidArgumentError("context_len ", context_len,
+                                " cannot hold queries at base ", query_base,
+                                " for ", tokens, " tokens");
+  }
+
+  const int64_t blocks_needed =
+      (context_len + block_size - 1) / block_size;
+  if (block_table.Dim(0) < blocks_needed) {
+    return InvalidArgumentError("block_table holds ", block_table.Dim(0),
+                                " blocks but context ", context_len,
+                                " needs ", blocks_needed);
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
+  const size_t shared = static_cast<size_t>(latent_dim) * sizeof(float);
+
+  LatentAttentionKernel<<<grid, kBlock, shared, stream>>>(
+      static_cast<const bf16*>(q_lat.Data()),
+      static_cast<const bf16*>(q_rope.Data()),
+      static_cast<const bf16*>(cache.Data()),
+      static_cast<const int32_t*>(block_table.Data()),
+      static_cast<bf16*>(out_lat.Data()), heads, latent_dim, rope_dim,
+      block_size, query_base, scale);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
+                      const TensorView& out, int64_t qk_nope_head_dim,
+                      cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(attn_lat, DataType::kBFloat16, 3, "attn_lat"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(kv_b, DataType::kBFloat16, 2, "kv_b"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
+
+  const int64_t tokens = attn_lat.Dim(0);
+  const int64_t heads = attn_lat.Dim(1);
+  const int64_t latent_dim = attn_lat.Dim(2);
+  const int64_t v_dim = out.Dim(2);
+
+  if (qk_nope_head_dim <= 0 || kv_b.Dim(1) != latent_dim ||
+      kv_b.Dim(0) != heads * (qk_nope_head_dim + v_dim)) {
+    return InvalidArgumentError("kv_b is ", kv_b.GetShape().ToString(),
+                                ", expected [", heads, " * (",
+                                qk_nope_head_dim, " + ", v_dim, "), ",
+                                latent_dim, "]");
+  }
+
+  if (out.Dim(0) != tokens || out.Dim(1) != heads) {
+    return InvalidArgumentError("out is ", out.GetShape().ToString(),
+                                ", expected [", tokens, ", ", heads, ", *]");
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
+  const size_t shared = static_cast<size_t>(latent_dim) * sizeof(float);
+
+  UnabsorbOutKernel<<<grid, kBlock, shared, stream>>>(
+      static_cast<const bf16*>(attn_lat.Data()),
+      static_cast<const bf16*>(kv_b.Data()), static_cast<bf16*>(out.Data()),
+      heads, qk_nope_head_dim, v_dim, latent_dim);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

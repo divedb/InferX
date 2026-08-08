@@ -165,4 +165,67 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
                     int64_t query_base, float scale,
                     cudaStream_t stream = nullptr);
 
+// --- The absorbed form (§14, M9's "obvious next move") ----------------------
+//
+// Fold `kv_b` into the query and the output instead of reconstructing K and V
+// for the whole context every step:
+//
+//     score(i,j,h) = (W_UK[h]ᵀ q_nope[i,h]) · c[j]  +  q_rope[i,h] · k_rope[j]
+//     out(i,h)     = W_UV[h] · Σ_j softmax_j · c[j]
+//
+// which is algebraically the unabsorbed computation with the projections
+// hoisted out of the sum. What changes is the shape of the work: a decode
+// step touches O(context · (latent + rope)) cached bytes directly through the
+// block table — no gather, no O(context · heads · (nope + v)) reconstruction
+// GEMM, and no scratch sized by context on the token side.
+
+/// \brief `q_lat[t,h] = W_UK[h]ᵀ · q_nope[t,h]`.
+///
+/// \param q_nope     `[tokens, heads, qk_nope_head_dim]` bf16 (not rotated —
+///                   the nope part never is).
+/// \param kv_b       The unabsorbed path's same `[heads·(nope+v), latent]`
+///                   weight; head `h`'s W_UK is rows `[h·(nope+v),
+///                   h·(nope+v)+nope)`. Passed whole so the two paths cannot
+///                   drift apart by loading different tensors.
+/// \param q_lat      `[tokens, heads, kv_lora_rank]` bf16, written.
+/// \param v_head_dim The v width, needed only to stride between heads.
+Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
+                  const TensorView& q_lat, int64_t v_head_dim,
+                  cudaStream_t stream = nullptr);
+
+/// \brief Causal attention of absorbed queries directly against the paged
+///        latent cache.
+///
+/// Reads `[latent | rope_key]` rows through the block table; the score is
+/// `q_lat` against the latent part plus `q_rope` against the tail, and the
+/// value accumulated is the latent itself. One sequence per call, like the
+/// unabsorbed path. Two-pass score-recomputing reference kernel, same as
+/// `MlaAttention`.
+///
+/// \param q_lat       `[tokens, heads, kv_lora_rank]` bf16 from `MlaAbsorbQ`.
+/// \param q_rope      `[tokens, heads, qk_rope_head_dim]` bf16, rotated.
+/// \param cache       `KeyCache(layer)` — `[blocks, block_size, 1,
+///                    latent + rope]`.
+/// \param block_table `[blocks_for_seq]` int32.
+/// \param context_len Cache length after this step's append.
+/// \param out_lat     `[tokens, heads, kv_lora_rank]` bf16, written.
+/// \param query_base  As in `MlaAttention`.
+/// \param scale       The same YaRN-corrected softmax scale.
+Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
+                          const TensorView& cache,
+                          const TensorView& block_table, int64_t context_len,
+                          const TensorView& out_lat, int64_t query_base,
+                          float scale, cudaStream_t stream = nullptr);
+
+/// \brief `out[t,h] = W_UV[h] · attn_lat[t,h]`.
+///
+/// \param attn_lat         `[tokens, heads, kv_lora_rank]` bf16.
+/// \param kv_b             As in `MlaAbsorbQ`; head `h`'s W_UV is rows
+///                         `[h·(nope+v)+nope, h·(nope+v)+nope+v)`.
+/// \param out              `[tokens, heads, v_head_dim]` bf16, written.
+/// \param qk_nope_head_dim The nope width, needed only to stride heads.
+Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
+                      const TensorView& out, int64_t qk_nope_head_dim,
+                      cudaStream_t stream = nullptr);
+
 }  // namespace inferx::kernels
