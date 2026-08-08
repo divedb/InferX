@@ -1939,3 +1939,415 @@ The recommended delivery units are phases 0 through 8, in order. Phases 9
 through 12 add new product capabilities and deployment topology and should not
 delay replacing the blocking per-stream application-thread behavior in the
 current server.
+
+## 18. DeepSeek-V2-Lite support: design and implementation plan
+
+This section is based on the InferX code as it exists on 2026-08-08. It plans
+the third served architecture, `DeepseekV2ForCausalLM`, which is also the
+first checkpoint to exercise the MLA attention layer built in M9. Like
+section 17 it is an incremental plan: each phase leaves a buildable tree, and
+correctness phases are separated from performance phases deliberately.
+
+### 18.1 Why this model and what it exercises
+
+DeepSeek-V2-Lite is the smallest checkpoint that combines the two M9 layers —
+MLA attention and a routed MoE FFN — with a real tokenizer, a real chat
+template, and published reference logits. Serving it closes the two open M9
+items at once: "wiring MLA into a served checkpoint" and the first real user
+of the bf16 stacked-expert MoE path (gpt-oss uses only the MXFP4 path).
+
+Model shape, from its `config.json`:
+
+| Property | Value |
+|---|---|
+| Architecture | `DeepseekV2ForCausalLM` |
+| Parameters | 15.7 B total, ~2.4 B active per token |
+| Layers / hidden / heads | 27 / 2048 / 16 (no GQA split; MLA) |
+| MLA | `kv_lora_rank` 512, `q_lora_rank` **null** (no Q compression), `qk_nope_head_dim` 128, `qk_rope_head_dim` 64, `v_head_dim` 128 |
+| Effective QK head dim | 192 (128 nope + 64 rope) |
+| MoE | 64 routed experts, top-6, `scoring_func` softmax, `topk_method` greedy, `norm_topk_prob` false, `routed_scaling_factor` 1.0 |
+| Shared experts | 2, **ungated**, stored as one fused MLP of width 2 × 1408 = 2816 |
+| Dense layers | `first_k_dense_replace` 1: layer 0 is a dense FFN at `intermediate_size` 10944; layers 1–26 are MoE (`moe_layer_freq` 1) |
+| RoPE | theta 10000, YaRN: `factor` 40, `original_max_position_embeddings` 4096, `mscale` 0.707, `mscale_all_dim` 0.707 → 163 840 context |
+| Vocabulary | 102 400; `tokenizer.json` (HF BPE), EOS `<｜end▁of▁sentence｜>` |
+| Weights | bf16 safetensors, ~31.4 GB |
+
+Two facts shape the whole plan:
+
+1. **The latent cache is 14× smaller than GQA.** 576 elements per token per
+   layer against the GQA formula's 8192 — `KvElementsPerTokenPerLayer()`
+   already returns this. KV capacity planning changes by an order of
+   magnitude, and the latent is replicated (not sharded) under TP.
+2. **The checkpoint does not fit the 16 GB development GPU at bf16.**
+   Section 18.6 treats serving memory as an explicit decision, not an
+   afterthought.
+
+### 18.2 What already exists (verified baseline)
+
+The M9 groundwork means far less is missing than "new architecture" suggests:
+
+| Asset | State |
+|---|---|
+| `MlaAttentionLayer` (`include/inferx/model/mla.h`, `src/model/mla.cc`) | Complete for one sequence: q down/up projection with the `q_lora_rank == 0` branch (exactly V2-Lite's shape), decoupled-rope split, latent RmsNorm, paged append/gather, unabsorbed attention. Compiled, tested at M9, **called by no model** |
+| `MlaAttentionLayer::LayoutFor` | Returns `KvLayout{entries_per_token = 1, kv_heads = 1, head_dim = 576}`; `KvBlockPool` accepts it and `ValueCache()` correctly fails |
+| MLA kernels (`csrc/mla.cu`) | Shape-generic — 512/64/128/128 needs no kernel change; bf16 only; attention kernel is the two-pass correctness form |
+| `MoeFfn` + `MoeRouteTopK` (`src/model/moe_ffn.cc`, `csrc/moe.cu`) | Softmax-then-top-k with ties to the lower index and optional renormalization is **exactly** V2-Lite's routing (`renormalize = false`); 6 ≤ `kMaxTopK` 16, 64 ≤ `kMaxExperts` 1024; dispatch is stable, atomic-free, graph-capturable |
+| Scheduler and KV pool | **Zero changes required.** The scheduler touches only block indices and `block_size`; geometry lives in `KvLayout`, chosen by the model class (T11 held) |
+| Tokenizer | `Tokenizer::LoadFrom` probes `tokenizer.json` and loads it through tokenizers-cpp; V2-Lite's BPE artifact and `tokenizer_config.json` EOS resolution work unchanged |
+| YaRN machinery | `ComputeYarnInvFreq` + table-driven rope with an attention factor exist — but only on the gpt-oss path, in the full-head form |
+| FlashInfer v0.6.9 (vendored) | Exposes `BatchMLAPagedAttention` (FA2, sm_89-usable) and `MLAPlan`, with a `DISPATCH_head_dim` arm for 512 — none of it wired |
+| Config MLA fields | `kv_lora_rank`, `q_lora_rank` (tolerates JSON null), `qk_*_head_dim`, `v_head_dim` parsed and validated; V2-Lite passes the MLA validation block |
+| M9 test suites | `tests/kernel/mla_test.cc` (722 lines, includes decode-equals-prefill and out-of-order block-table pins) and `moe_test.cc` (737 lines) were deleted by `99e5ed3` with the rest of the old test tree — **recoverable via `git show 99e5ed3^:<path>`** |
+
+### 18.3 Gap analysis
+
+#### Config parsing (`src/model/config.cc`) — four hard failures / silent errors
+
+1. `ParseArchitecture` rejects `DeepseekV2ForCausalLM` (unknown string).
+2. `rope_scaling` parsing calls `RequiredString("rope_type")`; V2-Lite spells
+   the key **`type`** — a hard `InvalidArgumentError` at load.
+3. YaRN `mscale` / `mscale_all_dim` are not parsed and have no `ModelConfig`
+   fields; the MLA softmax scale is hardcoded `1/sqrt(nope + rope)` in
+   `mla.cc`, wrong for any YaRN-scaled MLA config.
+4. MoE keys are spelled differently: InferX reads `num_experts` and
+   `shared_expert_intermediate_size`; DeepSeek writes `n_routed_experts` (64)
+   and `n_shared_experts` (a **count**, 2 — the width is
+   `n_shared_experts × moe_intermediate_size`). Today the file parses with
+   `num_experts = 0`, `is_moe()` false, and the model would **silently load
+   as dense**. `first_k_dense_replace`, `moe_layer_freq`,
+   `routed_scaling_factor`, `scoring_func`, `topk_method` have no fields at
+   all.
+
+Also: `q_dim()` / `kv_dim()` and the derived `head_dim` (2048/16 = 128) are
+meaningless under MLA and must not be consulted by the DeepSeek path.
+
+#### MLA layer — five gaps
+
+1. **Single-sequence contract.** `MlaAttentionLayer::Forward` takes one
+   sequence's flat `block_table` and one scalar `context_len`; `ForwardBatch`
+   is a ragged mixed batch. The header explicitly assigns the loop to the
+   caller.
+2. **No YaRN path.** `MlaRopeInPlace` computes plain `theta^(-2j/rope_dim)`
+   frequencies in-kernel; there is no table/attention-factor variant, so
+   YaRN frequencies cannot reach the MLA rope at all.
+3. **Softmax scale.** `scale = 1/sqrt(192)` must become
+   `mscale(mscale_all_dim)² / sqrt(192)` where
+   `mscale(m) = 0.1·m·ln(factor) + 1`. For V2-Lite that is
+   `(1.2608)² / sqrt(192) ≈ 0.11472`. Note: because
+   `mscale == mscale_all_dim`, HF's cos/sin attention factor is exactly 1.0
+   for this checkpoint — the entire mscale effect lands in the softmax scale.
+4. **RoPE convention unverified.** The kernel uses the half-split (NeoX)
+   rotation; HF's DeepSeek code applies `rotate_half` to a de-interleaved
+   view. Self-consistent tests cannot catch a mismatch; only real weights
+   can. (Resolution in 18.4, D2.)
+5. **Performance.** Only the unabsorbed form exists: every step gathers the
+   whole context and reconstructs K/V through the `kv_b` GEMM, then runs a
+   score-recomputing reference kernel. Correct, unusably slow at real
+   context, and its context-dependent scratch shapes block CUDA-graph
+   capture.
+
+#### MoE layer — four gaps
+
+1. **Shared-expert gate.** `MoeFfn` *requires* a `shared_gate` weight and
+   applies `out += sigmoid(gate)·shared` (Qwen2-MoE's convention). DeepSeek's
+   shared experts are an unconditional add. Needs an ungated mode.
+2. **Mixed dense/MoE stacks.** Neither existing model mixes layer types;
+   nothing in `ModelConfig` expresses "layer 0 is dense". Precedent:
+   `layer_is_sliding` for gpt-oss.
+3. **Expert weight stacking.** The checkpoint stores
+   `mlp.experts.{0..63}.{gate,up,down}_proj.weight` as ~192 tensors per
+   layer; `MoeWeights` wants stacked `[E, 2·inter, hidden]` / `[E, hidden,
+   inter]`. No stacking upload helper exists (`UploadConcatenated` is 2-D
+   only).
+4. **The bf16 expert path has never met a real model** — it runs 64 cuBLASLt
+   calls per layer behind a host readback of dispatch offsets each step,
+   which also makes it uncapturable as a graph. Acceptable for bring-up;
+   a performance-phase item, not a correctness one.
+
+#### Model class and serving wiring
+
+- No `DeepseekV2Model`; no loader references any MLA weight name.
+- `Engine::Create` dispatches on a single `if (arch == kGptOss)`; the
+  else-arm runner (`QwenRunner`) is a clean 7-method interface but lexically
+  bound to `model::Qwen2Model` throughout.
+- The chat template is one hard-coded Qwen2 ChatML function selected
+  unconditionally in `tokenization_service.cc`; V2-Lite's template is not
+  ChatML (`<｜begin▁of▁sentence｜>{system}` … `User: …\n\nAssistant: …<｜end▁of▁sentence｜>`),
+  and emitting `<|im_start|>` tokens at a DeepSeek vocabulary would be
+  silently wrong.
+- No model, kernel, config, or scheduler tests remain in the tree (all
+  deleted by `99e5ed3`); the DeepSeek work needs them restored first.
+
+### 18.4 Design decisions
+
+**D1 — Keep the fused 576-wide latent cache row.** `MlaAppendLatent` writes
+`[latent | rope_key]` as one row and the M9 paging tests pin that layout.
+FlashInfer's `MLAParams` takes separate `ckv`/`kpe` pointers *with separate
+strides*, so the fused row can be presented as two strided views of the same
+storage (`ckv = base, kpe = base + 512`, both with row stride 576) when the
+FlashInfer wrapper lands. Do not split the cache; verify the strided-view
+route in the performance phase and split only if FlashInfer's plan rejects
+it.
+
+**D2 — Settle the RoPE convention in the loader, not the kernel.** Both rope
+inputs are produced by projections whose *output channels* the loader owns:
+`q_proj`'s trailing 64 columns per head and `kv_a_proj_with_mqa`'s trailing
+64 rows. If HF's interleaved convention differs from the kernel's half-split
+form, permute those weight rows once at load so the kernel's convention
+becomes correct by construction — the cached rope key is then consistently
+permuted, and only dot products against equally-permuted queries matter.
+The golden-logits test (D5 phase) is the arbiter; the permutation is a
+loader constant, not a runtime branch.
+
+**D3 — Extend `MoeFfn` minimally: `shared_gated` flag and
+`routed_scaling_factor`.** Ungated mode reuses `AddInPlace` (or a trivial
+kernel) instead of `MoeAddSharedExpert`, and `shared_gate` becomes optional
+exactly when `shared_gated == false`. `routed_scaling_factor` multiplies the
+combine weights (1.0 for V2-Lite — plumbed but inert, so V3-family configs
+are not silently wrong later). Reject `scoring_func != "softmax"` and
+`topk_method != "greedy"` at config validation with typed errors.
+
+**D4 — Per-layer FFN kind on `ModelConfig`.** Add `first_k_dense_replace`
+and `moe_layer_freq` plus an `IsMoeLayer(i)` predicate (the
+`IsSlidingLayer` pattern). The model class branches per layer between the
+dense FFN weights (`mlp.{gate,up,down}_proj`) and `MoeFfn`.
+
+**D5 — MLA YaRN via a table variant.** Add `MlaRopeFromTable(x, rope_dim,
+positions, inv_freq[rope_dim/2], attn_factor)` beside `MlaRopeInPlace`, and
+generalize the host-side attention-factor computation so DeepSeek's
+`0.1·mscale·ln(factor) + 1` form and gpt-oss's default coexist. The softmax
+scale becomes a parameter of `MlaAttentionLayer::Create` (the header already
+anticipates this), computed once from config: for V2-Lite ≈ 0.11472.
+
+**D6 — Batched serving by a per-sequence loop first.** `DeepseekV2Model`
+iterates sequences of the `ForwardBatch`, slicing the flat token arrays and
+the sequence's `block_table` row per call — the loop the MLA header assigns
+to the caller. This is O(Σ context) reconstruction per layer per step and is
+accepted for bring-up; the performance phase replaces the attention inner
+loop, not the model structure. The executor must honor `batch.decode_only`
+(the uncommitted scheduler/`ForwardBatch` fix) rather than inferring decode
+from shape — it will be the first executor to do so.
+
+**D7 — Engine integration by de-Qwening the runner.** Rename `QwenRunner`
+to `ModelRunner` and make `SingleQwenRunner` a `SingleModelRunner<TModel>`
+template over the existing duck-typed 7-method contract, rather than adding
+a third parallel serving loop in `engine.cc`. The NCCL variant stays
+Qwen2-only (MLA TP is out of scope; the latent replicates rather than
+shards, and the engine already rejects TP > 1 for non-Qwen2). Bring-up may
+start on the simpler synchronous `RunGptOss` loop shape, but the target is
+the async `StepAsync`/`AwaitStep` path with device sampling so chat serving
+gets temperature/top-p, not host argmax.
+
+**D8 — Chat template as a selected kind, not a sniffed string.** Transcribe
+`ApplyDeepSeekV2ChatTemplate` beside the Qwen2 function (same
+tested-transcription policy; a Jinja engine remains out of scope) and add a
+`ChatTemplateKind` chosen at composition time — the server already knows the
+architecture where it constructs `InProcessTokenizationService`. This is
+the section 17.8 seam ("chat templates selected by immutable model
+version"), delivered early because DeepSeek forces it.
+
+### 18.5 HTTP-server integration details
+
+The section 17 gateway architecture needs no structural change — that is the
+point of the seams. Specific touch points:
+
+- **Model registry entry.** `id` = directory basename or
+  `--served-model-name` as today; capabilities must carry the real limits:
+  context length (advertise the practical serving limit, not 163 840, until
+  long-context YaRN serving is validated), no embeddings, streaming yes.
+  `GET /v1/models` then reports it without code changes.
+- **Tokenization service.** `TokenizeChat` routes through the
+  `ChatTemplateKind` (D8); `TokenizeCompletion` is unchanged.
+  `POST /v1/tokenize` works once the tokenizer loads; the known
+  `add_special_tokens = true` limitation (post-processor tokens
+  unimplemented) applies to DeepSeek exactly as to Qwen and keeps its
+  existing typed error.
+- **Validation and admission.** `max_tokens`/context checks read the model's
+  registry metadata — no DeepSeek constants in handlers. The admission KV
+  reservation estimate uses `KvElementsPerTokenPerLayer()`, which is already
+  MLA-correct; capacity numbers simply improve 14×.
+- **Sampling parameters.** Recommended defaults (e.g. temperature 0.3 for
+  V2-Lite-Chat) are a client concern; the server validates ranges as in
+  section 9, unchanged.
+- **Remote scheduler gateway.** The gateway loads only a tokenizer directory
+  and a model id — DeepSeek works there once the tokenizer directory and the
+  template kind are supplied; the gateway needs the same `ChatTemplateKind`
+  selection switch, driven by configuration rather than a loaded checkpoint.
+
+### 18.6 Serving memory on the 16 GB development GPU
+
+bf16 weights are ~31.4 GB; the box has 16 GB (sm_89). The weight mass is
+almost entirely routed experts: 64 × 3 × 1408 × 2048 × 26 layers ≈ 14.4 B of
+the 15.7 B parameters. Options, in preference order:
+
+1. **W4A16 routed experts, bf16 everything else.** ~7.2 GB experts (+ ~0.2 GB
+   group scales) + ~2.9 GB for attention/dense/shared/embeddings ≈ 10.5 GB,
+   leaving several GB for the latent KV pool — which at 31 104 bytes per
+   token (576 × 2 B × 27 layers) buys ~34 000 cached tokens per GB. The
+   `W4A16Gemm` kernel and int4 quantization kernels exist; what does not is
+   an int4 *expert* path in `MoeFfn` (a per-expert loop mirroring the bf16
+   loop is the bring-up form; a grouped int4 GEMM is a performance item).
+2. **Rented GPU at bf16** (the TP-validation pattern): correct first serving
+   numbers without new quantization code, at rental cost and iteration
+   latency.
+3. FP8 weights (~15.7 GB) do not leave room for a KV pool on this box; not
+   viable.
+
+Correctness does not wait on this choice: layer-level tests run at toy
+shapes on-box, and golden logits come from HF on CPU (one-off, RAM
+permitting) or from the rented-GPU run. The empty
+`bench-results/deepseek-v2-lite-vllm-20260808-1535/` directory suggests a
+vLLM baseline attempt already started; rerun it wherever the serving
+hardware decision lands.
+
+### 18.7 Phased implementation plan
+
+Order matters: the tree currently has the `src/kernels/` → `csrc/` rename
+half-landed (deletions staged, `csrc/` untracked) and the
+`ForwardBatch::decode_only` fix uncommitted. Land those first — every phase
+below touches files near them.
+
+#### Phase D0: land the in-flight rename and restore the test floor
+
+- Commit the `csrc/` move and the `decode_only` scheduler/`ForwardBatch`
+  change as separate commits.
+- Restore from `99e5ed3^`: `tests/kernel/mla_test.cc`, `moe_test.cc`,
+  `config_test.cc`, `scheduler_test.cc`, `prefix_cache_test.cc`,
+  `safetensors_test.cc`, and the old `tests/CMakeLists.txt` harness
+  (`inferx_add_kernel_test`, `kernel` labels, GPU self-skip). Target names
+  survived the rename (`inferx::kernels` is unchanged), so link lines
+  resolve.
+- Reconfigure the stale `build/` tree (it predates the rename).
+
+Exit: `ctest -L unit` is green host-only; `ctest -L kernel` is green on the
+box; the M9 MLA/MoE pins (decode-equals-prefill, out-of-order block table,
+router determinism) all run again.
+
+#### Phase D1: config parsing (host-only)
+
+- Add `Architecture::kDeepSeekV2` ↔ `"DeepseekV2ForCausalLM"`.
+- Accept `rope_scaling.type` as an alias for `rope_type`; parse `mscale` and
+  `mscale_all_dim` into new YaRN fields.
+- Alias `n_routed_experts` → `num_experts`; derive
+  `shared_expert_intermediate_size = n_shared_experts × moe_intermediate_size`;
+  parse `first_k_dense_replace`, `moe_layer_freq`, `routed_scaling_factor`,
+  `scoring_func`, `topk_method`; add `IsMoeLayer(i)`.
+- Validation arm for `kDeepSeekV2`: MLA fields required, reject non-softmax
+  scoring / non-greedy top-k with typed `Unimplemented` errors, forbid
+  consulting `q_dim()`/`kv_dim()` under MLA (assert or refactor call sites).
+- Tests: a checked-in V2-Lite `config.json` fixture parses to exact field
+  values; every alias and every rejection path is covered. This phase alone
+  removes all four silent-failure modes of 18.3.
+
+Exit: the real `config.json` round-trips; host-only tests cover the aliases,
+`type` vs `rope_type`, `q_lora_rank: null`, and `is_moe()` truth.
+
+#### Phase D2: MoE generalization
+
+- `MoeFfn::Config` gains `shared_gated` (default true — existing behavior)
+  and `routed_scaling_factor` (default 1.0). Ungated mode makes
+  `shared_gate` optional and adds the shared output with `AddInPlace`.
+- Extend the restored `moe_test.cc`: ungated shared expert changes every row
+  by exactly the shared-MLP output; scaling factor multiplies combine
+  weights; gated behavior unchanged.
+
+Exit: both shared-expert conventions tested against host references; the
+existing gpt-oss path is bit-identical.
+
+#### Phase D3: MLA YaRN and softmax scale
+
+- `MlaRopeFromTable` kernel variant (trailing-slice, table + attention
+  factor); generalized YaRN host computation with the DeepSeek mscale form.
+- `MlaAttentionLayer::Create` takes the softmax scale (config-computed);
+  the two rope call sites switch to the table variant when YaRN is active.
+- Tests: table variant equals `MlaRopeInPlace` when the table is unscaled
+  and the factor is 1; the V2-Lite scale constant (≈ 0.11472) is pinned;
+  frequencies match `_compute_yarn_parameters` for the V2-Lite parameters.
+
+Exit: MLA layer tests pass with and without YaRN; no change to non-MLA
+paths.
+
+#### Phase D4: `DeepseekV2Model`
+
+New `src/model/deepseek_v2.{h,cc}` following the `GptOssModel` structure
+(pimpl, non-blocking stream, `PrepareBatchInputs` / `RunPagedForward` split,
+grow-only scratch):
+
+- Loader: `q_proj` (no `q_a` — the `q_lora_rank == 0` branch),
+  `kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj`, `o_proj`; per-layer
+  dense-vs-MoE branch; expert stacking upload (one batched staging copy per
+  stacked tensor, not 192 `cudaMemcpy`s per layer); fused shared-expert MLP
+  into `shared_gate_up`/`shared_down`; the D2 loader-side rope permutation
+  if the golden test demands it.
+- `AttachKvCache` uses `MlaAttentionLayer::LayoutFor(config)`.
+- `Step`: per-sequence MLA loop over the ragged batch (D6), honoring
+  `batch.decode_only`; `Forward(tokens, out_logits)` single-prompt reference
+  path for the logits harness.
+- CUDA graphs: **explicitly deferred** — the unabsorbed MLA scratch shapes
+  depend on context length; `CaptureDecodeGraph` returns unimplemented and
+  the engine skips capture for this architecture.
+- Tests: `deepseek_v2_model_test.cc` modeled on `gpt_oss_model_test.cc` at
+  toy shapes (host-reference forward, decode-equals-prefill through the
+  paged cache, dense layer 0 vs MoE layer 1 branch).
+
+Exit: toy-shape model forward matches a host reference; paged decode equals
+prefill; the loader maps every tensor name in the real checkpoint index
+(verifiable host-only against the safetensors header without weights).
+
+#### Phase D5: engine, runner, template, serving
+
+- Rename `QwenRunner` → `ModelRunner`; `SingleModelRunner<TModel>` template;
+  `engine.cc` grows a `kDeepSeekV2` arm that builds it (TP > 1 stays
+  rejected).
+- `ApplyDeepSeekV2ChatTemplate` + `ChatTemplateKind` selection at
+  composition (18.5); template unit tests against fixtures generated by HF's
+  `apply_chat_template` for the same conversations, including the
+  no-system-message and multi-turn cases.
+- Golden logits: adapt `scripts/gen_reference_logits.py`; generate on CPU or
+  rented GPU (18.6); wire the logits-comparison test.
+- Serve end-to-end on the chosen memory strategy; capture the section 17.3
+  compatibility fixtures for the new model id.
+
+Exit: `inferx-serve --model <deepseek-dir>` answers `/v1/chat/completions`
+(streaming and blocking) with template-correct prompts; logits match HF
+within the established tolerance; the RoPE-convention question is settled by
+measurement and documented in ARCHITECTURE.md.
+
+#### Phase D6: performance (separately gated, after correctness)
+
+In expected-value order:
+
+1. **FlashInfer MLA decode** via `BatchMLAPagedAttention`
+   (`HEAD_DIM_CKV` 512, `HEAD_DIM_KPE` 64, FA2 path, sm_89) over the fused
+   cache row presented as strided `ckv`/`kpe` views (18.4 D1) — replaces
+   the gather + reconstruct + reference-attention chain for decode, and is
+   the "FlashInfer MLA wrapper" item DEVELOPMENT.md already names as the
+   reason for the CUDA 13 floor. Absorption (folding `kv_b` into Q/O) is the
+   alternative if the wrapper fights back; it changes no interfaces.
+2. **bf16 grouped expert GEMM** (CUTLASS grouped GEMM, or extend the
+   `Mxfp4GroupedGemm` device-dispatch pattern) — removes 64 launches and one
+   host sync per MoE layer per step, and unblocks graph capture of the FFN.
+3. **CUDA graphs for decode** once (1) and (2) give fixed shapes; honor
+   `decode_only`.
+4. **Device sampling / `StepAsync`** parity with the Qwen2 path.
+5. If serving on-box: the int4 expert path (18.6), first as a per-expert
+   loop, then grouped.
+
+Each item lands behind the D5 correctness fixtures re-run; no perf change
+merges on a red golden-logits test.
+
+### 18.8 Risks and open questions
+
+| Risk | Mitigation |
+|---|---|
+| RoPE interleave mismatch produces fluent-but-wrong output that layer tests cannot catch | The D5 golden-logits gate is mandatory before any serving claim; 18.4 D2's loader permutation is the prepared fix |
+| YaRN correctness beyond 4096 context is untested even with matching logits at short context | Advertise the validated context in the registry; extend with a long-context perplexity check before raising it |
+| bf16 stacked-expert path is unexercised at real scale (64 experts × 26 layers) | Phase D2/D4 toy tests first; watch the per-layer host sync cost in bring-up profiling, already slated for removal in D6 |
+| FlashInfer `MLAParams` may not accept the fused-row strided views | Verified in a spike at the start of D6; fallback is a cache split behind `LayoutFor` (mechanical) or the absorbed-form kernels |
+| 16 GB box cannot hold bf16 weights | Decided in 18.6 before D5 serving work; correctness phases are unaffected |
+| `Qwen2MoeForCausalLM` precedent: enum arms without implementations rot silently | D1 makes unsupported combinations hard errors; the config fixture tests pin every accepted and rejected field |
+
+The recommended delivery units are D0 through D5, in order; D6 items land
+individually afterwards. D0 and D1 are pure debt-paydown and are worth
+landing even if DeepSeek work pauses: they restore the deleted M9 test
+assets and make config parsing honest about what it does not support.
