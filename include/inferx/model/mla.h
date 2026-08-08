@@ -81,6 +81,12 @@ class MlaAttentionLayer {
 
   /// \brief Builds the layer and sizes its scratch.
   ///
+  /// YaRN is resolved here, once, from the config: the blended frequency table
+  /// for the rope sub-vector goes to the device, and the softmax scale becomes
+  /// `YarnMscale(factor, mscale_all_dim)² / sqrt(qk_nope + qk_rope)` — for
+  /// DeepSeek-V2-Lite ≈ 0.11472 against the unscaled 0.07217. A config without
+  /// YaRN keeps the closed-form rope and the plain `1/sqrt` scale.
+  ///
   /// \param max_tokens   Largest query batch that will ever be passed.
   /// \param max_context  Longest context that will ever be attended over. The
   ///                     reconstruction buffers are O(context · heads), which
@@ -89,6 +95,12 @@ class MlaAttentionLayer {
   static StatusOr<MlaAttentionLayer> Create(const ModelConfig& config,
                                             int64_t max_tokens,
                                             int64_t max_context);
+
+  /// \brief The attention softmax scale in use, YaRN correction included.
+  ///
+  /// Exposed so a test can pin the DeepSeek constant and a model can report
+  /// it; `Forward` already applies it.
+  float softmax_scale() const;
 
   ~MlaAttentionLayer();
   MlaAttentionLayer(const MlaAttentionLayer&) = delete;

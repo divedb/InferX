@@ -30,6 +30,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
+#include "inferx/kernels/gpt_oss.h"
 #include "inferx/kernels/mla.h"
 #include "inferx/model/config.h"
 #include "inferx/model/mla.h"
@@ -480,13 +481,13 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
       << "worst absolute error " << worst << " against scale " << scale;
 }
 
-TEST_F(MlaLayerTest, DecodingTokenByTokenEqualsPrefillingThemAtOnce) {
-  // The property the cache exists for. Prefill 9 tokens in one call; then, in
-  // a second pool, feed the same 9 tokens one at a time. The last row must
-  // agree — if the slot mapping, the block-table walk, or the causal bound is
-  // off by one, it will not, and neither path will look obviously wrong on its
-  // own.
-  const ModelConfig c = SmallMlaConfig();
+// The property the cache exists for, as a function of the config so the YaRN
+// and non-YaRN paths assert it identically. Prefill 9 tokens in one call;
+// then, in a second pool, feed the same 9 tokens one at a time. The last row
+// must agree — if the slot mapping, the block-table walk, or the causal bound
+// is off by one, it will not, and neither path will look obviously wrong on
+// its own.
+void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
   const Weights w = MakeWeights(c);
 
   constexpr int64_t tokens = 9;
@@ -588,6 +589,64 @@ TEST_F(MlaLayerTest, DecodingTokenByTokenEqualsPrefillingThemAtOnce) {
   }
 }
 
+TEST_F(MlaLayerTest, DecodingTokenByTokenEqualsPrefillingThemAtOnce) {
+  ExpectDecodeMatchesPrefill(SmallMlaConfig());
+}
+
+TEST_F(MlaLayerTest, DecodingEqualsPrefillingUnderYarn) {
+  // The same cache-consistency property through the YaRN table path: the
+  // shared key is rotated by the blended frequencies before caching, so a
+  // query rotated differently — or a table that differs between the two call
+  // sites — breaks the agreement immediately.
+  ModelConfig c = SmallMlaConfig();
+  c.yarn_factor = 4.0;
+  c.yarn_beta_fast = 32.0;
+  c.yarn_beta_slow = 1.0;
+  c.yarn_original_max_position = 8;
+  c.yarn_truncate = true;
+  c.yarn_mscale = 0.707;
+  c.yarn_mscale_all_dim = 0.707;
+
+  ExpectDecodeMatchesPrefill(c);
+}
+
+TEST_F(MlaLayerTest, DeepSeekV2LiteSoftmaxScaleIsPinned) {
+  // The real V2-Lite attention shape and YaRN parameters. The scale must be
+  // mscale(0.707)² / sqrt(192) with mscale = 0.1·0.707·ln(40) + 1 — not the
+  // plain 1/sqrt(192), and not gpt-oss's 0.1·ln(40)+1 temperature.
+  ModelConfig c;
+  c.architecture = model::Architecture::kLlama;
+  c.hidden_size = 64;
+  c.intermediate_size = 128;
+  c.num_hidden_layers = 1;
+  c.num_attention_heads = 16;
+  c.num_key_value_heads = 16;
+  c.head_dim = 4;
+  c.vocab_size = 128;
+  c.rope_theta = 10000.0;
+  c.kv_lora_rank = 512;
+  c.q_lora_rank = 0;
+  c.qk_nope_head_dim = 128;
+  c.qk_rope_head_dim = 64;
+  c.v_head_dim = 128;
+  c.yarn_factor = 40.0;
+  c.yarn_beta_fast = 32.0;
+  c.yarn_beta_slow = 1.0;
+  c.yarn_original_max_position = 4096;
+  c.yarn_mscale = 0.707;
+  c.yarn_mscale_all_dim = 0.707;
+
+  auto layer = MlaAttentionLayer::Create(c, 1, 1);
+  ASSERT_TRUE(layer.ok()) << layer.status();
+  EXPECT_NEAR(layer->softmax_scale(), 0.114721f, 1e-4f);
+
+  // Without YaRN the same shape falls back to the plain inverse square root.
+  c.yarn_factor = 0.0;
+  auto plain = MlaAttentionLayer::Create(c, 1, 1);
+  ASSERT_TRUE(plain.ok()) << plain.status();
+  EXPECT_NEAR(plain->softmax_scale(), 1.0f / std::sqrt(192.0f), 1e-6f);
+}
+
 // --- The kernels the layer is built from ------------------------------------
 
 TEST_F(MlaTest, RopeInPlaceRotatesOnlyTheTail) {
@@ -642,6 +701,94 @@ TEST_F(MlaTest, RopeInPlaceRotatesOnlyTheTail) {
     delta += std::abs(__bfloat162float(got[i]) - x[i]);
   }
   EXPECT_GT(delta, 1e-2) << "a non-zero position left the tail untouched";
+}
+
+TEST_F(MlaTest, RopeFromTableMatchesTheClosedFormAtFactorOne) {
+  // With inv_freq[j] = theta^(-2j/rope_dim) and attention factor 1, the table
+  // kernel is the in-place kernel by definition. This is the equivalence that
+  // lets the YaRN path share every downstream test with the closed form.
+  constexpr int64_t tokens = 4, heads = 3, head_dim = 16, rope_dim = 8;
+  constexpr float theta = 10000.0f;
+
+  std::vector<float> x(static_cast<size_t>(tokens * heads * head_dim));
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = Fill(static_cast<int64_t>(i), 5, 0.9f) + 0.3f;
+  }
+  x = RoundTrip(x);
+
+  const std::vector<int32_t> positions{0, 3, 17, 40};
+
+  std::vector<float> inv_freq(rope_dim / 2);
+  for (int64_t j = 0; j < rope_dim / 2; ++j) {
+    inv_freq[static_cast<size_t>(j)] = std::pow(
+        theta, -2.0f * static_cast<float>(j) / static_cast<float>(rope_dim));
+  }
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView a_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
+                                Shape({tokens, heads, head_dim}));
+  const TensorView b_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
+                                Shape({tokens, heads, head_dim}));
+  const TensorView pos_v =
+      Upload(keep, positions, DataType::kInt32, Shape({tokens}));
+  const TensorView freq_v =
+      Upload(keep, inv_freq, DataType::kFloat, Shape({rope_dim / 2}));
+
+  ASSERT_TRUE(kernels::MlaRopeInPlace(a_v, rope_dim, pos_v, theta).ok());
+  ASSERT_TRUE(
+      kernels::MlaRopeFromTable(b_v, rope_dim, pos_v, freq_v, 1.0f).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  const auto a = Download<bf16>(a_v, tokens * heads * head_dim);
+  const auto b = Download<bf16>(b_v, tokens * heads * head_dim);
+
+  // Not bitwise: the in-place kernel raises theta with device fast math while
+  // the table came from host std::pow. One bf16 step of slack absorbs that.
+  for (size_t i = 0; i < a.size(); ++i) {
+    EXPECT_NEAR(__bfloat162float(a[i]), __bfloat162float(b[i]), 1.5e-2f)
+        << "element " << i;
+  }
+}
+
+TEST_F(MlaTest, YarnFrequenciesAreExactAtTheLadderEnds) {
+  // DeepSeek-V2-Lite's YaRN over its 64-wide rope sub-vector. The correction
+  // window computes to [10.47, 22.51], truncated to [10, 23] — so dimensions
+  // at or below 10 must be *pure extrapolation* (the original frequencies,
+  // keeping local detail) and dimensions at or past 23 pure interpolation
+  // (the original divided by the factor, reaching the longer context). The
+  // ladder ends are exact, not blended, and pinning them catches a ramp with
+  // its endpoints off by one.
+  constexpr int64_t rope_dim = 64;
+  constexpr double theta = 10000.0, factor = 40.0;
+
+  std::vector<float> got(rope_dim / 2);
+  const float attn = kernels::ComputeYarnInvFreq(
+      rope_dim, theta, factor, /*beta_fast=*/32.0, /*beta_slow=*/1.0,
+      /*original_max=*/4096, /*truncate=*/true, got.data());
+
+  for (int64_t j = 0; j < rope_dim / 2; ++j) {
+    const double original = std::pow(theta, -2.0 * static_cast<double>(j) /
+                                                static_cast<double>(rope_dim));
+    if (j <= 10) {
+      EXPECT_NEAR(got[static_cast<size_t>(j)], original, original * 1e-6)
+          << "dimension " << j << " should extrapolate";
+    } else if (j >= 23) {
+      EXPECT_NEAR(got[static_cast<size_t>(j)], original / factor,
+                  original / factor * 1e-6)
+          << "dimension " << j << " should interpolate";
+    }
+    if (j > 0) {
+      EXPECT_LT(got[static_cast<size_t>(j)], got[static_cast<size_t>(j) - 1])
+          << "frequencies must descend";
+    }
+  }
+
+  // The returned temperature is HF's default form, YarnMscale at coefficient
+  // 1 — and DeepSeek's parameterized form must agree with it there.
+  EXPECT_NEAR(attn, kernels::YarnMscale(factor, 1.0), 1e-6f);
+  EXPECT_NEAR(kernels::YarnMscale(factor, 0.707), 1.260804f, 1e-5f);
+  EXPECT_FLOAT_EQ(kernels::YarnMscale(0.5, 0.707), 1.0f);  // factor <= 1
+  EXPECT_FLOAT_EQ(kernels::YarnMscale(factor, 0.0), 1.0f);  // coefficient 0
 }
 
 TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {

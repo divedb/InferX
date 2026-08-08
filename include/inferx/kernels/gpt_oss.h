@@ -158,4 +158,22 @@ float ComputeYarnInvFreq(int64_t head_dim, double base, double factor,
                          double beta_fast, double beta_slow,
                          int64_t original_max, bool truncate, float* out);
 
+/// \brief DeepSeek's parameterized YaRN temperature,
+///        `0.1 · mscale · ln(factor) + 1`.
+///
+/// The generalization of the factor `ComputeYarnInvFreq` returns, which is
+/// this function at `mscale = 1` — gpt-oss reaches it through HF's default
+/// while DeepSeek configures the coefficient. Two uses, and they compose
+/// differently:
+///
+///   * the rope's cos/sin factor is `YarnMscale(f, mscale) /
+///     YarnMscale(f, mscale_all_dim)` — exactly 1 when the two coefficients
+///     are equal, as in DeepSeek-V2-Lite (both 0.707); and
+///   * the attention softmax scale is multiplied by
+///     `YarnMscale(f, mscale_all_dim)²` when `mscale_all_dim` is set.
+///
+/// Follows HF's `yarn_get_mscale`, including returning exactly 1 for
+/// `factor <= 1` and for `mscale = 0`.
+float YarnMscale(double factor, double mscale);
+
 }  // namespace inferx::kernels

@@ -45,6 +45,36 @@ __global__ void RopeInPlaceKernel(bf16* __restrict__ x,
   }
 }
 
+// The same trailing-slice rotation, with the frequency ladder precomputed on
+// the host and an attention factor scaling cos/sin -- the table-driven form
+// YaRN needs, mirroring RopeTableKernel's relationship to RopeKernel.
+__global__ void RopeFromTableKernel(bf16* __restrict__ x,
+                                    const int32_t* __restrict__ positions,
+                                    const float* __restrict__ inv_freq,
+                                    int64_t heads, int64_t head_dim,
+                                    int64_t rope_dim, float attn_factor) {
+  const int64_t token = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t half = rope_dim / 2;
+  const float pos = static_cast<float>(positions[token]);
+
+  bf16* row = x + (token * heads + head) * head_dim + (head_dim - rope_dim);
+
+  for (int64_t j = threadIdx.x; j < half; j += blockDim.x) {
+    const float angle = pos * inv_freq[j];
+
+    float s, c;
+    __sincosf(angle, &s, &c);
+    s *= attn_factor;
+    c *= attn_factor;
+
+    const float lo = ToF32(row[j]);
+    const float hi = ToF32(row[j + half]);
+    row[j] = ToBf16(lo * c - hi * s);
+    row[j + half] = ToBf16(hi * c + lo * s);
+  }
+}
+
 __global__ void SplitTrailingKernel(const bf16* __restrict__ src,
                                     bf16* __restrict__ head,
                                     bf16* __restrict__ tail, int64_t heads,
@@ -255,6 +285,52 @@ Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
       static_cast<bf16*>(x.Data()),
       static_cast<const int32_t*>(positions.Data()), heads, head_dim, rope_dim,
       theta);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
+                        const TensorView& positions, const TensorView& inv_freq,
+                        float attn_factor, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 3, "x"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(positions, DataType::kInt32, 1, "positions"));
+
+  const int64_t tokens = x.Dim(0);
+  const int64_t heads = x.Dim(1);
+  const int64_t head_dim = x.Dim(2);
+
+  if (rope_dim <= 0 || rope_dim > head_dim || rope_dim % 2 != 0) {
+    return InvalidArgumentError("rope_dim must be even and within head_dim (",
+                                head_dim, "), got ", rope_dim);
+  }
+
+  if (positions.Dim(0) != tokens) {
+    return InvalidArgumentError("positions has ", positions.Dim(0),
+                                " entries but x has ", tokens, " tokens");
+  }
+
+  if (!inv_freq.IsDefined() || inv_freq.Rank() != 1 ||
+      inv_freq.GetDataType() != DataType::kFloat ||
+      inv_freq.Dim(0) != rope_dim / 2) {
+    return InvalidArgumentError("inv_freq must be [", rope_dim / 2, "] fp32");
+  }
+
+  if (!(attn_factor > 0.0f) || !isfinite(attn_factor)) {
+    return InvalidArgumentError("attn_factor must be positive and finite, got ",
+                                attn_factor);
+  }
+
+  if (tokens == 0) return OkStatus();
+
+  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(heads));
+
+  RopeFromTableKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<bf16*>(x.Data()),
+      static_cast<const int32_t*>(positions.Data()),
+      static_cast<const float*>(inv_freq.Data()), heads, head_dim, rope_dim,
+      attn_factor);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

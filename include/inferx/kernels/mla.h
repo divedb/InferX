@@ -59,6 +59,31 @@ Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
                       const TensorView& positions, float theta,
                       cudaStream_t stream = nullptr);
 
+/// \brief `MlaRopeInPlace` with the frequencies from a precomputed table.
+///
+/// The table-driven form YaRN needs, standing to `MlaRopeInPlace` exactly as
+/// `RotaryEmbeddingFromTable` stands to `RotaryEmbedding`: the blended
+/// frequencies are not a closed form of two constants, and the attention
+/// factor scales cos and sin. With `inv_freq[j] = theta^(-2j/rope_dim)` and
+/// `attn_factor = 1` this is the same rotation as `MlaRopeInPlace`, which is
+/// what the tests pin.
+///
+/// \param x           `[tokens, heads, head_dim]` bf16, rotated in place.
+/// \param rope_dim    Width of the trailing rotated part.
+/// \param positions   `[tokens]` int32.
+/// \param inv_freq    `[rope_dim/2]` fp32 on the device — for YaRN, from
+///                    `ComputeYarnInvFreq` over `rope_dim` (the rope
+///                    sub-vector has its own frequency ladder, so the blend is
+///                    computed over its width, not the head's).
+/// \param attn_factor Scales cos and sin. For DeepSeek this is
+///                    `YarnMscale(factor, mscale) / YarnMscale(factor,
+///                    mscale_all_dim)` — exactly 1 for V2-Lite, where the two
+///                    are equal and the whole mscale effect moves into the
+///                    attention softmax scale instead.
+Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
+                        const TensorView& positions, const TensorView& inv_freq,
+                        float attn_factor, cudaStream_t stream = nullptr);
+
 /// \brief Splits `[rows, heads, a + b]` into `[rows, heads, a]` and
 ///        `[rows, heads, b]`.
 ///

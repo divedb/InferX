@@ -449,7 +449,12 @@ float ComputeYarnInvFreq(int64_t head_dim, double base, double factor,
 
   // YaRN's attention temperature. Reached by default rather than by
   // configuration for gpt-oss, and ~1.34657 at factor 32.
-  return static_cast<float>(0.1 * std::log(factor) + 1.0);
+  return YarnMscale(factor, 1.0);
+}
+
+float YarnMscale(double factor, double mscale) {
+  if (factor <= 1.0) return 1.0f;
+  return static_cast<float>(0.1 * mscale * std::log(factor) + 1.0);
 }
 
 }  // namespace inferx::kernels
