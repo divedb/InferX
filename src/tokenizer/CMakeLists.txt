@@ -1,5 +1,3 @@
-# inferx_tokenizer -- artifact-driven tokenizer service.
-
 add_library(inferx_tokenizer
   tokenizer.cc
   unicode.cc

@@ -25,6 +25,8 @@
 # where neither sampler does anything but an argmax.
 set -euo pipefail
 
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
 MODEL="${MODEL:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1}"
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B-Instruct}"
 PORT="${PORT:-8001}"
@@ -33,11 +35,11 @@ MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
 
-source "$HOME/inferx/.venv-vllm/bin/activate"
+source "$ROOT/.venv-vllm/bin/activate"
 export VLLM_WSL2_ENABLE_PIN_MEMORY=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
 
-exec vllm serve "$MODEL" \
+exec "$ROOT/.venv-vllm/bin/python" "$ROOT/.venv-vllm/bin/vllm" serve "$MODEL" \
   --host 127.0.0.1 --port "$PORT" \
   --served-model-name "$MODEL_NAME" \
   --dtype bfloat16 \

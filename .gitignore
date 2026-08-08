@@ -20,6 +20,7 @@ compile_commands.json
 perf.data*
 *.nsys-rep
 *.ncu-rep
+.claude
 
 # Models and weights (never commit)
 models/
