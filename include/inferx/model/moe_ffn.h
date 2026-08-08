@@ -39,6 +39,8 @@ struct MoeWeights {
   /// `[hidden, shared_intermediate]`.
   TensorView shared_down;
   /// `[1, hidden]` — the shared expert's own scalar gate, pre-sigmoid.
+  /// Qwen2-MoE only; DeepSeek's ungated shared experts leave it undefined
+  /// (\see Config::shared_gated).
   TensorView shared_gate;
 
   // Biases. Undefined means the architecture has none, which is Qwen2-MoE and
@@ -108,6 +110,18 @@ class MoeFfn {
     int64_t moe_intermediate = 0;
     int64_t shared_intermediate = 0;  // 0 when there is no shared expert
     bool norm_topk_prob = true;
+
+    /// Whether the shared expert is gated by its own sigmoid
+    /// (`out += σ(gate)·shared`, Qwen2-MoE's convention) or added plainly
+    /// (`out += shared`, DeepSeek's). Gated requires `shared_gate`; ungated
+    /// must leave it undefined — a checkpoint carrying a gate the config says
+    /// to ignore is a mis-read, not a preference.
+    bool shared_gated = true;
+
+    /// DeepSeek's `routed_scaling_factor`, multiplying the routed mixture's
+    /// gate weights and never the shared expert. 1.0 — every non-DeepSeek
+    /// architecture — is the identity.
+    float routed_scaling_factor = 1.0f;
 
     Activation activation = Activation::kSiluMul;
     /// Only read for `kGptOssClamped`.

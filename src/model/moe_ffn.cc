@@ -191,7 +191,9 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
   }
 
   INFERX_RETURN_IF_ERROR(kernels::MoeRouteTopK(logits_v, weights_v, experts_v,
-                                               c.norm_topk_prob, stream));
+                                               c.norm_topk_prob,
+                                               c.routed_scaling_factor,
+                                               stream));
 
   // --- 2. Group by expert ---------------------------------------------------
 
@@ -337,11 +339,21 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       kernels::MoeCombineRows(expert_out_all, dest_v, weights_v, out, stream));
 
   if (c.shared_intermediate > 0) {
-    if (!weights.shared_gate_up.IsDefined() ||
-        !weights.shared_down.IsDefined() || !weights.shared_gate.IsDefined()) {
+    if (!weights.shared_gate_up.IsDefined() || !weights.shared_down.IsDefined()) {
       return InvalidArgumentError("MoeFfn: shared_intermediate is ",
                                   c.shared_intermediate,
                                   " but the shared expert's weights are unset");
+    }
+
+    // The gate weight must match the convention exactly. A gated config with
+    // no gate cannot compute; an ungated config with a gate means the loader
+    // read a Qwen2-MoE checkpoint as DeepSeek (or vice versa), and silently
+    // ignoring the tensor would hide it.
+    if (c.shared_gated != weights.shared_gate.IsDefined()) {
+      return InvalidArgumentError(
+          "MoeFfn: shared expert is ", c.shared_gated ? "gated" : "ungated",
+          " but shared_gate is ",
+          weights.shared_gate.IsDefined() ? "set" : "unset");
     }
 
     const int64_t si = c.shared_intermediate;
@@ -354,19 +366,25 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     INFERX_ASSIGN_OR_RETURN(
         const TensorView sout,
         impl_->shared_out.View(kBf16, Shape({tokens, c.hidden})));
-    INFERX_ASSIGN_OR_RETURN(const TensorView sgate,
-                            impl_->shared_gate.View(kBf16, Shape({tokens, 1})));
 
     INFERX_RETURN_IF_ERROR(
         gemm->LinearBF16(x, weights.shared_gate_up, sgu, stream));
     INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(sgu, sact, stream));
     INFERX_RETURN_IF_ERROR(
         gemm->LinearBF16(sact, weights.shared_down, sout, stream));
-    INFERX_RETURN_IF_ERROR(
-        gemm->LinearBF16(x, weights.shared_gate, sgate, stream));
 
-    INFERX_RETURN_IF_ERROR(
-        kernels::MoeAddSharedExpert(sout, sgate, out, stream));
+    if (c.shared_gated) {
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView sgate,
+          impl_->shared_gate.View(kBf16, Shape({tokens, 1})));
+      INFERX_RETURN_IF_ERROR(
+          gemm->LinearBF16(x, weights.shared_gate, sgate, stream));
+      INFERX_RETURN_IF_ERROR(
+          kernels::MoeAddSharedExpert(sout, sgate, out, stream));
+    } else {
+      // DeepSeek adds the shared experts unconditionally; there is no gate.
+      INFERX_RETURN_IF_ERROR(kernels::AddInPlace(out, sout, stream));
+    }
   }
 
   return OkStatus();

@@ -35,7 +35,8 @@ constexpr int kMaxExperts = 1024;
 __global__ void RouteTopKKernel(const bf16* __restrict__ logits,
                                 float* __restrict__ out_weights,
                                 int32_t* __restrict__ out_experts,
-                                int64_t num_experts, int k, bool renormalize) {
+                                int64_t num_experts, int k, bool renormalize,
+                                float gate_scale) {
   extern __shared__ float row[];
 
   const int64_t token = blockIdx.x;
@@ -117,7 +118,7 @@ __global__ void RouteTopKKernel(const bf16* __restrict__ logits,
 
     const float scale = (renormalize && total > 0.0f) ? 1.0f / total : 1.0f;
     for (int slot = 0; slot < k; ++slot) {
-      out_weights[token * k + slot] = chosen[slot] * scale;
+      out_weights[token * k + slot] = chosen[slot] * scale * gate_scale;
     }
   }
 }
@@ -288,7 +289,12 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
 
 Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
                     const TensorView& out_experts, bool renormalize,
-                    cudaStream_t stream) {
+                    float scale, cudaStream_t stream) {
+  if (!(scale > 0.0f) || !isfinite(scale)) {
+    return InvalidArgumentError("gate scale must be positive and finite, got ",
+                                scale);
+  }
+
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(out_weights, DataType::kFloat, 2, "out_weights"));
@@ -330,7 +336,7 @@ Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
       static_cast<const bf16*>(logits.Data()),
       static_cast<float*>(out_weights.Data()),
       static_cast<int32_t*>(out_experts.Data()), num_experts,
-      static_cast<int>(k), renormalize);
+      static_cast<int>(k), renormalize, scale);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

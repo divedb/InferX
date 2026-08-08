@@ -660,6 +660,274 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
   }
 }
 
+TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
+  // DeepSeek's convention: no sigmoid gate, the shared MLP's output is added
+  // as-is. So (routed + shared) - routed must equal the shared MLP computed by
+  // hand -- not merely change every row, but change it by the right amount.
+  MoeFfn::Config c;
+  c.hidden = 32;
+  c.num_experts = 4;
+  c.top_k = 1;
+  c.moe_intermediate = 16;
+  c.shared_intermediate = 16;
+  c.shared_gated = false;
+
+  constexpr int64_t tokens = 12;
+
+  auto rand_vec = [](size_t n, float salt) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) {
+      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
+                         static_cast<int64_t>(i % 13), salt);
+    }
+    return RoundTrip(v);
+  };
+
+  const std::vector<float> x = rand_vec(
+      static_cast<size_t>(tokens * c.hidden), 0.1f);
+  const std::vector<float> router = rand_vec(
+      static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
+  const std::vector<float> gate_up = rand_vec(
+      static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
+      1.4f);
+  const std::vector<float> down = rand_vec(
+      static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate), 2.7f);
+  const std::vector<float> sgu = rand_vec(
+      static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 3.1f);
+  const std::vector<float> sdown = rand_vec(
+      static_cast<size_t>(c.hidden * c.shared_intermediate), 3.9f);
+
+  // The shared MLP by hand: silu(gate) * up through the down projection.
+  const int64_t si = c.shared_intermediate;
+  std::vector<float> want_shared(static_cast<size_t>(tokens * c.hidden), 0.0f);
+  for (int64_t t = 0; t < tokens; ++t) {
+    std::vector<float> act(static_cast<size_t>(si));
+    for (int64_t j = 0; j < si; ++j) {
+      float g = 0.0f;
+      float u = 0.0f;
+      for (int64_t i = 0; i < c.hidden; ++i) {
+        const float xv = x[static_cast<size_t>(t * c.hidden + i)];
+        g += xv * sgu[static_cast<size_t>(j * c.hidden + i)];
+        u += xv * sgu[static_cast<size_t>((si + j) * c.hidden + i)];
+      }
+      act[static_cast<size_t>(j)] = (g / (1.0f + std::exp(-g))) * u;
+    }
+    for (int64_t i = 0; i < c.hidden; ++i) {
+      float acc = 0.0f;
+      for (int64_t j = 0; j < si; ++j) {
+        acc += act[static_cast<size_t>(j)] *
+               sdown[static_cast<size_t>(i * si + j)];
+      }
+      want_shared[static_cast<size_t>(t * c.hidden + i)] = acc;
+    }
+  }
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
+                                Shape({tokens, c.hidden}));
+
+  MoeWeights w;
+  w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
+                    Shape({c.num_experts, c.hidden}));
+  w.gate_up = Upload(keep, ToBf16(gate_up), DataType::kBFloat16,
+                     Shape({c.num_experts, 2 * c.moe_intermediate, c.hidden}));
+  w.down = Upload(keep, ToBf16(down), DataType::kBFloat16,
+                  Shape({c.num_experts, c.hidden, c.moe_intermediate}));
+
+  auto gemm = kernels::CublasLtGemm::Create();
+  ASSERT_TRUE(gemm.ok()) << gemm.status();
+
+  MoeFfn::Config routed_only = c;
+  routed_only.shared_intermediate = 0;
+
+  const TensorView out_routed =
+      Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
+  auto routed_ffn = MoeFfn::Create(routed_only, tokens);
+  ASSERT_TRUE(routed_ffn.ok()) << routed_ffn.status();
+  ASSERT_TRUE(routed_ffn->Forward(x_v, w, out_routed, &*gemm).ok());
+
+  // No shared_gate uploaded: the ungated convention forbids it.
+  w.shared_gate_up = Upload(keep, ToBf16(sgu), DataType::kBFloat16,
+                            Shape({2 * c.shared_intermediate, c.hidden}));
+  w.shared_down = Upload(keep, ToBf16(sdown), DataType::kBFloat16,
+                         Shape({c.hidden, c.shared_intermediate}));
+
+  const TensorView out_both =
+      Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
+  auto both_ffn = MoeFfn::Create(c, tokens);
+  ASSERT_TRUE(both_ffn.ok()) << both_ffn.status();
+  ASSERT_TRUE(both_ffn->Forward(x_v, w, out_both, &*gemm).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  const auto routed = Download<bf16>(out_routed, tokens * c.hidden);
+  const auto both = Download<bf16>(out_both, tokens * c.hidden);
+
+  double scale = 0.0;
+  for (const float v : want_shared) scale = std::max<double>(scale, std::abs(v));
+  ASSERT_GT(scale, 0.0) << "degenerate shared reference";
+
+  double worst = 0.0;
+  for (size_t i = 0; i < want_shared.size(); ++i) {
+    const double got_delta = static_cast<double>(__bfloat162float(both[i])) -
+                             static_cast<double>(__bfloat162float(routed[i]));
+    worst = std::max(worst, std::abs(got_delta - want_shared[i]));
+  }
+
+  // The delta went through one bf16 subtraction on top of the usual two-GEMM
+  // error, so the layer test's 2% gets a little headroom.
+  EXPECT_LT(worst / scale, 0.03) << "worst delta error " << worst
+                                 << " against scale " << scale;
+}
+
+TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
+  // The factor multiplies the gate weights, so the whole routed output scales
+  // by it and nothing else changes -- same experts, same order.
+  MoeFfn::Config c;
+  c.hidden = 32;
+  c.num_experts = 4;
+  c.top_k = 2;
+  c.moe_intermediate = 16;
+  c.norm_topk_prob = false;  // DeepSeek-V2's setting, where the factor applies
+
+  constexpr int64_t tokens = 12;
+  constexpr float kFactor = 2.5f;
+
+  auto rand_vec = [](size_t n, float salt) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) {
+      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
+                         static_cast<int64_t>(i % 13), salt);
+    }
+    return RoundTrip(v);
+  };
+
+  const std::vector<float> x = rand_vec(
+      static_cast<size_t>(tokens * c.hidden), 0.1f);
+  const std::vector<float> router = rand_vec(
+      static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
+  const std::vector<float> gate_up = rand_vec(
+      static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
+      1.4f);
+  const std::vector<float> down = rand_vec(
+      static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate), 2.7f);
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
+                                Shape({tokens, c.hidden}));
+
+  MoeWeights w;
+  w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
+                    Shape({c.num_experts, c.hidden}));
+  w.gate_up = Upload(keep, ToBf16(gate_up), DataType::kBFloat16,
+                     Shape({c.num_experts, 2 * c.moe_intermediate, c.hidden}));
+  w.down = Upload(keep, ToBf16(down), DataType::kBFloat16,
+                  Shape({c.num_experts, c.hidden, c.moe_intermediate}));
+
+  auto gemm = kernels::CublasLtGemm::Create();
+  ASSERT_TRUE(gemm.ok()) << gemm.status();
+
+  const TensorView out_unit =
+      Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
+  auto unit_ffn = MoeFfn::Create(c, tokens);
+  ASSERT_TRUE(unit_ffn.ok()) << unit_ffn.status();
+  ASSERT_TRUE(unit_ffn->Forward(x_v, w, out_unit, &*gemm).ok());
+
+  MoeFfn::Config scaled = c;
+  scaled.routed_scaling_factor = kFactor;
+
+  const TensorView out_scaled =
+      Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
+  auto scaled_ffn = MoeFfn::Create(scaled, tokens);
+  ASSERT_TRUE(scaled_ffn.ok()) << scaled_ffn.status();
+  ASSERT_TRUE(scaled_ffn->Forward(x_v, w, out_scaled, &*gemm).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  const auto unit = Download<bf16>(out_unit, tokens * c.hidden);
+  const auto got = Download<bf16>(out_scaled, tokens * c.hidden);
+
+  double scale = 0.0;
+  for (size_t i = 0; i < unit.size(); ++i) {
+    scale = std::max<double>(
+        scale, std::abs(kFactor * __bfloat162float(unit[i])));
+  }
+  ASSERT_GT(scale, 0.0) << "degenerate mixture";
+
+  double worst = 0.0;
+  for (size_t i = 0; i < unit.size(); ++i) {
+    worst = std::max<double>(
+        worst, std::abs(__bfloat162float(got[i]) -
+                        kFactor * __bfloat162float(unit[i])));
+  }
+
+  EXPECT_LT(worst / scale, 0.02) << "worst error " << worst << " against scale "
+                                 << scale;
+}
+
+TEST_F(MoeTest, SharedGateMustMatchTheConvention) {
+  // A gated config without a gate cannot compute; an ungated config with a
+  // gate means a Qwen2-MoE checkpoint was read as DeepSeek or vice versa.
+  // Both are loader bugs and both must fail loudly.
+  MoeFfn::Config c;
+  c.hidden = 32;
+  c.num_experts = 4;
+  c.top_k = 1;
+  c.moe_intermediate = 16;
+  c.shared_intermediate = 16;
+
+  constexpr int64_t tokens = 4;
+
+  std::vector<DeviceBuffer> keep;
+  const std::vector<float> zeros(
+      static_cast<size_t>(tokens * c.hidden), 0.0f);
+  const TensorView x_v = Upload(keep, ToBf16(zeros), DataType::kBFloat16,
+                                Shape({tokens, c.hidden}));
+
+  MoeWeights w;
+  const std::vector<float> rw(static_cast<size_t>(c.num_experts * c.hidden),
+                              0.01f);
+  w.router = Upload(keep, ToBf16(rw), DataType::kBFloat16,
+                    Shape({c.num_experts, c.hidden}));
+  const std::vector<float> gu(
+      static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
+      0.01f);
+  w.gate_up = Upload(keep, ToBf16(gu), DataType::kBFloat16,
+                     Shape({c.num_experts, 2 * c.moe_intermediate, c.hidden}));
+  const std::vector<float> dw(
+      static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate),
+      0.01f);
+  w.down = Upload(keep, ToBf16(dw), DataType::kBFloat16,
+                  Shape({c.num_experts, c.hidden, c.moe_intermediate}));
+  const std::vector<float> sg(
+      static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 0.01f);
+  w.shared_gate_up = Upload(keep, ToBf16(sg), DataType::kBFloat16,
+                            Shape({2 * c.shared_intermediate, c.hidden}));
+  const std::vector<float> sd(
+      static_cast<size_t>(c.hidden * c.shared_intermediate), 0.01f);
+  w.shared_down = Upload(keep, ToBf16(sd), DataType::kBFloat16,
+                         Shape({c.hidden, c.shared_intermediate}));
+
+  auto gemm = kernels::CublasLtGemm::Create();
+  ASSERT_TRUE(gemm.ok()) << gemm.status();
+
+  const TensorView out =
+      Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
+
+  // Gated (the default) without a gate weight: rejected.
+  auto gated = MoeFfn::Create(c, tokens);
+  ASSERT_TRUE(gated.ok()) << gated.status();
+  EXPECT_FALSE(gated->Forward(x_v, w, out, &*gemm).ok());
+
+  // Ungated with a gate weight: also rejected.
+  const std::vector<float> gate_w(static_cast<size_t>(c.hidden), 0.01f);
+  w.shared_gate = Upload(keep, ToBf16(gate_w), DataType::kBFloat16,
+                         Shape({1, c.hidden}));
+  MoeFfn::Config ungated = c;
+  ungated.shared_gated = false;
+  auto ungated_ffn = MoeFfn::Create(ungated, tokens);
+  ASSERT_TRUE(ungated_ffn.ok()) << ungated_ffn.status();
+  EXPECT_FALSE(ungated_ffn->Forward(x_v, w, out, &*gemm).ok());
+}
+
 TEST_F(MoeTest, IdenticalInputProducesIdenticalOutput) {
   // The determinism claim in moe.h, checked rather than asserted. The grouping
   // is the part at risk: an atomic cursor would reorder rows between runs, and

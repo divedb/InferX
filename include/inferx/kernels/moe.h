@@ -50,9 +50,13 @@ namespace inferx::kernels {
 ///                    mixture itself.
 /// \param out_experts `[tokens, k]` int32, the chosen expert indices.
 /// \param renormalize Divide the `k` weights by their sum.
+/// \param scale       Multiplies every written weight — DeepSeek's
+///                    `routed_scaling_factor`, applied where HF applies it: to
+///                    the gate weights, so the routed mixture scales and the
+///                    shared expert (added later) does not. 1 everywhere else.
 Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
                     const TensorView& out_experts, bool renormalize,
-                    cudaStream_t stream = nullptr);
+                    float scale = 1.0f, cudaStream_t stream = nullptr);
 
 /// \brief Groups the `tokens × k` assignments by expert, stably.
 ///
