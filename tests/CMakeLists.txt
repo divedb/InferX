@@ -55,6 +55,7 @@ inferx_add_test(prefix_cache_test      unit/prefix_cache_test.cc)
 if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(moe_test kernel/moe_test.cc)
   inferx_add_kernel_test(mla_test kernel/mla_test.cc)
+  inferx_add_kernel_test(deepseek_v2_model_test kernel/deepseek_v2_model_test.cc)
 endif()
 
 add_executable(inferx_transport_test
