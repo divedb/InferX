@@ -60,6 +60,13 @@ struct ForwardBatch {
   /// device-sampled continuation sets this.
   bool tokens_from_device = false;
 
+  /// True only when every contributing token is an established generation
+  /// continuation, never a prompt token. Shape cannot answer this: a one-token
+  /// prompt (and a prompt's final one-token chunk) has the same one-row shape
+  /// as decode. Executors use this semantic marker before replaying a decode
+  /// CUDA graph.
+  bool decode_only = false;
+
   /// Which token indices need logits. Usually one per sequence -- the last --
   /// because computing the LM head over every prefill token costs a
   /// `[tokens, 151936]` GEMM to throw nearly all of it away.

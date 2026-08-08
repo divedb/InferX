@@ -513,6 +513,7 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 
   out_batch->num_seqs = num_seqs;
   out_batch->max_blocks_per_seq = impl_->max_blocks_per_seq;
+  out_batch->decode_only = true;
   out_batch->block_table.assign(
       static_cast<size_t>(num_seqs * impl_->max_blocks_per_seq), 0);
   out_batch->seq_lens.assign(static_cast<size_t>(num_seqs), 0);
@@ -562,6 +563,11 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
     if (!contributes) continue;
 
     const int64_t start = seq.cached;
+
+    // A final one-token prompt chunk is shaped exactly like decode. Preserve
+    // the semantic distinction so an executor never replays a decode graph for
+    // prefill merely because token_count == sequence_count.
+    if (seq.generated() == 0) out_batch->decode_only = false;
 
     for (int64_t i = start; i < end; ++i) {
       int32_t block = 0;

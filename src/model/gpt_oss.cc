@@ -1176,8 +1176,7 @@ Status GptOssModel::Step(const ForwardBatch& batch,
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(batch));
   cudaGraphExec_t graph = nullptr;
-  const bool decode_shape = batch.num_tokens() == batch.num_seqs;
-  if (decode_shape) {
+  if (batch.decode_only) {
     graph = impl_->FindGraph(batch.num_tokens(), batch.num_seqs,
                              batch.max_blocks_per_seq);
   }
