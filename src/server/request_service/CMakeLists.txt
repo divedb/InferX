@@ -6,4 +6,5 @@ target_link_libraries(inferx_managed_request_service PUBLIC
   inferx::admission
   inferx::request_runtime
   inferx::scheduler_client
+  inferx::support
   inferx::flags)

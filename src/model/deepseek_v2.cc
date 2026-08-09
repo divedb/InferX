@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -21,6 +20,7 @@
 #include "inferx/model/moe_ffn.h"
 #include "inferx/model/safetensors.h"
 #include "inferx/model/weight_loader.h"
+#include "inferx/support/log.h"
 
 namespace inferx::model {
 namespace {
@@ -419,12 +419,11 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   // the MoE layers (hundreds of MB of experts each) dominate and a stall
   // should name its layer.
   const auto load_start = std::chrono::steady_clock::now();
-  std::fprintf(stderr,
-               "deepseek-v2: loading %zu tensors, %.1f GB, %lld layers "
-               "(rope convention: %s, %d copy threads)\n",
-               ckpt.size(), static_cast<double>(ckpt.TotalBytes()) / 1e9,
-               static_cast<long long>(config.num_hidden_layers),
-               "deinterleaved", loader.threads());
+  LOG(INFO) << "deepseek-v2: loading " << ckpt.size() << " tensors, "
+            << static_cast<double>(ckpt.TotalBytes()) / 1e9 << " GB, "
+            << config.num_hidden_layers
+            << " layers (rope convention: deinterleaved, " << loader.threads()
+            << " copy threads)";
 
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) {
     LayerWeights& w = impl->layers[static_cast<size_t>(i)];
@@ -434,16 +433,14 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
     const size_t layer_before = loader.stats().bytes;
     const auto log_layer = [&](const char* kind) {
       const auto now = std::chrono::steady_clock::now();
-      std::fprintf(
-          stderr, "deepseek-v2: layer %2lld/%lld (%s) %5.0f MB in %5lld ms, "
-                  "%5.1f GB total\n",
-          static_cast<long long>(i + 1),
-          static_cast<long long>(config.num_hidden_layers), kind,
-          static_cast<double>(loader.stats().bytes - layer_before) / 1e6,
-          static_cast<long long>(
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  now - layer_start).count()),
-          static_cast<double>(loader.stats().bytes) / 1e9);
+      VLOG(3) << "deepseek-v2: layer " << (i + 1) << '/'
+              << config.num_hidden_layers << " (" << kind << ") "
+              << static_cast<double>(loader.stats().bytes - layer_before) / 1e6
+              << " MB in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     now - layer_start).count()
+              << " ms, " << static_cast<double>(loader.stats().bytes) / 1e9
+              << " GB total";
     };
 
     auto up = [&](const std::string& name, const Shape& expected,
@@ -569,13 +566,12 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   // disk (cold page cache), h2d-bound is PCIe (the warm floor).
   INFERX_RETURN_IF_ERROR(loader.Finish());
   const WeightLoaderStats& ls = loader.stats();
-  std::fprintf(
-      stderr,
-      "deepseek-v2: loaded %.1f GB in %.1f s (stage %.1f s, h2d wait %.1f s)\n",
-      static_cast<double>(ls.bytes) / 1e9,
-      std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::steady_clock::now() - load_start).count(),
-      ls.stage_seconds, ls.h2d_wait_seconds);
+  LOG(INFO) << "deepseek-v2: loaded " << static_cast<double>(ls.bytes) / 1e9
+            << " GB in "
+            << std::chrono::duration_cast<std::chrono::duration<double>>(
+                   std::chrono::steady_clock::now() - load_start).count()
+            << " s (stage " << ls.stage_seconds << " s, h2d wait "
+            << ls.h2d_wait_seconds << " s)";
 
   INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 

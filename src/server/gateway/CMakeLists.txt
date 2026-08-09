@@ -18,3 +18,4 @@ target_link_libraries(inferx_gateway_server PUBLIC
 
 add_executable(inferx-gateway main.cc)
 target_link_libraries(inferx-gateway PRIVATE inferx::gateway_server)
+target_link_libraries(inferx-gateway PRIVATE inferx::support)

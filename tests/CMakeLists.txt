@@ -52,6 +52,7 @@ inferx_add_test(safetensors_test       unit/safetensors_test.cc)
 inferx_add_test(config_test            unit/config_test.cc)
 inferx_add_test(scheduler_test         unit/scheduler_test.cc)
 inferx_add_test(prefix_cache_test      unit/prefix_cache_test.cc)
+inferx_add_test(log_test               unit/log_test.cc)
 
 if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(weight_loader_test kernel/weight_loader_test.cc)

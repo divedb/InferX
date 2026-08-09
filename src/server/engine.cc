@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
 #include <thread>
 #include <unordered_map>
@@ -15,6 +14,7 @@
 #include "inferx/model/deepseek_v2.h"
 #include "inferx/model/gpt_oss.h"
 #include "inferx/observe/metrics.h"
+#include "inferx/support/log.h"
 #include "qwen_runner.h"
 
 namespace inferx::server {
@@ -812,7 +812,7 @@ struct Engine::Impl {
     // visible in the server log: the HTTP streams can only express a generic
     // finish reason, and discarding `why` made GPU/kernel failures look like a
     // clean shutdown during serving benchmarks.
-    std::fprintf(stderr, "engine step failed: %s\n", why.ToString().c_str());
+    LOG(ERROR) << "engine step failed: " << why;
 
     for (auto& [id, state] : active) {
       state.generation->Finish(FinishReason::kOutOfMemory, state.generated);

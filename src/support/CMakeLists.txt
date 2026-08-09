@@ -3,6 +3,7 @@
 add_library(inferx_support
   file.cc
   json.cc
+  log.cc
 )
 add_library(inferx::support ALIAS inferx_support)
 
@@ -15,4 +16,9 @@ target_link_libraries(inferx_support
     absl::status
     absl::statusor
     absl::strings
+    absl::log
+    absl::log_initialize
+    absl::log_globals
+    absl::log_sink_registry
+    absl::time
 )

@@ -4,6 +4,7 @@
 #include "inferx/server/api/error_mapping.h"
 #include "inferx/server/request/request_id.h"
 #include "inferx/server/transport/sse_writer.h"
+#include "inferx/support/log.h"
 
 namespace inferx::server::handlers {
 namespace {
@@ -29,12 +30,17 @@ folly::coro::Task<void> WriteError(
              : ::inferx::api::FinishReason::kLength;
 }
 
+const char* FinishName(scheduler_client::FinishReason reason) {
+  return reason == scheduler_client::FinishReason::kStop ? "stop" : "length";
+}
+
 }  // namespace
 
 folly::coro::Task<void> CompletionHandler::Handle(
     transport::HttpRequest request, transport::RequestContext context,
     transport::ResponseWriter& response,
     folly::CancellationToken cancellation) {
+  const auto request_started = std::chrono::steady_clock::now();
   if (!context.authenticated) {
     co_await WriteError(request, response,
                         absl::UnauthenticatedError(
@@ -102,6 +108,7 @@ folly::coro::Task<void> CompletionHandler::Handle(
     co_await WriteError(request, response, submitted.status(), {}, cancellation);
     co_return;
   }
+  const auto queued_at = std::chrono::steady_clock::now();
 
   const int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
                               std::chrono::system_clock::now().time_since_epoch())
@@ -111,6 +118,7 @@ folly::coro::Task<void> CompletionHandler::Handle(
   std::string collected;
   scheduler_client::Usage usage;
   scheduler_client::FinishReason finish = scheduler_client::FinishReason::kNone;
+  std::optional<std::chrono::steady_clock::time_point> first_token_at;
   transport::SseWriter sse(&response);
   if (parsed->sampling.stream) {
     Status started = co_await sse.Start(request.version(), request.keep_alive(),
@@ -124,6 +132,11 @@ folly::coro::Task<void> CompletionHandler::Handle(
   }
   while (auto next = co_await events.next()) {
     auto event = std::move(*next);
+    if (!first_token_at.has_value() &&
+        (!event.text_delta.empty() || !event.token_ids.empty() ||
+         event.terminal)) {
+      first_token_at = std::chrono::steady_clock::now();
+    }
     if (!event.error.ok()) {
       if (!parsed->sampling.stream) {
         co_await WriteError(request, response, event.error, {}, cancellation);
@@ -170,6 +183,22 @@ folly::coro::Task<void> CompletionHandler::Handle(
   const ::inferx::api::Usage api_usage{
       static_cast<int32_t>(usage.prompt_tokens),
       static_cast<int32_t>(usage.completion_tokens)};
+  const auto finished_at = std::chrono::steady_clock::now();
+  const auto first = first_token_at.value_or(finished_at);
+  LOG(INFO) << Rid(submitted->request_id)
+            << "access route=/v1/completions model=" << parsed->model
+            << " status=200 prompt_tokens=" << usage.prompt_tokens
+            << " completion_tokens=" << usage.completion_tokens
+            << " queue_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   first - queued_at).count()
+            << " ttft_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   first - request_started).count()
+            << " latency_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   finished_at - request_started).count()
+            << " finish_reason=" << FinishName(finish);
   if (parsed->sampling.stream) {
     (void)co_await sse.Event(
         ::inferx::api::CompletionChunkJson(

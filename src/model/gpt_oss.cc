@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -19,6 +18,7 @@
 #include "inferx/kernels/mxfp4.h"
 #include "inferx/model/moe_ffn.h"
 #include "inferx/model/weight_loader.h"
+#include "inferx/support/log.h"
 
 namespace inferx::model {
 namespace {
@@ -48,16 +48,15 @@ struct ForwardProfile {
 
   void report(int64_t tokens) const {
     const double total = dequant + moe_forward + attn_proj + attn_kernel;
-    std::fprintf(stderr,
-        "[gpt-oss profile] %lld tokens, %lld layers, total %.0f ms\n"
-        "  dequant (MXFP4 -> bf16):          %8.1f ms  (%4.1f%%)\n"
-        "  moe_forward:                      %8.1f ms  (%4.1f%%)\n"
-        "  attn_proj (qkv+o GEMMs, rope):    %8.1f ms  (%4.1f%%)\n"
-        "  attn_kernel (attend + sink):      %8.1f ms  (%4.1f%%)\n",
-        static_cast<long long>(tokens), static_cast<long long>(layers), total,
-        dequant, 100 * dequant / total, moe_forward,
-        100 * moe_forward / total, attn_proj, 100 * attn_proj / total,
-        attn_kernel, 100 * attn_kernel / total);
+    LOG(INFO) << "gpt-oss profile: tokens=" << tokens << " layers=" << layers
+              << " total_ms=" << total << " dequant_ms=" << dequant
+              << " dequant_pct=" << 100 * dequant / total
+              << " moe_forward_ms=" << moe_forward
+              << " moe_forward_pct=" << 100 * moe_forward / total
+              << " attn_proj_ms=" << attn_proj
+              << " attn_proj_pct=" << 100 * attn_proj / total
+              << " attn_kernel_ms=" << attn_kernel
+              << " attn_kernel_pct=" << 100 * attn_kernel / total;
   }
 };
 

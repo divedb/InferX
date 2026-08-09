@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 
 #include "inferx/server/gateway/gateway_server.h"
+#include "inferx/support/log.h"
 
 namespace {
 
@@ -23,7 +25,11 @@ void Usage(const char* program) {
       "  --chat-template <kind>          qwen2 (default) or deepseek-v2\n"
       "  --host <address>                default: 127.0.0.1\n"
       "  --port <number>                 default: 8000\n"
-      "  --api-key-sha256 <hex>          repeatable bearer-token hash\n",
+      "  --api-key-sha256 <hex>          repeatable bearer-token hash\n"
+      "  --log-level <level>              debug, info, warning, or error\n"
+      "  --v <n>                          VLOG level\n"
+      "  --log-json                       JSON-lines stderr output\n"
+      "  --log-file <path>                append logs to a file\n",
       program);
 }
 
@@ -41,6 +47,7 @@ bool Value(int argc, char** argv, int* index, const char* option,
 
 int main(int argc, char** argv) {
   inferx::server::gateway::GatewayServerConfig config;
+  inferx::LogOptions log_options;
   for (int i = 1; i < argc; ++i) {
     const std::string option = argv[i];
     std::string value;
@@ -78,6 +85,28 @@ int main(int argc, char** argv) {
     } else if (option == "--api-key-sha256") {
       if (!Value(argc, argv, &i, option.c_str(), &value)) return 2;
       config.api_key_sha256.push_back(value);
+    } else if (option == "--log-level") {
+      if (!Value(argc, argv, &i, option.c_str(), &log_options.min_level)) {
+        return 2;
+      }
+      if (log_options.min_level == "debug") {
+        log_options.min_level = "info";
+        log_options.verbosity = std::max(log_options.verbosity, 1);
+      } else if (log_options.min_level != "info" &&
+                 log_options.min_level != "warning" &&
+                 log_options.min_level != "error") {
+        std::fprintf(stderr, "error: invalid --log-level %s\n",
+                     log_options.min_level.c_str());
+        return 2;
+      }
+    } else if (option == "--v") {
+      if (!Value(argc, argv, &i, option.c_str(), &value)) return 2;
+      log_options.verbosity = std::max(0, std::atoi(value.c_str()));
+    } else if (option == "--log-json") {
+      log_options.json = true;
+    } else if (option == "--log-file") {
+      if (!Value(argc, argv, &i, option.c_str(), &value)) return 2;
+      log_options.file = value;
     } else {
       std::fprintf(stderr, "error: unknown option %s\n", option.c_str());
       Usage(argv[0]);
@@ -85,20 +114,21 @@ int main(int argc, char** argv) {
     }
   }
 
+  inferx::InitLogging(log_options);
   auto gateway = inferx::server::gateway::GatewayServer::Create(config);
   if (!gateway.ok()) {
-    std::fprintf(stderr, "error: %s\n", gateway.status().ToString().c_str());
+    LOG(ERROR) << "gateway creation failed: " << gateway.status();
     return 1;
   }
   g_gateway = gateway->get();
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
-  std::fprintf(stderr, "inferx-gateway listening on http://%s:%d\n",
-               config.host.c_str(), config.port);
+  LOG(INFO) << "inferx-gateway listening on http://" << config.host << ':'
+            << config.port;
   const auto status = (*gateway)->Listen();
   g_gateway = nullptr;
   if (!status.ok()) {
-    std::fprintf(stderr, "error: %s\n", status.ToString().c_str());
+    LOG(ERROR) << "gateway listen failed: " << status;
     return 1;
   }
   return 0;

@@ -11,6 +11,7 @@
 
 #include "inferx/server/engine.h"
 #include "inferx/server/http_server.h"
+#include "inferx/support/log.h"
 
 namespace {
 
@@ -48,6 +49,10 @@ void PrintUsage(const char* argv0) {
       "  --w4a16                quantize projection weights to grouped int4\n"
       "  --fp8-kv               store the KV cache as FP8 e4m3\n"
       "  --no-cuda-graphs       skip decode graph capture at startup\n"
+      "  --log-level <level>    debug, info, warning, or error\n"
+      "  --v <n>                enable VLOG messages through level n\n"
+      "  --log-json             write JSON-lines logs to stderr\n"
+      "  --log-file <path>      append logs to a file\n"
       "\n"
       "Only greedy decoding is implemented: temperature and top_p are\n"
       "accepted and ignored, and responses report system_fingerprint\n"
@@ -90,6 +95,7 @@ bool ParseDevices(const std::string& value, std::vector<int>* devices) {
 int main(int argc, char** argv) {
   inferx::server::EngineConfig engine_config;
   inferx::server::HttpServerConfig http_config;
+  inferx::LogOptions log_options;
   bool comm_backend_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -163,6 +169,28 @@ int main(int argc, char** argv) {
       engine_config.fp8_kv_cache = true;
     } else if (arg == "--no-cuda-graphs") {
       engine_config.capture_graphs = false;
+    } else if (arg == "--log-level") {
+      if (!NextValue(argc, argv, &i, "--log-level", &log_options.min_level)) {
+        return 2;
+      }
+      if (log_options.min_level == "debug") {
+        log_options.min_level = "info";
+        log_options.verbosity = std::max(log_options.verbosity, 1);
+      } else if (log_options.min_level != "info" &&
+                 log_options.min_level != "warning" &&
+                 log_options.min_level != "error") {
+        std::fprintf(stderr, "error: invalid --log-level %s\n",
+                     log_options.min_level.c_str());
+        return 2;
+      }
+    } else if (arg == "--v") {
+      if (!NextValue(argc, argv, &i, "--v", &value)) return 2;
+      log_options.verbosity = std::max(0, std::atoi(value.c_str()));
+    } else if (arg == "--log-json") {
+      log_options.json = true;
+    } else if (arg == "--log-file") {
+      if (!NextValue(argc, argv, &i, "--log-file", &value)) return 2;
+      log_options.file = value;
     } else {
       std::fprintf(stderr, "error: unknown option %s\n\n", arg.c_str());
       PrintUsage(argv[0]);
@@ -190,13 +218,14 @@ int main(int argc, char** argv) {
       std::max<int64_t>(engine_config.scheduler.max_batch_tokens,
                         engine_config.scheduler.max_seq_len);
 
-  std::fprintf(stderr, "loading %s ...\n", engine_config.model_dir.c_str());
+  inferx::InitLogging(log_options);
+  LOG(INFO) << "loading model from " << engine_config.model_dir;
 
   inferx::StatusOr<std::unique_ptr<inferx::server::Engine>> engine =
       inferx::server::Engine::Create(engine_config);
 
   if (!engine.ok()) {
-    std::fprintf(stderr, "error: %s\n", engine.status().ToString().c_str());
+    LOG(ERROR) << "model load failed: " << engine.status();
     return 1;
   }
 
@@ -204,7 +233,7 @@ int main(int argc, char** argv) {
       inferx::server::HttpServer::Create(engine->get(), http_config);
 
   if (!server.ok()) {
-    std::fprintf(stderr, "error: %s\n", server.status().ToString().c_str());
+    LOG(ERROR) << "server creation failed: " << server.status();
     return 1;
   }
 
@@ -212,33 +241,26 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, HandleSignal);
   std::signal(SIGTERM, HandleSignal);
 
-  std::fprintf(stderr,
-               "inferx-serve listening on http://%s:%d\n"
-               "  model        : %s\n"
-               "  weights      : %s\n"
-               "  cuda graphs  : %s\n"
-               "  max running  : %lld\n"
-               "  max seq len  : %lld\n"
-               "  kv blocks    : %lld x %lld tokens\n"
-               "  sampling     : greedy only (temperature/top_p ignored)\n",
-               http_config.host.c_str(), http_config.port,
-               (*engine)->model_name().c_str(),
-               engine_config.fp8_weights ? "fp8 e4m3" : "bf16",
-               engine_config.capture_graphs ? "on" : "off",
-               static_cast<long long>(engine_config.scheduler.max_running),
-               static_cast<long long>(engine_config.scheduler.max_seq_len),
-               static_cast<long long>(engine_config.kv_blocks),
-               static_cast<long long>(engine_config.block_size));
+  LOG(INFO) << "inferx-serve listening on http://" << http_config.host << ':'
+            << http_config.port << " model=" << (*engine)->model_name()
+            << " weights="
+            << (engine_config.fp8_weights ? "fp8-e4m3" :
+                engine_config.int4_weights ? "w4a16" : "bf16")
+            << " cuda_graphs=" << (engine_config.capture_graphs ? "on" : "off")
+            << " max_running=" << engine_config.scheduler.max_running
+            << " max_seq_len=" << engine_config.scheduler.max_seq_len
+            << " kv_blocks=" << engine_config.kv_blocks
+            << " block_size=" << engine_config.block_size;
 
   const inferx::Status listened = (*server)->Listen();
 
   g_server = nullptr;
 
   if (!listened.ok()) {
-    std::fprintf(stderr, "error: %s\n", listened.ToString().c_str());
+    LOG(ERROR) << "listen failed: " << listened;
     return 1;
   }
 
-  std::fprintf(stderr, "shutting down\n");
+  LOG(INFO) << "shutting down";
   return 0;
 }

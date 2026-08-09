@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "inferx/support/log.h"
+
 namespace inferx::server::request {
 
 folly::coro::Task<StatusOr<scheduler_client::SubmitResult>>
@@ -25,6 +27,9 @@ ManagedRequestService::Submit(scheduler_client::ScheduledRequest request,
         {.tenant_id = request.tenant_id,
          .reserved_tokens = static_cast<uint32_t>(reserved_tokens)});
     if (!decision.admitted()) {
+      LOG(WARNING) << Rid(request.request_id) << "admission rejected: "
+                   << (decision.message.empty() ? "unspecified reason"
+                                                : decision.message);
       co_return ResourceExhaustedError(
           decision.message.empty() ? "request admission rejected"
                                    : decision.message);
@@ -56,6 +61,8 @@ ManagedRequestService::Submit(scheduler_client::ScheduledRequest request,
   }
   auto submitted = co_await scheduler_->Submit(std::move(request), cancellation);
   if (!submitted.ok()) {
+    LOG(WARNING) << Rid((*created)->request_id)
+                 << "scheduler submission failed: " << submitted.status();
     (void)Finish((*created)->request_id, RequestState::kRejected);
     co_return submitted.status();
   }
@@ -65,6 +72,7 @@ ManagedRequestService::Submit(scheduler_client::ScheduledRequest request,
     (void)Finish(submitted->request_id, RequestState::kFailed);
     co_return InternalError("failed to queue request lifecycle");
   }
+  VLOG(1) << Rid(submitted->request_id) << "request queued";
   co_return *submitted;
 }
 
@@ -86,8 +94,10 @@ ManagedRequestService::Events(RequestId request_id,
         (void)context->TransitionTo(RequestState::kDecoding);
       }
       started = true;
+      VLOG(1) << Rid(request_id) << "request decoding started";
     }
     if (!event.error.ok()) {
+      LOG(ERROR) << Rid(request_id) << "generation failed: " << event.error;
       (void)Finish(request_id, RequestState::kFailed);
       co_yield std::move(event);
       co_return;
@@ -97,6 +107,7 @@ ManagedRequestService::Events(RequestId request_id,
         (void)context->TransitionTo(RequestState::kFinishing);
       }
       (void)Finish(request_id, RequestState::kCompleted);
+      VLOG(1) << Rid(request_id) << "request completed";
       co_yield std::move(event);
       co_return;
     }
