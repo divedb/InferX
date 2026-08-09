@@ -7,20 +7,27 @@ the TP_VALIDATION.md pattern). Everything below is scripted or env-gated;
 nothing needs code changes on the rented machine except the one decision the
 session exists to make.
 
-## What this session decides
+## What this session decided (settled 2026-08-09)
 
-1. **The RoPE convention** — the standing ARCHITECTURE.md caveat. Our MLA rope
-   rotates half-split pairs; HF's DeepSeek code de-interleaves storage pairs
-   first. The two are settled by measurement, not argument:
-   `INFERX_DSV2_ROPE_DEINTERLEAVE=1` switches the loader to the de-interleaved
-   reading, and whichever setting passes the argmax gate is the convention.
-   **After this session,** hardcode the winner in `src/model/deepseek_v2.cc`
-   (see `RopeDeinterleaveRequested`) and delete the env var: a semantics
-   toggle must not survive validation.
-2. **Whether the whole composition matches HF** — YaRN table, mscale softmax
-   scale, dense/MoE schedule, routing, ungated shared experts, loader mapping.
+1. **The RoPE convention** — settled: **de-interleaved**. Not by argmax
+   voting in the end, but directly: with the load-time row gather, InferX's
+   post-rope q/k tensors match HF's `apply_rotary_emb` outputs to bf16
+   rounding, and the YaRN inv_freq tables agree to 1e-8. The gather is
+   hardcoded in `src/model/deepseek_v2.cc` (`DeinterleaveMap`) and the
+   `INFERX_DSV2_ROPE_DEINTERLEAVE` toggle is deleted.
+2. **Whether the whole composition matches HF** — it does, with one landmine
+   **in HF, not here**: transformers' integrated `DeepseekV2Attention`
+   (measured on 5.14.1) uses a bare `qk_head_dim**-0.5` softmax scale,
+   dropping the yarn `mscale**2` factor (~1.5896) that the checkpoint's own
+   `modeling_deepseek.py` (and vLLM) apply and that InferX applies. Left
+   uncorrected it moved 17 of 65 teacher-forced argmaxes; every layer's
+   hidden state past the first attention diverged while position 0 — whose
+   1-element softmax is scale-invariant — stayed clean, which is the
+   signature to remember. `scripts/gen_deepseek_logits.py` patches the scale
+   back before writing goldens; references generated without it are wrong.
 3. **First serving numbers** for the unabsorbed MLA + per-expert-GEMM path,
-   which set the baseline the D6 performance items are measured against.
+   which set the baseline the D6 performance items are measured against
+   (still pending).
 
 ## Box requirements
 
@@ -43,11 +50,23 @@ pip install -U "huggingface_hub[cli]"
 huggingface-cli download deepseek-ai/DeepSeek-V2-Lite --local-dir /ckpt/dsv2-lite
 huggingface-cli download deepseek-ai/DeepSeek-V2-Lite-Chat --local-dir /ckpt/dsv2-lite-chat
 
-# 3. Golden logits (transformers + torch in a venv; trust_remote_code is
-#    required -- the checkpoint ships its own modeling code).
+# 3. Golden logits (transformers + torch in a venv). The script loads the
+#    integrated transformers implementation (trust_remote_code=False) and then
+#    restores the yarn mscale^2 softmax scale the integrated port drops --
+#    do not generate references any other way (see "What this session
+#    decided" #2).
 python -m venv .venv-ref && . .venv-ref/bin/activate
 pip install torch transformers accelerate
 scripts/gen_deepseek_logits.py /ckpt/dsv2-lite testdata/deepseek_v2_lite_logits.bin
+# Also pin multi-step greedy generation through HF's real use_cache path. Use
+# the Chat checkpoint here when validating the checkpoint served in production.
+# With --decode-output, the IXRL logits file spans the whole teacher-forced
+# prompt+continuation, giving the cached-decode gate HF's margins at every
+# generated position.
+scripts/gen_deepseek_logits.py /ckpt/dsv2-lite-chat \
+    testdata/deepseek_v2_lite_chat_logits.bin \
+    --decode-output testdata/deepseek_v2_lite_decode.bin \
+    --max-new-tokens 128 --prompt "<a long, representative prompt>"
 # With >= 70 GB RAM, prefer the stricter fp32 CPU reference (hours, one-off):
 #   scripts/gen_deepseek_logits.py /ckpt/dsv2-lite out.bin --fp32
 
@@ -55,17 +74,21 @@ scripts/gen_deepseek_logits.py /ckpt/dsv2-lite testdata/deepseek_v2_lite_logits.
 export INFERX_TEST_DEEPSEEK_CHECKPOINT=/ckpt/dsv2-lite
 cd build && ctest -R DeepseekV2Reference --output-on-failure
 
-# 5. If (and only if) the argmax gate fails at essentially every position:
-INFERX_DSV2_ROPE_DEINTERLEAVE=1 ctest -R DeepseekV2Reference --output-on-failure
-# Record which setting passed. That is the RoPE convention. Hardcode it.
+# For the cached-decode gate, point both inputs at artifacts made from the same
+# Chat checkpoint. The test uses Scheduler::PrepareStep/CommitStep and the real
+# paged latent cache, and compares every generated token ID rather than text.
+export INFERX_TEST_DEEPSEEK_CHECKPOINT=/ckpt/dsv2-lite-chat
+export INFERX_TEST_DEEPSEEK_LOGITS=../testdata/deepseek_v2_lite_chat_logits.bin
+export INFERX_TEST_DEEPSEEK_DECODE=../testdata/deepseek_v2_lite_decode.bin
+ctest -R DeepseekV2Reference --output-on-failure
 
-# 6. Serve, and check the template end to end.
+# 5. Serve, and check the template end to end.
 ./build/src/server/inferx-serve --model /ckpt/dsv2-lite-chat \
     --kv-blocks 8192 --block-size 16 --no-cuda-graphs
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"dsv2-lite-chat","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":32}'
 
-# 7. Baseline against vLLM on the same box (bench-results/ naming convention:
+# 6. Baseline against vLLM on the same box (bench-results/ naming convention:
 #    deepseek-v2-lite-<engine>-<date>).
 MODEL=/ckpt/dsv2-lite-chat MODEL_NAME=deepseek-v2-lite ./scripts/run_vllm.sh
 bench/serve_bench.py ...
@@ -73,18 +96,28 @@ bench/serve_bench.py ...
 
 ## Interpreting the gate
 
-- **Argmax equal at every position, both toggle settings tried once**: done.
-  Record the passing convention, the worst-deviation number, and the serving
-  throughput in ARCHITECTURE.md's measurement section.
-- **Argmax differs at every position under both settings**: the problem is not
-  the interleave. Suspect, in order: the mscale softmax scale (compare
-  `MlaAttentionLayer::softmax_scale()` ≈ 0.114721 against
-  `q_head_dim**-0.5 * yarn_get_mscale(40, 0.707)**2` in the HF code), the
-  YaRN frequency table, then the loader mapping (rerun with `GetChecked`
-  errors in the log).
-- **A single position differs**: check the router's 6th/7th margin at that
-  token before concluding anything — bf16 routing discontinuity, the gpt-oss
-  precedent (see the note in `deepseek_v2_reference_test.cc`).
+- Both gates tolerate an argmax flip only when the reference's own top-2
+  margin is within `kTieTolerance` (0.25, two bf16 ULPs at logit magnitude
+  ~32): the chat prompt has *exact* bf16 ties at several positions, where no
+  winner exists to agree with. The cached-decode gate teacher-forces the
+  reference token after a tolerated tie so one flip doesn't invalidate the
+  rest of the trajectory. 2026-08-09 measurement: 9 tie flips over 193
+  teacher-forced positions, 2 over 128 cached decode steps (one of which HF's
+  own generate loop also disagrees with its own full forward on), zero hard
+  mismatches on either checkpoint or on the 157-token long prompt.
+- **Argmax differs at many positions by wide margins**: suspect, in order:
+  the reference itself (generated without the mscale^2 patch — see "What
+  this session decided" #2), the loader mapping (rerun with `GetChecked`
+  errors in the log), then the YaRN frequency table.
+- **Divergence that spares position 0 but hits everything else, growing with
+  depth**: an attention-score-scale or rope-angle class of bug — position
+  0's softmax is over one element, so scale and rotation cannot touch it.
+  Compare `MlaAttentionLayer::softmax_scale()` ≈ 0.114721 against
+  `q_head_dim**-0.5 * yarn_get_mscale(40, 0.707)**2` first.
+- **A single position differs beyond tolerance**: check the router's 6th/7th
+  margin at that token before concluding anything — bf16 routing
+  discontinuity, the gpt-oss precedent (see the note in
+  `deepseek_v2_reference_test.cc`).
 - The 5% span-normalized magnitude bound is diagnostic, not the gate, for the
   same reason as gpt-oss: a bf16 reference is not more precise than what it
   checks.

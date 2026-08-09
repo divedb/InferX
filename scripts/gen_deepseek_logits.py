@@ -35,6 +35,8 @@ Output is the same 'IXRL' container as gen_reference_logits.py:
 Usage:
     scripts/gen_deepseek_logits.py <checkpoint-dir> <output.bin> [--prompt TEXT]
     scripts/gen_deepseek_logits.py <checkpoint-dir> <output.bin> [--fp32] [id ...]
+    scripts/gen_deepseek_logits.py <checkpoint-dir> <output.bin> \
+        --decode-output decode.bin --max-new-tokens 128 [--prompt TEXT]
 """
 
 import struct
@@ -44,6 +46,34 @@ MAGIC = b"IXRL"
 VERSION = 1
 
 DEFAULT_PROMPT = "The capital of France is"
+
+
+def fix_yarn_softmax_scale(model) -> None:
+    """Restore the YaRN mscale^2 softmax-scale correction HF's port dropped.
+
+    The checkpoint's own modeling_deepseek.py multiplies softmax_scale by
+    yarn_get_mscale(factor, mscale_all_dim)^2 (and vLLM does the same), but
+    transformers' integrated DeepseekV2Attention uses a bare
+    qk_head_dim**-0.5 -- measured directly on transformers 5.14.1, where that
+    one difference moved 17 of 65 teacher-forced argmaxes on a chat prompt.
+    Without this patch the generated reference encodes the port's bug and no
+    correct engine can match it.
+    """
+    import math
+
+    config = model.config
+    rope = (getattr(config, "rope_scaling", None)
+            or getattr(config, "rope_parameters", None))
+    if not rope or rope.get("rope_type", rope.get("type")) != "yarn":
+        return
+    mscale_all_dim = rope.get("mscale_all_dim", 0)
+    factor = rope["factor"]
+    if not mscale_all_dim or factor <= 1:
+        return
+    m = 0.1 * mscale_all_dim * math.log(factor) + 1.0
+    for layer in model.model.layers:
+        layer.self_attn.scaling *= m * m
+    print(f"applied yarn mscale^2 softmax-scale correction ({m * m:.6f})")
 
 
 def main() -> int:
@@ -60,6 +90,26 @@ def main() -> int:
 
     fp32 = "--fp32" in rest
     rest = [a for a in rest if a != "--fp32"]
+
+    decode_output = None
+    max_new_tokens = 0
+    if "--decode-output" in rest:
+        at = rest.index("--decode-output")
+        if at + 1 >= len(rest):
+            print("--decode-output needs a path", file=sys.stderr)
+            return 2
+        decode_output = rest[at + 1]
+        del rest[at : at + 2]
+    if "--max-new-tokens" in rest:
+        at = rest.index("--max-new-tokens")
+        if at + 1 >= len(rest):
+            print("--max-new-tokens needs a positive integer", file=sys.stderr)
+            return 2
+        max_new_tokens = int(rest[at + 1])
+        del rest[at : at + 2]
+    if decode_output is not None and max_new_tokens <= 0:
+        print("--decode-output requires --max-new-tokens > 0", file=sys.stderr)
+        return 2
 
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=False)
 
@@ -82,9 +132,35 @@ def main() -> int:
         )
         device = "cuda"
     model.eval()
+    fix_yarn_softmax_scale(model)
 
     with torch.no_grad():
         input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+
+        prompt_ids = list(ids)
+        generated = None
+        if decode_output is not None:
+            sequence = model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                eos_token_id=None,
+                pad_token_id=tokenizer.eos_token_id,
+            )[0].cpu().tolist()
+            generated = sequence[len(ids) :]
+            if len(generated) != max_new_tokens:
+                raise RuntimeError(
+                    f"requested {max_new_tokens} decode tokens but HF emitted "
+                    f"{len(generated)}"
+                )
+            # The IXRL container then covers the whole teacher-forced
+            # sequence, not just the prompt: the cached-decode test needs
+            # HF's margins at every generated position to tell a bf16
+            # near-tie flip from a real cache defect.
+            ids = ids + generated
+            input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+
         logits = model(input_ids).logits[0].float().cpu()
 
     tokens, vocab = logits.shape
@@ -97,6 +173,21 @@ def main() -> int:
         f.write(logits.numpy().astype("<f4").tobytes())
 
     print(f"wrote {tokens} x {vocab} logits for ids {ids} to {output}")
+
+    if decode_output is not None:
+        # IXDG is deliberately separate from IXRL: the latter is a dense
+        # teacher-forced logit oracle, while this is the exact sequence emitted
+        # by HF's cached greedy generation loop. The C++ test feeds every
+        # winning token back through InferX's scheduler and paged KV cache.
+        with open(decode_output, "wb") as f:
+            f.write(b"IXDG")
+            f.write(struct.pack("<III", 1, len(prompt_ids), len(generated)))
+            f.write(struct.pack(f"<{len(prompt_ids)}i", *prompt_ids))
+            f.write(struct.pack(f"<{len(generated)}i", *generated))
+        print(
+            f"wrote {len(generated)} cached greedy decode tokens to "
+            f"{decode_output}"
+        )
     return 0
 
 

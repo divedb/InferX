@@ -42,24 +42,15 @@ Status Grow(Scratch* s, size_t bytes) {
   return OkStatus();
 }
 
-// The RoPE-convention question (§18.4 D2, ARCHITECTURE.md's "unverified"
-// caveat), as a validation-time toggle. Our kernel rotates half-split pairs
-// (j, j+half); HF's DeepSeek code de-interleaves storage pairs (2j, 2j+1)
-// before the same rotation. If the checkpoint's rope output channels are laid
-// out interleaved, the fix is a load-time gather of the rope rows -- even
-// source rows first, then odd -- applied identically to the Q heads and the
-// shared key, so every dot product pairs permuted-with-permuted.
+// The checkpoint stores rope output channels interleaved -- storage pairs
+// (2j, 2j+1) -- while our kernel rotates half-split pairs (j, j+half). The
+// fix is this load-time gather of the rope rows, even source rows first,
+// then odd, applied identically to the Q heads and the shared key so every
+// dot product pairs permuted-with-permuted. Measured against HF on real
+// weights (docs/DSV2_VALIDATION.md, 2026-08-09): with the permutation, the
+// post-rope q/k tensors match HF's to bf16 rounding, settling §18.4 D2 and
+// ARCHITECTURE.md's "unverified" caveat.
 //
-// An environment toggle rather than a constant, deliberately and temporarily:
-// the golden-logits test on a machine with real weights is the only arbiter,
-// and a toggle makes that session a re-run instead of a rebuild. Once
-// measured, the winning convention gets hardcoded and this env var removed --
-// it must not outlive validation (docs/DSV2_VALIDATION.md).
-bool RopeDeinterleaveRequested() {
-  const char* env = std::getenv("INFERX_DSV2_ROPE_DEINTERLEAVE");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 // Identity over `rows`, with each listed `rope`-wide block at `starts`
 // replaced by the de-interleaving gather: evens first, then odds.
 std::vector<int64_t> DeinterleaveMap(int64_t rows,
@@ -433,8 +424,7 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                "(rope convention: %s, %d copy threads)\n",
                ckpt.size(), static_cast<double>(ckpt.TotalBytes()) / 1e9,
                static_cast<long long>(config.num_hidden_layers),
-               RopeDeinterleaveRequested() ? "deinterleaved" : "half-split",
-               loader.threads());
+               "deinterleaved", loader.threads());
 
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) {
     LayerWeights& w = impl->layers[static_cast<size_t>(i)];
@@ -471,8 +461,7 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
     // no q_a/q_a_norm -- exactly the branch MlaAttentionLayer takes when
     // MlaWeights.q_a is undefined. The rope output channels of the Q
     // projection and of kv_a's shared key are the two places the
-    // de-interleave toggle applies (see RopeDeinterleaveRequested above).
-    const bool deinterleave = RopeDeinterleaveRequested();
+    // de-interleave gather applies (see DeinterleaveMap above).
 
     // The rope block within each Q head's [nope | rope] output rows.
     std::vector<int64_t> q_rope_starts;
@@ -485,37 +474,24 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                                 Shape({config.q_lora_rank, h}), &w.mla.q_a));
       INFERX_RETURN_IF_ERROR(up("self_attn.q_a_layernorm.weight",
                                 Shape({config.q_lora_rank}), &w.mla.q_a_norm));
-      const std::string name = p + "self_attn.q_b_proj.weight";
-      const Shape shape({heads * qk, config.q_lora_rank});
       INFERX_ASSIGN_OR_RETURN(
           w.mla.q_b,
-          deinterleave
-              ? loader.LoadRowPermuted(
-                    name, shape,
-                    DeinterleaveMap(heads * qk, q_rope_starts, rope))
-              : loader.Load(name, shape));
+          loader.LoadRowPermuted(
+              p + "self_attn.q_b_proj.weight",
+              Shape({heads * qk, config.q_lora_rank}),
+              DeinterleaveMap(heads * qk, q_rope_starts, rope)));
     } else {
-      const std::string name = p + "self_attn.q_proj.weight";
-      const Shape shape({heads * qk, h});
       INFERX_ASSIGN_OR_RETURN(
           w.mla.q_b,
-          deinterleave
-              ? loader.LoadRowPermuted(
-                    name, shape,
-                    DeinterleaveMap(heads * qk, q_rope_starts, rope))
-              : loader.Load(name, shape));
+          loader.LoadRowPermuted(
+              p + "self_attn.q_proj.weight", Shape({heads * qk, h}),
+              DeinterleaveMap(heads * qk, q_rope_starts, rope)));
     }
-    {
-      const std::string name = p + "self_attn.kv_a_proj_with_mqa.weight";
-      const Shape shape({latent + rope, h});
-      INFERX_ASSIGN_OR_RETURN(
-          w.mla.kv_a,
-          deinterleave
-              ? loader.LoadRowPermuted(
-                    name, shape,
-                    DeinterleaveMap(latent + rope, {latent}, rope))
-              : loader.Load(name, shape));
-    }
+    INFERX_ASSIGN_OR_RETURN(
+        w.mla.kv_a,
+        loader.LoadRowPermuted(p + "self_attn.kv_a_proj_with_mqa.weight",
+                               Shape({latent + rope, h}),
+                               DeinterleaveMap(latent + rope, {latent}, rope)));
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_a_layernorm.weight",
                               Shape({latent}), &w.mla.kv_a_norm));
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_b_proj.weight",

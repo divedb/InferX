@@ -349,6 +349,11 @@ std::vector<float> RmsNormed(const std::vector<float>& x,
   return out;
 }
 
+// Interleaved-pair rotation -- (2j, 2j+1) with frequency j -- which is the
+// checkpoint convention the loader realizes by de-interleaving the rope
+// weight rows before the kernel's half-split rotation. The host reference
+// works on the un-permuted projection, so it rotates the storage pairs
+// directly; attention scores are invariant to the shared layout choice.
 void RopeTail(std::vector<float>& x, int64_t rows, int64_t width,
               int64_t rope_dim, int64_t rows_per_position) {
   const int64_t half = rope_dim / 2;
@@ -361,10 +366,10 @@ void RopeTail(std::vector<float>& x, int64_t rows, int64_t width,
       const float angle = pos * inv_freq;
       const float s = std::sin(angle);
       const float cs = std::cos(angle);
-      const float lo = row[j];
-      const float hi = row[j + half];
-      row[j] = lo * cs - hi * s;
-      row[j + half] = hi * cs + lo * s;
+      const float lo = row[2 * j];
+      const float hi = row[2 * j + 1];
+      row[2 * j] = lo * cs - hi * s;
+      row[2 * j + 1] = hi * cs + lo * s;
     }
   }
 }
