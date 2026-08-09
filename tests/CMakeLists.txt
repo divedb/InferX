@@ -54,6 +54,7 @@ inferx_add_test(scheduler_test         unit/scheduler_test.cc)
 inferx_add_test(prefix_cache_test      unit/prefix_cache_test.cc)
 
 if(INFERX_CUDA_MEETS_FLOOR)
+  inferx_add_kernel_test(weight_loader_test kernel/weight_loader_test.cc)
   inferx_add_kernel_test(moe_test kernel/moe_test.cc)
   inferx_add_kernel_test(mla_test kernel/mla_test.cc)
   inferx_add_kernel_test(deepseek_v2_model_test kernel/deepseek_v2_model_test.cc)

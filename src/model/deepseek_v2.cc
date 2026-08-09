@@ -20,6 +20,7 @@
 #include "inferx/model/mla.h"
 #include "inferx/model/moe_ffn.h"
 #include "inferx/model/safetensors.h"
+#include "inferx/model/weight_loader.h"
 
 namespace inferx::model {
 namespace {
@@ -41,57 +42,6 @@ Status Grow(Scratch* s, size_t bytes) {
   return OkStatus();
 }
 
-StatusOr<TensorView> Upload(std::vector<DeviceBuffer>* keep,
-                            const Tensor& host) {
-  const size_t bytes = DataTypeByteSize(host.dtype(), host.numel());
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(buf.data(), host.data(), bytes, cudaMemcpyHostToDevice));
-
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
-                            DeviceId::Cuda(0));
-}
-
-// Concatenates same-width 2-D host tensors along dim 0 into one device
-// tensor. Used to fuse a dense FFN's gate and up projections (one GEMM at run
-// time) and the shared expert's the same way -- the qwen2.cc/gpt_oss.cc
-// pattern.
-StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
-                                        std::vector<DeviceBuffer>* keep) {
-  int64_t rows = 0;
-  const int64_t cols = parts.front().dim(1);
-  size_t bytes = 0;
-
-  for (const Tensor& t : parts) {
-    if (t.rank() != 2 || t.dim(1) != cols) {
-      return InvalidArgumentError("cannot concatenate: expected [*, ", cols,
-                                  "], got ", t.shape().ToString());
-    }
-    rows += t.dim(0);
-    bytes += static_cast<size_t>(t.nbytes());
-  }
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
-
-  size_t offset = 0;
-  for (const Tensor& t : parts) {
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(buf.data() + offset, t.data(),
-                   static_cast<size_t>(t.nbytes()), cudaMemcpyHostToDevice));
-    offset += static_cast<size_t>(t.nbytes());
-  }
-
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), parts.front().dtype(),
-                            Shape({rows, cols}), DeviceId::Cuda(0));
-}
-
 // The RoPE-convention question (§18.4 D2, ARCHITECTURE.md's "unverified"
 // caveat), as a validation-time toggle. Our kernel rotates half-split pairs
 // (j, j+half); HF's DeepSeek code de-interleaves storage pairs (2j, 2j+1)
@@ -108,40 +58,6 @@ StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
 bool RopeDeinterleaveRequested() {
   const char* env = std::getenv("INFERX_DSV2_ROPE_DEINTERLEAVE");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Uploads a 2-D host tensor with its rows permuted: destination row i reads
-// source row `row_map[i]`. Used only by the rope de-interleave above.
-StatusOr<TensorView> UploadRowPermuted(std::vector<DeviceBuffer>* keep,
-                                       const Tensor& host,
-                                       const std::vector<int64_t>& row_map) {
-  const int64_t rows = host.dim(0);
-  const int64_t cols = host.dim(1);
-  const size_t row_bytes = DataTypeByteSize(host.dtype(), cols);
-
-  if (static_cast<int64_t>(row_map.size()) != rows) {
-    return InvalidArgumentError("row_map covers ", row_map.size(), " of ",
-                                rows, " rows");
-  }
-
-  std::vector<std::byte> staged(static_cast<size_t>(rows) * row_bytes);
-  const auto* src = static_cast<const std::byte*>(host.data());
-  for (int64_t i = 0; i < rows; ++i) {
-    std::memcpy(staged.data() + static_cast<size_t>(i) * row_bytes,
-                src + static_cast<size_t>(row_map[static_cast<size_t>(i)]) *
-                          row_bytes,
-                row_bytes);
-  }
-
-  INFERX_ASSIGN_OR_RETURN(
-      DeviceBuffer buf, DeviceBuffer::Allocate(staged.size(), DeviceId::Cuda(0)));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), staged.data(),
-                                         staged.size(),
-                                         cudaMemcpyHostToDevice));
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
-                            DeviceId::Cuda(0));
 }
 
 // Identity over `rows`, with each listed `rope`-wide block at `starts`
@@ -483,28 +399,25 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   const int64_t moe_inter = config.moe_intermediate_size;
   const int64_t shared_inter = config.shared_expert_intermediate_size;
 
-  auto get = [&](const std::string& name, const Shape& expected) {
-    return ckpt.GetChecked(name, expected);
-  };
+  // The shared movement layer: pinned staging ring, parallel host-side
+  // copies, chunked device allocation. Views it returns are not readable
+  // until Finish()/Release() below — everything loads, then the pipeline
+  // drains once.
+  INFERX_ASSIGN_OR_RETURN(WeightLoader loader, WeightLoader::Create(&ckpt));
 
   INFERX_ASSIGN_OR_RETURN(
-      const Tensor embed,
-      get("model.embed_tokens.weight", Shape({config.vocab_size, h})));
-  INFERX_ASSIGN_OR_RETURN(impl->embed, Upload(&impl->weight_buffers, embed));
+      impl->embed,
+      loader.Load("model.embed_tokens.weight", Shape({config.vocab_size, h})));
 
-  INFERX_ASSIGN_OR_RETURN(const Tensor norm,
-                          get("model.norm.weight", Shape({h})));
   INFERX_ASSIGN_OR_RETURN(impl->final_norm,
-                          Upload(&impl->weight_buffers, norm));
+                          loader.Load("model.norm.weight", Shape({h})));
 
   if (config.tie_word_embeddings) {
     impl->lm_head = impl->embed;
   } else {
     INFERX_ASSIGN_OR_RETURN(
-        const Tensor head,
-        get("lm_head.weight", Shape({config.vocab_size, h})));
-    INFERX_ASSIGN_OR_RETURN(impl->lm_head,
-                            Upload(&impl->weight_buffers, head));
+        impl->lm_head,
+        loader.Load("lm_head.weight", Shape({config.vocab_size, h})));
   }
 
   impl->layers.resize(static_cast<size_t>(config.num_hidden_layers));
@@ -515,29 +428,20 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   // the MoE layers (hundreds of MB of experts each) dominate and a stall
   // should name its layer.
   const auto load_start = std::chrono::steady_clock::now();
-  const auto uploaded_bytes = [&impl] {
-    size_t total = 0;
-    for (const DeviceBuffer& buf : impl->weight_buffers) total += buf.size();
-    return total;
-  };
   std::fprintf(stderr,
                "deepseek-v2: loading %zu tensors, %.1f GB, %lld layers "
-               "(rope convention: %s)\n",
+               "(rope convention: %s, %d copy threads)\n",
                ckpt.size(), static_cast<double>(ckpt.TotalBytes()) / 1e9,
                static_cast<long long>(config.num_hidden_layers),
-               RopeDeinterleaveRequested() ? "deinterleaved" : "half-split");
-
-  // Reused host staging for the stacked expert tensors: the checkpoint stores
-  // ~192 tensors per MoE layer, and packing them on the host first makes the
-  // upload one cudaMemcpy per stacked tensor instead of one per expert.
-  std::vector<std::byte> staging;
+               RopeDeinterleaveRequested() ? "deinterleaved" : "half-split",
+               loader.threads());
 
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) {
     LayerWeights& w = impl->layers[static_cast<size_t>(i)];
     const std::string p = absl::StrCat("model.layers.", i, ".");
 
     const auto layer_start = std::chrono::steady_clock::now();
-    const size_t layer_before = uploaded_bytes();
+    const size_t layer_before = loader.stats().bytes;
     const auto log_layer = [&](const char* kind) {
       const auto now = std::chrono::steady_clock::now();
       std::fprintf(
@@ -545,17 +449,16 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                   "%5.1f GB total\n",
           static_cast<long long>(i + 1),
           static_cast<long long>(config.num_hidden_layers), kind,
-          static_cast<double>(uploaded_bytes() - layer_before) / 1e6,
+          static_cast<double>(loader.stats().bytes - layer_before) / 1e6,
           static_cast<long long>(
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   now - layer_start).count()),
-          static_cast<double>(uploaded_bytes()) / 1e9);
+          static_cast<double>(loader.stats().bytes) / 1e9);
     };
 
     auto up = [&](const std::string& name, const Shape& expected,
                   TensorView* out) -> Status {
-      INFERX_ASSIGN_OR_RETURN(const Tensor t, get(p + name, expected));
-      INFERX_ASSIGN_OR_RETURN(*out, Upload(&impl->weight_buffers, t));
+      INFERX_ASSIGN_OR_RETURN(*out, loader.Load(p + name, expected));
       return OkStatus();
     };
 
@@ -582,40 +485,36 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                                 Shape({config.q_lora_rank, h}), &w.mla.q_a));
       INFERX_RETURN_IF_ERROR(up("self_attn.q_a_layernorm.weight",
                                 Shape({config.q_lora_rank}), &w.mla.q_a_norm));
-      INFERX_ASSIGN_OR_RETURN(
-          const Tensor q_b,
-          get(p + "self_attn.q_b_proj.weight",
-              Shape({heads * qk, config.q_lora_rank})));
+      const std::string name = p + "self_attn.q_b_proj.weight";
+      const Shape shape({heads * qk, config.q_lora_rank});
       INFERX_ASSIGN_OR_RETURN(
           w.mla.q_b,
           deinterleave
-              ? UploadRowPermuted(&impl->weight_buffers, q_b,
-                                  DeinterleaveMap(heads * qk, q_rope_starts,
-                                                  rope))
-              : Upload(&impl->weight_buffers, q_b));
+              ? loader.LoadRowPermuted(
+                    name, shape,
+                    DeinterleaveMap(heads * qk, q_rope_starts, rope))
+              : loader.Load(name, shape));
     } else {
-      INFERX_ASSIGN_OR_RETURN(
-          const Tensor q_proj,
-          get(p + "self_attn.q_proj.weight", Shape({heads * qk, h})));
+      const std::string name = p + "self_attn.q_proj.weight";
+      const Shape shape({heads * qk, h});
       INFERX_ASSIGN_OR_RETURN(
           w.mla.q_b,
           deinterleave
-              ? UploadRowPermuted(&impl->weight_buffers, q_proj,
-                                  DeinterleaveMap(heads * qk, q_rope_starts,
-                                                  rope))
-              : Upload(&impl->weight_buffers, q_proj));
+              ? loader.LoadRowPermuted(
+                    name, shape,
+                    DeinterleaveMap(heads * qk, q_rope_starts, rope))
+              : loader.Load(name, shape));
     }
     {
-      INFERX_ASSIGN_OR_RETURN(const Tensor kv_a,
-                              get(p + "self_attn.kv_a_proj_with_mqa.weight",
-                                  Shape({latent + rope, h})));
+      const std::string name = p + "self_attn.kv_a_proj_with_mqa.weight";
+      const Shape shape({latent + rope, h});
       INFERX_ASSIGN_OR_RETURN(
           w.mla.kv_a,
           deinterleave
-              ? UploadRowPermuted(&impl->weight_buffers, kv_a,
-                                  DeinterleaveMap(latent + rope, {latent},
-                                                  rope))
-              : Upload(&impl->weight_buffers, kv_a));
+              ? loader.LoadRowPermuted(
+                    name, shape,
+                    DeinterleaveMap(latent + rope, {latent}, rope))
+              : loader.Load(name, shape));
     }
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_a_layernorm.weight",
                               Shape({latent}), &w.mla.kv_a_norm));
@@ -628,17 +527,12 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
 
     if (!config.IsMoeLayer(i)) {
       const int64_t inter = config.intermediate_size;
-      std::vector<Tensor> gate_up;
-      INFERX_ASSIGN_OR_RETURN(Tensor gate,
-                              get(p + "mlp.gate_proj.weight",
-                                  Shape({inter, h})));
-      INFERX_ASSIGN_OR_RETURN(Tensor upw,
-                              get(p + "mlp.up_proj.weight", Shape({inter, h})));
-      gate_up.push_back(std::move(gate));
-      gate_up.push_back(std::move(upw));
+      const std::vector<std::string> gate_up = {p + "mlp.gate_proj.weight",
+                                                p + "mlp.up_proj.weight"};
       INFERX_ASSIGN_OR_RETURN(
           w.dense_gate_up,
-          UploadConcatenated(gate_up, &impl->weight_buffers));
+          loader.LoadStacked(gate_up, Shape({inter, h}),
+                             Shape({2 * inter, h})));
       INFERX_RETURN_IF_ERROR(
           up("mlp.down_proj.weight", Shape({h, inter}), &w.dense_down));
       log_layer("dense");
@@ -649,77 +543,44 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
         up("mlp.gate.weight", Shape({experts, h}), &w.router));
 
     // Routed experts, stacked. gate_up interleaves [gate_e | up_e] per expert
-    // exactly as MoeWeights documents; down stacks plainly.
+    // exactly as MoeWeights documents; down stacks plainly. Declaring the
+    // stack to the loader keeps it one streamed device tensor without the
+    // old per-layer host repack.
     {
-      const size_t part = DataTypeByteSize(kBf16, moe_inter * h);
-      staging.resize(static_cast<size_t>(experts) * 2 * part);
+      std::vector<std::string> names;
+      names.reserve(static_cast<size_t>(2 * experts));
       for (int64_t e = 0; e < experts; ++e) {
         const std::string ep = absl::StrCat(p, "mlp.experts.", e, ".");
-        INFERX_ASSIGN_OR_RETURN(
-            const Tensor gate,
-            get(ep + "gate_proj.weight", Shape({moe_inter, h})));
-        INFERX_ASSIGN_OR_RETURN(
-            const Tensor upw, get(ep + "up_proj.weight", Shape({moe_inter, h})));
-        std::memcpy(staging.data() + static_cast<size_t>(e) * 2 * part,
-                    gate.data(), part);
-        std::memcpy(staging.data() + static_cast<size_t>(e) * 2 * part + part,
-                    upw.data(), part);
+        names.push_back(ep + "gate_proj.weight");
+        names.push_back(ep + "up_proj.weight");
       }
-
-      INFERX_ASSIGN_OR_RETURN(
-          DeviceBuffer buf,
-          DeviceBuffer::Allocate(staging.size(), DeviceId::Cuda(0)));
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), staging.data(),
-                                             staging.size(),
-                                             cudaMemcpyHostToDevice));
-      impl->weight_buffers.push_back(std::move(buf));
       INFERX_ASSIGN_OR_RETURN(
           w.experts_gate_up,
-          TensorView::Create(impl->weight_buffers.back().data(), kBf16,
-                             Shape({experts, 2 * moe_inter, h}),
-                             DeviceId::Cuda(0)));
+          loader.LoadStacked(names, Shape({moe_inter, h}),
+                             Shape({experts, 2 * moe_inter, h})));
     }
     {
-      const size_t part = DataTypeByteSize(kBf16, h * moe_inter);
-      staging.resize(static_cast<size_t>(experts) * part);
+      std::vector<std::string> names;
+      names.reserve(static_cast<size_t>(experts));
       for (int64_t e = 0; e < experts; ++e) {
-        const std::string ep = absl::StrCat(p, "mlp.experts.", e, ".");
-        INFERX_ASSIGN_OR_RETURN(
-            const Tensor down,
-            get(ep + "down_proj.weight", Shape({h, moe_inter})));
-        std::memcpy(staging.data() + static_cast<size_t>(e) * part, down.data(),
-                    part);
+        names.push_back(absl::StrCat(p, "mlp.experts.", e, ".down_proj.weight"));
       }
-
-      INFERX_ASSIGN_OR_RETURN(
-          DeviceBuffer buf,
-          DeviceBuffer::Allocate(staging.size(), DeviceId::Cuda(0)));
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), staging.data(),
-                                             staging.size(),
-                                             cudaMemcpyHostToDevice));
-      impl->weight_buffers.push_back(std::move(buf));
       INFERX_ASSIGN_OR_RETURN(
           w.experts_down,
-          TensorView::Create(impl->weight_buffers.back().data(), kBf16,
-                             Shape({experts, h, moe_inter}),
-                             DeviceId::Cuda(0)));
+          loader.LoadStacked(names, Shape({h, moe_inter}),
+                             Shape({experts, h, moe_inter})));
     }
 
     // The shared experts, stored as one fused MLP of width
     // n_shared_experts × moe_intermediate_size (2816 for V2-Lite).
     if (shared_inter > 0) {
-      std::vector<Tensor> gate_up;
-      INFERX_ASSIGN_OR_RETURN(Tensor gate,
-                              get(p + "mlp.shared_experts.gate_proj.weight",
-                                  Shape({shared_inter, h})));
-      INFERX_ASSIGN_OR_RETURN(Tensor upw,
-                              get(p + "mlp.shared_experts.up_proj.weight",
-                                  Shape({shared_inter, h})));
-      gate_up.push_back(std::move(gate));
-      gate_up.push_back(std::move(upw));
+      const std::vector<std::string> gate_up = {
+          p + "mlp.shared_experts.gate_proj.weight",
+          p + "mlp.shared_experts.up_proj.weight"};
       INFERX_ASSIGN_OR_RETURN(
           w.shared_gate_up,
-          UploadConcatenated(gate_up, &impl->weight_buffers));
+          loader.LoadStacked(gate_up, Shape({shared_inter, h}),
+                             Shape({2 * shared_inter, h})));
       INFERX_RETURN_IF_ERROR(up("mlp.shared_experts.down_proj.weight",
                                 Shape({h, shared_inter}), &w.shared_down));
     }
@@ -727,11 +588,20 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
     log_layer("moe");
   }
 
+  // Everything is enqueued; the views become readable here. The stage/h2d
+  // split says where a slow load actually spent its time: stage-bound is the
+  // disk (cold page cache), h2d-bound is PCIe (the warm floor).
+  INFERX_RETURN_IF_ERROR(loader.Finish());
+  const WeightLoaderStats& ls = loader.stats();
   std::fprintf(
-      stderr, "deepseek-v2: loaded %.1f GB in %.1f s\n",
-      static_cast<double>(uploaded_bytes()) / 1e9,
+      stderr,
+      "deepseek-v2: loaded %.1f GB in %.1f s (stage %.1f s, h2d wait %.1f s)\n",
+      static_cast<double>(ls.bytes) / 1e9,
       std::chrono::duration_cast<std::chrono::duration<double>>(
-          std::chrono::steady_clock::now() - load_start).count());
+          std::chrono::steady_clock::now() - load_start).count(),
+      ls.stage_seconds, ls.h2d_wait_seconds);
+
+  INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
   INFERX_ASSIGN_OR_RETURN(MlaAttentionLayer mla,
                           MlaAttentionLayer::Create(config, 1, 1));
