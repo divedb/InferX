@@ -1,4 +1,4 @@
-#include "inferx/server/engine.h"
+#include "inferx/engine/engine.h"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +17,7 @@
 #include "inferx/support/log.h"
 #include "qwen_runner.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 namespace {
 
 using model::ForwardBatch;
@@ -1113,4 +1113,4 @@ std::string Engine::metrics() const {
   return output;
 }
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

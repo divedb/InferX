@@ -13,7 +13,7 @@ This proposal was informed by these local revisions:
 
 - vLLM `fd47e57f4b0d` (`v0.6.3`): `vllm/engine/metrics.py` and `docs/source/serving/metrics.rst`.
 - SGLang `b8ec544946f1`: `python/sglang/srt/observability/metrics_collector.py` and `experimental/sgl-router/src/server/metrics.rs`.
-- InferX: `include/inferx/server/engine.h` and the existing `/stats` handler in `src/server/http_server.cc`.
+- InferX: `include/inferx/engine/engine.h` and the existing `/stats` handler in `src/server/http_server.cc`.
 
 vLLM establishes the essential serving signals: running/waiting/swapped requests, KV-cache occupancy, prefix-cache hits, preemptions, prompt and generated token throughput, time to first token (TTFT), time per output token, end-to-end latency, request lengths, and finish reason. SGLang adds useful operational detail: queue time, inter-token latency (ITL), absolute token-pool capacity, retractions, CUDA graph mode, batch occupancy, forward cost, startup/model-load information, aborts, and transfer metrics for disaggregated serving. Its router implementation also demonstrates that exposition need not put a third-party client library in the request path.
 

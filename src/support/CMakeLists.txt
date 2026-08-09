@@ -1,9 +1,11 @@
 # inferx_support -- small utilities with no device or model dependencies.
 
 add_library(inferx_support
+  crash.cc
   file.cc
   json.cc
   log.cc
+  shutdown.cc
 )
 add_library(inferx::support ALIAS inferx_support)
 
@@ -21,4 +23,6 @@ target_link_libraries(inferx_support
     absl::log_globals
     absl::log_sink_registry
     absl::time
+    absl::failure_signal_handler
+    absl::symbolize
 )

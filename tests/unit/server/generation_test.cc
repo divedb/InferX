@@ -3,9 +3,9 @@
 
 #include <string>
 
-#include "inferx/server/engine.h"
+#include "inferx/engine/engine.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 namespace {
 
 TEST(GenerationTest, DeliversEventsAndTerminalStateInOrder) {
@@ -64,4 +64,4 @@ TEST(GenerationTest, ReportsBoundedBufferOverflow) {
 }
 
 }  // namespace
-}  // namespace inferx::server
+}  // namespace inferx::engine

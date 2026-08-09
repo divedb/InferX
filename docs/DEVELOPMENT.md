@@ -16,7 +16,7 @@ both `nccl.h` and `libnccl.so` are discoverable at configure time. CMake prints
 `NCCL backend : ON` when it is enabled. A two-GPU launch is:
 
 ```bash
-./build-cuda/src/server/inferx-serve \
+./build-cuda/src/main/inferx-serve \
   --model /path/to/checkpoint \
   --tensor-parallel-size 2 \
   --devices 0,1 \
@@ -36,7 +36,7 @@ configuration:
 
 ```bash
 key_hash="$(printf %s "$INFERX_API_KEY" | sha256sum | cut -d' ' -f1)"
-./build/src/server/inferx-serve \
+./build/src/main/inferx-serve \
   --model /path/to/checkpoint \
   --api-key-sha256 "$key_hash"
 ```
@@ -207,6 +207,29 @@ docs/               ARCHITECTURE.md is the design of record
 ```
 
 ## Conventions
+
+### Crash diagnostics
+
+Executables must install the fatal-signal handler once, near the start of
+`main()` and before starting worker threads:
+
+```cpp
+#include "inferx/support/crash.h"
+
+int main(int argc, char** argv) {
+  inferx::InstallCrashHandler(argv[0]);
+  // Initialize and run the process.
+}
+```
+
+The handler reports `SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGFPE`, and `SIGILL` with
+a best-effort symbolized stack trace on stderr, then terminates the process.
+Build with debug information and keep symbols available for useful function and
+source locations. `CHECK` and `LOG(FATAL)` abort through the same path.
+
+Do not use this handler for graceful shutdown. `SIGINT` and `SIGTERM` belong to
+`BlockShutdownSignals()` and `ShutdownSignalWaiter`, which run shutdown work
+outside an asynchronous signal handler.
 
 **Errors.** `absl::Status` / `absl::StatusOr` everywhere, via
 `inferx/core/status.h`. Use `INFERX_RETURN_IF_ERROR` and

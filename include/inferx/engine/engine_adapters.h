@@ -1,10 +1,13 @@
 #pragma once
 
-#include "inferx/server/engine.h"
+#include "inferx/engine/engine.h"
 #include "inferx/server/observability/metrics_snapshot.h"
 #include "inferx/server/scheduler_client/in_process_scheduler_client.h"
 
-namespace inferx::server {
+namespace inferx::engine {
+
+namespace scheduler_client = server::scheduler_client;
+namespace observability = server::observability;
 
 class EngineSchedulerBackend final
     : public scheduler_client::InProcessEngineBackend {
@@ -27,4 +30,4 @@ class EngineMetricsSource final : public observability::MetricsSource {
   const Engine* engine_;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

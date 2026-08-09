@@ -1,8 +1,8 @@
 #include <utility>
 
-#include "inferx/server/engine.h"
+#include "inferx/engine/engine.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 namespace {
 
 constexpr size_t kGenerationEventCapacity = 256;
@@ -67,4 +67,4 @@ void Generation::Finish(scheduler::FinishReason reason, int32_t generated) {
   closed_ = true;
 }
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

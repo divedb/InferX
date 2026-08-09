@@ -1,13 +1,7 @@
-# inferx_server -- the engine's step loop and the HTTP front end.
-#
-# Unlike inferx::api, this needs a device: it owns the model. Anything that can
-# be tested without one belongs in inferx::api instead, which is why the wire
-# format lives there and only the loop and the socket live here.
+# inferx_server -- the HTTP composition layer around inferx::engine.
 
 add_library(inferx_server
-  engine.cc
   http_server.cc
-  qwen_runner.cc
 )
 add_library(inferx::server ALIAS inferx_server)
 
@@ -18,9 +12,8 @@ target_link_libraries(inferx_server
     inferx::core
     inferx::support
     inferx::api
-    inferx::model
-    inferx::observe
-    inferx::engine_client
+    inferx::engine
+    inferx::engine_adapters
     inferx::admission
     inferx::auth
     inferx::http_transport
@@ -32,8 +25,6 @@ target_link_libraries(inferx_server
     inferx::tokenization_service
     inferx::scheduler_client
     inferx::server_observability
-    inferx::scheduler
-    inferx::tokenizer
     inferx::flags
   PRIVATE
     inferx::beast
@@ -45,9 +36,6 @@ if(TARGET inferx_grpc_scheduler_transport)
     inferx::grpc_scheduler_transport)
 endif()
 
-# Threads, for the engine loop and the bounded HTTP executors.
+# Threads for the bounded HTTP executors.
 find_package(Threads REQUIRED)
 target_link_libraries(inferx_server PUBLIC Threads::Threads)
-
-add_executable(inferx-serve main.cc)
-target_link_libraries(inferx-serve PRIVATE inferx::server)

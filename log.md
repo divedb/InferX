@@ -19,9 +19,9 @@ Surveyed `third_party/` for a reusable logging library:
 
 ~23 ad-hoc `std::fprintf(stderr, ...)` / iostream call sites, concentrated in:
 
-- `src/server/main.cc`, `src/server/gateway/main.cc` — CLI errors, startup/shutdown banners.
+- `src/main/main.cc`, `src/server/gateway/main.cc` — CLI errors, startup/shutdown banners.
 - `src/model/deepseek_v2.cc`, `src/model/gpt_oss.cc` — weight-load progress and diagnostics.
-- `src/server/engine.cc:815` — `engine step failed: ...` (the only runtime error path that logs today).
+- `src/engine/engine.cc` — `engine step failed: ...` (the only runtime error path that logs today).
 
 Problems: no severity levels, no timestamps, no thread/source location, no request correlation, no runtime verbosity control, and load-progress spam can't be turned off.
 
@@ -101,7 +101,7 @@ Defaults preserve today's behavior (human-readable stderr, INFO).
 Phased; each phase builds green and is independently landable.
 
 1. **Foundation.** Add `log.h`/`log.cc`, CMake wiring, `InitLogging` called from both `main.cc`s behind the new flags. Add a unit test using `absl::ScopedMockLog` (googletest is already a dependency) verifying init, JSON sink output shape, and `Rid` formatting.
-2. **Convert error paths.** Replace the `fprintf` calls in `src/server/engine.cc`, `src/server/main.cc`, `src/server/gateway/main.cc` with `LOG(ERROR)`/`LOG(INFO)`. CLI *usage* errors (bad flags, `--help`) stay on raw `fprintf` — that's UI, not logging.
+2. **Convert error paths.** Replace the `fprintf` calls in `src/engine/engine.cc`, `src/main/main.cc`, `src/server/gateway/main.cc` with `LOG(ERROR)`/`LOG(INFO)`. CLI *usage* errors (bad flags, `--help`) stay on raw `fprintf` — that's UI, not logging.
 3. **Convert model loaders.** `deepseek_v2.cc`, `gpt_oss.cc`: summary → `LOG(INFO)`, per-layer progress → `VLOG(3)`. This also fixes the load-spam problem.
 4. **Access log.** One `LOG(INFO)` line at request completion in the request service with the fields from §3.2.3, prefixed with `Rid(id)`.
 5. **Scheduler/admission + VLOG tracing.** Add WARNING on rejects/preemptions and `VLOG(1..2)` tracing per §3.1.

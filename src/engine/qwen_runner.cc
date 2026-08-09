@@ -16,7 +16,7 @@
 #include "inferx/comm/nccl_communicator.h"
 #include "inferx/core/cuda_utils.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 namespace {
 
 int64_t SteadyNowNs() {
@@ -407,4 +407,4 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
       std::move(model), device, std::move(communication)));
 }
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

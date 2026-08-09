@@ -53,7 +53,6 @@ add_subdirectory(src/server/tokenization)
 add_subdirectory(src/server/transport)
 add_subdirectory(src/server/middleware)
 add_subdirectory(src/server/observability)
-add_subdirectory(src/server/engine_client)
 add_subdirectory(src/server/handlers)
 if(TARGET inferx_grpc_scheduler_transport)
   add_subdirectory(src/server/gateway)
@@ -62,7 +61,9 @@ endif()
 # The server owns the model, so it needs device code; the wire format it speaks
 # does not, which is why src/api is unconditional and this is not.
 if(INFERX_CUDA_MEETS_FLOOR)
+  add_subdirectory(src/engine)
   add_subdirectory(src/server)
+  add_subdirectory(src/main)
 endif()
 
 if(INFERX_BUILD_BENCH AND INFERX_CUDA_MEETS_FLOOR)
@@ -72,6 +73,9 @@ endif()
 # Demos exercise FlashInfer kernel templates directly (no PyTorch/TVM-FFI layer).
 # Gated on both the CUDA floor and FlashInfer presence (see demo/CMakeLists.txt).
 add_subdirectory(demo)
+
+# Small, host-only examples of reusable InferX components.
+add_subdirectory(examples)
 
 if(BUILD_TESTING)
   add_subdirectory(tests)

@@ -10,7 +10,7 @@
 #include "inferx/core/status.h"
 #include "inferx/model/qwen2.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 
 struct QwenRunnerConfig {
   std::string model_dir;
@@ -56,4 +56,4 @@ class QwenRunner {
   virtual std::vector<RankTelemetry> telemetry() const = 0;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

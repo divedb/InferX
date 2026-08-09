@@ -1375,7 +1375,7 @@ The existing code already provides useful parts of the target architecture:
 - `src/api/openai.cc` is host-only and already owns request parsing, response
   JSON, SSE framing, stop-string matching, and usage encoding for chat and text
   completions.
-- `src/server/engine.cc` supplies an in-process execution adapter: it owns the
+- `src/engine/engine.cc` supplies an in-process execution adapter: it owns the
   tokenizer, scheduler, model runner, generation loop, metrics, and a blocking
   `Generation::Next` event queue.
 - `src/scheduler/scheduler.cc` is host-only and already implements FCFS
@@ -1458,12 +1458,12 @@ Split CMake targets so host-only code is built even when
   linking the existing `inferx::api` during migration;
 - `inferx::request_runtime`: request context/state machine, admission,
   streaming buffer, auth contracts, registry contracts, and handler pipeline;
-- `inferx::engine_client`: the in-process adapter from the scheduler-client and
+- `inferx::engine_adapters`: the in-process adapter from the scheduler-client and
   tokenizer-service contracts to the existing `Engine`; and
 - `inferx::server`: the CUDA-gated composition root and executable support.
 
 Upstream Boost and Folly targets must remain private behind the two existing
-InferX aliases. CUDA libraries must appear only below `inferx::engine_client`
+InferX aliases. CUDA libraries must appear only below `inferx::engine_adapters`
 or the final composition target. Add a configure-time or link-time test that a
 host-only build can compile protocol, lifecycle, admission, streaming, and
 transport unit tests without `inferx::model` or `inferx::kernels`.

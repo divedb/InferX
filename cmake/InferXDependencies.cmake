@@ -33,6 +33,13 @@ set(ABSL_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 add_subdirectory("${INFERX_THIRD_PARTY}/abseil-cpp" EXCLUDE_FROM_ALL SYSTEM)
 
+# Abseil selects its frame-pointer stack unwinder on Linux/x86. Preserve the
+# frames between the signal trampoline and the interrupted first-party code;
+# otherwise the failure handler can print only the faulting program counter.
+target_compile_options(absl_stacktrace PRIVATE -fno-omit-frame-pointer)
+target_compile_options(absl_failure_signal_handler PRIVATE
+  -fno-omit-frame-pointer)
+
 # ---------------------------------------------------------------------------
 # mimalloc -- backing allocator for HostAllocatorImpl. Pinned to v3.4.3.
 #
@@ -240,6 +247,19 @@ target_include_directories(sentencepiece-static PRIVATE
   "${_inferx_spm_compat}/third_party")
 
 # ---------------------------------------------------------------------------
+# CLI11 -- command-line parsing for the executables. Pinned to v2.5.0.
+#
+# Header-only. Used only by the entry points under src/main and the gateway;
+# library targets must not depend on it.
+# ---------------------------------------------------------------------------
+_inferx_require_submodule(cli11)
+set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CLI11_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(CLI11_SINGLE_FILE OFF CACHE BOOL "" FORCE)
+add_subdirectory("${INFERX_THIRD_PARTY}/cli11" EXCLUDE_FROM_ALL SYSTEM)
+
+# ---------------------------------------------------------------------------
 # Planned dependencies, by milestone. Add with:
 #   git submodule add --depth 1 <url> third_party/<name>
 #
@@ -247,5 +267,4 @@ target_include_directories(sentencepiece-static PRIVATE
 #                        For the request hot path, if JSON parsing ever shows
 #                        up in a profile. It has not yet: a chat request is a
 #                        few hundred bytes next to a multi-millisecond step.
-#   --  spdlog           https://github.com/gabime/spdlog.git
 # ---------------------------------------------------------------------------

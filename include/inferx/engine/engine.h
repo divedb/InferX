@@ -17,7 +17,7 @@
 #include "inferx/scheduler/scheduler.h"
 #include "inferx/tokenizer/tokenizer.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 
 struct EngineConfig {
   /// Checkpoint directory: safetensors, config.json, tokenizer.json.
@@ -244,4 +244,4 @@ class Engine {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

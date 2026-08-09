@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "inferx/core/status.h"
-#include "inferx/server/engine.h"
+#include "inferx/engine/engine.h"
 
 namespace inferx::server {
 
@@ -70,7 +70,7 @@ class HttpServer {
  public:
   /// \param engine Borrowed; must outlive the server.
   static StatusOr<std::unique_ptr<HttpServer>> Create(
-      Engine* engine, const HttpServerConfig& config);
+      engine::Engine* engine, const HttpServerConfig& config);
 
   ~HttpServer();
 

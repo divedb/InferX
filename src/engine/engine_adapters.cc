@@ -1,6 +1,6 @@
-#include "engine_adapters.h"
+#include "inferx/engine/engine_adapters.h"
 
-namespace inferx::server {
+namespace inferx::engine {
 namespace {
 
 scheduler_client::FinishReason ConvertFinishReason(
@@ -88,4 +88,4 @@ observability::MetricsSnapshot EngineMetricsSource::Snapshot() const {
           .evicted_blocks = static_cast<uint64_t>(stats.evicted_blocks)};
 }
 
-}  // namespace inferx::server
+}  // namespace inferx::engine

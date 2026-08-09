@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "engine_adapters.h"
+#include "inferx/engine/engine_adapters.h"
 #include "inferx/server/admission/admission_controller.h"
 #include "inferx/server/auth/api_key_store.h"
 #include "inferx/server/auth/authenticator.h"
@@ -66,7 +66,7 @@ bool IsSha256Hex(std::string_view value) {
 }  // namespace
 
 struct HttpServer::Impl {
-  Engine* engine;
+  engine::Engine* engine;
   HttpServerConfig config;
   std::unique_ptr<folly::CPUThreadPoolExecutor> blocking_executor;
   std::unique_ptr<transport::IoRuntime> runtime;
@@ -77,13 +77,13 @@ struct HttpServer::Impl {
   handlers::HealthState health;
   request::RequestManager request_manager;
   admission::AdmissionController admission;
-  std::unique_ptr<EngineSchedulerBackend> scheduler_backend;
+  std::unique_ptr<engine::EngineSchedulerBackend> scheduler_backend;
   std::shared_ptr<scheduler_client::RemoteSchedulerTransport>
       scheduler_transport;
   std::unique_ptr<scheduler_client::SchedulerClient> scheduler;
   std::unique_ptr<request::ManagedRequestService> requests;
   tokenization::InProcessTokenizationService tokenization;
-  EngineMetricsSource metrics;
+  engine::EngineMetricsSource metrics;
   std::shared_ptr<transport::Routes> routes;
   std::unique_ptr<transport::BeastListener> listener;
 
@@ -93,7 +93,7 @@ struct HttpServer::Impl {
   bool listen_finished = false;
   bool stopping = false;
 
-  Impl(Engine* engine_value, HttpServerConfig config_value,
+  Impl(engine::Engine* engine_value, HttpServerConfig config_value,
        std::unique_ptr<folly::CPUThreadPoolExecutor> blocking_value,
        std::unique_ptr<transport::IoRuntime> runtime_value)
       : engine(engine_value),
@@ -115,7 +115,8 @@ struct HttpServer::Impl {
                          : tokenizer::ChatTemplateKind::kQwen2),
         metrics(engine) {
     if (config.scheduler_endpoint.empty()) {
-      scheduler_backend = std::make_unique<EngineSchedulerBackend>(engine);
+      scheduler_backend =
+          std::make_unique<engine::EngineSchedulerBackend>(engine);
       scheduler = std::make_unique<scheduler_client::InProcessSchedulerClient>(
           scheduler_backend.get());
     } else {
@@ -252,7 +253,7 @@ HttpServer::HttpServer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 HttpServer::~HttpServer() = default;
 
 StatusOr<std::unique_ptr<HttpServer>> HttpServer::Create(
-    Engine* engine, const HttpServerConfig& config) {
+    engine::Engine* engine, const HttpServerConfig& config) {
   if (engine == nullptr) return InvalidArgumentError("engine is null");
   if (config.port < 0 || config.port > 65535) {
     return InvalidArgumentError("port must be in [0, 65535]");

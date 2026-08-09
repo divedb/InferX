@@ -47,6 +47,7 @@ add_library(inferx::flags ALIAS inferx_flags)
 
 target_compile_options(inferx_flags INTERFACE
   $<$<COMPILE_LANGUAGE:CXX>:
+    -fno-omit-frame-pointer
     -Wall
     -Wextra
     -Wpedantic
