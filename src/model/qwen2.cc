@@ -20,6 +20,7 @@
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/quantize.h"
 #include "inferx/kernels/w4a16_gemm.h"
+#include "inferx/model/weight_loader.h"
 
 #ifdef INFERX_WITH_FLASHINFER
 #include "absl/types/span.h"
@@ -29,27 +30,6 @@
 
 namespace inferx::model {
 namespace {
-
-/// Copies one checkpoint tensor to the device and returns a view over it.
-///
-/// The source is a borrowed host tensor over the checkpoint's mapping, so this
-/// is the point where 6 GB actually crosses PCIe -- and the point where the
-/// pages get faulted in, one tensor at a time, rather than all at once.
-StatusOr<TensorView> Upload(const Tensor& host, DeviceId device,
-                            std::vector<DeviceBuffer>* keep) {
-  INFERX_ASSIGN_OR_RETURN(
-      DeviceBuffer buf,
-      DeviceBuffer::Allocate(static_cast<size_t>(host.nbytes()), device));
-
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(buf.data(), host.data(),
-                                         static_cast<size_t>(host.nbytes()),
-                                         cudaMemcpyHostToDevice));
-
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
-                            device);
-}
 
 /// Weights for one decoder block. Views into buffers owned by Impl.
 struct LayerWeights {
@@ -88,48 +68,6 @@ struct LayerWeights {
   float k_scale = 1.0f;
   float v_scale = 1.0f;
 };
-
-/// Uploads several host tensors end to end into one device buffer.
-///
-/// The concatenation happens here rather than on the device because it happens
-/// once, at load, and a copy per tensor into the right offset is simpler than
-/// any kernel that would do the same thing.
-StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
-                                        DeviceId device,
-                                        std::vector<DeviceBuffer>* keep) {
-  int64_t rows = 0;
-  int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
-  size_t bytes = 0;
-
-  for (const Tensor& t : parts) {
-    rows += t.dim(0);
-    bytes += static_cast<size_t>(t.nbytes());
-
-    if (t.rank() == 2 && t.dim(1) != cols) {
-      return InvalidArgumentError("cannot concatenate: widths ", cols, " and ",
-                                  t.dim(1), " differ");
-    }
-  }
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, device));
-
-  size_t offset = 0;
-  for (const Tensor& t : parts) {
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(buf.data() + offset, t.data(),
-                   static_cast<size_t>(t.nbytes()), cudaMemcpyHostToDevice));
-    offset += static_cast<size_t>(t.nbytes());
-  }
-
-  keep->push_back(std::move(buf));
-
-  const Shape shape = parts.front().rank() == 2 ? Shape({rows, cols})
-                                                : Shape({rows});
-
-  return TensorView::Create(keep->back().data(), parts.front().dtype(), shape,
-                            device);
-}
 
 /// A scratch buffer plus the view over it, so activations are allocated once
 /// and reshaped per call rather than per layer.
@@ -1284,12 +1222,19 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     return comm::ShardHostTensor(tensor, axis, tp_rank, tp_size);
   };
 
+  // The shared movement layer, in per-tensor-buffer mode
+  // (device_chunk_bytes = 0): QuantizeWeightsToF8/Int4 later free the bf16
+  // originals buffer by buffer, and a shared chunk would keep freed bytes
+  // pinned by their neighbours. The pipelining and copy threads still apply.
+  WeightLoader::Options loader_options;
+  loader_options.device = device;
+  loader_options.device_chunk_bytes = 0;
+  INFERX_ASSIGN_OR_RETURN(WeightLoader loader,
+                          WeightLoader::Create(&ckpt, loader_options));
+
   INFERX_ASSIGN_OR_RETURN(
-      const Tensor embed_host,
-      ckpt.GetChecked("model.embed_tokens.weight",
-                      Shape({config.vocab_size, h})));
-  INFERX_ASSIGN_OR_RETURN(impl->embed,
-                          Upload(embed_host, device, &impl->weight_buffers));
+      impl->embed,
+      loader.Load("model.embed_tokens.weight", Shape({config.vocab_size, h})));
 
   // Tied embeddings: the output projection *is* the embedding matrix, so the
   // LM head is the same device buffer rather than a second 600 MB copy.
@@ -1297,17 +1242,12 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     impl->lm_head = impl->embed;
   } else {
     INFERX_ASSIGN_OR_RETURN(
-        const Tensor lm_host,
-        ckpt.GetChecked("lm_head.weight", Shape({config.vocab_size, h})));
-    INFERX_ASSIGN_OR_RETURN(impl->lm_head,
-                            Upload(lm_host, device, &impl->weight_buffers));
+        impl->lm_head,
+        loader.Load("lm_head.weight", Shape({config.vocab_size, h})));
   }
 
-  INFERX_ASSIGN_OR_RETURN(const Tensor final_norm_host,
-                          ckpt.GetChecked("model.norm.weight", Shape({h})));
   INFERX_ASSIGN_OR_RETURN(impl->final_norm,
-                          Upload(final_norm_host, device,
-                                 &impl->weight_buffers));
+                          loader.Load("model.norm.weight", Shape({h})));
 
   impl->layers.reserve(static_cast<size_t>(config.num_hidden_layers));
 
@@ -1318,10 +1258,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
 
     const auto load = [&](std::string_view suffix, const Shape& shape,
                           TensorView* dst) -> Status {
-      INFERX_ASSIGN_OR_RETURN(const Tensor host,
-                              ckpt.GetChecked(absl::StrCat(p, suffix), shape));
       INFERX_ASSIGN_OR_RETURN(*dst,
-                              Upload(host, device, &impl->weight_buffers));
+                              loader.Load(absl::StrCat(p, suffix), shape));
       return OkStatus();
     };
 
@@ -1345,10 +1283,9 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
         qkv.push_back(std::move(local));
       }
-      INFERX_ASSIGN_OR_RETURN(w.qkv_w,
-                              UploadConcatenated(qkv, device,
-                                                 &impl->weight_buffers));
-      w.qkv_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
+      INFERX_ASSIGN_OR_RETURN(const Shape qkv_shape, ConcatenatedShape(qkv));
+      INFERX_ASSIGN_OR_RETURN(w.qkv_w, loader.UploadStacked(qkv, qkv_shape));
+      w.qkv_buf = static_cast<int>(loader.buffer_count()) - 1;
     }
 
     if (config.attention_bias) {
@@ -1363,9 +1300,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
         qkv_bias.push_back(std::move(local));
       }
-      INFERX_ASSIGN_OR_RETURN(
-          w.qkv_b,
-          UploadConcatenated(qkv_bias, device, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(const Shape bias_shape,
+                              ConcatenatedShape(qkv_bias));
+      INFERX_ASSIGN_OR_RETURN(w.qkv_b,
+                              loader.UploadStacked(qkv_bias, bias_shape));
     }
 
     {
@@ -1374,10 +1312,9 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
           ckpt.GetChecked(absl::StrCat(p, "self_attn.o_proj.weight"),
                           Shape({h, config.q_dim()})));
       INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
-      INFERX_ASSIGN_OR_RETURN(w.o_w,
-                              Upload(local, device, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(w.o_w, loader.Upload(local));
     }
-    w.o_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
+    w.o_buf = static_cast<int>(loader.buffer_count()) - 1;
 
     {
       std::vector<Tensor> gate_up;
@@ -1389,10 +1326,11 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
         gate_up.push_back(std::move(local));
       }
+      INFERX_ASSIGN_OR_RETURN(const Shape gate_up_shape,
+                              ConcatenatedShape(gate_up));
       INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
-                              UploadConcatenated(gate_up, device,
-                                                 &impl->weight_buffers));
-      w.gate_up_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
+                              loader.UploadStacked(gate_up, gate_up_shape));
+      w.gate_up_buf = static_cast<int>(loader.buffer_count()) - 1;
     }
 
     {
@@ -1401,13 +1339,16 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
           ckpt.GetChecked(absl::StrCat(p, "mlp.down_proj.weight"),
                           Shape({h, inter})));
       INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
-      INFERX_ASSIGN_OR_RETURN(w.down_w,
-                              Upload(local, device, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(w.down_w, loader.Upload(local));
     }
-    w.down_buf = static_cast<int>(impl->weight_buffers.size()) - 1;
+    w.down_buf = static_cast<int>(loader.buffer_count()) - 1;
 
     impl->layers.push_back(w);
   }
+
+  // Drain the upload pipeline and take ownership of the buffers. Views handed
+  // out above are not readable before this point.
+  INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
 #ifdef INFERX_WITH_FLASHINFER
   INFERX_ASSIGN_OR_RETURN(kernels::FlashInferDecode fi,

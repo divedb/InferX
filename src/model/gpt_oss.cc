@@ -18,6 +18,7 @@
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/mxfp4.h"
 #include "inferx/model/moe_ffn.h"
+#include "inferx/model/weight_loader.h"
 
 namespace inferx::model {
 namespace {
@@ -79,66 +80,12 @@ Status Grow(Scratch* s, size_t bytes) {
   return OkStatus();
 }
 
-// Uploads a host tensor to the device and returns a view over the copy. The
-// buffer is appended to `keep`, which owns it for the model's lifetime.
-StatusOr<TensorView> Upload(std::vector<DeviceBuffer>* keep,
-                            const Tensor& host) {
-  const size_t bytes = DataTypeByteSize(host.dtype(), host.numel());
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(buf.data(), host.data(), bytes, cudaMemcpyHostToDevice));
-
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), host.dtype(),
-                            host.shape(), DeviceId::Cuda(0));
-}
-
-// Uploads several same-width 2-D host tensors end-to-end as one device buffer,
-// concatenating along dim 0. Mirrors qwen2.cc's helper of the same name: the
-// QKV projections are stored as three separate tensors in the checkpoint but
-// are cheapest as one fused GEMM, so they are concatenated once at load.
-StatusOr<TensorView> UploadConcatenated(const std::vector<Tensor>& parts,
-                                        std::vector<DeviceBuffer>* keep) {
-  int64_t rows = 0;
-  int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
-  size_t bytes = 0;
-
-  for (const Tensor& t : parts) {
-    rows += t.dim(0);
-    bytes += static_cast<size_t>(t.nbytes());
-    if (t.rank() == 2 && t.dim(1) != cols) {
-      return InvalidArgumentError("cannot concatenate: widths ", cols, " and ",
-                                  t.dim(1), " differ");
-    }
-  }
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
-
-  size_t offset = 0;
-  for (const Tensor& t : parts) {
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(buf.data() + offset, t.data(),
-                   static_cast<size_t>(t.nbytes()), cudaMemcpyHostToDevice));
-    offset += static_cast<size_t>(t.nbytes());
-  }
-
-  keep->push_back(std::move(buf));
-
-  const Shape shape =
-      parts.front().rank() == 2 ? Shape({rows, cols}) : Shape({rows});
-  return TensorView::Create(keep->back().data(), parts.front().dtype(), shape,
-                            DeviceId::Cuda(0));
-}
-
 // Uploads a `[experts, 2·inter]` bias with its last axis de-interleaved, so it
 // lines up with weights that `DequantizeMxfp4GateUpToBf16` already split into
-// `[gate | up]`. Done on the host because it is 368 KB per layer and happens
-// once per layer per call, against 423 MB of weights moving beside it.
-StatusOr<TensorView> UploadDeinterleaved(std::vector<DeviceBuffer>* keep,
+// `[gate | up]`. The gather stays on the host because it is 368 KB per layer,
+// against 423 MB of weights moving beside it; the loader stages the permuted
+// copy before returning, so the scratch vector may die with this scope.
+StatusOr<TensorView> UploadDeinterleaved(WeightLoader* loader,
                                          const Tensor& host) {
   if (host.rank() != 2 || host.dim(1) % 2 != 0) {
     return InvalidArgumentError("gate_up bias must be [experts, even], got ",
@@ -161,17 +108,11 @@ StatusOr<TensorView> UploadDeinterleaved(std::vector<DeviceBuffer>* keep,
     }
   }
 
-  const size_t bytes = permuted.size() * sizeof(uint16_t);
-
-  INFERX_ASSIGN_OR_RETURN(DeviceBuffer buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(buf.data(), permuted.data(), bytes, cudaMemcpyHostToDevice));
-
-  keep->push_back(std::move(buf));
-
-  return TensorView::Create(keep->back().data(), host.dtype(), host.shape(),
-                            DeviceId::Cuda(0));
+  INFERX_ASSIGN_OR_RETURN(
+      const Tensor staged,
+      Tensor::FromBlob(permuted.data(), host.dtype(), host.shape(),
+                       DeviceId::Cpu()));
+  return loader->Upload(staged);
 }
 
 // One layer's non-expert weights, resident on the device.
@@ -712,17 +653,19 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
 
   auto get = [&](const std::string& name) { return impl->ckpt.Get(name); };
 
-  INFERX_ASSIGN_OR_RETURN(const Tensor embed, get("model.embed_tokens.weight"));
-  INFERX_ASSIGN_OR_RETURN(impl->embed, Upload(&impl->weight_buffers, embed));
+  // The shared movement layer, borrowing the checkpoint Impl owns. Unchecked
+  // (shape-free) loads on purpose: this loader validates its shapes
+  // downstream, at the kernels, as it always has.
+  INFERX_ASSIGN_OR_RETURN(WeightLoader loader,
+                          WeightLoader::Create(&impl->ckpt));
 
-  INFERX_ASSIGN_OR_RETURN(const Tensor norm, get("model.norm.weight"));
-  INFERX_ASSIGN_OR_RETURN(impl->final_norm,
-                          Upload(&impl->weight_buffers, norm));
+  INFERX_ASSIGN_OR_RETURN(impl->embed,
+                          loader.Load("model.embed_tokens.weight"));
+  INFERX_ASSIGN_OR_RETURN(impl->final_norm, loader.Load("model.norm.weight"));
 
   // Untied: gpt-oss carries a separate lm_head, which is 1.16 GB of the
   // budget on its own.
-  INFERX_ASSIGN_OR_RETURN(const Tensor head, get("lm_head.weight"));
-  INFERX_ASSIGN_OR_RETURN(impl->lm_head, Upload(&impl->weight_buffers, head));
+  INFERX_ASSIGN_OR_RETURN(impl->lm_head, loader.Load("lm_head.weight"));
 
   impl->layers.resize(static_cast<size_t>(config.num_hidden_layers));
 
@@ -731,8 +674,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
     const std::string p = absl::StrCat("model.layers.", i, ".");
 
     auto up = [&](const std::string& name, TensorView* out) -> Status {
-      INFERX_ASSIGN_OR_RETURN(const Tensor t, get(p + name));
-      INFERX_ASSIGN_OR_RETURN(*out, Upload(&impl->weight_buffers, t));
+      INFERX_ASSIGN_OR_RETURN(*out, loader.Load(p + name));
       return OkStatus();
     };
 
@@ -757,10 +699,14 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
         qkv_w_parts.push_back(std::move(wt));
         qkv_b_parts.push_back(std::move(bs));
       }
-      INFERX_ASSIGN_OR_RETURN(
-          w.qkv_w, UploadConcatenated(qkv_w_parts, &impl->weight_buffers));
-      INFERX_ASSIGN_OR_RETURN(
-          w.qkv_b, UploadConcatenated(qkv_b_parts, &impl->weight_buffers));
+      INFERX_ASSIGN_OR_RETURN(const Shape qkv_w_shape,
+                              ConcatenatedShape(qkv_w_parts));
+      INFERX_ASSIGN_OR_RETURN(w.qkv_w,
+                              loader.UploadStacked(qkv_w_parts, qkv_w_shape));
+      INFERX_ASSIGN_OR_RETURN(const Shape qkv_b_shape,
+                              ConcatenatedShape(qkv_b_parts));
+      INFERX_ASSIGN_OR_RETURN(w.qkv_b,
+                              loader.UploadStacked(qkv_b_parts, qkv_b_shape));
     }
     INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.weight", &w.o_w));
     INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.bias", &w.o_b));
@@ -791,20 +737,20 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
     // showed was 98.6% of Forward. gate_up_bias is de-interleaved on the way
     // up so the device layout matches `DequantizeMxfp4GateUpToBf16`'s split
     // output; the rest copy verbatim.
-    INFERX_ASSIGN_OR_RETURN(
-        w.gate_up_blocks_dev, Upload(&impl->weight_buffers, w.gate_up_blocks));
-    INFERX_ASSIGN_OR_RETURN(
-        w.gate_up_scales_dev, Upload(&impl->weight_buffers, w.gate_up_scales));
-    INFERX_ASSIGN_OR_RETURN(
-        w.gate_up_bias_dev,
-        UploadDeinterleaved(&impl->weight_buffers, w.gate_up_bias));
-    INFERX_ASSIGN_OR_RETURN(
-        w.down_blocks_dev, Upload(&impl->weight_buffers, w.down_blocks));
-    INFERX_ASSIGN_OR_RETURN(
-        w.down_scales_dev, Upload(&impl->weight_buffers, w.down_scales));
-    INFERX_ASSIGN_OR_RETURN(w.down_bias_dev,
-                            Upload(&impl->weight_buffers, w.down_bias));
+    INFERX_ASSIGN_OR_RETURN(w.gate_up_blocks_dev,
+                            loader.Upload(w.gate_up_blocks));
+    INFERX_ASSIGN_OR_RETURN(w.gate_up_scales_dev,
+                            loader.Upload(w.gate_up_scales));
+    INFERX_ASSIGN_OR_RETURN(w.gate_up_bias_dev,
+                            UploadDeinterleaved(&loader, w.gate_up_bias));
+    INFERX_ASSIGN_OR_RETURN(w.down_blocks_dev, loader.Upload(w.down_blocks));
+    INFERX_ASSIGN_OR_RETURN(w.down_scales_dev, loader.Upload(w.down_scales));
+    INFERX_ASSIGN_OR_RETURN(w.down_bias_dev, loader.Upload(w.down_bias));
   }
+
+  // Drain the upload pipeline and take ownership of the buffers. Views handed
+  // out above are not readable before this point.
+  INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
   // Experts are now resident on the device; the comment that used to live here
   // about "uploaded lazily below, at first use" is retired, as is the whole

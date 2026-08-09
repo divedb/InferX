@@ -92,6 +92,10 @@ class WeightLoader {
   /// \brief Uploads one tensor, shape-checked against the checkpoint.
   StatusOr<TensorView> Load(std::string_view name, const Shape& expected);
 
+  /// \brief Uploads one tensor with whatever dtype and shape the checkpoint
+  ///        records — for models whose shapes are validated downstream.
+  StatusOr<TensorView> Load(std::string_view name);
+
   /// \brief Uploads several same-shaped tensors end to end as one tensor.
   ///
   /// Every source must match `part` (and share a dtype); the result is shaped
@@ -106,6 +110,22 @@ class WeightLoader {
   StatusOr<TensorView> LoadRowPermuted(std::string_view name,
                                        const Shape& expected,
                                        absl::Span<const int64_t> row_map);
+
+  /// \brief Uploads an already-materialized host tensor.
+  ///
+  /// The escape hatch for callers that transform between lookup and upload —
+  /// TP sharding, small host-side gathers. Every verb stages its source
+  /// completely before returning (only the pinned slots are read
+  /// asynchronously), so the source may be a temporary.
+  StatusOr<TensorView> Upload(const Tensor& host);
+
+  /// \brief Uploads host tensors end to end as one `out`-shaped tensor.
+  ///
+  /// Unlike `LoadStacked`, parts need not share a shape — QKV fusion stacks
+  /// `[q_dim, h]` with two `[kv_dim, h]` — only a dtype, and `out`'s byte
+  /// size must equal the parts' sum.
+  StatusOr<TensorView> UploadStacked(absl::Span<const Tensor> parts,
+                                     const Shape& out);
 
   /// \brief Drains the pipeline. Only after this returns are all views valid.
   Status Finish();
@@ -122,6 +142,14 @@ class WeightLoader {
   /// \brief The resolved host-copy thread count.
   int threads() const;
 
+  /// \brief Device buffers created so far.
+  ///
+  /// With `device_chunk_bytes = 0` every tensor gets a dedicated buffer, so
+  /// `buffer_count() - 1` right after a verb is that tensor's index in the
+  /// `Release()`d vector — for callers that must later free individual
+  /// tensors (qwen2's FP8/INT4 conversion releases the bf16 originals).
+  size_t buffer_count() const;
+
  private:
   struct Impl;
 
@@ -129,5 +157,13 @@ class WeightLoader {
 
   std::unique_ptr<Impl> impl_;
 };
+
+/// \brief The shape of `parts` stacked along dim 0: rows sum, widths must
+///        agree (1-D parts sum plainly).
+///
+/// The companion to `UploadStacked` for QKV-style fusions, computing the
+/// declared shape from the (possibly TP-sharded) parts actually fetched
+/// rather than from the config.
+StatusOr<Shape> ConcatenatedShape(absl::Span<const Tensor> parts);
 
 }  // namespace inferx::model

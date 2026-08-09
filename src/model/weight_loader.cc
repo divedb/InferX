@@ -366,36 +366,70 @@ StatusOr<TensorView> WeightLoader::Load(std::string_view name,
                            expected);
 }
 
+StatusOr<TensorView> WeightLoader::Load(std::string_view name) {
+  INFERX_ASSIGN_OR_RETURN(const Tensor t, impl_->ckpt->Get(name));
+  const size_t total = static_cast<size_t>(t.nbytes());
+  const Extent extent{static_cast<const std::byte*>(t.data()), total};
+  return impl_->FinishLoad(absl::MakeConstSpan(&extent, 1), total, t.dtype(),
+                           t.shape());
+}
+
 StatusOr<TensorView> WeightLoader::LoadStacked(
     absl::Span<const std::string> names, const Shape& part, const Shape& out) {
   if (names.empty()) {
     return InvalidArgumentError("LoadStacked: no source tensors");
   }
 
-  std::vector<Tensor> parts;  // keeps the mmap borrows alive through Stream
+  std::vector<Tensor> parts;  // keeps the mmap borrows alive through staging
   parts.reserve(names.size());
+  for (const std::string& name : names) {
+    INFERX_ASSIGN_OR_RETURN(Tensor t, impl_->ckpt->GetChecked(name, part));
+    parts.push_back(std::move(t));
+  }
+
+  return UploadStacked(parts, out);
+}
+
+StatusOr<TensorView> WeightLoader::Upload(const Tensor& host) {
+  if (!host.defined() || !host.is_cpu()) {
+    return InvalidArgumentError("Upload: source must be a defined host tensor");
+  }
+  const size_t total = static_cast<size_t>(host.nbytes());
+  const Extent extent{static_cast<const std::byte*>(host.data()), total};
+  return impl_->FinishLoad(absl::MakeConstSpan(&extent, 1), total,
+                           host.dtype(), host.shape());
+}
+
+StatusOr<TensorView> WeightLoader::UploadStacked(absl::Span<const Tensor> parts,
+                                                 const Shape& out) {
+  if (parts.empty()) {
+    return InvalidArgumentError("UploadStacked: no source tensors");
+  }
+
   std::vector<Extent>& extents = impl_->extents;
   extents.clear();
 
   size_t total = 0;
-  for (const std::string& name : names) {
-    INFERX_ASSIGN_OR_RETURN(Tensor t, impl_->ckpt->GetChecked(name, part));
-    if (!parts.empty() && t.dtype() != parts.front().dtype()) {
-      return InvalidArgumentError("LoadStacked: ", name, " is ",
-                                  DataTypeName(t.dtype()), " but ", names[0],
-                                  " is ", DataTypeName(parts.front().dtype()));
+  for (const Tensor& t : parts) {
+    if (!t.defined() || !t.is_cpu()) {
+      return InvalidArgumentError(
+          "UploadStacked: sources must be defined host tensors");
+    }
+    if (t.dtype() != parts.front().dtype()) {
+      return InvalidArgumentError("UploadStacked: mixed dtypes ",
+                                  DataTypeName(t.dtype()), " and ",
+                                  DataTypeName(parts.front().dtype()));
     }
     extents.push_back(Extent{static_cast<const std::byte*>(t.data()),
                              static_cast<size_t>(t.nbytes())});
     total += static_cast<size_t>(t.nbytes());
-    parts.push_back(std::move(t));
   }
 
   const DataType dtype = parts.front().dtype();
   if (total != static_cast<size_t>(DataTypeByteSize(dtype, out.Numel()))) {
-    return InvalidArgumentError("LoadStacked: ", names.size(), " parts of ",
-                                part.ToString(), " do not fill ",
-                                out.ToString());
+    return InvalidArgumentError("UploadStacked: ", parts.size(),
+                                " parts totalling ", total,
+                                " bytes do not fill ", out.ToString());
   }
 
   return impl_->FinishLoad(extents, total, dtype, out);
@@ -457,6 +491,26 @@ StatusOr<std::vector<DeviceBuffer>> WeightLoader::Release() {
 const WeightLoaderStats& WeightLoader::stats() const { return impl_->stats; }
 
 int WeightLoader::threads() const { return impl_->threads; }
+
+size_t WeightLoader::buffer_count() const { return impl_->chunks.size(); }
+
+StatusOr<Shape> ConcatenatedShape(absl::Span<const Tensor> parts) {
+  if (parts.empty()) {
+    return InvalidArgumentError("ConcatenatedShape: no parts");
+  }
+
+  int64_t rows = 0;
+  const int64_t cols = parts.front().rank() == 2 ? parts.front().dim(1) : 0;
+
+  for (const Tensor& t : parts) {
+    rows += t.dim(0);
+    if (t.rank() == 2 && t.dim(1) != cols) {
+      return InvalidArgumentError("cannot concatenate: widths ", cols, " and ",
+                                  t.dim(1), " differ");
+    }
+  }
+  return parts.front().rank() == 2 ? Shape({rows, cols}) : Shape({rows});
+}
 
 WeightLoader::WeightLoader(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}

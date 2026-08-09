@@ -201,6 +201,83 @@ TEST_F(WeightLoaderTest, CpuRowPermutedGathersRows) {
   EXPECT_EQ(ReadBack(*view, 24, DeviceId::Cpu()), expected);
 }
 
+TEST_F(WeightLoaderTest, CpuUploadTakesMaterializedHostTensors) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok());
+
+  // A temporary the caller transforms itself — the TP-shard case. The loader
+  // stages before returning, so the source may die right after the call.
+  std::vector<float> scratch = Iota(8, 500.0f);
+  {
+    auto blob = Tensor::FromBlob(scratch.data(), DataType::kFloat,
+                                 Shape({2, 4}), DeviceId::Cpu());
+    ASSERT_TRUE(blob.ok());
+    auto view = loader->Upload(*blob);
+    ASSERT_TRUE(view.ok()) << view.status().ToString();
+    ASSERT_TRUE(loader->Finish().ok());
+    EXPECT_EQ(ReadBack(*view, 8, DeviceId::Cpu()), scratch);
+  }
+
+  // Heterogeneous stack: [6,4] and [2,3] parts fuse byte-wise into [30].
+  auto a = checkpoint_->Get("a");
+  auto p0 = checkpoint_->Get("p0");
+  ASSERT_TRUE(a.ok() && p0.ok());
+  const std::vector<Tensor> parts = {*a, *p0};
+  auto stacked = loader->UploadStacked(parts, Shape({30}));
+  ASSERT_TRUE(stacked.ok()) << stacked.status().ToString();
+  ASSERT_TRUE(loader->Finish().ok());
+
+  std::vector<float> expected = Iota(24, 0.0f);
+  const std::vector<float> tail = Iota(6, 100.0f);
+  expected.insert(expected.end(), tail.begin(), tail.end());
+  EXPECT_EQ(ReadBack(*stacked, 30, DeviceId::Cpu()), expected);
+}
+
+TEST_F(WeightLoaderTest, UncheckedLoadUsesTheCheckpointShape) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok());
+
+  auto view = loader->Load("a");
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view->Rank(), 2);
+  EXPECT_EQ(view->Dim(0), 6);
+  EXPECT_EQ(view->Dim(1), 4);
+}
+
+TEST_F(WeightLoaderTest, ZeroChunkBytesDedicatesOneBufferPerTensor) {
+  WeightLoader::Options opts = SmallOptions(DeviceId::Cpu());
+  opts.device_chunk_bytes = 0;
+  auto loader = WeightLoader::Create(&*checkpoint_, opts);
+  ASSERT_TRUE(loader.ok());
+
+  ASSERT_TRUE(loader->Load("a", Shape({6, 4})).ok());
+  EXPECT_EQ(loader->buffer_count(), 1u);
+  ASSERT_TRUE(loader->Load("p0", Shape({2, 3})).ok());
+  EXPECT_EQ(loader->buffer_count(), 2u);
+
+  // One buffer per tensor, in load order; sizes may round up to alignment.
+  auto buffers = loader->Release();
+  ASSERT_TRUE(buffers.ok());
+  ASSERT_EQ(buffers->size(), 2u);
+  EXPECT_GE((*buffers)[0].size(), 24 * sizeof(float));
+  EXPECT_GE((*buffers)[1].size(), 6 * sizeof(float));
+}
+
+TEST_F(WeightLoaderTest, ConcatenatedShapeSumsRows) {
+  auto a = checkpoint_->Get("a");    // [6,4]
+  auto p0 = checkpoint_->Get("p0");  // [2,3]
+  ASSERT_TRUE(a.ok() && p0.ok());
+
+  auto same = model::ConcatenatedShape({{*a, *a}});
+  ASSERT_TRUE(same.ok());
+  EXPECT_EQ(same->ToString(), Shape({12, 4}).ToString());
+
+  // Mismatched widths refuse.
+  EXPECT_FALSE(model::ConcatenatedShape({{*a, *p0}}).ok());
+}
+
 TEST_F(WeightLoaderTest, RejectsMismatchedInputs) {
   auto loader =
       WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
