@@ -40,3 +40,6 @@
 [submodule "third_party/fast_float"]
 	path = third_party/fast_float
 	url = git@github.com:fastfloat/fast_float.git
+[submodule "hpc-ops"]
+	path = third_party/hpc-ops
+	url = https://github.com/Tencent/hpc-ops
