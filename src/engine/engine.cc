@@ -456,11 +456,6 @@ struct Engine::Impl {
 
   Impl() = default;
 
-  // The two synchronous models (Step to host logits, argmax here) against the
-  // Qwen2 async runner. One predicate and two forwarding helpers rather than a
-  // third serving loop: RunSyncModel is the only consumer.
-  bool is_sync_model() const { return sync_model_runner != nullptr; }
-
   // Routes one sampled token to its request: detokenize, apply stop sequences,
   // emit whatever is now safe to send.
   void Deliver(const TokenDelta& delta) {
@@ -661,11 +656,7 @@ struct Engine::Impl {
   }
 
   void Run() {
-    if (is_sync_model()) {
-      RunSyncModel();
-    } else {
-      RunQwen2();
-    }
+    RunModel();
 
     // Requests can still be in the intake queue when shutdown wins the race
     // with the loop. Close those streams and account for them just like active
@@ -691,12 +682,12 @@ struct Engine::Impl {
     active.clear();
   }
 
-  // The Qwen2 serving loop: continuous batching over a paged KV cache, driven
-  // by the scheduler. This is M3-M10's path, unchanged by the gpt-oss work
-  // except that the model and scheduler are reached through pointers (so the
-  // gpt-oss path, which has neither, can share this struct).
-  void RunQwen2() {
+  // Continuous batching over a paged KV cache. Architecture runners differ in
+  // how a step produces samples, while admission, scheduling, commit, delivery,
+  // completion, and accounting remain shared here.
+  void RunModel() {
     ForwardBatch batch;
+    std::vector<float> logits;
     std::vector<int32_t> sampled;
     std::vector<TokenDelta> deltas;
 
@@ -778,9 +769,35 @@ struct Engine::Impl {
             std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
                         [](int32_t k) { return k >= 0; });
 
-        Status stepped = model_runner->StepAsync(batch);
+        Status stepped;
+        std::vector<scheduler::StepLogprob> step_logprobs;
+        if (model_runner != nullptr) {
+          stepped = model_runner->StepAsync(batch);
+          if (stepped.ok()) stepped = model_runner->AwaitStep(&sampled);
 
-        if (stepped.ok()) stepped = model_runner->AwaitStep(&sampled);
+          if (stepped.ok() && wants_logprobs) {
+            std::vector<SampledLogprob> raw;
+            stepped = model_runner->ReadSampledLogprobs(&raw);
+            step_logprobs.resize(raw.size());
+            for (size_t i = 0; i < raw.size(); ++i) {
+              step_logprobs[i] = {raw[i].present, raw[i].logprob,
+                                  std::move(raw[i].top)};
+            }
+          }
+        } else {
+          stepped = sync_model_runner->Step(batch, &logits);
+          if (stepped.ok()) {
+            const int64_t vocab = sync_model_runner->vocab_size();
+            sampled.clear();
+            sampled.reserve(batch.logits_indices.size());
+            step_logprobs.resize(batch.logits_indices.size());
+            for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
+              float* row = logits.data() + i * static_cast<size_t>(vocab);
+              sampled.push_back(
+                  HostSampleRow(row, vocab, batch, i, &step_logprobs[i]));
+            }
+          }
+        }
 
         // A device error is not recoverable per-request: the KV cache state is
         // now unknown, so every in-flight sequence is suspect. Failing them all
@@ -789,22 +806,6 @@ struct Engine::Impl {
           FailAll(stepped);
           stopping.store(true, std::memory_order_relaxed);
           break;
-        }
-
-        std::vector<scheduler::StepLogprob> step_logprobs;
-        if (wants_logprobs) {
-          std::vector<SampledLogprob> raw;
-          if (const Status read = model_runner->ReadSampledLogprobs(&raw);
-              !read.ok()) {
-            FailAll(read);
-            stopping.store(true, std::memory_order_relaxed);
-            break;
-          }
-          step_logprobs.resize(raw.size());
-          for (size_t i = 0; i < raw.size(); ++i) {
-            step_logprobs[i] = {raw[i].present, raw[i].logprob,
-                                std::move(raw[i].top)};
-          }
         }
 
         if (const Status committed = scheduler->CommitStep(
@@ -816,13 +817,17 @@ struct Engine::Impl {
         }
 
         for (const TokenDelta& delta : deltas) Deliver(delta);
-        metrics.RecordRankSteps(model_runner->telemetry(),
-                                batch.num_tokens() > batch.num_seqs);
+        if (model_runner != nullptr) {
+          metrics.RecordRankSteps(model_runner->telemetry(),
+                                  batch.num_tokens() > batch.num_seqs);
+        }
 
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
         stats.tokens_generated += static_cast<int64_t>(deltas.size());
-        stats.last_step_ms = model_runner->last_step_device_ms();
+        if (model_runner != nullptr) {
+          stats.last_step_ms = model_runner->last_step_device_ms();
+        }
       }
 
       for (const scheduler::Completion& completion :
@@ -840,168 +845,6 @@ struct Engine::Impl {
         stats.prefix_hit_tokens = scheduler->prefix_hit_tokens();
         stats.prefix_miss_tokens = scheduler->prefix_miss_tokens();
         stats.evicted_blocks = scheduler->evicted_blocks();
-      }
-    }
-  }
-
-  // The gpt-oss serving loop: scheduler-driven continuous batching, but with a
-  // synchronous Step + host argmax where the Qwen2 path uses StepAsync +
-  // device sampling. The shape of the loop (intake -> PrepareStep -> Step ->
-  // CommitStep -> Deliver) is deliberately the same as RunQwen2's, so the two
-  // read as one design with the sampling/async parts swapped.
-  //
-  // The win over the old batch-1 RunGptOss is real: the MXFP4 expert upload
-  // (~10 GB over PCIe per layer) is per-forward, not per-token, so a batch of N
-  // sequences pays it once rather than N times. Each token in a 4-sequence
-  // batch costs ~1/4 the bandwidth-floor latency of the single-sequence path,
-  // even before Phase 4's fused GEMM makes the upload itself resident.
-  //
-  // Decode may replay a captured CUDA graph. Sampling remains on the host:
-  // logits already come back for argmax, so device sampling is a separate
-  // optimization rather than a graph prerequisite.
-  void RunSyncModel() {
-    std::vector<float> logits;
-    std::vector<int32_t> sampled;
-    std::vector<TokenDelta> deltas;
-
-    while (!stopping.load(std::memory_order_relaxed)) {
-      {
-        std::unique_lock<std::mutex> lock(mutex);
-
-        // Same coalesce as the Qwen2 path: when the scheduler is empty, a
-        // newly-arrived burst is given a short quiet window to accumulate
-        // before the first batch is formed. Without it, batch membership
-        // depends on thread timing, which showed up as different greedy
-        // continuations for identical bursts.
-        if (!intake.empty() && !scheduler->HasWork()) {
-          size_t observed = intake.size();
-          auto quiet_until =
-              std::chrono::steady_clock::now() + kBatchCoalesceWait;
-
-          while (!stopping.load(std::memory_order_relaxed)) {
-            if (wake.wait_until(lock, quiet_until) == std::cv_status::timeout) {
-              break;
-            }
-            if (intake.size() != observed) {
-              observed = intake.size();
-              quiet_until =
-                  std::chrono::steady_clock::now() + kBatchCoalesceWait;
-            }
-          }
-        }
-
-        while (!intake.empty()) {
-          Pending pending = std::move(intake.front());
-          intake.pop_front();
-
-          const Status added = scheduler->AddRequest(
-              pending.id, std::move(pending.prompt), pending.params);
-
-          if (!added.ok()) {
-            lock.unlock();
-            pending.generation->Finish(FinishReason::kOutOfMemory, 0);
-            metrics.RecordFinish(FinishReason::kOutOfMemory, 0,
-                                 pending.submitted);
-            lock.lock();
-            continue;
-          }
-
-          Active state;
-          state.generation = pending.generation;
-          state.decoder = std::make_unique<tokenizer::IncrementalDecoder>(
-              tokenizer.get(),
-              /*skip_special=*/!pending.params.keep_special_tokens);
-          state.stop = std::move(pending.stop);
-          state.include_stop_str = pending.params.include_stop_str_in_output;
-          state.want_logprobs = pending.params.want_logprobs;
-          state.submitted = pending.submitted;
-
-          active.emplace(pending.id, std::move(state));
-        }
-
-        if (!scheduler->HasWork()) {
-          wake.wait_for(lock, kIdleWait);
-          continue;
-        }
-      }
-
-      // Disconnects, noticed once per step.
-      for (const auto& [id, state] : active) {
-        if (state.generation->cancelled()) scheduler->Cancel(id);
-      }
-
-      ForwardBatch batch;
-      if (const Status prepared = scheduler->PrepareStep(&batch);
-          !prepared.ok()) {
-        FailAll(prepared);
-        continue;
-      }
-      RecordAdmissions();
-
-      if (batch.token_ids.empty()) {
-        for (const scheduler::Completion& completion :
-             scheduler->TakeCompleted()) {
-          Retire(completion.id, completion.reason);
-        }
-        continue;
-      }
-
-      // Synchronous step: logits come back to the host, argmax runs here, and
-      // the sampled tokens go to the scheduler. The Qwen2 path's StepAsync /
-      // AwaitStep overlap does not apply -- both synchronous models
-      // stream-synchronize inside Step.
-      const Status stepped = sync_model_runner->Step(batch, &logits);
-
-      if (!stepped.ok()) {
-        FailAll(stepped);
-        stopping.store(true, std::memory_order_relaxed);
-        break;
-      }
-
-      // One sample per requested logits row, on the host: the synchronous
-      // models already ship logits back, so the full vLLM-compatible
-      // treatment (penalties, masks, temperature/top-p/top-k/min-p, seeded
-      // draw, logprobs) costs a few vocabulary-length passes per row.
-      const int64_t vocab = sync_model_runner->vocab_size();
-      sampled.clear();
-      sampled.reserve(batch.logits_indices.size());
-      std::vector<scheduler::StepLogprob> step_logprobs(
-          batch.logits_indices.size());
-      bool wants_logprobs = false;
-      for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
-        float* row = logits.data() + i * static_cast<size_t>(vocab);
-        sampled.push_back(
-            HostSampleRow(row, vocab, batch, i, &step_logprobs[i]));
-        wants_logprobs = wants_logprobs || step_logprobs[i].present;
-      }
-
-      if (const Status committed = scheduler->CommitStep(
-              sampled, &deltas, wants_logprobs ? &step_logprobs : nullptr);
-          !committed.ok()) {
-        FailAll(committed);
-        stopping.store(true, std::memory_order_relaxed);
-        break;
-      }
-
-      for (const TokenDelta& delta : deltas) Deliver(delta);
-
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        ++stats.steps;
-        stats.tokens_generated += static_cast<int64_t>(deltas.size());
-        stats.running = scheduler->num_running();
-        stats.waiting = scheduler->num_waiting();
-        stats.blocks_in_use = scheduler->blocks_in_use();
-        stats.preemptions = scheduler->preemptions();
-        stats.cached_blocks = scheduler->cached_blocks();
-        stats.prefix_hit_tokens = scheduler->prefix_hit_tokens();
-        stats.prefix_miss_tokens = scheduler->prefix_miss_tokens();
-        stats.evicted_blocks = scheduler->evicted_blocks();
-      }
-
-      for (const scheduler::Completion& completion :
-           scheduler->TakeCompleted()) {
-        Retire(completion.id, completion.reason);
       }
     }
   }
