@@ -6,6 +6,7 @@
 
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
+#include "inferx/model/parallel/linear.h"
 #include "inferx/ops/gpt_oss.h"
 #include "inferx/ops/layers.h"
 #include "inferx/ops/moe.h"
@@ -144,7 +145,26 @@ MoeFfn& MoeFfn::operator=(MoeFfn&&) noexcept = default;
 Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
                        const TensorView& out, ops::CublasLtGemm* gemm,
                        Stream stream) {
+  return ForwardImpl(x, weights, out, gemm, nullptr, stream);
+}
+
+Status MoeFfn::ForwardParallel(const TensorView& x, const MoeWeights& weights,
+                               const TensorView& out, ops::CublasLtGemm* gemm,
+                               comm::Communicator& communicator,
+                               Stream stream) {
+  return ForwardImpl(x, weights, out, gemm, &communicator, stream);
+}
+
+Status MoeFfn::ForwardImpl(const TensorView& x, const MoeWeights& weights,
+                           const TensorView& out, ops::CublasLtGemm* gemm,
+                           comm::Communicator* communicator, Stream stream) {
   if (gemm == nullptr) return InvalidArgumentError("MoeFfn: gemm is null");
+
+  if (communicator != nullptr && communicator->size() > 1 &&
+      weights.down_bias.IsDefined()) {
+    return UnimplementedError(
+        "MoeFfn: tensor-parallel down bias must be applied after reduction");
+  }
 
   if (!x.IsDefined() || x.Rank() != 2 || x.GetDataType() != kBf16) {
     return InvalidArgumentError("MoeFfn: x must be a 2-D bf16 tensor");
@@ -332,6 +352,11 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       // DeepSeek adds the shared experts unconditionally; there is no gate.
       INFERX_RETURN_IF_ERROR(ops::AddInPlace(out, sout, stream));
     }
+  }
+
+  if (communicator != nullptr) {
+    INFERX_RETURN_IF_ERROR(
+        parallel::RowParallelLinear::ReduceOutput(*communicator, out, stream));
   }
 
   return OkStatus();

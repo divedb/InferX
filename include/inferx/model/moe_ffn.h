@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 
+#include "inferx/comm/communicator.h"
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
@@ -158,6 +159,14 @@ class MoeFfn {
                  const TensorView& out, ops::CublasLtGemm* gemm,
                  Stream stream = {});
 
+  /// \brief Tensor-parallel forward over local expert-width shards.
+  ///
+  /// Routing remains replicated. Routed and shared-expert partial outputs are
+  /// combined locally, then reduced exactly once inside this layer.
+  Status ForwardParallel(const TensorView& x, const MoeWeights& weights,
+                         const TensorView& out, ops::CublasLtGemm* gemm,
+                         comm::Communicator& communicator, Stream stream = {});
+
   /// \brief The per-expert row counts of the last `Forward`, for tests and
   ///        for the load-imbalance metric a scheduler would want.
   ///
@@ -165,6 +174,10 @@ class MoeFfn {
   StatusOr<std::vector<int32_t>> LastExpertCounts() const;
 
  private:
+  Status ForwardImpl(const TensorView& x, const MoeWeights& weights,
+                     const TensorView& out, ops::CublasLtGemm* gemm,
+                     comm::Communicator* communicator, Stream stream);
+
   struct Impl;
   explicit MoeFfn(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
