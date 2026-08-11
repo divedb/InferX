@@ -14,6 +14,8 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
+#include "inferx/model/parallel/tp_dims.h"
+#include "inferx/model/parallel/tp_layout.h"
 #include "inferx/model/weight_loader.h"
 #include "inferx/ops/gemm.h"
 #include "inferx/ops/layers.h"
@@ -82,6 +84,7 @@ struct Scratch {
 
 struct Qwen2Model::Impl {
   ModelConfig config;
+  parallel::TpDims tp_dims;
   std::unique_ptr<comm::Communicator> comm;
   DeviceRuntime* runtime = nullptr;
 
@@ -111,17 +114,11 @@ struct Qwen2Model::Impl {
                 std::unique_ptr<comm::Communicator> communicator)
       : comm(std::move(communicator)), gemm(std::move(g)) {}
 
-  int64_t LocalHeads() const {
-    return config.num_attention_heads / comm->size();
-  }
-  int64_t LocalKvHeads() const {
-    return config.num_key_value_heads / comm->size();
-  }
-  int64_t LocalQDim() const { return LocalHeads() * config.head_dim; }
-  int64_t LocalKvDim() const { return LocalKvHeads() * config.head_dim; }
-  int64_t LocalIntermediate() const {
-    return config.intermediate_size / comm->size();
-  }
+  int64_t LocalHeads() const { return tp_dims.local_heads; }
+  int64_t LocalKvHeads() const { return tp_dims.local_kv_heads; }
+  int64_t LocalQDim() const { return tp_dims.local_q_dim; }
+  int64_t LocalKvDim() const { return tp_dims.local_kv_dim; }
+  int64_t LocalIntermediate() const { return tp_dims.local_intermediate; }
 
   // M3: the paged cache and the per-step index buffers that address it.
   std::unique_ptr<KvBlockPool> pool;
@@ -1277,14 +1274,9 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size)
     return InvalidArgumentError(
         "Qwen2Model: invalid TP topology rank=", tp_rank, " size=", tp_size);
-  if (config.num_attention_heads % tp_size != 0 ||
-      config.num_key_value_heads % tp_size != 0 ||
-      config.intermediate_size % tp_size != 0) {
-    return InvalidArgumentError(
-        "Qwen2Model: TP size ", tp_size, " must divide attention heads ",
-        config.num_attention_heads, ", KV heads ", config.num_key_value_heads,
-        " and intermediate size ", config.intermediate_size);
-  }
+  const parallel::TpLayout tp_layout = parallel::Qwen2TpLayout(config);
+  INFERX_ASSIGN_OR_RETURN(const parallel::TpDims tp_dims,
+                          parallel::TpDims::For(config, tp_layout, tp_size));
 
   if (config.weight_dtype != DataType::kBFloat16) {
     return UnimplementedError(
@@ -1306,6 +1298,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
 
   auto impl = std::make_unique<Impl>(std::move(gemm), std::move(communicator));
   impl->config = config;
+  impl->tp_dims = tp_dims;
   impl->runtime = runtime;
 
   // A dedicated stream, non-blocking. Two reasons, and the first is not
