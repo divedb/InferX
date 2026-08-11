@@ -711,34 +711,50 @@ StatusOr<GptOssModel> GptOssModel::Load(
     INFERX_RETURN_IF_ERROR(up("post_attention_layernorm.weight", &w.post_norm));
 
     // Q/K/V are loaded as one fused weight + bias (one GEMM at run time rather
-    // than three). The host tensors are fetched, concatenated, and uploaded
-    // once; the separate per-projection weights are never uploaded, which
-    // matters now that resident experts make device memory tight -- keeping
-    // both would roughly double the attention weight footprint and push
-    // cuBLASLt off its workspace, which measured as a 10x slowdown everywhere.
+    // than three). LoadStacked streams only this rank's rows while preserving
+    // the Q|K|V order expected by SplitQkvWithBias. The separate projections
+    // are never uploaded, which matters now that resident experts make device
+    // memory tight.
     {
-      std::vector<Tensor> qkv_w_parts;
-      std::vector<Tensor> qkv_b_parts;
-      for (const std::string_view name :
-           {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}) {
-        INFERX_ASSIGN_OR_RETURN(Tensor wt,
-                                get(absl::StrCat(p, name, ".weight")));
-        INFERX_ASSIGN_OR_RETURN(Tensor bs, get(absl::StrCat(p, name, ".bias")));
-        qkv_w_parts.push_back(std::move(wt));
-        qkv_b_parts.push_back(std::move(bs));
+      std::vector<std::string> weight_names;
+      std::vector<std::string> bias_names;
+      std::vector<Shape> weight_shapes;
+      std::vector<Shape> bias_shapes;
+      for (const auto& [name, rows] : {std::pair<std::string_view, int64_t>{
+                                           "self_attn.q_proj", config.q_dim()},
+                                       {"self_attn.k_proj", config.kv_dim()},
+                                       {"self_attn.v_proj", config.kv_dim()}}) {
+        weight_names.push_back(absl::StrCat(p, name, ".weight"));
+        bias_names.push_back(absl::StrCat(p, name, ".bias"));
+        weight_shapes.emplace_back(Shape({rows, h}));
+        bias_shapes.emplace_back(Shape({rows}));
       }
-      INFERX_ASSIGN_OR_RETURN(const Shape qkv_w_shape,
-                              ConcatenatedShape(qkv_w_parts));
-      INFERX_ASSIGN_OR_RETURN(w.qkv_w,
-                              loader.UploadStacked(qkv_w_parts, qkv_w_shape));
-      INFERX_ASSIGN_OR_RETURN(const Shape qkv_b_shape,
-                              ConcatenatedShape(qkv_b_parts));
-      INFERX_ASSIGN_OR_RETURN(w.qkv_b,
-                              loader.UploadStacked(qkv_b_parts, qkv_b_shape));
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_w,
+          loader.LoadStacked(weight_names, weight_shapes,
+                             Shape({config.q_dim() + 2 * config.kv_dim(), h}),
+                             tp_layout.SpecFor(weight_names.front()), tp_rank,
+                             tp_size));
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_b,
+          loader.LoadStacked(bias_names, bias_shapes,
+                             Shape({config.q_dim() + 2 * config.kv_dim()}),
+                             tp_layout.SpecFor(bias_names.front()), tp_rank,
+                             tp_size));
     }
-    INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.weight", &w.o_w));
+    {
+      const std::string name = absl::StrCat(p, "self_attn.o_proj.weight");
+      INFERX_ASSIGN_OR_RETURN(
+          w.o_w, loader.Load(name, Shape({h, config.q_dim()}),
+                             tp_layout.SpecFor(name), tp_rank, tp_size));
+    }
     INFERX_RETURN_IF_ERROR(up("self_attn.o_proj.bias", &w.o_b));
-    INFERX_RETURN_IF_ERROR(up("self_attn.sinks", &w.sinks));
+    {
+      const std::string name = absl::StrCat(p, "self_attn.sinks");
+      INFERX_ASSIGN_OR_RETURN(
+          w.sinks, loader.Load(name, Shape({heads}), tp_layout.SpecFor(name),
+                               tp_rank, tp_size));
+    }
 
     INFERX_RETURN_IF_ERROR(up("mlp.router.weight", &w.router_w));
     INFERX_RETURN_IF_ERROR(up("mlp.router.bias", &w.router_b));
