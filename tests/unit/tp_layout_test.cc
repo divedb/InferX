@@ -63,5 +63,16 @@ TEST(TpDimsTest, DerivesEveryQwen2LocalDimensionOnce) {
   EXPECT_EQ(dims->local_intermediate, 32);
 }
 
+TEST(ShardSpecTest, ResolvesNestedExpertAxes) {
+  EXPECT_EQ(*ResolveShardAxis({Partition::kRows, 1}, 2), 0);
+  EXPECT_EQ(*ResolveShardAxis({Partition::kCols, 1}, 2), 1);
+  EXPECT_EQ(*ResolveShardAxis({Partition::kRows, 1, 1}, 3), 1);
+  EXPECT_EQ(*ResolveShardAxis({Partition::kCols, 1, 2}, 3), 2);
+
+  const auto invalid = ResolveShardAxis({Partition::kRows, 1, 3}, 3);
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 }  // namespace
 }  // namespace inferx::model::parallel

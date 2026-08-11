@@ -45,23 +45,6 @@ struct Segment {
 // Below this, splitting a copy across threads costs more than it saves.
 constexpr size_t kStripeBytes = size_t{1} << 20;
 
-StatusOr<int> ShardAxis(parallel::Partition partition, int rank) {
-  switch (partition) {
-    case parallel::Partition::kReplicated:
-      return -1;
-    case parallel::Partition::kRows:
-    case parallel::Partition::kVocab:
-      if (rank < 1)
-        return InvalidArgumentError("cannot row-shard a scalar tensor");
-      return 0;
-    case parallel::Partition::kCols:
-      if (rank != 2)
-        return InvalidArgumentError("column sharding requires a 2-D tensor");
-      return 1;
-  }
-  return InvalidArgumentError("unknown tensor partition");
-}
-
 // Persistent workers for the host side of staging. The page faults a cold
 // load spends most of its time in are taken inside these memcpys, so N
 // threads fault N streams of the file in parallel — the actual win; the copy
@@ -389,16 +372,25 @@ StatusOr<TensorView> WeightLoader::Load(std::string_view name,
                               " cannot be sharded before unpacking");
   }
   INFERX_ASSIGN_OR_RETURN(const int axis,
-                          ShardAxis(shard.partition, tensor.rank()));
+                          parallel::ResolveShardAxis(shard, tensor.rank()));
   const int64_t global_axis = expected.Dim(axis);
-  if (global_axis % tp_size != 0) {
+  if (shard.segments <= 0 || global_axis % shard.segments != 0) {
+    return InvalidArgumentError("Load: dimension ", global_axis, " of ", name,
+                                " cannot split into ", shard.segments,
+                                " shard segments");
+  }
+  const int64_t segment_axis = global_axis / shard.segments;
+  if (segment_axis % tp_size != 0) {
     return InvalidArgumentError("Load: dimension ", global_axis, " on axis ",
                                 axis, " of ", name,
-                                " is not divisible by TP size ", tp_size);
+                                " has segments that are not divisible by TP "
+                                "size ",
+                                tp_size);
   }
-  const int64_t local_axis = global_axis / tp_size;
-  if (local_axis % shard.unit != 0) {
-    return InvalidArgumentError("Load: local dimension ", local_axis, " of ",
+  const int64_t local_segment = segment_axis / tp_size;
+  const int64_t local_axis = local_segment * shard.segments;
+  if (local_segment % shard.unit != 0) {
+    return InvalidArgumentError("Load: local segment ", local_segment, " of ",
                                 name, " is not aligned to shard unit ",
                                 shard.unit);
   }
@@ -409,7 +401,9 @@ StatusOr<TensorView> WeightLoader::Load(std::string_view name,
   const int64_t outer = expected.Numel() / (global_axis * inner);
   const size_t element_bytes = DataTypeBitWidth(tensor.dtype()) / 8;
   const size_t extent_bytes =
-      static_cast<size_t>(local_axis * inner) * element_bytes;
+      static_cast<size_t>(local_segment * inner) * element_bytes;
+  const size_t segment_stride =
+      static_cast<size_t>(segment_axis * inner) * element_bytes;
   const size_t source_stride =
       static_cast<size_t>(global_axis * inner) * element_bytes;
   const size_t rank_offset = static_cast<size_t>(tp_rank) * extent_bytes;
@@ -417,11 +411,14 @@ StatusOr<TensorView> WeightLoader::Load(std::string_view name,
 
   std::vector<Extent>& extents = impl_->extents;
   extents.clear();
-  extents.reserve(static_cast<size_t>(outer));
+  extents.reserve(static_cast<size_t>(outer * shard.segments));
   for (int64_t i = 0; i < outer; ++i) {
-    extents.push_back(
-        Extent{source + static_cast<size_t>(i) * source_stride + rank_offset,
-               extent_bytes});
+    for (int segment = 0; segment < shard.segments; ++segment) {
+      extents.push_back(Extent{
+          source + static_cast<size_t>(i) * source_stride +
+              static_cast<size_t>(segment) * segment_stride + rank_offset,
+          extent_bytes});
+    }
   }
   const size_t total = static_cast<size_t>(
       DataTypeByteSize(tensor.dtype(), local_shape.Numel()));
@@ -485,7 +482,7 @@ StatusOr<TensorView> WeightLoader::LoadStacked(
   extents.clear();
   Shape local_out = global_out;
   INFERX_ASSIGN_OR_RETURN(const int out_axis,
-                          ShardAxis(shard.partition, global_out.Rank()));
+                          parallel::ResolveShardAxis(shard, global_out.Rank()));
   if (global_out.Dim(out_axis) % tp_size != 0) {
     return InvalidArgumentError("LoadStacked: output dimension ",
                                 global_out.Dim(out_axis), " on axis ", out_axis,
@@ -510,16 +507,24 @@ StatusOr<TensorView> WeightLoader::LoadStacked(
                                 " cannot be sharded before unpacking");
     }
     INFERX_ASSIGN_OR_RETURN(const int axis,
-                            ShardAxis(shard.partition, tensor.rank()));
+                            parallel::ResolveShardAxis(shard, tensor.rank()));
     const int64_t global_axis = tensor.dim(axis);
-    if (global_axis % tp_size != 0) {
+    if (shard.segments <= 0 || global_axis % shard.segments != 0) {
+      return InvalidArgumentError(
+          "LoadStacked: dimension ", global_axis, " of ", names[part_index],
+          " cannot split into ", shard.segments, " shard segments");
+    }
+    const int64_t segment_axis = global_axis / shard.segments;
+    if (segment_axis % tp_size != 0) {
       return InvalidArgumentError("LoadStacked: dimension ", global_axis,
                                   " on axis ", axis, " of ", names[part_index],
-                                  " is not divisible by TP size ", tp_size);
+                                  " has segments that are not divisible by TP "
+                                  "size ",
+                                  tp_size);
     }
-    const int64_t local_axis = global_axis / tp_size;
-    if (local_axis % shard.unit != 0) {
-      return InvalidArgumentError("LoadStacked: local dimension ", local_axis,
+    const int64_t local_segment = segment_axis / tp_size;
+    if (local_segment % shard.unit != 0) {
+      return InvalidArgumentError("LoadStacked: local segment ", local_segment,
                                   " of ", names[part_index],
                                   " is not aligned to shard unit ", shard.unit);
     }
@@ -527,16 +532,21 @@ StatusOr<TensorView> WeightLoader::LoadStacked(
     const int64_t outer = tensor.numel() / (global_axis * inner);
     const size_t element_bytes = DataTypeBitWidth(dtype) / 8;
     const size_t extent_bytes =
-        static_cast<size_t>(local_axis * inner) * element_bytes;
+        static_cast<size_t>(local_segment * inner) * element_bytes;
+    const size_t segment_stride =
+        static_cast<size_t>(segment_axis * inner) * element_bytes;
     const size_t source_stride =
         static_cast<size_t>(global_axis * inner) * element_bytes;
     const size_t rank_offset = static_cast<size_t>(tp_rank) * extent_bytes;
     const auto* source = static_cast<const std::byte*>(tensor.data());
     for (int64_t i = 0; i < outer; ++i) {
-      extents.push_back(
-          Extent{source + static_cast<size_t>(i) * source_stride + rank_offset,
-                 extent_bytes});
-      total += extent_bytes;
+      for (int segment = 0; segment < shard.segments; ++segment) {
+        extents.push_back(Extent{
+            source + static_cast<size_t>(i) * source_stride +
+                static_cast<size_t>(segment) * segment_stride + rank_offset,
+            extent_bytes});
+        total += extent_bytes;
+      }
     }
     parts.push_back(std::move(tensor));
   }

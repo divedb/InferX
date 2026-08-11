@@ -111,6 +111,7 @@ class WeightLoaderTest : public ::testing::Test {
   void SetUp() override {
     ckpt_.Add("a", {6, 4}, Iota(24, 0.0f));
     ckpt_.Add("b", {2, 4}, Iota(8, 100.0f));
+    ckpt_.Add("expert", {2, 4, 6}, Iota(48, 0.0f));
     ckpt_.Add("p0", {2, 3}, Iota(6, 100.0f));
     ckpt_.Add("p1", {2, 3}, Iota(6, 200.0f));
     ckpt_.Add("p2", {2, 3}, Iota(6, 300.0f));
@@ -188,6 +189,48 @@ TEST_F(WeightLoaderTest, CpuShardedLoadStreamsRowsAndColumns) {
   EXPECT_EQ(cols->Dim(1), 2);
   EXPECT_EQ(ReadBack(*cols, 12, DeviceId::Cpu()),
             (std::vector<float>{0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21}));
+}
+
+TEST_F(WeightLoaderTest, CpuShardedLoadUsesExplicitNestedAxis) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok());
+
+  auto view = loader->Load(
+      "expert", Shape({2, 4, 6}),
+      model::parallel::ShardSpec{model::parallel::Partition::kRows, 1, 1}, 1,
+      2);
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view->Dim(0), 2);
+  EXPECT_EQ(view->Dim(1), 2);
+  EXPECT_EQ(view->Dim(2), 6);
+
+  std::vector<float> expected = Iota(12, 12.0f);
+  const std::vector<float> second_expert = Iota(12, 36.0f);
+  expected.insert(expected.end(), second_expert.begin(), second_expert.end());
+  EXPECT_EQ(ReadBack(*view, 24, DeviceId::Cpu()), expected);
+}
+
+TEST_F(WeightLoaderTest, CpuShardedLoadSplitsFusedSegmentsIndependently) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok());
+
+  auto view = loader->Load(
+      "expert", Shape({2, 4, 6}),
+      model::parallel::ShardSpec{model::parallel::Partition::kRows, 1, 1, 2}, 1,
+      2);
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view->Dim(0), 2);
+  EXPECT_EQ(view->Dim(1), 2);
+  EXPECT_EQ(view->Dim(2), 6);
+
+  std::vector<float> expected = Iota(6, 6.0f);
+  for (const float start : {18.0f, 30.0f, 42.0f}) {
+    const std::vector<float> part = Iota(6, start);
+    expected.insert(expected.end(), part.begin(), part.end());
+  }
+  EXPECT_EQ(ReadBack(*view, 24, DeviceId::Cpu()), expected);
 }
 
 TEST_F(WeightLoaderTest, CpuStackedConcatenatesInNameOrder) {

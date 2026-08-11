@@ -330,6 +330,11 @@ struct ShardSpec {
   // projections, quant-block granularity for MXFP4/INT4 weights, and
   // interleaving units for fused gate_up layouts.
   int64_t unit = 1;
+  // -1 infers the ordinary matrix axis. Nested expert tensors override this
+  // with 1 (rows) or 2 (columns).
+  int axis = -1;
+  // Fused gate/up uses 2 so both halves shard independently.
+  int segments = 1;
 };
 ```
 

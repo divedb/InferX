@@ -11,6 +11,7 @@
 add_library(inferx_model
   config.cc
   forward_batch.cc
+  partition.cc
   safetensors.cc
   tp_dims.cc
   tp_layout.cc
