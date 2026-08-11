@@ -1178,6 +1178,8 @@ int64_t GptOssModel::captured_graphs() const {
   return static_cast<int64_t>(impl_->graphs.size());
 }
 
+Status GptOssModel::AbortCommunicator() { return impl_->comm->Abort(); }
+
 Status GptOssModel::Step(const ForwardBatch& batch,
                          std::vector<float>* out_logits) {
   if (impl_->pool == nullptr) {

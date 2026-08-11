@@ -76,6 +76,64 @@ class Qwen2RankModel final : public RankModel {
   bool fp8_kv_cache_ = false;
 };
 
+class GptOssRankModel final : public RankModel {
+ public:
+  GptOssRankModel(model::GptOssModel model, HostSampler sampler, int rank)
+      : model_(std::move(model)), sampler_(std::move(sampler)), rank_(rank) {}
+
+  Status PrepareWeights() override { return OkStatus(); }
+  int64_t KvBlockBytes(int64_t block_size) const override {
+    return model_.KvBlockBytes(block_size);
+  }
+  Status AttachKvCache(int64_t blocks, int64_t block_size) override {
+    return model_.AttachKvCache(blocks, block_size);
+  }
+  Status EnableSampling(int64_t) override { return OkStatus(); }
+  KvBlockPool* kv_pool() override { return model_.kv_pool(); }
+  Status ReserveActivations(int64_t max_tokens) override {
+    return model_.ReserveActivations(max_tokens);
+  }
+  Status StepAsync(const model::ForwardBatch& batch) override {
+    batch_ = batch;
+    sampled_.clear();
+    logprobs_.clear();
+    return model_.Step(batch, &logits_);
+  }
+  Status AwaitStep(std::vector<int32_t>* sampled) override {
+    sampled->clear();
+    if (rank_ != 0) return OkStatus();
+
+    const int64_t vocab = model_.config().vocab_size;
+    sampled_.reserve(batch_.logits_indices.size());
+    logprobs_.resize(batch_.logits_indices.size());
+    for (size_t i = 0; i < batch_.logits_indices.size(); ++i) {
+      float* row = logits_.data() + i * static_cast<size_t>(vocab);
+      sampled_.push_back(sampler_(row, vocab, batch_, i, &logprobs_[i]));
+    }
+    *sampled = sampled_;
+    return OkStatus();
+  }
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* logprobs) override {
+    *logprobs = logprobs_;
+    return OkStatus();
+  }
+  Status CaptureDecodeGraph(int64_t num_seqs,
+                            int64_t max_blocks_per_seq) override {
+    return model_.CaptureDecodeGraph(num_seqs, max_blocks_per_seq);
+  }
+  Status AbortCommunication() override { return model_.AbortCommunicator(); }
+  float last_step_device_ms() const override { return 0.0f; }
+
+ private:
+  model::GptOssModel model_;
+  HostSampler sampler_;
+  int rank_ = 0;
+  model::ForwardBatch batch_;
+  std::vector<float> logits_;
+  std::vector<int32_t> sampled_;
+  std::vector<SampledLogprob> logprobs_;
+};
+
 template <typename Model>
 Status AttachSizedKvCache(Model* model, const EngineConfig& config,
                           DeviceId device) {
@@ -103,11 +161,38 @@ StatusOr<std::unique_ptr<ModelRunner>> BuildDeepseekV2Runner(
 }
 
 StatusOr<std::unique_ptr<ModelRunner>> BuildGptOssRunner(
-    const EngineConfig& config, DeviceId device, HostSampler sampler) {
-  INFERX_ASSIGN_OR_RETURN(model::GptOssModel model,
-                          model::GptOssModel::Load(config.model_dir, device));
-  INFERX_RETURN_IF_ERROR(AttachSizedKvCache(&model, config, device));
-  return MakeSyncModelRunner(std::move(model), std::move(sampler));
+    const EngineConfig& config, HostSampler sampler) {
+  TensorParallelRunnerConfig runner_config;
+  runner_config.device_kind = config.device_kind;
+  runner_config.devices = config.devices;
+  runner_config.use_nccl = config.comm_backend == "nccl";
+  runner_config.collective_timing_sample_every =
+      config.collective_timing_sample_every;
+  runner_config.kv_blocks = config.kv_blocks;
+  runner_config.kv_cache_memory_bytes = config.kv_cache_memory_bytes;
+  runner_config.gpu_memory_utilization = config.gpu_memory_utilization;
+  runner_config.block_size = config.block_size;
+  runner_config.max_seq_len = config.scheduler.max_seq_len;
+  runner_config.max_sampling_rows = config.scheduler.max_running;
+  runner_config.supports_graph_capture = config.tensor_parallel_size == 1;
+  runner_config.requires_graph_warmup = false;
+
+  const std::string model_dir = config.model_dir;
+  RankModelFactory factory =
+      [model_dir, sampler = std::move(sampler)](
+          ParallelContext context) -> StatusOr<std::unique_ptr<RankModel>> {
+    const int rank = context.tp_rank();
+    INFERX_ASSIGN_OR_RETURN(
+        model::GptOssModel model,
+        model::GptOssModel::Load(model_dir, context.TakeTpCommunicator()));
+    return std::unique_ptr<RankModel>(
+        std::make_unique<GptOssRankModel>(std::move(model), sampler, rank));
+  };
+
+  INFERX_ASSIGN_OR_RETURN(
+      std::unique_ptr<TensorParallelRunner> runner,
+      TensorParallelRunner::Create(runner_config, std::move(factory)));
+  return std::unique_ptr<ModelRunner>(std::move(runner));
 }
 
 StatusOr<std::unique_ptr<ModelRunner>> BuildQwenFamilyRunner(
@@ -163,7 +248,7 @@ StatusOr<std::unique_ptr<ModelRunner>> BuildModelRunner(
       return BuildDeepseekV2Runner(config, primary_device,
                                    std::move(host_sampler));
     case model::Architecture::kGptOss:
-      return BuildGptOssRunner(config, primary_device, std::move(host_sampler));
+      return BuildGptOssRunner(config, std::move(host_sampler));
     case model::Architecture::kQwen2:
     case model::Architecture::kQwen2Moe:
     case model::Architecture::kLlama:

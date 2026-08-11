@@ -133,6 +133,9 @@ class GptOssModel {
 
   int64_t captured_graphs() const;
 
+  /// \brief Aborts an in-flight tensor-parallel collective.
+  Status AbortCommunicator();
+
  private:
   struct Impl;
   explicit GptOssModel(std::unique_ptr<Impl> impl);
