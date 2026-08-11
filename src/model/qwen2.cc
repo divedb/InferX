@@ -1402,12 +1402,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     }
 
     {
+      const std::string name = absl::StrCat(p, "self_attn.o_proj.weight");
       INFERX_ASSIGN_OR_RETURN(
-          Tensor host,
-          ckpt.GetChecked(absl::StrCat(p, "self_attn.o_proj.weight"),
-                          Shape({h, config.q_dim()})));
-      INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
-      INFERX_ASSIGN_OR_RETURN(w.o_w, loader.Upload(local));
+          w.o_w, loader.Load(name, Shape({h, config.q_dim()}),
+                             tp_layout.SpecFor(name), tp_rank, tp_size));
     }
     w.o_buf = static_cast<int>(loader.buffer_count()) - 1;
 
@@ -1428,11 +1426,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     }
 
     {
+      const std::string name = absl::StrCat(p, "mlp.down_proj.weight");
       INFERX_ASSIGN_OR_RETURN(
-          Tensor host, ckpt.GetChecked(absl::StrCat(p, "mlp.down_proj.weight"),
-                                       Shape({h, inter})));
-      INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
-      INFERX_ASSIGN_OR_RETURN(w.down_w, loader.Upload(local));
+          w.down_w, loader.Load(name, Shape({h, inter}),
+                                tp_layout.SpecFor(name), tp_rank, tp_size));
     }
     w.down_buf = static_cast<int>(loader.buffer_count()) - 1;
 

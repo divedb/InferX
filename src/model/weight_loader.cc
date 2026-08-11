@@ -45,6 +45,23 @@ struct Segment {
 // Below this, splitting a copy across threads costs more than it saves.
 constexpr size_t kStripeBytes = size_t{1} << 20;
 
+StatusOr<int> ShardAxis(parallel::Partition partition, int rank) {
+  switch (partition) {
+    case parallel::Partition::kReplicated:
+      return -1;
+    case parallel::Partition::kRows:
+    case parallel::Partition::kVocab:
+      if (rank < 1)
+        return InvalidArgumentError("cannot row-shard a scalar tensor");
+      return 0;
+    case parallel::Partition::kCols:
+      if (rank != 2)
+        return InvalidArgumentError("column sharding requires a 2-D tensor");
+      return 1;
+  }
+  return InvalidArgumentError("unknown tensor partition");
+}
+
 // Persistent workers for the host side of staging. The page faults a cold
 // load spends most of its time in are taken inside these memcpys, so N
 // threads fault N streams of the file in parallel — the actual win; the copy
@@ -347,6 +364,68 @@ StatusOr<TensorView> WeightLoader::Load(std::string_view name,
   const Extent extent{static_cast<const std::byte*>(t.data()), total};
   return impl_->FinishLoad(absl::MakeConstSpan(&extent, 1), total, t.dtype(),
                            expected);
+}
+
+StatusOr<TensorView> WeightLoader::Load(std::string_view name,
+                                        const Shape& expected,
+                                        const parallel::ShardSpec& shard,
+                                        int tp_rank, int tp_size) {
+  if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size) {
+    return InvalidArgumentError("Load: invalid TP topology rank=", tp_rank,
+                                " size=", tp_size);
+  }
+  if (shard.partition == parallel::Partition::kReplicated || tp_size == 1) {
+    return Load(name, expected);
+  }
+  if (shard.unit <= 0) {
+    return InvalidArgumentError("Load: shard unit must be positive for ", name);
+  }
+
+  INFERX_ASSIGN_OR_RETURN(const Tensor tensor,
+                          impl_->ckpt->GetChecked(name, expected));
+  if (DataTypeBitWidth(tensor.dtype()) % 8 != 0) {
+    return UnimplementedError("Load: packed dtype ",
+                              DataTypeName(tensor.dtype()),
+                              " cannot be sharded before unpacking");
+  }
+  INFERX_ASSIGN_OR_RETURN(const int axis,
+                          ShardAxis(shard.partition, tensor.rank()));
+  const int64_t global_axis = expected.Dim(axis);
+  if (global_axis % tp_size != 0) {
+    return InvalidArgumentError("Load: dimension ", global_axis, " on axis ",
+                                axis, " of ", name,
+                                " is not divisible by TP size ", tp_size);
+  }
+  const int64_t local_axis = global_axis / tp_size;
+  if (local_axis % shard.unit != 0) {
+    return InvalidArgumentError("Load: local dimension ", local_axis, " of ",
+                                name, " is not aligned to shard unit ",
+                                shard.unit);
+  }
+
+  Shape local_shape = expected;
+  local_shape.SetDim(axis, local_axis);
+  const int64_t inner = expected.InnerNumel(axis) / global_axis;
+  const int64_t outer = expected.Numel() / (global_axis * inner);
+  const size_t element_bytes = DataTypeBitWidth(tensor.dtype()) / 8;
+  const size_t extent_bytes =
+      static_cast<size_t>(local_axis * inner) * element_bytes;
+  const size_t source_stride =
+      static_cast<size_t>(global_axis * inner) * element_bytes;
+  const size_t rank_offset = static_cast<size_t>(tp_rank) * extent_bytes;
+  const auto* source = static_cast<const std::byte*>(tensor.data());
+
+  std::vector<Extent>& extents = impl_->extents;
+  extents.clear();
+  extents.reserve(static_cast<size_t>(outer));
+  for (int64_t i = 0; i < outer; ++i) {
+    extents.push_back(
+        Extent{source + static_cast<size_t>(i) * source_stride + rank_offset,
+               extent_bytes});
+  }
+  const size_t total = static_cast<size_t>(
+      DataTypeByteSize(tensor.dtype(), local_shape.Numel()));
+  return impl_->FinishLoad(extents, total, tensor.dtype(), local_shape);
 }
 
 StatusOr<TensorView> WeightLoader::Load(std::string_view name) {

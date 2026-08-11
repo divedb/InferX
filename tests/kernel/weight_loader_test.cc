@@ -8,6 +8,10 @@
 /// staging slots small enough that every path (slot split, stripe split,
 /// dedicated chunk) is exercised on tensors of a few megabytes.
 
+#include "inferx/model/weight_loader.h"
+
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -18,14 +22,11 @@
 #include <string>
 #include <vector>
 
-#include <cuda_runtime.h>
-#include <gtest/gtest.h>
-
 #include "absl/strings/str_cat.h"
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/shape.h"
+#include "inferx/model/parallel/partition.h"
 #include "inferx/model/safetensors.h"
-#include "inferx/model/weight_loader.h"
 
 namespace inferx {
 namespace {
@@ -140,8 +141,8 @@ std::vector<float> ReadBack(const TensorView& view, int64_t numel,
                             DeviceId device) {
   std::vector<float> out(static_cast<size_t>(numel));
   if (device.IsCuda()) {
-    EXPECT_EQ(cudaMemcpy(out.data(), view.Data(),
-                         out.size() * sizeof(float), cudaMemcpyDeviceToHost),
+    EXPECT_EQ(cudaMemcpy(out.data(), view.Data(), out.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost),
               cudaSuccess);
   } else {
     std::memcpy(out.data(), view.Data(), out.size() * sizeof(float));
@@ -161,6 +162,31 @@ TEST_F(WeightLoaderTest, CpuLoadRoundTripsTheBytes) {
   EXPECT_EQ(ReadBack(*view, 24, DeviceId::Cpu()), Iota(24, 0.0f));
   EXPECT_EQ(loader->stats().tensors, 1u);
   EXPECT_EQ(loader->stats().bytes, 24 * sizeof(float));
+}
+
+TEST_F(WeightLoaderTest, CpuShardedLoadStreamsRowsAndColumns) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok()) << loader.status().ToString();
+
+  auto rows = loader->Load(
+      "a", Shape({6, 4}),
+      model::parallel::ShardSpec{model::parallel::Partition::kRows, 1}, 1, 2);
+  ASSERT_TRUE(rows.ok()) << rows.status().ToString();
+  EXPECT_EQ(rows->Rank(), 2);
+  EXPECT_EQ(rows->Dim(0), 3);
+  EXPECT_EQ(rows->Dim(1), 4);
+  EXPECT_EQ(ReadBack(*rows, 12, DeviceId::Cpu()), Iota(12, 12.0f));
+
+  auto cols = loader->Load(
+      "a", Shape({6, 4}),
+      model::parallel::ShardSpec{model::parallel::Partition::kCols, 1}, 0, 2);
+  ASSERT_TRUE(cols.ok()) << cols.status().ToString();
+  EXPECT_EQ(cols->Rank(), 2);
+  EXPECT_EQ(cols->Dim(0), 6);
+  EXPECT_EQ(cols->Dim(1), 2);
+  EXPECT_EQ(ReadBack(*cols, 12, DeviceId::Cpu()),
+            (std::vector<float>{0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21}));
 }
 
 TEST_F(WeightLoaderTest, CpuStackedConcatenatesInNameOrder) {
@@ -288,15 +314,13 @@ TEST_F(WeightLoaderTest, RejectsMismatchedInputs) {
   // Absent tensor.
   EXPECT_FALSE(loader->Load("nope", Shape({6, 4})).ok());
   // row_map must cover every row exactly.
-  EXPECT_FALSE(
-      loader->LoadRowPermuted("a", Shape({6, 4}), {{0, 1, 2}}).ok());
+  EXPECT_FALSE(loader->LoadRowPermuted("a", Shape({6, 4}), {{0, 1, 2}}).ok());
   // ...with in-range sources.
   EXPECT_FALSE(
       loader->LoadRowPermuted("a", Shape({6, 4}), {{0, 1, 2, 3, 4, 9}}).ok());
   // The declared out shape must match the parts exactly.
   const std::vector<std::string> names = {"p0", "p1"};
-  EXPECT_FALSE(
-      loader->LoadStacked(names, Shape({2, 3}), Shape({5, 3})).ok());
+  EXPECT_FALSE(loader->LoadStacked(names, Shape({2, 3}), Shape({5, 3})).ok());
 }
 
 TEST_F(WeightLoaderTest, CudaMatchesTheHostGathers) {

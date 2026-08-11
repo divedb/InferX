@@ -12,6 +12,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
+#include "inferx/model/parallel/partition.h"
 #include "inferx/model/safetensors.h"
 
 namespace inferx::model {
@@ -85,6 +86,12 @@ class WeightLoader {
 
   /// \brief Uploads one tensor, shape-checked against the checkpoint.
   StatusOr<TensorView> Load(std::string_view name, const Shape& expected);
+
+  /// \brief Loads one rank's declared tensor-parallel shard directly from
+  ///        the checkpoint mapping. `expected` is the global shape.
+  StatusOr<TensorView> Load(std::string_view name, const Shape& expected,
+                            const parallel::ShardSpec& shard, int tp_rank,
+                            int tp_size);
 
   /// \brief Uploads one tensor with whatever dtype and shape the checkpoint
   ///        records — for models whose shapes are validated downstream.
