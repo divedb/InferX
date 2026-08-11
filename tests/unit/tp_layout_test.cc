@@ -21,6 +21,15 @@ ModelConfig Qwen2Config() {
   return config;
 }
 
+ModelConfig GptOssConfig() {
+  ModelConfig config;
+  config.num_attention_heads = 64;
+  config.num_key_value_heads = 8;
+  config.head_dim = 64;
+  config.moe_intermediate_size = 2880;
+  return config;
+}
+
 TEST(TpLayoutTest, DescribesQwen2CheckpointSharding) {
   const TpLayout layout = Qwen2TpLayout(Qwen2Config());
 
@@ -72,6 +81,47 @@ TEST(ShardSpecTest, ResolvesNestedExpertAxes) {
   const auto invalid = ResolveShardAxis({Partition::kRows, 1, 3}, 3);
   ASSERT_FALSE(invalid.ok());
   EXPECT_EQ(invalid.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(TpLayoutTest, DescribesGptOssAttentionAndPackedExperts) {
+  const ModelConfig config = GptOssConfig();
+  const TpLayout layout = GptOssTpLayout(config);
+
+  EXPECT_EQ(layout.SpecFor("model.layers.2.self_attn.q_proj.weight"),
+            (ShardSpec{Partition::kRows, 64}));
+  EXPECT_EQ(layout.SpecFor("model.layers.2.self_attn.o_proj.weight"),
+            (ShardSpec{Partition::kCols, 64}));
+  EXPECT_EQ(layout.SpecFor("model.layers.2.self_attn.o_proj.bias"),
+            (ShardSpec{Partition::kReplicated, 1}));
+  EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.gate_up_proj_blocks"),
+            (ShardSpec{Partition::kRows, 1, 1, 2}));
+  EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.down_proj_blocks"),
+            (ShardSpec{Partition::kCols, 16, 2}));
+  EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.down_proj_bias"),
+            (ShardSpec{Partition::kReplicated, 1}));
+  EXPECT_EQ(layout.kv_sharding(), KvSharding::kHeads);
+}
+
+TEST(TpLayoutTest, ValidatesGptOssMxfp4ShardAlignment) {
+  ModelConfig config = GptOssConfig();
+  const TpLayout layout = GptOssTpLayout(config);
+  EXPECT_TRUE(layout.Validate(config, 2).ok());
+
+  config.moe_intermediate_size = 2864;
+  const Status invalid = layout.Validate(config, 2);
+  EXPECT_EQ(invalid.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(std::string(invalid.message()),
+              HasSubstr("MoE intermediate size"));
+  EXPECT_THAT(std::string(invalid.message()), HasSubstr("unit 32"));
+}
+
+TEST(TpDimsTest, DerivesGptOssLocalExpertWidth) {
+  const ModelConfig config = GptOssConfig();
+  const auto dims = TpDims::For(config, GptOssTpLayout(config), 2);
+  ASSERT_TRUE(dims.ok()) << dims.status();
+  EXPECT_EQ(dims->local_heads, 32);
+  EXPECT_EQ(dims->local_kv_heads, 4);
+  EXPECT_EQ(dims->local_moe_intermediate, 1440);
 }
 
 }  // namespace

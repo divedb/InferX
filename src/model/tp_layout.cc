@@ -110,4 +110,33 @@ TpLayout Qwen2TpLayout(const ModelConfig& config) {
        CollectivePoint::kAfterFfnOutput});
 }
 
+TpLayout GptOssTpLayout(const ModelConfig& config) {
+  const ShardSpec attention_rows{Partition::kRows, config.head_dim};
+  const ShardSpec attention_cols{Partition::kCols, config.head_dim};
+  const ShardSpec expert_gate_up{Partition::kRows, 1, 1, 2};
+  // MXFP4 stores two weights per byte and one scale per 32 weights. Requiring
+  // 16 packed bytes per local down shard keeps both representations aligned.
+  const ShardSpec expert_down_blocks{Partition::kCols, 16, 2};
+  const ShardSpec expert_down_scales{Partition::kCols, 1, 2};
+  return TpLayout({{"self_attn.q_proj.weight", attention_rows},
+                   {"self_attn.k_proj.weight", attention_rows},
+                   {"self_attn.v_proj.weight", attention_rows},
+                   {"self_attn.q_proj.bias", attention_rows},
+                   {"self_attn.k_proj.bias", attention_rows},
+                   {"self_attn.v_proj.bias", attention_rows},
+                   {"self_attn.o_proj.weight", attention_cols},
+                   {"self_attn.sinks", {Partition::kRows, 1}},
+                   {"mlp.experts.gate_up_proj_blocks", expert_gate_up},
+                   {"mlp.experts.gate_up_proj_scales", expert_gate_up},
+                   {"mlp.experts.gate_up_proj_bias", expert_gate_up},
+                   {"mlp.experts.down_proj_blocks", expert_down_blocks},
+                   {"mlp.experts.down_proj_scales", expert_down_scales}},
+                  {{TpDimension::kAttentionHeads, 1},
+                   {TpDimension::kKvHeads, 1},
+                   {TpDimension::kMoeIntermediate, 32}},
+                  KvSharding::kHeads,
+                  {CollectivePoint::kAfterAttentionOutput,
+                   CollectivePoint::kAfterFfnOutput});
+}
+
 }  // namespace inferx::model::parallel

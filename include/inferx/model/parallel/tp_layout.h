@@ -64,4 +64,8 @@ class TpLayout {
 // loader and forward pass.
 TpLayout Qwen2TpLayout(const ModelConfig& config);
 
+// GPT-OSS attention and expert-weight strategy. Packed MXFP4 expert tensors
+// use explicit nested axes; fused gate/up tensors shard both halves together.
+TpLayout GptOssTpLayout(const ModelConfig& config);
+
 }  // namespace inferx::model::parallel
