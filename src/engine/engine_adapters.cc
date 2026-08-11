@@ -40,6 +40,13 @@ class EngineGeneration final : public scheduler_client::InProcessGeneration {
     event.terminal = engine_event.done;
     event.finish_reason = ConvertFinishReason(engine_event.reason);
     event.generated_tokens = static_cast<uint32_t>(engine_event.generated);
+    event.token = engine_event.token;
+    if (engine_event.has_logprob) {
+      event.has_logprob = true;
+      event.logprobs.token_id = engine_event.token;
+      event.logprobs.logprob = engine_event.logprob;
+      event.logprobs.top = std::move(engine_event.top_logprobs);
+    }
     co_return std::optional<scheduler_client::InProcessGenerationEvent>(
         std::move(event));
   }
@@ -62,6 +69,21 @@ EngineSchedulerBackend::Submit(
   scheduler::SamplingParams sampling;
   sampling.temperature = request.sampling.temperature;
   sampling.top_p = request.sampling.top_p;
+  sampling.top_k = request.sampling.top_k;
+  sampling.min_p = request.sampling.min_p;
+  sampling.presence_penalty = request.sampling.presence_penalty;
+  sampling.frequency_penalty = request.sampling.frequency_penalty;
+  sampling.repetition_penalty = request.sampling.repetition_penalty == 0
+                                    ? 1.0f
+                                    : request.sampling.repetition_penalty;
+  sampling.stop_tokens = request.sampling.stop_token_ids;
+  sampling.ignore_eos = request.sampling.ignore_eos;
+  sampling.min_tokens = request.sampling.min_tokens;
+  sampling.keep_special_tokens = !request.sampling.skip_special_tokens;
+  sampling.include_stop_str_in_output =
+      request.sampling.include_stop_str_in_output;
+  sampling.want_logprobs = request.sampling.want_logprobs;
+  sampling.top_logprobs = request.sampling.top_logprobs;
   sampling.seed = request.sampling.seed;
   auto submitted =
       engine_->Submit(request.prompt_tokens, request.sampling.max_tokens,

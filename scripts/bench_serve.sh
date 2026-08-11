@@ -20,7 +20,7 @@ ROOT=$(pwd)
 
 MODEL_DIR="${MODEL_DIR:-$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1}"
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-3B-Instruct}"
-SERVE=${SERVE:-$ROOT/build-cuda/src/server/inferx-serve}
+SERVE=${SERVE:-$ROOT/build-cuda/src/main/inferx-serve}
 BENCH=$ROOT/bench/serve_bench.py
 
 # Matched settings. Both engines get the same concurrency cap and the same
@@ -71,7 +71,7 @@ trap 'stop_server' EXIT INT TERM
 start_inferx() {  # $1: extra inferx-serve flags
   setsid "$SERVE" --model "$MODEL_DIR" --port 8000 \
     --served-model-name "$MODEL_NAME" \
-    --max-running "$MAX_SEQS" --max-seq-len "$MAX_SEQ_LEN" \
+    --max-num-seqs "$MAX_SEQS" --max-model-len "$MAX_SEQ_LEN" \
     $1 $INFERX_SERVER_ARGS > "$OUT_DIR/inferx_server.log" 2>&1 &
   SERVER_PID=$!
 }
@@ -103,15 +103,15 @@ echo | tee -a "$LOG"
 for engine in "${ENGINES[@]}"; do
   case "$engine" in
     inferx-bf16) start_inferx "" ;;
-    inferx-tp1)  start_inferx "--tensor-parallel-size 1 --devices 0 --comm-backend single" ;;
-    inferx-tp2)  start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl" ;;
-    inferx-tp2-scraped) start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl" ;;
-    inferx-tp2-sampled) start_inferx "--tensor-parallel-size 2 --devices 0,1 --comm-backend nccl --collective-timing-sample-rate ${COLLECTIVE_SAMPLE_RATE:-128}" ;;
+    inferx-tp1)  start_inferx "--tensor-parallel-size 1 --device-ids 0 --comm-backend single" ;;
+    inferx-tp2)  start_inferx "--tensor-parallel-size 2 --device-ids 0,1 --comm-backend nccl" ;;
+    inferx-tp2-scraped) start_inferx "--tensor-parallel-size 2 --device-ids 0,1 --comm-backend nccl" ;;
+    inferx-tp2-sampled) start_inferx "--tensor-parallel-size 2 --device-ids 0,1 --comm-backend nccl --collective-timing-sample-rate ${COLLECTIVE_SAMPLE_RATE:-128}" ;;
     # Weights-only fp8 exists as its own row to attribute a difference to the
-    # weights or to the KV cache; --fp8-kv also forces the prefill dequant
-    # workaround (§14, M8), so the two are not one knob.
-    inferx-fp8w) start_inferx "--fp8" ;;
-    inferx-fp8)  start_inferx "--fp8 --fp8-kv" ;;
+    # weights or to the KV cache; --kv-cache-dtype fp8 also forces the prefill
+    # dequant workaround (§14, M8), so the two are not one knob.
+    inferx-fp8w) start_inferx "--quantization fp8" ;;
+    inferx-fp8)  start_inferx "--quantization fp8 --kv-cache-dtype fp8" ;;
     vllm)        start_vllm ;;
     *) echo "unknown engine: $engine" >&2; exit 2 ;;
   esac

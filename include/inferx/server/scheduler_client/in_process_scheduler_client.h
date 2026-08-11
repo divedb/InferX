@@ -14,6 +14,11 @@ struct InProcessGenerationEvent {
   bool terminal = false;
   FinishReason finish_reason = FinishReason::kNone;
   uint32_t generated_tokens = 0;
+  /// The step's sampled token (-1 on the terminal event) and, when the
+  /// request asked, its logprobs.
+  int32_t token = -1;
+  bool has_logprob = false;
+  TokenLogprobs logprobs;
 };
 class InProcessGeneration {
  public:

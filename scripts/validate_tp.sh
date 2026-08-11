@@ -61,7 +61,7 @@ echo "run_serving=$RUN_SERVING"
 run_recorded uname -a || true
 
 section "CUDA and NCCL software"
-run_recorded "$BUILD_DIR/src/server/inferx-serve" --help || true
+run_recorded "$BUILD_DIR/src/main/inferx-serve" --help || true
 if command -v nvcc >/dev/null 2>&1; then run_recorded nvcc --version || true; fi
 if command -v ldconfig >/dev/null 2>&1; then
   run_recorded /bin/bash -c "ldconfig -p 2>/dev/null | grep -E 'libnccl|libcuda'" || true

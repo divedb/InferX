@@ -5,12 +5,14 @@
 # Logs to /tmp/vllm_server.log. Intended to be run detached, which the benchmark
 # driver does; run it by hand to inspect startup.
 #
-# The flags mirror inferx-serve's so the two engines answer the same question:
-# bf16 weights, a bf16 KV cache, chunked prefill and prefix caching on in both,
-# and the same concurrency cap. vLLM sizes its KV cache from a memory fraction
-# rather than a block count; 0.85 leaves it far more KV than inferx's 4096
-# blocks, a handicap we accept rather than tune away -- neither engine's cache
-# is the binding constraint at these lengths.
+# The flags are the same as inferx-serve's (inferx-serve follows vLLM's flag
+# names) so the two engines answer the same question: bf16 weights, a bf16 KV
+# cache, chunked prefill and prefix caching on in both, and the same
+# concurrency cap. Both engines now size their KV cache from a memory fraction
+# (--gpu-memory-utilization; inferx-serve defaults to 0.92, this launcher's
+# 0.85 for vLLM) -- neither engine's cache is the binding constraint at these
+# lengths. Pin inferx's cache with --num-gpu-blocks-override if a fixed block
+# count is wanted.
 #
 # VLLM_WSL2_ENABLE_PIN_MEMORY: vLLM disables pinned host memory under WSL2, and
 # its 0.26 model runner allocates UVA buffers that require it -- without this

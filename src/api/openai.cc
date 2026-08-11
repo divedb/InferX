@@ -11,10 +11,97 @@ namespace {
 // OpenAI caps these; we cap them too so that a typo cannot ask the engine for
 // four billion tokens and have the scheduler discover it later.
 constexpr int32_t kMaxTokensLimit = 32768;
+// OpenAI's cap on per-position logprob alternatives, and vLLM's
+// --max-logprobs default.
+constexpr int32_t kMaxLogprobs = 20;
+// Parser-level sanity bound; the handler further bounds n by the server's
+// sequence cap, which the parser cannot see.
+constexpr int32_t kMaxChoices = 64;
+
+/// Request fields whose feature InferX does not implement. Present and
+/// non-null means a clear 400 naming the feature -- the vLLM-compat contract
+/// is that nothing is silently ignored. Unknown fields stay ignored, which is
+/// OpenAI's own tolerance for forward compatibility.
+Status RejectUnsupportedFields(const JsonValue& root) {
+  static constexpr struct {
+    std::string_view field;
+    std::string_view feature;
+  } kRejected[] = {
+      {"logit_bias", "logit biasing"},
+      {"bad_words", "bad-words filtering"},
+      {"allowed_token_ids", "token allow-lists"},
+      {"prompt_logprobs", "prompt logprobs"},
+      {"logprob_token_ids", "explicit logprob token ids"},
+      {"truncate_prompt_tokens", "prompt truncation"},
+      {"structured_outputs", "structured outputs"},
+      {"guided_json", "structured outputs"},
+      {"guided_regex", "structured outputs"},
+      {"guided_choice", "structured outputs"},
+      {"guided_grammar", "structured outputs"},
+      {"prompt_embeds", "prompt embeddings"},
+  };
+  for (const auto& rejected : kRejected) {
+    if (const JsonValue* value = root.Find(rejected.field);
+        value != nullptr && !value->IsNull()) {
+      return InvalidArgumentError(rejected.field,
+                                  " is not supported by InferX (",
+                                  rejected.feature, ")");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(const bool use_beam_search,
+                          root.OptionalBool("use_beam_search", false));
+  if (use_beam_search) {
+    return InvalidArgumentError(
+        "use_beam_search is not supported by InferX (beam search)");
+  }
+
+  // `{"type": "text"}` asks for what happens anyway; anything else is a
+  // structured-output request.
+  if (const JsonValue* format = root.Find("response_format");
+      format != nullptr && !format->IsNull()) {
+    if (!format->IsObject()) {
+      return InvalidArgumentError("response_format must be an object, got ",
+                                  format->KindName());
+    }
+    INFERX_ASSIGN_OR_RETURN(const std::string_view type,
+                            format->RequiredString("type"));
+    if (type != "text") {
+      return InvalidArgumentError("response_format type \"", type,
+                                  "\" is not supported by InferX "
+                                  "(structured outputs)");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(
+      const bool spaces,
+      root.OptionalBool("spaces_between_special_tokens", true));
+  if (!spaces) {
+    return InvalidArgumentError(
+        "spaces_between_special_tokens=false is not supported by InferX");
+  }
+
+  return OkStatus();
+}
 
 Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
-  INFERX_ASSIGN_OR_RETURN(const int64_t max_tokens,
+  INFERX_RETURN_IF_ERROR(RejectUnsupportedFields(root));
+
+  INFERX_ASSIGN_OR_RETURN(int64_t max_tokens,
                           root.OptionalInt("max_tokens", out->max_tokens));
+
+  // OpenAI renamed chat's max_tokens to max_completion_tokens; both are
+  // accepted, and disagreement is a client bug worth naming rather than a
+  // precedence puzzle.
+  if (const JsonValue* renamed = root.Find("max_completion_tokens");
+      renamed != nullptr && !renamed->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t value, renamed->AsInt());
+    if (root.Find("max_tokens") != nullptr && value != max_tokens) {
+      return InvalidArgumentError(
+          "max_tokens and max_completion_tokens disagree; send one of them");
+    }
+    max_tokens = value;
+  }
 
   if (max_tokens <= 0 || max_tokens > kMaxTokensLimit) {
     return InvalidArgumentError("max_tokens must be between 1 and ",
@@ -68,12 +155,39 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
 
   INFERX_ASSIGN_OR_RETURN(const int64_t top_k,
                           root.OptionalInt("top_k", out->top_k));
-  if (top_k < 0 || top_k > std::numeric_limits<int32_t>::max()) {
+  // vLLM historically used -1 for "disabled"; treat it as 0.
+  if (top_k < -1 || top_k > std::numeric_limits<int32_t>::max()) {
     return InvalidArgumentError("top_k must be a non-negative 32-bit integer");
   }
-  out->top_k = static_cast<int32_t>(top_k);
-  if (out->top_k != 0) {
-    return UnimplementedError("top_k is not supported by the current sampler");
+  out->top_k = top_k < 0 ? 0 : static_cast<int32_t>(top_k);
+
+  if (const JsonValue* min_p = root.Find("min_p");
+      min_p != nullptr && !min_p->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, min_p->AsDouble());
+    if (value < 0.0 || value > 1.0) {
+      return InvalidArgumentError("min_p must be in [0, 1], got ", value);
+    }
+    out->min_p = static_cast<float>(value);
+  }
+
+  if (const JsonValue* penalty = root.Find("presence_penalty");
+      penalty != nullptr && !penalty->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, penalty->AsDouble());
+    if (value < -2.0 || value > 2.0) {
+      return InvalidArgumentError("presence_penalty must be in [-2, 2], got ",
+                                  value);
+    }
+    out->presence_penalty = static_cast<float>(value);
+  }
+
+  if (const JsonValue* penalty = root.Find("frequency_penalty");
+      penalty != nullptr && !penalty->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const double value, penalty->AsDouble());
+    if (value < -2.0 || value > 2.0) {
+      return InvalidArgumentError("frequency_penalty must be in [-2, 2], got ",
+                                  value);
+    }
+    out->frequency_penalty = static_cast<float>(value);
   }
 
   if (const JsonValue* penalty = root.Find("repetition_penalty");
@@ -84,15 +198,24 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
           "repetition_penalty must be in (0, 2], got ", value);
     }
     out->repetition_penalty = static_cast<float>(value);
-    if (out->repetition_penalty != 1.0f) {
-      return UnimplementedError(
-          "repetition_penalty is not supported by the current sampler");
-    }
   }
 
   INFERX_ASSIGN_OR_RETURN(const int64_t n, root.OptionalInt("n", out->n));
-  if (n != 1) {
-    return UnimplementedError("n must be 1; multiple sequences are unsupported");
+  if (n < 1 || n > kMaxChoices) {
+    return InvalidArgumentError("n must be between 1 and ", kMaxChoices,
+                                ", got ", n);
+  }
+  out->n = static_cast<int32_t>(n);
+
+  // Old clients: best_of was removed from vLLM but still arrives; it is only
+  // meaningful when it differs from n, which InferX does not implement.
+  if (const JsonValue* best_of = root.Find("best_of");
+      best_of != nullptr && !best_of->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t value, best_of->AsInt());
+    if (value != n) {
+      return InvalidArgumentError(
+          "best_of differing from n is not supported by InferX");
+    }
   }
 
   if (const JsonValue* seed = root.Find("seed");
@@ -128,6 +251,70 @@ Status ParseSampling(const JsonValue& root, SamplingRequest* out) {
     }
   }
 
+  if (const JsonValue* ids = root.Find("stop_token_ids");
+      ids != nullptr && !ids->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const auto* list, ids->AsArray());
+    for (const JsonValue& entry : *list) {
+      INFERX_ASSIGN_OR_RETURN(const int64_t value, entry.AsInt());
+      if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+        return InvalidArgumentError(
+            "stop_token_ids entries must be non-negative 32-bit integers");
+      }
+      out->stop_token_ids.push_back(static_cast<int32_t>(value));
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(out->ignore_eos,
+                          root.OptionalBool("ignore_eos", false));
+
+  INFERX_ASSIGN_OR_RETURN(const int64_t min_tokens,
+                          root.OptionalInt("min_tokens", 0));
+  if (min_tokens < 0 || min_tokens > max_tokens) {
+    return InvalidArgumentError("min_tokens must be in [0, max_tokens], got ",
+                                min_tokens);
+  }
+  out->min_tokens = static_cast<int32_t>(min_tokens);
+
+  INFERX_ASSIGN_OR_RETURN(out->skip_special_tokens,
+                          root.OptionalBool("skip_special_tokens", true));
+  INFERX_ASSIGN_OR_RETURN(
+      out->include_stop_str_in_output,
+      root.OptionalBool("include_stop_str_in_output", false));
+
+  return OkStatus();
+}
+
+/// Chat spelling: `logprobs` is a bool, `top_logprobs` the count. OpenAI
+/// requires `logprobs: true` before `top_logprobs` means anything.
+Status ParseChatLogprobs(const JsonValue& root, SamplingRequest* out) {
+  INFERX_ASSIGN_OR_RETURN(out->want_logprobs,
+                          root.OptionalBool("logprobs", false));
+  INFERX_ASSIGN_OR_RETURN(const int64_t top,
+                          root.OptionalInt("top_logprobs", 0));
+  if (top < 0 || top > kMaxLogprobs) {
+    return InvalidArgumentError("top_logprobs must be in [0, ", kMaxLogprobs,
+                                "], got ", top);
+  }
+  if (top > 0 && !out->want_logprobs) {
+    return InvalidArgumentError(
+        "top_logprobs requires \"logprobs\": true");
+  }
+  out->top_logprobs = static_cast<int32_t>(top);
+  return OkStatus();
+}
+
+/// Completions spelling: `logprobs` is an integer count (or null).
+Status ParseCompletionLogprobs(const JsonValue& root, SamplingRequest* out) {
+  if (const JsonValue* logprobs = root.Find("logprobs");
+      logprobs != nullptr && !logprobs->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t value, logprobs->AsInt());
+    if (value < 0 || value > kMaxLogprobs) {
+      return InvalidArgumentError("logprobs must be in [0, ", kMaxLogprobs,
+                                  "], got ", value);
+    }
+    out->want_logprobs = true;
+    out->top_logprobs = static_cast<int32_t>(value);
+  }
   return OkStatus();
 }
 
@@ -136,6 +323,97 @@ void AppendField(std::string_view key, std::string_view value,
   AppendJsonString(key, out);
   out->push_back(':');
   AppendJsonString(value, out);
+}
+
+/// The raw UTF-8 bytes of a token string, as a JSON array of numbers. OpenAI
+/// reports these alongside the string because a token need not be a whole
+/// character: the string half of such a token is lossy, the bytes are not.
+void AppendBytesArray(std::string_view token, std::string* out) {
+  out->push_back('[');
+  for (size_t index = 0; index < token.size(); ++index) {
+    if (index != 0) out->push_back(',');
+    *out += std::to_string(static_cast<unsigned char>(token[index]));
+  }
+  out->push_back(']');
+}
+
+/// Chat shape: `{"content":[{"token","logprob","bytes","top_logprobs"}]}`.
+/// Emits the full `"logprobs":<value>` member, null when there is no report,
+/// so callers keep the pre-logprobs bytes unchanged.
+void AppendChatLogprobs(const ChoiceLogprobs* logprobs, std::string* out) {
+  *out += "\"logprobs\":";
+  if (logprobs == nullptr) {
+    *out += "null";
+    return;
+  }
+  *out += "{\"content\":[";
+  for (size_t index = 0; index < logprobs->tokens.size(); ++index) {
+    const TokenLogprob& token = logprobs->tokens[index];
+    if (index != 0) out->push_back(',');
+    *out += "{\"token\":";
+    AppendJsonString(token.token, out);
+    *out += ",\"logprob\":";
+    *out += std::to_string(token.logprob);
+    *out += ",\"bytes\":";
+    AppendBytesArray(token.token, out);
+    *out += ",\"top_logprobs\":[";
+    for (size_t rank = 0; rank < token.top.size(); ++rank) {
+      if (rank != 0) out->push_back(',');
+      *out += "{\"token\":";
+      AppendJsonString(token.top[rank].first, out);
+      *out += ",\"logprob\":";
+      *out += std::to_string(token.top[rank].second);
+      *out += ",\"bytes\":";
+      AppendBytesArray(token.top[rank].first, out);
+      out->push_back('}');
+    }
+    *out += "]}";
+  }
+  *out += "]}";
+}
+
+/// Completions shape: four parallel arrays. `text_offset` counts bytes from
+/// the start of the choice's text, so an echoed prompt shifts every entry by
+/// the prompt's length -- the offsets locate tokens in what the client
+/// actually received.
+void AppendCompletionLogprobs(const ChoiceLogprobs* logprobs,
+                              size_t text_offset, std::string* out) {
+  *out += "\"logprobs\":";
+  if (logprobs == nullptr) {
+    *out += "null";
+    return;
+  }
+  *out += "{\"tokens\":[";
+  for (size_t index = 0; index < logprobs->tokens.size(); ++index) {
+    if (index != 0) out->push_back(',');
+    AppendJsonString(logprobs->tokens[index].token, out);
+  }
+  *out += "],\"token_logprobs\":[";
+  for (size_t index = 0; index < logprobs->tokens.size(); ++index) {
+    if (index != 0) out->push_back(',');
+    *out += std::to_string(logprobs->tokens[index].logprob);
+  }
+  *out += "],\"top_logprobs\":[";
+  for (size_t index = 0; index < logprobs->tokens.size(); ++index) {
+    const TokenLogprob& token = logprobs->tokens[index];
+    if (index != 0) out->push_back(',');
+    out->push_back('{');
+    for (size_t rank = 0; rank < token.top.size(); ++rank) {
+      if (rank != 0) out->push_back(',');
+      AppendJsonString(token.top[rank].first, out);
+      out->push_back(':');
+      *out += std::to_string(token.top[rank].second);
+    }
+    out->push_back('}');
+  }
+  *out += "],\"text_offset\":[";
+  size_t offset = text_offset;
+  for (size_t index = 0; index < logprobs->tokens.size(); ++index) {
+    if (index != 0) out->push_back(',');
+    *out += std::to_string(offset);
+    offset += logprobs->tokens[index].token.size();
+  }
+  *out += "]}";
 }
 
 }  // namespace
@@ -193,7 +471,38 @@ StatusOr<ChatCompletionRequest> ParseChatCompletionRequest(
     request.messages.push_back(std::move(message));
   }
 
+  // Tool calling has server-side plumbing InferX lacks; a request that sends
+  // tools expects tool_calls back and must hear "no" rather than get prose.
+  if (const JsonValue* tools = root.Find("tools");
+      tools != nullptr && !tools->IsNull()) {
+    INFERX_ASSIGN_OR_RETURN(const auto* list, tools->AsArray());
+    if (!list->empty()) {
+      return InvalidArgumentError(
+          "tools are not supported by InferX (tool calling)");
+    }
+  }
+  if (const JsonValue* choice = root.Find("tool_choice");
+      choice != nullptr && !choice->IsNull()) {
+    if (choice->kind() != JsonValue::Kind::kString) {
+      return InvalidArgumentError(
+          "tool_choice is not supported by InferX (tool calling)");
+    }
+    INFERX_ASSIGN_OR_RETURN(const std::string_view value, choice->AsString());
+    if (value != "none") {
+      return InvalidArgumentError(
+          "tool_choice \"", value,
+          "\" is not supported by InferX (tool calling)");
+    }
+  }
+
+  INFERX_ASSIGN_OR_RETURN(const bool echo, root.OptionalBool("echo", false));
+  if (echo) {
+    return InvalidArgumentError(
+        "echo is not supported on chat completions; use /v1/completions");
+  }
+
   INFERX_RETURN_IF_ERROR(ParseSampling(root, &request.sampling));
+  INFERX_RETURN_IF_ERROR(ParseChatLogprobs(root, &request.sampling));
 
   return request;
 }
@@ -231,7 +540,16 @@ StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body) {
   INFERX_ASSIGN_OR_RETURN(const std::string_view text, prompt->AsString());
   request.prompt = std::string(text);
 
+  if (const JsonValue* suffix = root.Find("suffix");
+      suffix != nullptr && !suffix->IsNull()) {
+    return InvalidArgumentError(
+        "suffix is not supported by InferX (fill-in-the-middle)");
+  }
+
   INFERX_RETURN_IF_ERROR(ParseSampling(root, &request.sampling));
+  INFERX_RETURN_IF_ERROR(ParseCompletionLogprobs(root, &request.sampling));
+  INFERX_ASSIGN_OR_RETURN(request.sampling.echo,
+                          root.OptionalBool("echo", false));
 
   return request;
 }
@@ -253,6 +571,65 @@ StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body) {
   INFERX_ASSIGN_OR_RETURN(
       request.add_special_tokens,
       root.OptionalBool("add_special_tokens", false));
+  return request;
+}
+
+StatusOr<VllmTokenizeRequest> ParseVllmTokenizeRequest(std::string_view body) {
+  INFERX_ASSIGN_OR_RETURN(const JsonValue root, ParseJson(body));
+  if (!root.IsObject()) {
+    return InvalidArgumentError("request body must be a JSON object, got ",
+                                root.KindName());
+  }
+  VllmTokenizeRequest request;
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
+  // vLLM's /tokenize also accepts a chat `messages` form, which requires a
+  // chat template; rejecting it loudly beats tokenizing the wrong thing.
+  if (const JsonValue* messages = root.Find("messages");
+      messages != nullptr && !messages->IsNull()) {
+    return InvalidArgumentError(
+        "chat tokenization via /tokenize is not supported by InferX; "
+        "use \"prompt\"");
+  }
+  INFERX_ASSIGN_OR_RETURN(const std::string_view prompt,
+                          root.RequiredString("prompt"));
+  request.prompt = std::string(prompt);
+  INFERX_ASSIGN_OR_RETURN(
+      request.add_special_tokens,
+      root.OptionalBool("add_special_tokens", true));
+  return request;
+}
+
+StatusOr<DetokenizeRequest> ParseDetokenizeRequest(std::string_view body) {
+  INFERX_ASSIGN_OR_RETURN(const JsonValue root, ParseJson(body));
+  if (!root.IsObject()) {
+    return InvalidArgumentError("request body must be a JSON object, got ",
+                                root.KindName());
+  }
+  DetokenizeRequest request;
+  INFERX_ASSIGN_OR_RETURN(const std::string_view model,
+                          root.RequiredString("model"));
+  if (model.empty()) return InvalidArgumentError("\"model\" is empty");
+  request.model = std::string(model);
+  const JsonValue* tokens = root.Find("tokens");
+  if (tokens == nullptr) {
+    return InvalidArgumentError("missing required field \"tokens\"");
+  }
+  if (!tokens->IsArray()) {
+    return InvalidArgumentError("\"tokens\" must be an array of integers");
+  }
+  INFERX_ASSIGN_OR_RETURN(const auto* values, tokens->AsArray());
+  request.tokens.reserve(values->size());
+  for (const JsonValue& value : *values) {
+    INFERX_ASSIGN_OR_RETURN(const int64_t id, value.AsInt());
+    if (id < std::numeric_limits<int32_t>::min() ||
+        id > std::numeric_limits<int32_t>::max()) {
+      return InvalidArgumentError("\"tokens\" entries must be 32-bit integers");
+    }
+    request.tokens.push_back(static_cast<int32_t>(id));
+  }
   return request;
 }
 
@@ -305,7 +682,7 @@ StatusOr<EmbeddingsRequest> ParseEmbeddingsRequest(std::string_view body) {
 }
 
 std::string ChatCompletionJson(std::string_view id, std::string_view model,
-                               std::string_view content, FinishReason reason,
+                               const std::vector<ChatChoice>& choices,
                                const Usage& usage, int64_t created,
                                bool sampled) {
   std::string out = "{";
@@ -317,12 +694,20 @@ std::string ChatCompletionJson(std::string_view id, std::string_view model,
   AppendField("model", model, &out);
   out += ",\"system_fingerprint\":";
   AppendJsonString(sampled ? "sampled" : "greedy", &out);
-  out += ",\"choices\":[{\"index\":0,"
-         "\"message\":{\"role\":\"assistant\",\"content\":";
-  AppendJsonString(content, &out);
-  out += "},\"logprobs\":null,\"finish_reason\":";
-  AppendJsonString(FinishReasonName(reason), &out);
-  out += "}],\"usage\":{\"prompt_tokens\":";
+  out += ",\"choices\":[";
+  for (size_t index = 0; index < choices.size(); ++index) {
+    if (index != 0) out.push_back(',');
+    out += "{\"index\":";
+    out += std::to_string(index);
+    out += ",\"message\":{\"role\":\"assistant\",\"content\":";
+    AppendJsonString(choices[index].content, &out);
+    out += "},";
+    AppendChatLogprobs(choices[index].logprobs, &out);
+    out += ",\"finish_reason\":";
+    AppendJsonString(FinishReasonName(choices[index].finish_reason), &out);
+    out.push_back('}');
+  }
+  out += "],\"usage\":{\"prompt_tokens\":";
   out += std::to_string(usage.prompt_tokens);
   out += ",\"completion_tokens\":";
   out += std::to_string(usage.completion_tokens);
@@ -337,7 +722,8 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
                                     std::string_view role,
                                     std::string_view content,
                                     const FinishReason* reason,
-                                    int64_t created, bool sampled) {
+                                    int64_t created, bool sampled,
+                                    const ChoiceLogprobs* logprobs) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -364,7 +750,9 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
     AppendField("content", content, &out);
   }
 
-  out += "},\"logprobs\":null,\"finish_reason\":";
+  out += "},";
+  AppendChatLogprobs(logprobs, &out);
+  out += ",\"finish_reason\":";
 
   if (reason == nullptr) {
     out += "null";
@@ -378,7 +766,7 @@ std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
 }
 
 std::string CompletionJson(std::string_view id, std::string_view model,
-                           std::string_view text, FinishReason reason,
+                           const std::vector<CompletionChoice>& choices,
                            const Usage& usage, int64_t created, bool sampled) {
   std::string out = "{";
 
@@ -389,11 +777,21 @@ std::string CompletionJson(std::string_view id, std::string_view model,
   AppendField("model", model, &out);
   out += ",\"system_fingerprint\":";
   AppendJsonString(sampled ? "sampled" : "greedy", &out);
-  out += ",\"choices\":[{\"index\":0,\"text\":";
-  AppendJsonString(text, &out);
-  out += ",\"logprobs\":null,\"finish_reason\":";
-  AppendJsonString(FinishReasonName(reason), &out);
-  out += "}],\"usage\":{\"prompt_tokens\":";
+  out += ",\"choices\":[";
+  for (size_t index = 0; index < choices.size(); ++index) {
+    if (index != 0) out.push_back(',');
+    out += "{\"index\":";
+    out += std::to_string(index);
+    out += ",\"text\":";
+    AppendJsonString(choices[index].text, &out);
+    out.push_back(',');
+    AppendCompletionLogprobs(choices[index].logprobs,
+                             choices[index].text_offset, &out);
+    out += ",\"finish_reason\":";
+    AppendJsonString(FinishReasonName(choices[index].finish_reason), &out);
+    out.push_back('}');
+  }
+  out += "],\"usage\":{\"prompt_tokens\":";
   out += std::to_string(usage.prompt_tokens);
   out += ",\"completion_tokens\":";
   out += std::to_string(usage.completion_tokens);
@@ -407,7 +805,8 @@ std::string CompletionJson(std::string_view id, std::string_view model,
 std::string CompletionChunkJson(std::string_view id, std::string_view model,
                                 std::string_view text,
                                 const FinishReason* reason, int64_t created,
-                                bool sampled) {
+                                bool sampled, const ChoiceLogprobs* logprobs,
+                                size_t text_offset) {
   std::string out = "{";
 
   AppendField("id", id, &out);
@@ -419,7 +818,9 @@ std::string CompletionChunkJson(std::string_view id, std::string_view model,
   AppendJsonString(sampled ? "sampled" : "greedy", &out);
   out += ",\"choices\":[{\"index\":0,\"text\":";
   AppendJsonString(text, &out);
-  out += ",\"logprobs\":null,\"finish_reason\":";
+  out.push_back(',');
+  AppendCompletionLogprobs(logprobs, text_offset, &out);
+  out += ",\"finish_reason\":";
 
   if (reason == nullptr) {
     out += "null";
@@ -478,6 +879,25 @@ std::string TokenizeJson(std::string_view model,
   }
   out += "],\"token_count\":";
   out += std::to_string(token_ids.size());
+  out += "}";
+  return out;
+}
+
+std::string VllmTokenizeJson(const std::vector<int32_t>& token_ids) {
+  std::string out = "{\"count\":";
+  out += std::to_string(token_ids.size());
+  out += ",\"max_model_len\":null,\"tokens\":[";
+  for (size_t index = 0; index < token_ids.size(); ++index) {
+    if (index != 0) out.push_back(',');
+    out += std::to_string(token_ids[index]);
+  }
+  out += "]}";
+  return out;
+}
+
+std::string DetokenizeJson(std::string_view prompt) {
+  std::string out = "{\"prompt\":";
+  AppendJsonString(prompt, &out);
   out += "}";
   return out;
 }

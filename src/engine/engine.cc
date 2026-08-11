@@ -4,7 +4,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <limits>
+#include <numeric>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -15,6 +19,7 @@
 #include "inferx/model/gpt_oss.h"
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
+#include "kv_autosize.h"
 #include "qwen_runner.h"
 
 namespace inferx::engine {
@@ -43,6 +48,148 @@ constexpr auto kBatchCoalesceWait = std::chrono::milliseconds(1);
 double SecondsSince(std::chrono::steady_clock::time_point start,
                     std::chrono::steady_clock::time_point end) {
   return std::chrono::duration<double>(end - start).count();
+}
+
+// Full sampling for one host-resident logits row, used by the synchronous
+// model paths (DeepSeek-V2, gpt-oss) that ship logits back anyway. Mirrors
+// the device sampler's semantics: penalties and min-tokens masks mutate the
+// row first, then greedy or a seeded truncated draw, then logprobs at
+// temperature 1 over the post-penalty logits.
+int32_t HostSampleRow(float* row, int64_t vocab,
+                      const model::ForwardBatch& batch, size_t i,
+                      scheduler::StepLogprob* logprob_out) {
+  using FB = model::ForwardBatch;
+  const auto at_f = [&](const std::vector<float>& v, float fallback) {
+    return i < v.size() ? v[i] : fallback;
+  };
+
+  const float presence = at_f(batch.presence_penalty, 0.0f);
+  const float frequency = at_f(batch.frequency_penalty, 0.0f);
+  const float repetition = at_f(batch.repetition_penalty, 1.0f);
+  const size_t hist_cap = static_cast<size_t>(FB::kPenaltyHistoryCap);
+  if ((presence != 0.0f || frequency != 0.0f || repetition != 1.0f) &&
+      batch.penalty_history_ids.size() >= (i + 1) * hist_cap) {
+    for (size_t j = 0; j < hist_cap; ++j) {
+      const int32_t id = batch.penalty_history_ids[i * hist_cap + j];
+      if (id < 0 || static_cast<int64_t>(id) >= vocab) continue;
+      float& value = row[id];
+      if (repetition != 1.0f) {
+        value = value > 0.0f ? value / repetition : value * repetition;
+      }
+      value -= presence;
+      value -= frequency * static_cast<float>(
+                               batch.penalty_history_counts[i * hist_cap + j]);
+    }
+  }
+
+  const size_t mask_cap = static_cast<size_t>(FB::kMaskCap);
+  if (batch.mask_token_ids.size() >= (i + 1) * mask_cap) {
+    for (size_t j = 0; j < mask_cap; ++j) {
+      const int32_t id = batch.mask_token_ids[i * mask_cap + j];
+      if (id >= 0 && static_cast<int64_t>(id) < vocab) {
+        row[id] = -std::numeric_limits<float>::infinity();
+      }
+    }
+  }
+
+  const float temperature = at_f(batch.temperature, 0.0f);
+  int32_t chosen = 0;
+  if (temperature <= 0.0f) {
+    chosen = static_cast<int32_t>(std::max_element(row, row + vocab) - row);
+  } else {
+    const float top_p = at_f(batch.top_p, 1.0f);
+    const int32_t top_k = i < batch.top_k.size() ? batch.top_k[i] : 0;
+    const float min_p = at_f(batch.min_p, 0.0f);
+    const uint64_t seed = i < batch.seeds.size() ? batch.seeds[i] : 0;
+
+    const float inv_t = 1.0f / temperature;
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int64_t v = 0; v < vocab; ++v) {
+      max_logit = std::max(max_logit, row[v] * inv_t);
+    }
+    std::vector<std::pair<float, int32_t>> probs;
+    probs.reserve(static_cast<size_t>(vocab));
+    double total = 0.0;
+    for (int64_t v = 0; v < vocab; ++v) {
+      const float p = std::exp(row[v] * inv_t - max_logit);
+      total += p;
+      probs.emplace_back(p, static_cast<int32_t>(v));
+    }
+
+    // Descending by probability; index breaks ties so the order is total.
+    std::sort(probs.begin(), probs.end(),
+              [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first > b.first
+                                          : a.second < b.second;
+              });
+
+    // The surviving prefix under all three truncations at once.
+    size_t keep = probs.size();
+    if (top_k > 0) keep = std::min<size_t>(keep, static_cast<size_t>(top_k));
+    if (min_p > 0.0f) {
+      const double floor_prob = static_cast<double>(min_p) * probs[0].first;
+      size_t n = 0;
+      while (n < keep && probs[n].first >= floor_prob) ++n;
+      keep = std::max<size_t>(n, 1);
+    }
+    double mass = 0.0;
+    if (top_p < 1.0f) {
+      size_t n = 0;
+      while (n < keep) {
+        mass += probs[n].first / total;
+        ++n;
+        if (mass >= top_p) break;
+      }
+      keep = std::max<size_t>(n, 1);
+    } else {
+      for (size_t n = 0; n < keep; ++n) mass += probs[n].first / total;
+    }
+
+    std::mt19937_64 rng(seed);
+    const double target =
+        std::uniform_real_distribution<double>(0.0, mass)(rng);
+    double running = 0.0;
+    chosen = probs[keep - 1].second;
+    for (size_t n = 0; n < keep; ++n) {
+      running += probs[n].first / total;
+      if (running >= target) {
+        chosen = probs[n].second;
+        break;
+      }
+    }
+  }
+
+  const int32_t logprob_k =
+      i < batch.logprobs_k.size() ? batch.logprobs_k[i] : -1;
+  if (logprob_out != nullptr && logprob_k >= 0) {
+    float raw_max = -std::numeric_limits<float>::infinity();
+    for (int64_t v = 0; v < vocab; ++v) raw_max = std::max(raw_max, row[v]);
+    double raw_total = 0.0;
+    for (int64_t v = 0; v < vocab; ++v) {
+      raw_total += std::exp(row[v] - raw_max);
+    }
+    const float log_z = static_cast<float>(std::log(raw_total)) + raw_max;
+
+    logprob_out->present = true;
+    logprob_out->logprob = row[chosen] - log_z;
+
+    const size_t want = std::min<size_t>(
+        static_cast<size_t>(logprob_k),
+        static_cast<size_t>(FB::kMaxTopLogprobs));
+    if (want > 0) {
+      std::vector<int32_t> order(static_cast<size_t>(vocab));
+      std::iota(order.begin(), order.end(), 0);
+      std::partial_sort(order.begin(), order.begin() + want, order.end(),
+                        [&](int32_t a, int32_t b) {
+                          return row[a] != row[b] ? row[a] > row[b] : a < b;
+                        });
+      for (size_t j = 0; j < want; ++j) {
+        logprob_out->top.emplace_back(order[j], row[order[j]] - log_z);
+      }
+    }
+  }
+
+  return chosen;
 }
 
 struct ServingMetrics {
@@ -293,6 +440,12 @@ struct Engine::Impl {
 
     std::vector<std::string> stop;
     bool stop_hit = false;
+    /// Keep the matched stop string in the output instead of truncating
+    /// before it (vLLM's include_stop_str_in_output).
+    bool include_stop_str = false;
+    /// Emit one event per token even when it decodes to no text, so each
+    /// token's logprob reaches the client.
+    bool want_logprobs = false;
     int32_t generated = 0;
     std::chrono::steady_clock::time_point submitted;
     std::chrono::steady_clock::time_point last_token;
@@ -345,20 +498,45 @@ struct Engine::Impl {
 
     state.text += state.decoder->Push(delta.token);
 
+    // Every emitted event carries this step's token and, when asked for, its
+    // logprob -- the client-side logprobs array is per token, not per text
+    // delta.
+    const auto attach = [&](Generation::Event* event) {
+      event->generated = state.generated;
+      event->token = delta.token;
+      if (delta.has_logprob) {
+        event->has_logprob = true;
+        event->logprob = delta.logprob;
+        event->top_logprobs = delta.top_logprobs;
+      }
+    };
+
     // A stop sequence ends the generation even though the scheduler, which
     // never sees text, has no idea it happened. Cancelling here retires the
     // sequence on the next step and frees its blocks.
     if (!state.stop.empty()) {
-      const size_t at = api::FindStopSequence(state.text, state.stop);
+      // The earliest match, and its needle: include_stop_str_in_output keeps
+      // the matched text, so the offset alone is not enough.
+      size_t at = std::string::npos;
+      size_t match_len = 0;
+      for (const std::string& needle : state.stop) {
+        if (needle.empty()) continue;
+        const size_t pos = state.text.find(needle);
+        if (pos < at) {
+          at = pos;
+          match_len = needle.size();
+        }
+      }
 
       if (at != std::string::npos) {
-        state.text.resize(at);
+        state.text.resize(state.include_stop_str ? at + match_len : at);
         state.stop_hit = true;
 
-        if (state.emitted < state.text.size()) {
+        if (state.emitted < state.text.size() || state.want_logprobs) {
           Generation::Event event;
-          event.text = state.text.substr(state.emitted);
-          event.generated = state.generated;
+          event.text = state.text.substr(
+              std::min(state.emitted, state.text.size()));
+          attach(&event);
 
           state.generation->Emit(std::move(event));
           state.emitted = state.text.size();
@@ -383,13 +561,15 @@ struct Engine::Impl {
     const size_t hold = api::StopSequenceHoldback(state.text, state.stop);
     const size_t safe = state.text.size() - hold;
 
-    if (safe > state.emitted) {
+    if (safe > state.emitted || state.want_logprobs) {
       Generation::Event event;
-      event.text = state.text.substr(state.emitted, safe - state.emitted);
-      event.generated = state.generated;
+      if (safe > state.emitted) {
+        event.text = state.text.substr(state.emitted, safe - state.emitted);
+        state.emitted = safe;
+      }
+      attach(&event);
 
       state.generation->Emit(std::move(event));
-      state.emitted = safe;
     }
   }
 
@@ -578,8 +758,11 @@ struct Engine::Impl {
           Active state;
           state.generation = pending.generation;
           state.decoder = std::make_unique<tokenizer::IncrementalDecoder>(
-              tokenizer.get(), /*skip_special=*/true);
+              tokenizer.get(),
+              /*skip_special=*/!pending.params.keep_special_tokens);
           state.stop = std::move(pending.stop);
+          state.include_stop_str = pending.params.include_stop_str_in_output;
+          state.want_logprobs = pending.params.want_logprobs;
           state.submitted = pending.submitted;
 
           active.emplace(pending.id, std::move(state));
@@ -605,6 +788,10 @@ struct Engine::Impl {
       RecordAdmissions();
 
       if (!batch.token_ids.empty()) {
+        const bool wants_logprobs =
+            std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
+                        [](int32_t k) { return k >= 0; });
+
         Status stepped = qwen2_model->StepAsync(batch);
 
         if (stepped.ok()) stepped = qwen2_model->AwaitStep(&sampled);
@@ -618,7 +805,25 @@ struct Engine::Impl {
           break;
         }
 
-        if (const Status committed = scheduler->CommitStep(sampled, &deltas);
+        std::vector<scheduler::StepLogprob> step_logprobs;
+        if (wants_logprobs) {
+          std::vector<model::Qwen2Model::SampledLogprob> raw;
+          if (const Status read = qwen2_model->ReadSampledLogprobs(&raw);
+              !read.ok()) {
+            FailAll(read);
+            stopping.store(true, std::memory_order_relaxed);
+            break;
+          }
+          step_logprobs.resize(raw.size());
+          for (size_t i = 0; i < raw.size(); ++i) {
+            step_logprobs[i] = {raw[i].present, raw[i].logprob,
+                                std::move(raw[i].top)};
+          }
+        }
+
+        if (const Status committed = scheduler->CommitStep(
+                sampled, &deltas,
+                wants_logprobs ? &step_logprobs : nullptr);
             !committed.ok()) {
           FailAll(committed);
           stopping.store(true, std::memory_order_relaxed);
@@ -719,8 +924,11 @@ struct Engine::Impl {
           Active state;
           state.generation = pending.generation;
           state.decoder = std::make_unique<tokenizer::IncrementalDecoder>(
-              tokenizer.get(), /*skip_special=*/true);
+              tokenizer.get(),
+              /*skip_special=*/!pending.params.keep_special_tokens);
           state.stop = std::move(pending.stop);
+          state.include_stop_str = pending.params.include_stop_str_in_output;
+          state.want_logprobs = pending.params.want_logprobs;
           state.submitted = pending.submitted;
 
           active.emplace(pending.id, std::move(state));
@@ -765,19 +973,25 @@ struct Engine::Impl {
         break;
       }
 
-      // One argmax per requested logits row. The batch carries logits_indices
-      // naming which rows to sample, and Step returns them in the same order.
+      // One sample per requested logits row, on the host: the synchronous
+      // models already ship logits back, so the full vLLM-compatible
+      // treatment (penalties, masks, temperature/top-p/top-k/min-p, seeded
+      // draw, logprobs) costs a few vocabulary-length passes per row.
       const int64_t vocab = sync_model_vocab();
       sampled.clear();
       sampled.reserve(batch.logits_indices.size());
+      std::vector<scheduler::StepLogprob> step_logprobs(
+          batch.logits_indices.size());
+      bool wants_logprobs = false;
       for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
-        const float* row = logits.data() + i * static_cast<size_t>(vocab);
-        const int32_t tok =
-            static_cast<int32_t>(std::max_element(row, row + vocab) - row);
-        sampled.push_back(tok);
+        float* row = logits.data() + i * static_cast<size_t>(vocab);
+        sampled.push_back(HostSampleRow(row, vocab, batch, i,
+                                        &step_logprobs[i]));
+        wants_logprobs = wants_logprobs || step_logprobs[i].present;
       }
 
-      if (const Status committed = scheduler->CommitStep(sampled, &deltas);
+      if (const Status committed = scheduler->CommitStep(
+              sampled, &deltas, wants_logprobs ? &step_logprobs : nullptr);
           !committed.ok()) {
         FailAll(committed);
         stopping.store(true, std::memory_order_relaxed);
@@ -889,19 +1103,38 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       return UnimplementedError(
           "tensor parallel serving is currently implemented for Qwen2 only");
     }
-    // Same synchronous serve as gpt-oss, with one difference worth naming:
-    // --capture-graphs is accepted and *skipped* rather than attempted. The
-    // unabsorbed MLA path sizes its scratch by context length, so
-    // CaptureDecodeGraph is Unimplemented by design (§18.7 D4), and failing
-    // startup over a documented limitation would be wrong. FP8/int4 flags are
-    // ignored the same way the gpt-oss arm ignores them.
+    // A quantization request that would be silently ignored is a startup
+    // error: the caller asked for behavior this arm cannot deliver.
+    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
+      return InvalidArgumentError(
+          "--quantization / --kv-cache-dtype are not supported for the "
+          "DeepSeek-V2 architecture");
+    }
+    // --enforce-eager's default is accepted and *skipped* rather than
+    // attempted: the unabsorbed MLA path sizes its scratch by context length,
+    // so CaptureDecodeGraph is Unimplemented by design (§18.7 D4), and
+    // failing startup over a documented limitation would be wrong.
+    if (config.capture_graphs) {
+      LOG(INFO) << "DeepSeek-V2 serves without CUDA graphs by design; "
+                   "graph capture is skipped";
+    }
     INFERX_ASSIGN_OR_RETURN(model::DeepseekV2Model deepseek,
                             model::DeepseekV2Model::Load(config.model_dir));
 
     // The latent cache: 576 elements/token/layer for V2-Lite against a GQA
-    // model's thousands, so the same --kv-blocks buys ~14x the cached context.
+    // model's thousands, so the same block count buys ~14x the cached context.
+    INFERX_ASSIGN_OR_RETURN(
+        const int64_t kv_blocks,
+        AutosizeKvBlocksOnCurrentDevice(KvSizingSpec{
+            .explicit_blocks = config.kv_blocks,
+            .explicit_bytes = config.kv_cache_memory_bytes,
+            .gpu_memory_utilization = config.gpu_memory_utilization,
+            .block_bytes = deepseek.KvBlockBytes(config.block_size),
+            .min_blocks = (config.scheduler.max_seq_len + config.block_size -
+                           1) /
+                          config.block_size}));
     INFERX_RETURN_IF_ERROR(
-        deepseek.AttachKvCache(config.kv_blocks, config.block_size));
+        deepseek.AttachKvCache(kv_blocks, config.block_size));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,
@@ -910,7 +1143,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     impl->deepseek_model =
         std::make_unique<model::DeepseekV2Model>(std::move(deepseek));
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = config.kv_blocks;
+    impl->stats.blocks_total = kv_blocks;
 
     INFERX_RETURN_IF_ERROR(impl->deepseek_model->ReserveActivations(
         config.scheduler.max_batch_tokens));
@@ -919,16 +1152,13 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       return UnimplementedError(
           "tensor parallel serving is currently implemented for Qwen2 only");
     }
-    // Phase 3 slow serve. FP8 weights / KV cache, CUDA graphs and the scheduler
-    // are Qwen2-path options that GptOssModel does not expose; silently
-    // ignoring them keeps `inferx-serve --model <gpt-oss> --fp8` from crashing
-    // on a method that does not exist, and the launch log below names the path
-    // so the slowness is not a mystery.
-    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache ||
-        config.capture_graphs) {
-      // Not an error: the flags are accepted, the gpt-oss path simply does not
-      // use them. Logging is the caller's business; the return path is what
-      // matters here.
+    // A quantization request that would be silently ignored is a startup
+    // error; gpt-oss weights are MXFP4 from the checkpoint and the Qwen2-path
+    // quantization methods do not exist on this class.
+    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
+      return InvalidArgumentError(
+          "--quantization / --kv-cache-dtype are not supported for the "
+          "gpt-oss architecture");
     }
 
     INFERX_ASSIGN_OR_RETURN(model::GptOssModel gpt_oss,
@@ -936,10 +1166,20 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
 
     // Attach a paged KV cache so the scheduler can batch multiple sequences.
     // gpt-oss has 24 layers × 8 kv_heads × 64 head_dim × 2 (bf16) = 2048
-    // bytes/token/layer; the pool sizing is a VRAM/latency trade the caller
-    // makes via --kv-blocks, same as Qwen2.
+    // bytes/token/layer; the pool sizing is the same VRAM/latency trade as
+    // Qwen2, auto-sized unless pinned.
+    INFERX_ASSIGN_OR_RETURN(
+        const int64_t kv_blocks,
+        AutosizeKvBlocksOnCurrentDevice(KvSizingSpec{
+            .explicit_blocks = config.kv_blocks,
+            .explicit_bytes = config.kv_cache_memory_bytes,
+            .gpu_memory_utilization = config.gpu_memory_utilization,
+            .block_bytes = gpt_oss.KvBlockBytes(config.block_size),
+            .min_blocks = (config.scheduler.max_seq_len + config.block_size -
+                           1) /
+                          config.block_size}));
     INFERX_RETURN_IF_ERROR(
-        gpt_oss.AttachKvCache(config.kv_blocks, config.block_size));
+        gpt_oss.AttachKvCache(kv_blocks, config.block_size));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,
@@ -948,7 +1188,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     impl->gpt_oss_model =
         std::make_unique<model::GptOssModel>(std::move(gpt_oss));
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = config.kv_blocks;
+    impl->stats.blocks_total = kv_blocks;
 
     // Size the activation scratch once, for the largest batch that will ever
     // run. The scratch only grows, so a later growth inside a step is fine --
@@ -976,7 +1216,10 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     runner_config.int4_weights = config.int4_weights;
     runner_config.fp8_kv_cache = config.fp8_kv_cache;
     runner_config.kv_blocks = config.kv_blocks;
+    runner_config.kv_cache_memory_bytes = config.kv_cache_memory_bytes;
+    runner_config.gpu_memory_utilization = config.gpu_memory_utilization;
     runner_config.block_size = config.block_size;
+    runner_config.max_seq_len = config.scheduler.max_seq_len;
     runner_config.max_sampling_rows = config.scheduler.max_running;
     INFERX_ASSIGN_OR_RETURN(std::unique_ptr<QwenRunner> model,
                             QwenRunner::Create(runner_config));
@@ -988,7 +1231,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     impl->qwen2_model = std::move(model);
     impl->metrics.ConfigureRanks(impl->qwen2_model->telemetry());
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = config.kv_blocks;
+    impl->stats.blocks_total = impl->qwen2_model->kv_pool()->num_blocks();
 
     // One graph per batch size. The block-table width is fixed for the whole
     // scheduler, so the only shape that varies between decode steps is the
@@ -1070,7 +1313,11 @@ StatusOr<std::shared_ptr<Generation>> Engine::Submit(
   pending.submitted = std::chrono::steady_clock::now();
   pending.params = std::move(sampling);
   pending.params.max_tokens = max_tokens;
-  pending.params.stop_tokens = {impl_->tokenizer->eos_id()};
+  // User stop-token ids arrive in `stop_tokens`; EOS joins them unless the
+  // request asked to generate through it.
+  if (!pending.params.ignore_eos) {
+    pending.params.stop_tokens.push_back(impl_->tokenizer->eos_id());
+  }
   pending.stop = std::move(stop);
   pending.generation = generation;
 

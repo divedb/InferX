@@ -252,12 +252,65 @@ Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
 ///                    distribution and callers pass it constantly.
 /// \param top_p       `[n]` float in (0, 1]. Values at or above 1 disable
 ///                    truncation.
+/// \param top_k       `[n]` int32. Keep only the k most probable tokens
+///                    (ties keep more). 0 disables.
+/// \param min_p       `[n]` float in [0, 1]. Drop tokens whose probability is
+///                    below `min_p * max_prob`. 0 disables.
 /// \param seeds       `[n]` uint64, one per row.
 /// \param out         `[n]` int32, the sampled ids.
 Status SampleTokens(const TensorView& logits, const TensorView& rows,
                     const TensorView& temperature, const TensorView& top_p,
+                    const TensorView& top_k, const TensorView& min_p,
                     const TensorView& seeds, const TensorView& out,
                     cudaStream_t stream = nullptr);
+
+/// \brief Applies repetition/presence/frequency penalties and stop-token
+/// masks to logits rows in place, before sampling.
+///
+/// Runs unconditionally inside the captured decode body -- a branch would
+/// bake whichever mode was live at capture -- and rows without penalties or
+/// masks exit in a handful of reads. The host supplies each row's generated
+/// history as (unique id, count) pairs, so no atomics are needed: every entry
+/// touches a distinct logit.
+///
+/// \param logits         `[rows, vocab]` bf16, mutated in place.
+/// \param rows           `[n]` int32, which rows to touch.
+/// \param presence       `[n]` float, additive on any seen token (0 off).
+/// \param frequency      `[n]` float, additive scaled by count (0 off).
+/// \param repetition     `[n]` float, HF multiplicative form (1 off).
+/// \param history_ids    `[n, history_cap]` int32, unique generated ids,
+///                       -1 padded.
+/// \param history_counts `[n, history_cap]` int32, occurrence counts.
+/// \param mask_ids       `[n, mask_cap]` int32, ids to force to -inf
+///                       (min-tokens stop suppression), -1 padded.
+Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
+                      const TensorView& presence, const TensorView& frequency,
+                      const TensorView& repetition,
+                      const TensorView& history_ids,
+                      const TensorView& history_counts,
+                      const TensorView& mask_ids,
+                      cudaStream_t stream = nullptr);
+
+/// \brief Log-probabilities of the sampled tokens, after the fact.
+///
+/// Computed over the (post-penalty) logits at temperature 1, matching
+/// vLLM's default reporting rather than the sampling distribution. Rows whose
+/// `k_wanted` is negative exit immediately, so the kernel is graph-safe to
+/// launch unconditionally.
+///
+/// \param logits    `[rows, vocab]` bf16.
+/// \param rows      `[n]` int32.
+/// \param chosen    `[n]` int32, the ids `SampleTokens` picked.
+/// \param k_wanted  `[n]` int32: -1 off, 0 chosen-token only, k>0 also the
+///                  top-k alternatives.
+/// \param chosen_lp `[n]` float out, the chosen token's logprob.
+/// \param top_ids   `[n, max_k]` int32 out, most probable first, -1 padded.
+/// \param top_lps   `[n, max_k]` float out, parallel to `top_ids`.
+Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
+                       const TensorView& chosen, const TensorView& k_wanted,
+                       const TensorView& chosen_lp, const TensorView& top_ids,
+                       const TensorView& top_lps,
+                       cudaStream_t stream = nullptr);
 
 /// \brief Copies `src[i]` into `dst[slot[i]]`, on the device.
 ///

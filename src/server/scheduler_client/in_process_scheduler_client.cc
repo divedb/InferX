@@ -57,6 +57,8 @@ folly::coro::AsyncGenerator<GenerationEvent&&> InProcessSchedulerClient::Events(
     event.attempt = attempt;
     event.sequence_number = sequence++;
     event.text_delta = std::move((*next)->text);
+    if ((*next)->token >= 0) event.token_ids.push_back((*next)->token);
+    if ((*next)->has_logprob) event.logprobs.push_back((*next)->logprobs);
     event.generated_tokens = (*next)->generated_tokens;
     event.terminal = (*next)->terminal;
     event.finish_reason = (*next)->finish_reason;

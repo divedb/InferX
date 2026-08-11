@@ -29,6 +29,36 @@ struct SamplingParams {
   /// Nucleus threshold. At or above 1 disables truncation.
   float top_p = 1.0f;
 
+  /// Keep only the `top_k` most probable tokens. 0 disables.
+  int32_t top_k = 0;
+
+  /// Drop tokens whose probability is below `min_p * max_prob`. 0 disables.
+  float min_p = 0.0f;
+
+  /// OpenAI-style additive penalties on generated tokens (0 disables) and the
+  /// HF/vLLM multiplicative repetition penalty (1 disables). Applied to the
+  /// logits before sampling, over this sequence's generated history.
+  float presence_penalty = 0.0f;
+  float frequency_penalty = 0.0f;
+  float repetition_penalty = 1.0f;
+
+  /// Suppress `stop_tokens` for the first `min_tokens` generated tokens by
+  /// masking their logits, matching vLLM's semantics.
+  int32_t min_tokens = 0;
+
+  /// Consumed by the engine, not the scheduler: whether EOS was deliberately
+  /// left out of `stop_tokens`, whether detokenization keeps special tokens
+  /// in the output text, and whether a matched stop string stays in the
+  /// output rather than being truncated away.
+  bool ignore_eos = false;
+  bool keep_special_tokens = false;
+  bool include_stop_str_in_output = false;
+
+  /// Log-probability reporting: report the chosen token's logprob, plus up to
+  /// `top_logprobs` alternatives per position.
+  bool want_logprobs = false;
+  int32_t top_logprobs = 0;
+
   /// Fixes the draw. A request that pins its seed reproduces exactly, which is
   /// what makes a sampled server debuggable.
   uint64_t seed = 0;
@@ -73,6 +103,20 @@ struct TokenDelta {
   /// Set when this token also ended the sequence, so a streaming caller can
   /// close the stream on the same step rather than waiting for `TakeCompleted`.
   FinishReason finish = FinishReason::kNotFinished;
+
+  /// Present when the request asked for logprobs: the sampled token's
+  /// logprob and its top alternatives, most probable first.
+  bool has_logprob = false;
+  float logprob = 0.0f;
+  std::vector<std::pair<int32_t, float>> top_logprobs;
+};
+
+/// Per-sampled-token logprob data handed to `CommitStep` by the executor,
+/// parallel to its `sampled` vector.
+struct StepLogprob {
+  bool present = false;
+  float logprob = 0.0f;
+  std::vector<std::pair<int32_t, float>> top;
 };
 
 /// \brief A finished sequence, handed back to whatever submitted it.
@@ -184,8 +228,11 @@ class Scheduler {
   ///                    the request it belongs to. Cleared first. Streaming
   ///                    callers need this; batch callers can ignore it and read
   ///                    `TakeCompleted` instead.
+  /// \param logprobs    Optional, parallel to `sampled`; entries are copied
+  ///                    onto the matching deltas.
   Status CommitStep(const std::vector<int32_t>& sampled,
-                    std::vector<TokenDelta>* out_deltas = nullptr);
+                    std::vector<TokenDelta>* out_deltas = nullptr,
+                    const std::vector<StepLogprob>* logprobs = nullptr);
 
   /// \brief Removes and returns everything that finished since the last call.
   std::vector<Completion> TakeCompleted();

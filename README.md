@@ -119,7 +119,8 @@ real 0.86× on prefill. FP8 is the actual result: **1.37× vLLM on decode**,
 
 Writing the benchmark found two defects nothing else could see: `TCP_NODELAY`
 was off, putting a flat ~43 ms Nagle floor under every TTFT, and FP8 activation
-quantization ran in one CUDA block, which cost prefill 3.9× under `--fp8`.
+quantization ran in one CUDA block, which cost prefill 3.9× under
+`--quantization fp8`.
 Both are fixed; ARCHITECTURE.md §14 has the diagnosis.
 `./scripts/bench_serve.sh` reproduces the table.
 

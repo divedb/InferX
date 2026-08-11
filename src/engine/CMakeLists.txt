@@ -2,6 +2,7 @@
 
 add_library(inferx_engine
   engine.cc
+  kv_autosize.cc
   qwen_runner.cc)
 add_library(inferx::engine ALIAS inferx_engine)
 

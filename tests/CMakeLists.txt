@@ -55,10 +55,28 @@ inferx_add_test(prefix_cache_test      unit/prefix_cache_test.cc)
 inferx_add_test(log_test               unit/log_test.cc)
 inferx_add_test(crash_test             unit/support/crash_test.cc)
 
+inferx_add_test(openai_api_test        unit/api/openai_test.cc)
+
+inferx_add_test(vllm_compat_test       unit/support/vllm_compat_test.cc)
+target_link_libraries(vllm_compat_test PRIVATE inferx::vllm_compat)
+
+inferx_add_test(options_test           unit/support/options_test.cc)
+target_link_libraries(options_test PRIVATE inferx::serve_options)
+
+# GPU-free arithmetic, but its library (inferx::engine) only exists in
+# device-capable builds.
+if(INFERX_CUDA_MEETS_FLOOR)
+  inferx_add_test(kv_autosize_test     unit/kv_autosize_test.cc)
+  target_link_libraries(kv_autosize_test PRIVATE inferx::engine)
+  target_include_directories(kv_autosize_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+endif()
+
 if(INFERX_CUDA_MEETS_FLOOR)
   inferx_add_kernel_test(weight_loader_test kernel/weight_loader_test.cc)
   inferx_add_kernel_test(moe_test kernel/moe_test.cc)
   inferx_add_kernel_test(mla_test kernel/mla_test.cc)
+  inferx_add_kernel_test(sampling_test kernel/sampling_test.cc)
   inferx_add_kernel_test(deepseek_v2_model_test kernel/deepseek_v2_model_test.cc)
   inferx_add_kernel_test(deepseek_v2_reference_test
                          kernel/deepseek_v2_reference_test.cc)

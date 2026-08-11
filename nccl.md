@@ -269,7 +269,7 @@ CLI shape for the first release:
 
 ```text
 --tensor-parallel-size 2
---devices 0,1
+--device-ids 0,1
 --comm-backend nccl
 ```
 

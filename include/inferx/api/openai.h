@@ -43,8 +43,21 @@ struct SamplingRequest {
 
   /// Nucleus threshold; at or above 1 disables truncation.
   float top_p = 1.0f;
+  /// Keep only the `top_k` most probable tokens. 0 disables.
   int32_t top_k = 0;
+  /// Drop tokens whose probability is below `min_p * max_prob`. 0 disables.
+  float min_p = 0.0f;
+
+  /// OpenAI-style additive penalties on seen tokens ([-2, 2], 0 disables):
+  /// presence penalizes any token that has appeared, frequency scales with
+  /// its count. `repetition_penalty` is the HF/vLLM multiplicative form
+  /// ((0, 2], 1 disables). All apply to generated tokens only.
+  float presence_penalty = 0.0f;
+  float frequency_penalty = 0.0f;
   float repetition_penalty = 1.0f;
+
+  /// Parallel generations from the same prompt. The handler bounds it by the
+  /// server's sequence cap; each choice draws with seed + index.
   int32_t n = 1;
 
   /// Fixes the draw so a request is reproducible. Absent means the server
@@ -56,6 +69,32 @@ struct SamplingRequest {
   /// not against token ids -- a stop string need not be a token boundary, and
   /// mapping it to ids would silently fail to fire when it is not.
   std::vector<std::string> stop;
+
+  /// Token ids that end the generation, matched exactly (vLLM extension).
+  std::vector<int32_t> stop_token_ids;
+
+  /// Keep generating past EOS until another limit fires (vLLM extension).
+  bool ignore_eos = false;
+
+  /// Suppress EOS and stop-token ids for the first `min_tokens` generated
+  /// tokens (vLLM extension).
+  int32_t min_tokens = 0;
+
+  /// Drop special tokens from decoded output. vLLM's default is true.
+  bool skip_special_tokens = true;
+
+  /// Leave the matched stop string in the returned text instead of
+  /// truncating just before it (vLLM extension).
+  bool include_stop_str_in_output = false;
+
+  /// Log-probability reporting. `want_logprobs` is chat `logprobs: true` or a
+  /// completions `logprobs` integer; `top_logprobs` is how many alternatives
+  /// per position (0 means only the chosen token's logprob).
+  bool want_logprobs = false;
+  int32_t top_logprobs = 0;
+
+  /// Completions only: prepend the prompt to the returned text.
+  bool echo = false;
 };
 
 /// \brief A parsed `POST /v1/chat/completions` body.
@@ -79,6 +118,24 @@ struct TokenizeRequest {
   bool add_special_tokens = false;
 };
 
+/// \brief A parsed vLLM-style `POST /tokenize` body.
+///
+/// Distinct from TokenizeRequest because the wire contracts differ: vLLM
+/// spells the input `prompt` and defaults `add_special_tokens` to true, and
+/// changing the /v1/tokenize defaults to match would silently change what
+/// existing InferX clients get back.
+struct VllmTokenizeRequest {
+  std::string model;
+  std::string prompt;
+  bool add_special_tokens = true;
+};
+
+/// \brief A parsed vLLM-style `POST /detokenize` body.
+struct DetokenizeRequest {
+  std::string model;
+  std::vector<int32_t> tokens;
+};
+
 struct EmbeddingsRequest {
   std::string model;
   std::vector<std::string> input;
@@ -98,12 +155,34 @@ StatusOr<ChatCompletionRequest> ParseChatCompletionRequest(
 StatusOr<CompletionRequest> ParseCompletionRequest(std::string_view body);
 
 StatusOr<TokenizeRequest> ParseTokenizeRequest(std::string_view body);
+StatusOr<VllmTokenizeRequest> ParseVllmTokenizeRequest(std::string_view body);
+StatusOr<DetokenizeRequest> ParseDetokenizeRequest(std::string_view body);
 StatusOr<EmbeddingsRequest> ParseEmbeddingsRequest(std::string_view body);
 
 /// \brief Token accounting returned with every response.
 struct Usage {
   int32_t prompt_tokens = 0;
   int32_t completion_tokens = 0;
+};
+
+/// \brief Log-probability data for one generated token, decoded to text.
+///
+/// This layer receives token strings rather than ids: turning an id into text
+/// takes a tokenizer, and this layer deliberately has none. The handler is
+/// where both halves meet, so the handler converts.
+struct TokenLogprob {
+  std::string token;
+  float logprob = 0.0f;
+  /// Alternatives, most probable first. Empty when the request asked for the
+  /// chosen token's logprob only (`top_logprobs` 0), which still renders as an
+  /// empty array -- OpenAI's shape has the key either way.
+  std::vector<std::pair<std::string, float>> top;
+};
+
+/// \brief One choice's logprob report. Rendered as `"logprobs":null` when the
+/// builder is given no report, which is the pre-logprobs wire behavior.
+struct ChoiceLogprobs {
+  std::vector<TokenLogprob> tokens;
 };
 
 /// \brief Why generation stopped, in OpenAI's vocabulary.
@@ -117,42 +196,75 @@ enum class FinishReason { kStop, kLength };
 
 const char* FinishReasonName(FinishReason reason);
 
+/// \brief One entry of a chat response's `choices` array.
+///
+/// `logprobs` is borrowed, not owned: the handler keeps the decoded report
+/// alive for the one call that renders it, and null renders as
+/// `"logprobs":null`.
+struct ChatChoice {
+  std::string content;
+  FinishReason finish_reason = FinishReason::kStop;
+  const ChoiceLogprobs* logprobs = nullptr;
+};
+
+/// \brief One entry of a text completion response's `choices` array.
+struct CompletionChoice {
+  std::string text;
+  FinishReason finish_reason = FinishReason::kStop;
+  const ChoiceLogprobs* logprobs = nullptr;
+  /// Where this choice's reported tokens start within `text`, in bytes: the
+  /// prompt length when the prompt was echoed, 0 otherwise. Feeds the
+  /// completions `text_offset` array, whose entries are cumulative.
+  size_t text_offset = 0;
+};
+
 /// \brief Builds a complete (non-streaming) chat completion response.
 ///
 /// \param id      Response id, echoed to the client.
 /// \param model   Model name to report.
-/// \param content The generated text.
+/// \param choices One entry per requested parallel generation; each is
+///                numbered by its position here.
 /// \param sampled Reported as `system_fingerprint`, so a client can tell
 ///                whether its temperature was acted on.
 std::string ChatCompletionJson(std::string_view id, std::string_view model,
-                               std::string_view content, FinishReason reason,
+                               const std::vector<ChatChoice>& choices,
                                const Usage& usage, int64_t created,
                                bool sampled = false);
 
 /// \brief Builds one `chat.completion.chunk` for the streaming path.
 ///
-/// \param content The delta since the previous chunk. May be empty, which is
-///                normal -- a token can decode to no complete character.
-/// \param role    Emitted in the first chunk only, as OpenAI's protocol
-///                requires; empty in the rest.
-/// \param reason  Non-null on the final chunk, which carries no content.
+/// \param content  The delta since the previous chunk. May be empty, which is
+///                 normal -- a token can decode to no complete character.
+/// \param role     Emitted in the first chunk only, as OpenAI's protocol
+///                 requires; empty in the rest.
+/// \param reason   Non-null on the final chunk, which carries no content.
+/// \param logprobs The report for the tokens this chunk covers, or null.
 std::string ChatCompletionChunkJson(std::string_view id, std::string_view model,
                                     std::string_view role,
                                     std::string_view content,
                                     const FinishReason* reason,
-                                    int64_t created, bool sampled = false);
+                                    int64_t created, bool sampled = false,
+                                    const ChoiceLogprobs* logprobs = nullptr);
 
 /// \brief Builds a complete (non-streaming) text completion response.
 std::string CompletionJson(std::string_view id, std::string_view model,
-                           std::string_view text, FinishReason reason,
+                           const std::vector<CompletionChoice>& choices,
                            const Usage& usage, int64_t created,
                            bool sampled = false);
 
 /// \brief Builds one `text_completion` chunk for the streaming path.
+///
+/// \param logprobs    The report for the tokens this chunk covers, or null.
+/// \param text_offset Cumulative byte position of the chunk's first reported
+///                    token; the handler advances it across chunks so the
+///                    stream's `text_offset` entries keep counting from where
+///                    the previous chunk stopped.
 std::string CompletionChunkJson(std::string_view id, std::string_view model,
                                 std::string_view text,
                                 const FinishReason* reason, int64_t created,
-                                bool sampled = false);
+                                bool sampled = false,
+                                const ChoiceLogprobs* logprobs = nullptr,
+                                size_t text_offset = 0);
 
 /// \brief Builds the trailing usage-only chunk of a stream.
 ///
@@ -174,6 +286,15 @@ std::string ModelsJson(std::string_view model, int64_t created);
 /// \brief Builds a tokenize response with exact token IDs and count.
 std::string TokenizeJson(std::string_view model,
                          const std::vector<int32_t>& token_ids);
+
+/// \brief Builds a vLLM-shaped `POST /tokenize` response.
+///
+/// `max_model_len` is emitted as a literal null: this layer has no registry,
+/// and vLLM's own schema allows null there.
+std::string VllmTokenizeJson(const std::vector<int32_t>& token_ids);
+
+/// \brief Builds a vLLM-shaped `POST /detokenize` response.
+std::string DetokenizeJson(std::string_view prompt);
 
 /// \brief Builds an OpenAI-shaped error body.
 std::string ErrorJson(std::string_view message, std::string_view type);

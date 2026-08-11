@@ -30,6 +30,7 @@
 #include "inferx/server/handlers/metrics_handler.h"
 #include "inferx/server/handlers/models_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
+#include "inferx/server/handlers/vllm_compat_handler.h"
 #include "inferx/server/middleware/authentication.h"
 #include "inferx/server/model_registry/registry.h"
 #include "inferx/server/request/managed_request_service.h"
@@ -99,6 +100,22 @@ class OkHandler final : public RequestHandler {
   RequestContext last_context;
 };
 
+/// Writes the raw request target back, so a test can see which route matched
+/// and what remainder a prefix route's handler would parse.
+class TargetEchoHandler final : public RequestHandler {
+ public:
+  folly::coro::Task<void> Handle(
+      HttpRequest request, RequestContext, ResponseWriter& writer,
+      folly::CancellationToken cancellation) override {
+    HttpResponse response{http::status::ok, request.version()};
+    response.keep_alive(request.keep_alive());
+    response.body() =
+        std::string(request.target().data(), request.target().size());
+    response.prepare_payload();
+    (void)co_await writer.WriteResponse(std::move(response), cancellation);
+  }
+};
+
 class ScopeGuard final : public RouteGuard {
  public:
   folly::coro::Task<Status> Check(const HttpRequest&,
@@ -157,10 +174,24 @@ class FakeTokenizationService final
         model_version, {21, 22, 23}, 3};
   }
 
+  StatusOr<std::string> Detokenize(
+      const ::inferx::server::request::ModelVersion& model_version,
+      const std::vector<::inferx::tokenizer::TokenId>& ids) override {
+    seen_version = model_version;
+    seen_detokenize_ids = ids;
+    // Inverts TokenizeCompletion's fixed encoding so a tokenize/detokenize
+    // round trip through the handlers is observable end to end.
+    if (ids == std::vector<::inferx::tokenizer::TokenId>{11, 12, 13}) {
+      return seen_prompt;
+    }
+    return absl::InvalidArgumentError("unknown token sequence");
+  }
+
   std::string seen_version;
   std::string seen_prompt;
   bool seen_add_special_tokens = false;
   size_t seen_messages = 0;
+  std::vector<::inferx::tokenizer::TokenId> seen_detokenize_ids;
 };
 
 class FakeRequestService final
@@ -170,6 +201,7 @@ class FakeRequestService final
   Submit(::inferx::server::scheduler_client::ScheduledRequest request,
          folly::CancellationToken) override {
     submitted = std::move(request);
+    all_submitted.push_back(submitted);
     co_return ::inferx::server::scheduler_client::SubmitResult{
         submitted.request_id, 0};
   }
@@ -178,6 +210,34 @@ class FakeRequestService final
       ::inferx::server::scheduler_client::GenerationEvent&&>
   Events(::inferx::server::request::RequestId request_id,
          folly::CancellationToken) override {
+    if (emit_logprobs) {
+      // One text-bearing token, then a token which completed no character:
+      // the second event has an empty text_delta but still owes its report.
+      ::inferx::server::scheduler_client::GenerationEvent first;
+      first.request_id = request_id;
+      first.sequence_number = 1;
+      first.text_delta = "he";
+      first.token_ids = {5};
+      first.logprobs = {{5, -0.25f, {{5, -0.25f}, {6, -1.5f}}}};
+      first.generated_tokens = 1;
+      co_yield std::move(first);
+      ::inferx::server::scheduler_client::GenerationEvent partial;
+      partial.request_id = request_id;
+      partial.sequence_number = 2;
+      partial.token_ids = {7};
+      partial.logprobs = {{7, -0.5f, {}}};
+      partial.generated_tokens = 2;
+      co_yield std::move(partial);
+      ::inferx::server::scheduler_client::GenerationEvent terminal;
+      terminal.request_id = request_id;
+      terminal.sequence_number = 3;
+      terminal.terminal = true;
+      terminal.finish_reason =
+          ::inferx::server::scheduler_client::FinishReason::kStop;
+      terminal.usage = {.prompt_tokens = 3, .completion_tokens = 2};
+      co_yield std::move(terminal);
+      co_return;
+    }
     ::inferx::server::scheduler_client::GenerationEvent first;
     first.request_id = request_id;
     first.sequence_number = 1;
@@ -202,6 +262,9 @@ class FakeRequestService final
   }
 
   ::inferx::server::scheduler_client::ScheduledRequest submitted;
+  std::vector<::inferx::server::scheduler_client::ScheduledRequest>
+      all_submitted;
+  bool emit_logprobs = false;
   bool cancelled = false;
 };
 
@@ -406,6 +469,52 @@ TEST(RoutesTest, AppliesMetadataBodyLimitAndGuardBeforeHandler) {
   EXPECT_EQ(guard->seen_scope, "inference.invoke");
 }
 
+TEST(RoutesTest, PrefixRoutesYieldToExactRoutesAndBoundTheirMatch) {
+  Routes routes;
+  ASSERT_TRUE(
+      routes.Add(http::verb::get, "/v1/models", std::make_shared<OkHandler>())
+          .ok());
+  ASSERT_TRUE(routes
+                  .AddPrefix(http::verb::get, "/v1/models/",
+                             {.name = "models.retrieve",
+                              .max_body_bytes = 1,
+                              .authentication_required = false},
+                             std::make_shared<TargetEchoHandler>())
+                  .ok());
+  // The trailing slash is the parameter boundary; without it a prefix could
+  // shadow exact siblings.
+  EXPECT_FALSE(routes
+                   .AddPrefix(http::verb::get, "/no-trailing-slash",
+                              {.authentication_required = false},
+                              std::make_shared<TargetEchoHandler>())
+                   .ok());
+
+  CapturingWriter exact_writer;
+  HttpRequest exact{http::verb::get, "/v1/models", 11};
+  folly::coro::blockingWait(routes.Handle(std::move(exact), {}, exact_writer, {}));
+  EXPECT_EQ(exact_writer.status, 200);
+  EXPECT_EQ(exact_writer.body, "{\"ok\":true}");
+
+  CapturingWriter id_writer;
+  HttpRequest by_id{http::verb::get, "/v1/models/llama", 11};
+  folly::coro::blockingWait(routes.Handle(std::move(by_id), {}, id_writer, {}));
+  EXPECT_EQ(id_writer.status, 200);
+  EXPECT_EQ(id_writer.body, "/v1/models/llama");
+
+  CapturingWriter missing_writer;
+  HttpRequest missing{http::verb::get, "/v1/modelsllama", 11};
+  folly::coro::blockingWait(
+      routes.Handle(std::move(missing), {}, missing_writer, {}));
+  EXPECT_EQ(missing_writer.status, 404);
+
+  // A prefix path with the wrong verb is a known path: 405, not 404.
+  CapturingWriter method_writer;
+  HttpRequest wrong_method{http::verb::post, "/v1/models/llama", 11};
+  folly::coro::blockingWait(
+      routes.Handle(std::move(wrong_method), {}, method_writer, {}));
+  EXPECT_EQ(method_writer.status, 405);
+}
+
 TEST(SseWriterTest, FramesEventsCommentsAndFinishes) {
   CapturingWriter writer;
   SseWriter sse(&writer);
@@ -441,19 +550,20 @@ TEST(OpenAiProtocolTest, ValidatesExtendedSamplingParameters) {
   EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
                    R"({"model":"m","prompt":"p","stream_options":{}})")
                    .ok());
-  EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
-                   R"({"model":"m","prompt":"p","n":2})")
-                   .ok());
-  EXPECT_EQ(::inferx::api::ParseCompletionRequest(
-                R"({"model":"m","prompt":"p","top_k":40})")
-                .status()
-                .code(),
-            absl::StatusCode::kUnimplemented);
-  EXPECT_EQ(::inferx::api::ParseCompletionRequest(
-                R"({"model":"m","prompt":"p","repetition_penalty":1.1})")
-                .status()
-                .code(),
-            absl::StatusCode::kUnimplemented);
+  // Implemented since the vLLM-compat work: n>1, top_k, and
+  // repetition_penalty parse into the sampling request rather than erroring.
+  auto multi = ::inferx::api::ParseCompletionRequest(
+      R"({"model":"m","prompt":"p","n":2})");
+  ASSERT_TRUE(multi.ok()) << multi.status();
+  EXPECT_EQ(multi->sampling.n, 2);
+  auto top_k = ::inferx::api::ParseCompletionRequest(
+      R"({"model":"m","prompt":"p","top_k":40})");
+  ASSERT_TRUE(top_k.ok()) << top_k.status();
+  EXPECT_EQ(top_k->sampling.top_k, 40);
+  auto penalty = ::inferx::api::ParseCompletionRequest(
+      R"({"model":"m","prompt":"p","repetition_penalty":1.1})");
+  ASSERT_TRUE(penalty.ok()) << penalty.status();
+  EXPECT_FLOAT_EQ(penalty->sampling.repetition_penalty, 1.1f);
   EXPECT_FALSE(::inferx::api::ParseCompletionRequest(
                    R"({"model":"m","prompt":"p","seed":-1})")
                    .ok());
@@ -1353,6 +1463,138 @@ TEST(TokenizeHandlerTest, EnforcesExactTokenContextLimit) {
   EXPECT_NE(writer.body.find("context limit"), std::string::npos);
 }
 
+TEST(ModelRetrieveHandlerTest, ReturnsSingleModelOrOpenAiNotFound) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v7";
+  model.alias = "chat-current";
+  model.created = 1712;
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kReady).ok());
+  ::inferx::server::handlers::ModelRetrieveHandler handler(&registry,
+                                                           "/v1/models/");
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+
+  CapturingWriter writer;
+  HttpRequest request{http::verb::get, "/v1/models/chat-current", 11};
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), context, writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_EQ(writer.body,
+            "{\"id\":\"chat-current\",\"object\":\"model\",\"created\":1712,"
+            "\"owned_by\":\"inferx\"}");
+
+  CapturingWriter missing_writer;
+  HttpRequest missing{http::verb::get, "/v1/models/unknown", 11};
+  folly::coro::blockingWait(
+      handler.Handle(std::move(missing), context, missing_writer, {}));
+  EXPECT_EQ(missing_writer.status, 404);
+  EXPECT_NE(missing_writer.body.find("\"code\":\"model_not_found\""),
+            std::string::npos);
+  EXPECT_NE(missing_writer.body.find("\"param\":\"model\""),
+            std::string::npos);
+}
+
+TEST(VllmTokenizeHandlerTest, EmitsVllmShapeAndRejectsChatForm) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v7";
+  model.alias = "chat-current";
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kReady).ok());
+  FakeTokenizationService service;
+  ::inferx::server::handlers::VllmTokenizeHandler handler(&registry, &service);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/tokenize", 11};
+  request.body() = "{\"model\":\"chat-current\",\"prompt\":\"hello\"}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), context, writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_EQ(writer.body,
+            "{\"count\":3,\"max_model_len\":null,\"tokens\":[11,12,13]}");
+  EXPECT_EQ(service.seen_version, "chat@v7");
+  EXPECT_EQ(service.seen_prompt, "hello");
+  // vLLM's default, the opposite of /v1/tokenize's.
+  EXPECT_TRUE(service.seen_add_special_tokens);
+
+  CapturingWriter chat_writer;
+  HttpRequest chat{http::verb::post, "/tokenize", 11};
+  chat.body() =
+      "{\"model\":\"chat-current\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"hi\"}]}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(chat), context, chat_writer, {}));
+  EXPECT_EQ(chat_writer.status, 400);
+  EXPECT_NE(chat_writer.body.find(
+                "chat tokenization via /tokenize is not supported"),
+            std::string::npos);
+}
+
+TEST(DetokenizeHandlerTest, RoundTripsTokenizeOutputThroughSequenceDecode) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v7";
+  model.alias = "chat-current";
+  model.visible_tenants.insert("tenant-a");
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v7", ModelState::kReady).ok());
+  FakeTokenizationService service;
+  ::inferx::server::handlers::VllmTokenizeHandler tokenize(&registry,
+                                                           &service);
+  ::inferx::server::handlers::DetokenizeHandler detokenize(&registry,
+                                                           &service);
+  RequestContext context;
+  context.authenticated = true;
+  context.tenant_id = "tenant-a";
+
+  CapturingWriter tokenize_writer;
+  HttpRequest encode{http::verb::post, "/tokenize", 11};
+  encode.body() = "{\"model\":\"chat-current\",\"prompt\":\"hello\"}";
+  folly::coro::blockingWait(
+      tokenize.Handle(std::move(encode), context, tokenize_writer, {}));
+  ASSERT_EQ(tokenize_writer.status, 200);
+
+  CapturingWriter detokenize_writer;
+  HttpRequest decode{http::verb::post, "/detokenize", 11};
+  decode.body() = "{\"model\":\"chat-current\",\"tokens\":[11,12,13]}";
+  folly::coro::blockingWait(
+      detokenize.Handle(std::move(decode), context, detokenize_writer, {}));
+  EXPECT_EQ(detokenize_writer.status, 200);
+  EXPECT_EQ(detokenize_writer.body, "{\"prompt\":\"hello\"}");
+  EXPECT_EQ(service.seen_version, "chat@v7");
+  EXPECT_EQ(service.seen_detokenize_ids,
+            (std::vector<::inferx::tokenizer::TokenId>{11, 12, 13}));
+
+  CapturingWriter malformed_writer;
+  HttpRequest malformed{http::verb::post, "/detokenize", 11};
+  malformed.body() = "{\"model\":\"chat-current\",\"tokens\":\"11\"}";
+  folly::coro::blockingWait(
+      detokenize.Handle(std::move(malformed), context, malformed_writer, {}));
+  EXPECT_EQ(malformed_writer.status, 400);
+  EXPECT_NE(malformed_writer.body.find("array of integers"),
+            std::string::npos);
+}
+
 TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
   auto store = std::make_shared<::inferx::server::auth::ApiKeyStore>();
   ::inferx::server::auth::Principal principal{"tenant-a", "user", "key"};
@@ -1408,6 +1650,66 @@ TEST(ApiRoutesTest, ComposesPublicProbesAndScopedTenantApi) {
       (*built)->Handle(std::move(models), {}, models_writer, {}));
   EXPECT_EQ(models_writer.status, 200);
   EXPECT_EQ(models_writer.body, "{\"object\":\"list\",\"data\":[]}");
+
+  // The retrieve prefix route shares the listing's scope; the empty registry
+  // answers with the OpenAI-shaped 404 rather than the router's.
+  CapturingWriter retrieve_writer;
+  HttpRequest retrieve{http::verb::get, "/v1/models/unknown", 11};
+  retrieve.set(http::field::authorization, "Bearer secret");
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(retrieve), {}, retrieve_writer, {}));
+  EXPECT_EQ(retrieve_writer.status, 404);
+  EXPECT_NE(retrieve_writer.body.find("\"code\":\"model_not_found\""),
+            std::string::npos);
+}
+
+TEST(ApiRoutesTest, ServesVllmCompatibilitySurface) {
+  auto guard = std::make_shared<ScopeGuard>();
+  ::inferx::server::handlers::HealthState health;
+  ::inferx::server::model_registry::Registry registry;
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  FakeMetricsSource metrics;
+  auto built = ::inferx::server::handlers::BuildApiRoutes(
+      {.health = &health,
+       .models = &registry,
+       .tokenization = &tokenization,
+       .requests = &requests,
+       .metrics = &metrics,
+       .guard = guard,
+       .max_inference_body_bytes = 64});
+  ASSERT_TRUE(built.ok()) << built.status();
+
+  CapturingWriter version_writer;
+  HttpRequest version{http::verb::get, "/version", 11};
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(version), {}, version_writer, {}));
+  EXPECT_EQ(version_writer.status, 200);
+  // Shape only: pinning the number would make every version bump a test edit.
+  EXPECT_TRUE(version_writer.body.starts_with("{\"version\":\""));
+  EXPECT_TRUE(version_writer.body.ends_with("\"}"));
+  EXPECT_GT(version_writer.body.size(), std::string("{\"version\":\"\"}").size());
+
+  for (const auto method : {http::verb::get, http::verb::post}) {
+    CapturingWriter ping_writer;
+    HttpRequest ping{method, "/ping", 11};
+    folly::coro::blockingWait(
+        (*built)->Handle(std::move(ping), {}, ping_writer, {}));
+    EXPECT_EQ(ping_writer.status, 200);
+    EXPECT_EQ(ping_writer.body, "{}");
+  }
+
+  CapturingWriter score_writer;
+  HttpRequest score{http::verb::post, "/v1/score", 11};
+  score.body() = "{\"model\":\"m\",\"text_1\":\"a\",\"text_2\":\"b\"}";
+  folly::coro::blockingWait(
+      (*built)->Handle(std::move(score), {}, score_writer, {}));
+  EXPECT_EQ(score_writer.status, 501);
+  EXPECT_NE(score_writer.body.find("\"type\":\"not_supported_error\""),
+            std::string::npos);
+  EXPECT_NE(score_writer.body.find(
+                "/v1/score is not supported by InferX (pooling models)"),
+            std::string::npos);
 }
 
 TEST(MetricsHandlerTest, RendersPrometheusAndLegacyStatsFromSameSnapshot) {
@@ -1666,6 +1968,230 @@ TEST(ChatCompletionHandlerTest, StreamsRoleBeforeContentAndUsage) {
   EXPECT_NE(writer.body.find("\"choices\":[]"), std::string::npos);
   EXPECT_NE(writer.body.find("data: [DONE]"), std::string::npos);
   EXPECT_TRUE(writer.finished);
+}
+
+// Registers a ready generation model "text@v1"; Registry owns a mutex, so it
+// is populated in place rather than returned.
+void FillReadyTextRegistry(::inferx::server::model_registry::Registry* registry) {
+  using namespace ::inferx::server::model_registry;
+  ModelRecord model;
+  model.id = "text";
+  model.version = "v1";
+  model.context_limit = 64;
+  ASSERT_TRUE(registry->Register(model).ok());
+  ASSERT_TRUE(registry->SetState("text", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry->SetState("text", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry->SetState("text", "v1", ModelState::kReady).ok());
+}
+
+TEST(CompletionHandlerTest, RejectsStreamingWithMultipleChoices) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"n\":2,\"stream\":true}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 400);
+  EXPECT_NE(writer.body.find("streaming with n>1"), std::string::npos);
+  EXPECT_TRUE(requests.all_submitted.empty());
+}
+
+TEST(CompletionHandlerTest, RejectsChoiceCountAboveServerCap) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() = "{\"model\":\"text@v1\",\"prompt\":\"input\",\"n\":9}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 400);
+  EXPECT_NE(writer.body.find("parallel-choice limit"), std::string::npos);
+  EXPECT_TRUE(requests.all_submitted.empty());
+}
+
+TEST(CompletionHandlerTest, RunsParallelChoicesWithDerivedSeeds) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"max_tokens\":2,"
+      "\"n\":2,\"seed\":9}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(writer.body.find("\"index\":0"), std::string::npos);
+  EXPECT_NE(writer.body.find("\"index\":1"), std::string::npos);
+  // Prompt tokens count once; each choice's single completion token sums.
+  EXPECT_NE(writer.body.find("\"usage\":{\"prompt_tokens\":3,"
+                             "\"completion_tokens\":2,\"total_tokens\":5}"),
+            std::string::npos);
+  ASSERT_EQ(requests.all_submitted.size(), 2);
+  EXPECT_EQ(requests.all_submitted[0].sampling.seed, 9u);
+  EXPECT_EQ(requests.all_submitted[1].sampling.seed, 10u);
+  EXPECT_NE(requests.all_submitted[0].request_id,
+            requests.all_submitted[1].request_id);
+}
+
+TEST(CompletionHandlerTest, EchoPrependsPromptText) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"max_tokens\":2,"
+      "\"echo\":true}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(writer.body.find("\"text\":\"inputhello\""), std::string::npos);
+}
+
+TEST(CompletionHandlerTest, StreamingEchoLeadsWithPromptChunk) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"max_tokens\":2,"
+      "\"echo\":true,\"stream\":true}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  const size_t prompt = writer.body.find("\"text\":\"input\"");
+  const size_t generated = writer.body.find("\"text\":\"hello\"");
+  ASSERT_NE(prompt, std::string::npos);
+  ASSERT_NE(generated, std::string::npos);
+  EXPECT_LT(prompt, generated);
+}
+
+TEST(CompletionHandlerTest, ReportsLogprobsWithFallbackTokenSpelling) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  requests.emit_logprobs = true;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"max_tokens\":2,"
+      "\"logprobs\":2}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  // The fake service has no tokenizer, so token text falls back to the
+  // placeholder spelling; both generated positions must be reported.
+  EXPECT_NE(writer.body.find("\"tokens\":[\"token_id:5\",\"token_id:7\"]"),
+            std::string::npos);
+  EXPECT_NE(writer.body.find("\"token_logprobs\":[-0.250000,-0.500000]"),
+            std::string::npos);
+  EXPECT_NE(
+      writer.body.find(
+          "\"top_logprobs\":[{\"token_id:5\":-0.250000,"
+          "\"token_id:6\":-1.500000},{}]"),
+      std::string::npos);
+  EXPECT_TRUE(requests.submitted.sampling.want_logprobs);
+  EXPECT_EQ(requests.submitted.sampling.top_logprobs, 2);
+}
+
+TEST(CompletionHandlerTest, StreamsChunkForTokenWithoutText) {
+  ::inferx::server::model_registry::Registry registry;
+  FillReadyTextRegistry(&registry);
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  requests.emit_logprobs = true;
+  ::inferx::server::handlers::CompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/completions", 11};
+  request.body() =
+      "{\"model\":\"text@v1\",\"prompt\":\"input\",\"max_tokens\":2,"
+      "\"logprobs\":0,\"stream\":true}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  // The second token completed no character but its report still needs a
+  // chunk: an empty text with a non-null logprobs object.
+  EXPECT_NE(writer.body.find("\"text\":\"\",\"logprobs\":{\"tokens\":"
+                             "[\"token_id:7\"]"),
+            std::string::npos);
+  EXPECT_NE(writer.body.find("\"tokens\":[\"token_id:5\"]"),
+            std::string::npos);
+}
+
+TEST(ChatCompletionHandlerTest, ReportsLogprobsInOpenAiChatShape) {
+  using namespace ::inferx::server::model_registry;
+  Registry registry;
+  ModelRecord model;
+  model.id = "chat";
+  model.version = "v1";
+  model.context_limit = 64;
+  ASSERT_TRUE(registry.Register(model).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kLoading).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kWarming).ok());
+  ASSERT_TRUE(registry.SetState("chat", "v1", ModelState::kReady).ok());
+  FakeTokenizationService tokenization;
+  FakeRequestService requests;
+  requests.emit_logprobs = true;
+  ::inferx::server::handlers::ChatCompletionHandler handler(
+      &registry, &tokenization, &requests);
+  RequestContext context;
+  context.authenticated = true;
+  CapturingWriter writer;
+  HttpRequest request{http::verb::post, "/v1/chat/completions", 11};
+  request.body() =
+      "{\"model\":\"chat@v1\",\"messages\":[{\"role\":\"user\","
+      "\"content\":\"hi\"}],\"max_tokens\":2,\"logprobs\":true,"
+      "\"top_logprobs\":2}";
+  folly::coro::blockingWait(
+      handler.Handle(std::move(request), std::move(context), writer, {}));
+  EXPECT_EQ(writer.status, 200);
+  EXPECT_NE(
+      writer.body.find(
+          "\"logprobs\":{\"content\":[{\"token\":\"token_id:5\","
+          "\"logprob\":-0.250000"),
+      std::string::npos);
+  EXPECT_NE(writer.body.find("{\"token\":\"token_id:6\","
+                             "\"logprob\":-1.500000"),
+            std::string::npos);
 }
 
 TEST(BeastListenerTest, ServesSequentialKeepAliveRequests) {

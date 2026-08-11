@@ -143,13 +143,14 @@ Per `docs/DSV2_VALIDATION.md`, with session amendments:
 python scripts/gen_deepseek_logits.py /root/autodl-tmp/ckpt/dsv2-lite \
     testdata/deepseek_v2_lite_logits.bin          # bf16 GPU reference
 export INFERX_TEST_DEEPSEEK_CHECKPOINT=/root/autodl-tmp/ckpt/dsv2-lite
-(cd build && ctest -R DeepseekV2Reference --output-on-failure)                      # convention A
-(cd build && INFERX_DSV2_ROPE_DEINTERLEAVE=1 ctest -R DeepseekV2Reference --output-on-failure)  # convention B
+(cd build && ctest -R DeepseekV2Reference --output-on-failure)
 
-INFERX_DSV2_ROPE_DEINTERLEAVE=1 ./build/src/server/inferx-serve \
+# (The INFERX_DSV2_ROPE_DEINTERLEAVE toggle used during this session is gone:
+# the deinterleaved convention won and is hardcoded.)
+./build/src/main/inferx-serve \
   --model /root/autodl-tmp/ckpt/dsv2-lite-chat \
   --served-model-name deepseek-v2-lite-chat \
-  --port 8080 --kv-blocks 8192 --block-size 16
+  --port 8080 --num-gpu-blocks-override 8192 --block-size 16
 ```
 
 Findings that changed the procedure:

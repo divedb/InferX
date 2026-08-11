@@ -4,6 +4,7 @@
 #include "inferx/server/handlers/metrics_handler.h"
 #include "inferx/server/handlers/completion_handler.h"
 #include "inferx/server/handlers/tokenize_handler.h"
+#include "inferx/server/handlers/vllm_compat_handler.h"
 
 namespace inferx::server::handlers {
 namespace {
@@ -116,6 +117,68 @@ StatusOr<std::shared_ptr<transport::Routes>> BuildApiRoutes(
        .required_scope = "inference.invoke"},
       std::make_shared<EmbeddingsHandler>(dependencies.models,
                                           dependencies.embeddings)));
+
+  // vLLM compatibility surface.
+  INFERX_RETURN_IF_ERROR(routes->AddPrefix(
+      boost::beast::http::verb::get, "/v1/models/",
+      {.name = "models.retrieve",
+       .max_body_bytes = 1,
+       .authentication_required = true,
+       .required_scope = "models.read"},
+      std::make_shared<ModelRetrieveHandler>(dependencies.models,
+                                             "/v1/models/")));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::get, "/version",
+      {.name = "version",
+       .max_body_bytes = 1,
+       .authentication_required = false},
+      std::make_shared<VersionHandler>()));
+  auto ping = std::make_shared<PingHandler>();
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::get, "/ping",
+      {.name = "ping",
+       .max_body_bytes = 1,
+       .authentication_required = false},
+      ping));
+  // vLLM's POST /ping ignores any body; a small allowance keeps a client that
+  // sends `{}` from a 413.
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::post, "/ping",
+      {.name = "ping",
+       .max_body_bytes = 1024,
+       .authentication_required = false},
+      ping));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::post, "/tokenize",
+      {.name = "vllm.tokenize",
+       .max_body_bytes = dependencies.max_inference_body_bytes,
+       .authentication_required = true,
+       .required_scope = "inference.invoke"},
+      std::make_shared<VllmTokenizeHandler>(dependencies.models,
+                                            dependencies.tokenization)));
+  INFERX_RETURN_IF_ERROR(routes->Add(
+      boost::beast::http::verb::post, "/detokenize",
+      {.name = "vllm.detokenize",
+       .max_body_bytes = dependencies.max_inference_body_bytes,
+       .authentication_required = true,
+       .required_scope = "inference.invoke"},
+      std::make_shared<DetokenizeHandler>(dependencies.models,
+                                          dependencies.tokenization)));
+  // Pooling-model endpoints a vLLM client may probe: a 501 that names the
+  // path tells it "never here" rather than the 404 that means "wrong URL".
+  // Unauthenticated on purpose -- the answer is the same for everyone and
+  // holds no tenant data. The inference body limit applies so a real scoring
+  // payload reaches the 501 instead of dying as a 413.
+  auto not_supported = std::make_shared<NotSupportedHandler>("pooling models");
+  for (const char* path : {"/pooling", "/score", "/rerank", "/v1/pooling",
+                           "/v1/score", "/v1/rerank"}) {
+    INFERX_RETURN_IF_ERROR(routes->Add(
+        boost::beast::http::verb::post, path,
+        {.name = std::string("not_supported") + path,
+         .max_body_bytes = dependencies.max_inference_body_bytes,
+         .authentication_required = false},
+        not_supported));
+  }
   return routes;
 }
 

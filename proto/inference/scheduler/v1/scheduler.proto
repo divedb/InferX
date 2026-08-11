@@ -42,6 +42,39 @@ message SamplingParams {
   float top_p = 3;
   uint64 seed = 4;
   repeated string stop = 5;
+
+  // Fields 6+ are append-only vLLM-compatible sampling extensions. Old
+  // servers ignore them; old clients leave them at proto3 defaults, which
+  // are all "feature off".
+  int32 top_k = 6;
+  float min_p = 7;
+  float presence_penalty = 8;
+  float frequency_penalty = 9;
+  // 0 on the wire means "unset" (proto3 default); the receiver treats it as
+  // the neutral 1.0.
+  float repetition_penalty = 10;
+  repeated int32 stop_token_ids = 11;
+  bool ignore_eos = 12;
+  int32 min_tokens = 13;
+  bool want_logprobs = 14;
+  int32 top_logprobs = 15;
+  // Inverted from the API's skip_special_tokens so the proto3 default
+  // (false) matches vLLM's default behavior (skip = true).
+  bool keep_special_tokens = 16;
+  bool include_stop_str_in_output = 17;
+}
+
+message TopLogprob {
+  int32 token_id = 1;
+  float logprob = 2;
+}
+
+// Log-probabilities for one generated token: the chosen token's logprob and
+// up to top_logprobs alternatives, most probable first.
+message TokenLogprobs {
+  int32 token_id = 1;
+  float logprob = 2;
+  repeated TopLogprob top = 3;
 }
 
 message SubmitRequest {
@@ -96,6 +129,8 @@ message GenerationEvent {
   FinishReason finish_reason = 9;
   Usage usage = 10;
   RpcError error = 11;
+  // Parallel to token_ids; present only when the request asked for logprobs.
+  repeated TokenLogprobs logprobs = 12;
 }
 
 message CancelRequest {

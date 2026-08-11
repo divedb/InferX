@@ -26,3 +26,21 @@ target_link_libraries(inferx_support
     absl::failure_signal_handler
     absl::symbolize
 )
+
+# inferx_vllm_compat -- the vLLM flag-stub registry, shared by both binaries'
+# parsers and their tests. Separate from inferx_support so that lib keeps no
+# CLI11 or OpenSSL dependency.
+find_package(OpenSSL REQUIRED)
+add_library(inferx_vllm_compat vllm_compat.cc)
+add_library(inferx::vllm_compat ALIAS inferx_vllm_compat)
+target_link_libraries(inferx_vllm_compat
+  PUBLIC inferx::support CLI11::CLI11
+  PRIVATE OpenSSL::Crypto)
+
+# inferx_serve_options -- inferx-serve's CLI schema as a linkable library, so
+# the parser is unit-testable. Public deps carry the header surface of
+# ServeOptions (engine + http-server config types).
+add_library(inferx_serve_options options.cc)
+add_library(inferx::serve_options ALIAS inferx_serve_options)
+target_link_libraries(inferx_serve_options
+  PUBLIC inferx::vllm_compat inferx::core inferx::folly_coro)

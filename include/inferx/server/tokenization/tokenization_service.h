@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -27,6 +28,31 @@ class TokenizationService {
   virtual StatusOr<TokenizedPrompt> TokenizeChat(
       const request::ModelVersion& model_version,
       const std::vector<tokenizer::ChatMessage>& messages) = 0;
+
+  /// \brief Decodes each id independently to its token string, for logprob
+  ///        reporting.
+  ///
+  /// Not a sequence decode: each returned string labels exactly one id, so
+  /// adjacent-token merge rules must not apply.
+  ///
+  /// The base implementation returns vLLM's placeholder spelling
+  /// `token_id:<N>`, which is what a deployment whose tokenizer lives in
+  /// another process can honestly report; the in-process service overrides it
+  /// with real decoding.
+  virtual StatusOr<std::vector<std::string>> DecodeTokens(
+      const request::ModelVersion& model_version,
+      const std::vector<tokenizer::TokenId>& ids);
+
+  /// \brief Decodes `ids` as one sequence, applying adjacent-token merge
+  ///        rules -- the inverse of tokenization, unlike DecodeTokens whose
+  ///        per-id strings would corrupt multibyte characters split across
+  ///        tokens.
+  ///
+  /// The base implementation returns Unimplemented: unlike DecodeTokens there
+  /// is no honest placeholder for a whole decoded prompt.
+  virtual StatusOr<std::string> Detokenize(
+      const request::ModelVersion& model_version,
+      const std::vector<tokenizer::TokenId>& ids);
 };
 
 /// Compatibility adapter for the currently loaded in-process model.
@@ -47,6 +73,12 @@ class InProcessTokenizationService final : public TokenizationService {
   StatusOr<TokenizedPrompt> TokenizeChat(
       const request::ModelVersion& model_version,
       const std::vector<tokenizer::ChatMessage>& messages) override;
+  StatusOr<std::vector<std::string>> DecodeTokens(
+      const request::ModelVersion& model_version,
+      const std::vector<tokenizer::TokenId>& ids) override;
+  StatusOr<std::string> Detokenize(
+      const request::ModelVersion& model_version,
+      const std::vector<tokenizer::TokenId>& ids) override;
 
  private:
   const tokenizer::Tokenizer* tokenizer_;

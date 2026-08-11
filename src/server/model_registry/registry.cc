@@ -68,15 +68,31 @@ StatusOr<ModelRecord> Registry::Resolve(std::string_view id_or_alias,
   std::lock_guard lock(mutex_);
   std::string key(id_or_alias);
   if (const auto alias = aliases_.find(key); alias != aliases_.end()) key = alias->second;
-  const auto it = records_.find(key);
-  if (it == records_.end() || it->second.state != ModelState::kReady) {
+  const ModelRecord* found = nullptr;
+  if (const auto it = records_.find(key);
+      it != records_.end() && it->second.state == ModelState::kReady) {
+    found = &it->second;
+  } else {
+    // API clients address models by bare ID ("deepseek-v2-lite-chat"), but
+    // records are keyed by id@version. Resolve a bare ID to its newest ready
+    // version rather than demanding clients know the version string.
+    for (const auto& [unused, record] : records_) {
+      if (record.id != id_or_alias || record.state != ModelState::kReady) {
+        continue;
+      }
+      if (found == nullptr || record.created > found->created) {
+        found = &record;
+      }
+    }
+  }
+  if (found == nullptr) {
     return NotFoundError("ready model not found: ", id_or_alias);
   }
-  if (!tenant.empty() && !it->second.visible_tenants.empty() &&
-      !it->second.visible_tenants.contains(std::string(tenant))) {
+  if (!tenant.empty() && !found->visible_tenants.empty() &&
+      !found->visible_tenants.contains(std::string(tenant))) {
     return NotFoundError("ready model not found: ", id_or_alias);
   }
-  return it->second;
+  return *found;
 }
 
 std::vector<ModelRecord> Registry::ReadyModels() const {

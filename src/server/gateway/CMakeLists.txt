@@ -16,6 +16,7 @@ target_link_libraries(inferx_gateway_server PUBLIC
   inferx::tokenizer
   inferx::folly_coro)
 
-add_executable(inferx-gateway main.cc)
+add_executable(inferx-gateway main.cc options.cc)
 target_link_libraries(inferx-gateway PRIVATE inferx::gateway_server)
-target_link_libraries(inferx-gateway PRIVATE inferx::support)
+target_link_libraries(inferx-gateway PRIVATE inferx::support
+  inferx::vllm_compat CLI11::CLI11)

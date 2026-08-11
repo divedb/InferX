@@ -7,8 +7,13 @@ add_library(inferx_request_handlers
   health_handler.cc
   metrics_handler.cc
   models_handler.cc
-  tokenize_handler.cc)
+  tokenize_handler.cc
+  vllm_compat_handler.cc)
 add_library(inferx::request_handlers ALIAS inferx_request_handlers)
+# /version reports the CMake project version; nothing else needs it, so the
+# definition stays private to this target.
+target_compile_definitions(inferx_request_handlers PRIVATE
+  INFERX_VERSION="${PROJECT_VERSION}")
 target_include_directories(inferx_request_handlers PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_link_libraries(inferx_request_handlers PUBLIC

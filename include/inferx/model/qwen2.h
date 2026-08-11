@@ -92,6 +92,26 @@ class Qwen2Model {
   /// \param block_size Tokens per block. 16 by default (T10).
   Status AttachKvCache(int64_t num_blocks, int64_t block_size = 16);
 
+  /// \brief Bytes one KV block would occupy across all layers, without
+  /// allocating. For sizing the pool before `AttachKvCache`. Honors the
+  /// current FP8-KV setting, so call it after `EnableFp8KvCache`.
+  int64_t KvBlockBytes(int64_t block_size) const;
+
+  /// \brief Logprobs of one sampled row, read back after `AwaitStep`.
+  struct SampledLogprob {
+    bool present = false;
+    float logprob = 0.0f;
+    /// Most probable first, at most `ForwardBatch::kMaxTopLogprobs` entries.
+    std::vector<std::pair<int32_t, float>> top;
+  };
+
+  /// \brief The last step's logprobs, one entry per sampled row.
+  ///
+  /// Valid only after `AwaitStep` returned for that step -- the same event
+  /// that publishes the sampled ids publishes these. Rows whose batch did not
+  /// ask (`logprobs_k` absent or negative) come back `present = false`.
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) const;
+
   /// \brief The pool, for the scheduler to allocate blocks from.
   ///
   /// The model owns the allocation because the executor owns device memory

@@ -1037,6 +1037,8 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
                              const int32_t* __restrict__ rows,
                              const float* __restrict__ temperature,
                              const float* __restrict__ top_p,
+                             const int32_t* __restrict__ top_k,
+                             const float* __restrict__ min_p,
                              const uint64_t* __restrict__ seeds,
                              int32_t* __restrict__ out, int64_t vocab) {
   __shared__ float shared[256];
@@ -1049,6 +1051,8 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
 
   const float t = temperature[r];
   const float p = top_p[r];
+  const int k = top_k[r];
+  const float mp = min_p[r];
 
   // Greedy is the temperature -> 0 limit, and the path most callers take.
   if (!(t > 0.0f)) {
@@ -1122,7 +1126,10 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
   // Pass 3: bisect the probability cutoff. The nucleus is every token whose
   // normalized probability is at least `cut`, where `cut` is the largest
   // threshold whose surviving mass still reaches p. Sorting would give the same
-  // set; this gets there with reductions instead.
+  // set; this gets there with reductions instead. top_k gets the same
+  // treatment with a count in place of the mass, min_p is a closed-form
+  // threshold (the max probability is exactly 1/total), and the final cut is
+  // the strictest of the three.
   if (threadIdx.x == 0) {
     s_cut = 0.0f;
     s_mass = 1.0f;
@@ -1167,8 +1174,73 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
     }
   }
 
-  const float cut = s_cut;
-  const float mass = s_mass;
+  float cut = s_cut;
+
+  // top_k: the largest cut that still keeps at least k tokens. Ties at the
+  // k-th probability keep more than k, which is the conventional resolution.
+  if (k > 0 && static_cast<int64_t>(k) < vocab) {
+    __shared__ float s_cut_k;
+    if (threadIdx.x == 0) s_cut_k = 0.0f;
+    __syncthreads();
+
+    float lo = 0.0f;
+    float hi = 1.0f;
+    for (int step = 0; step < 32; ++step) {
+      const float mid = 0.5f * (lo + hi);
+
+      float count = 0.0f;
+      for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+        const float prob =
+            __expf(__bfloat162float(row[i]) * inv_t - max_logit) / total;
+        if (prob >= mid) count += 1.0f;
+      }
+
+      shared[threadIdx.x] = count;
+      __syncthreads();
+      for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+          shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+      }
+
+      if (shared[0] >= static_cast<float>(k)) {
+        lo = mid;
+        if (threadIdx.x == 0) s_cut_k = mid;
+      } else {
+        hi = mid;
+      }
+      __syncthreads();
+    }
+    cut = fmaxf(cut, s_cut_k);
+    __syncthreads();
+  }
+
+  // min_p: relative to the most probable token, whose normalized probability
+  // is exp(0)/total.
+  if (mp > 0.0f) cut = fmaxf(cut, mp / total);
+
+  float mass = s_mass;
+
+  // The surviving mass is only known for the top_p cut; if top_k or min_p
+  // tightened it, one more reduction re-measures the survivors so the draw
+  // below normalizes correctly.
+  if (cut > s_cut) {
+    float local = 0.0f;
+    for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+      const float prob =
+          __expf(__bfloat162float(row[i]) * inv_t - max_logit) / total;
+      if (prob >= cut) local += prob;
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+      __syncthreads();
+    }
+    mass = shared[0];
+    __syncthreads();
+  }
 
   // Pass 4: inverse CDF over the nucleus. Philox rather than a counter hashed
   // by hand, so the stream is well-distributed and reproducible from the seed.
@@ -1213,6 +1285,161 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
   }
 }
 
+// Penalties and min-tokens stop masking, in place, before sampling. One block
+// per row; the history holds *unique* ids (the host aggregates counts), so
+// every entry touches a distinct logit and no atomics are needed. Rows with
+// nothing to do read three floats and exit, which is what makes it safe to
+// leave in the captured graph unconditionally.
+__global__ void ApplyPenaltiesKernel(
+    bf16* __restrict__ logits, const int32_t* __restrict__ rows,
+    const float* __restrict__ presence, const float* __restrict__ frequency,
+    const float* __restrict__ repetition,
+    const int32_t* __restrict__ history_ids,
+    const int32_t* __restrict__ history_counts, int hist_cap,
+    const int32_t* __restrict__ mask_ids, int mask_cap, int64_t vocab) {
+  const int r = static_cast<int>(blockIdx.x);
+  bf16* row = logits + static_cast<int64_t>(rows[r]) * vocab;
+
+  const float pres = presence[r];
+  const float freq = frequency[r];
+  const float rep = repetition[r];
+
+  if (pres != 0.0f || freq != 0.0f || rep != 1.0f) {
+    for (int i = static_cast<int>(threadIdx.x); i < hist_cap;
+         i += static_cast<int>(blockDim.x)) {
+      const int32_t id = history_ids[r * hist_cap + i];
+      if (id < 0 || static_cast<int64_t>(id) >= vocab) continue;
+
+      float value = __bfloat162float(row[id]);
+      if (rep != 1.0f) value = value > 0.0f ? value / rep : value * rep;
+      value -= pres;
+      value -= freq * static_cast<float>(history_counts[r * hist_cap + i]);
+      row[id] = __float2bfloat16(value);
+    }
+  }
+
+  for (int i = static_cast<int>(threadIdx.x); i < mask_cap;
+       i += static_cast<int>(blockDim.x)) {
+    const int32_t id = mask_ids[r * mask_cap + i];
+    if (id >= 0 && static_cast<int64_t>(id) < vocab) {
+      row[id] = __float2bfloat16(-INFINITY);
+    }
+  }
+}
+
+// Logprobs of the sampled token and its top-k alternatives, over the
+// (post-penalty) logits at temperature 1. Two reductions for the partition
+// function, then k rounds of "argmax strictly after the previous winner" in
+// (value, index) order -- k is at most 20, so k more passes beat any sort.
+__global__ void ComputeLogprobsKernel(
+    const bf16* __restrict__ logits, const int32_t* __restrict__ rows,
+    const int32_t* __restrict__ chosen, const int32_t* __restrict__ k_wanted,
+    float* __restrict__ chosen_lp, int32_t* __restrict__ top_ids,
+    float* __restrict__ top_lps, int max_k, int64_t vocab) {
+  __shared__ float shared[256];
+  __shared__ int shared_idx[256];
+  __shared__ float s_prev_val;
+  __shared__ int s_prev_idx;
+
+  const int r = static_cast<int>(blockIdx.x);
+  const int k = min(k_wanted[r], max_k);
+  if (k < 0) return;
+
+  const bf16* row = logits + static_cast<int64_t>(rows[r]) * vocab;
+
+  // Partition function at temperature 1.
+  float local_max = -INFINITY;
+  for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    local_max = fmaxf(local_max, __bfloat162float(row[i]));
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x],
+                                  shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_logit = shared[0];
+  __syncthreads();
+
+  float local_sum = 0.0f;
+  for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+    local_sum += __expf(__bfloat162float(row[i]) - max_logit);
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float log_z = __logf(shared[0]) + max_logit;
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    chosen_lp[r] = __bfloat162float(row[chosen[r]]) - log_z;
+    s_prev_val = INFINITY;
+    s_prev_idx = -1;
+  }
+  __syncthreads();
+
+  for (int j = 0; j < k; ++j) {
+    const float prev_val = s_prev_val;
+    const int prev_idx = s_prev_idx;
+
+    // The next winner is the largest element strictly after the previous one
+    // in descending (value, ascending index) order, so equal values resolve
+    // deterministically.
+    float best = -INFINITY;
+    int best_i = -1;
+    for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+      const float v = __bfloat162float(row[i]);
+      const bool after_prev =
+          v < prev_val ||
+          (v == prev_val && static_cast<int>(i) > prev_idx);
+      if (!after_prev) continue;
+      if (v > best || (v == best && static_cast<int>(i) < best_i)) {
+        best = v;
+        best_i = static_cast<int>(i);
+      }
+    }
+    shared[threadIdx.x] = best;
+    shared_idx[threadIdx.x] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        const float other = shared[threadIdx.x + stride];
+        const int other_i = shared_idx[threadIdx.x + stride];
+        if (other > shared[threadIdx.x] ||
+            (other == shared[threadIdx.x] && other_i >= 0 &&
+             (shared_idx[threadIdx.x] < 0 ||
+              other_i < shared_idx[threadIdx.x]))) {
+          shared[threadIdx.x] = other;
+          shared_idx[threadIdx.x] = other_i;
+        }
+      }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      const int idx = shared_idx[0];
+      top_ids[r * max_k + j] = idx;
+      top_lps[r * max_k + j] = idx < 0 ? -INFINITY : shared[0] - log_z;
+      s_prev_val = shared[0];
+      s_prev_idx = idx;
+    }
+    __syncthreads();
+  }
+
+  // Pad the tail so a reader never confuses stale entries for results.
+  for (int j = k + static_cast<int>(threadIdx.x); j < max_k;
+       j += static_cast<int>(blockDim.x)) {
+    top_ids[r * max_k + j] = -1;
+    top_lps[r * max_k + j] = -INFINITY;
+  }
+}
+
 Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
                     const TensorView& out, cudaStream_t stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
@@ -1241,6 +1468,7 @@ Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
 
 Status SampleTokens(const TensorView& logits, const TensorView& rows,
                     const TensorView& temperature, const TensorView& top_p,
+                    const TensorView& top_k, const TensorView& min_p,
                     const TensorView& seeds, const TensorView& out,
                     cudaStream_t stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
@@ -1248,17 +1476,25 @@ Status SampleTokens(const TensorView& logits, const TensorView& rows,
   INFERX_RETURN_IF_ERROR(
       CheckTensor(temperature, DataType::kFloat, 1, "temperature"));
   INFERX_RETURN_IF_ERROR(CheckTensor(top_p, DataType::kFloat, 1, "top_p"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(top_k, DataType::kInt32, 1, "top_k"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(min_p, DataType::kFloat, 1, "min_p"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kInt32, 1, "out"));
 
   const int64_t n = rows.Dim(0);
   const int64_t vocab = logits.Dim(1);
 
   for (const auto& [t, name] : {std::pair{temperature, "temperature"},
-                                std::pair{top_p, "top_p"}}) {
+                                std::pair{top_p, "top_p"},
+                                std::pair{min_p, "min_p"}}) {
     if (t.Dim(0) != n) {
       return InvalidArgumentError(name, " has ", t.Dim(0), " entries but ", n,
                                   " rows were requested");
     }
+  }
+
+  if (top_k.Dim(0) != n) {
+    return InvalidArgumentError("top_k has ", top_k.Dim(0), " entries but ", n,
+                                " rows were requested");
   }
 
   if (seeds.Dim(0) != n) {
@@ -1278,8 +1514,108 @@ Status SampleTokens(const TensorView& logits, const TensorView& rows,
       static_cast<const int32_t*>(rows.Data()),
       static_cast<const float*>(temperature.Data()),
       static_cast<const float*>(top_p.Data()),
+      static_cast<const int32_t*>(top_k.Data()),
+      static_cast<const float*>(min_p.Data()),
       static_cast<const uint64_t*>(seeds.Data()),
       static_cast<int32_t*>(out.Data()), vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
+                      const TensorView& presence, const TensorView& frequency,
+                      const TensorView& repetition,
+                      const TensorView& history_ids,
+                      const TensorView& history_counts,
+                      const TensorView& mask_ids, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(presence, DataType::kFloat, 1, "presence"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(frequency, DataType::kFloat, 1, "frequency"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(repetition, DataType::kFloat, 1, "repetition"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(history_ids, DataType::kInt32, 2, "history_ids"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(history_counts, DataType::kInt32, 2, "history_counts"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(mask_ids, DataType::kInt32, 2, "mask_ids"));
+
+  const int64_t n = rows.Dim(0);
+  const int64_t vocab = logits.Dim(1);
+  const int64_t hist_cap = history_ids.Dim(1);
+  const int64_t mask_cap = mask_ids.Dim(1);
+
+  for (const auto& [t, name] :
+       {std::pair{presence, "presence"}, std::pair{frequency, "frequency"},
+        std::pair{repetition, "repetition"}}) {
+    if (t.Dim(0) != n) {
+      return InvalidArgumentError(name, " has ", t.Dim(0), " entries but ", n,
+                                  " rows were requested");
+    }
+  }
+  if (history_ids.Dim(0) != n || history_counts.Dim(0) != n ||
+      mask_ids.Dim(0) != n ||
+      history_counts.Dim(1) != hist_cap) {
+    return InvalidArgumentError(
+        "penalty history/mask shapes disagree with the row count");
+  }
+
+  if (n == 0) return OkStatus();
+
+  ApplyPenaltiesKernel<<<static_cast<unsigned>(n), 128, 0, stream>>>(
+      static_cast<bf16*>(logits.Data()),
+      static_cast<const int32_t*>(rows.Data()),
+      static_cast<const float*>(presence.Data()),
+      static_cast<const float*>(frequency.Data()),
+      static_cast<const float*>(repetition.Data()),
+      static_cast<const int32_t*>(history_ids.Data()),
+      static_cast<const int32_t*>(history_counts.Data()),
+      static_cast<int>(hist_cap),
+      static_cast<const int32_t*>(mask_ids.Data()),
+      static_cast<int>(mask_cap), vocab);
+
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
+                       const TensorView& chosen, const TensorView& k_wanted,
+                       const TensorView& chosen_lp, const TensorView& top_ids,
+                       const TensorView& top_lps, cudaStream_t stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(chosen, DataType::kInt32, 1, "chosen"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(k_wanted, DataType::kInt32, 1, "k_wanted"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(chosen_lp, DataType::kFloat, 1, "chosen_lp"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(top_ids, DataType::kInt32, 2, "top_ids"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(top_lps, DataType::kFloat, 2, "top_lps"));
+
+  const int64_t n = rows.Dim(0);
+  const int64_t vocab = logits.Dim(1);
+  const int64_t max_k = top_ids.Dim(1);
+
+  if (chosen.Dim(0) != n || k_wanted.Dim(0) != n || chosen_lp.Dim(0) != n ||
+      top_ids.Dim(0) != n || top_lps.Dim(0) != n || top_lps.Dim(1) != max_k) {
+    return InvalidArgumentError("logprob output shapes disagree with the row "
+                                "count");
+  }
+
+  if (n == 0) return OkStatus();
+
+  ComputeLogprobsKernel<<<static_cast<unsigned>(n), 256, 0, stream>>>(
+      static_cast<const bf16*>(logits.Data()),
+      static_cast<const int32_t*>(rows.Data()),
+      static_cast<const int32_t*>(chosen.Data()),
+      static_cast<const int32_t*>(k_wanted.Data()),
+      static_cast<float*>(chosen_lp.Data()),
+      static_cast<int32_t*>(top_ids.Data()),
+      static_cast<float*>(top_lps.Data()), static_cast<int>(max_k), vocab);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();

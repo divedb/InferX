@@ -606,6 +606,11 @@ DeepseekV2Model& DeepseekV2Model::operator=(DeepseekV2Model&&) noexcept =
 
 const ModelConfig& DeepseekV2Model::config() const { return impl_->config; }
 
+int64_t DeepseekV2Model::KvBlockBytes(int64_t block_size) const {
+  return KvBlockPool::BlockBytes(impl_->config.num_hidden_layers, block_size,
+                                 MlaAttentionLayer::LayoutFor(impl_->config));
+}
+
 Status DeepseekV2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,

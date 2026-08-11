@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "inferx/core/status.h"
@@ -26,6 +27,29 @@ struct SamplingParams {
   float top_p = 1;
   uint64_t seed = 0;
   std::vector<std::string> stop;
+
+  // vLLM-compatible sampling extensions; defaults are all "feature off".
+  int32_t top_k = 0;
+  float min_p = 0;
+  float presence_penalty = 0;
+  float frequency_penalty = 0;
+  float repetition_penalty = 1;
+  std::vector<int32_t> stop_token_ids;
+  bool ignore_eos = false;
+  int32_t min_tokens = 0;
+  bool want_logprobs = false;
+  int32_t top_logprobs = 0;
+  bool skip_special_tokens = true;
+  bool include_stop_str_in_output = false;
+};
+
+/// Log-probabilities for one generated token, mirroring the wire message:
+/// the chosen token plus up to `top_logprobs` alternatives, most probable
+/// first (the chosen token is always included in `top` when it ranks).
+struct TokenLogprobs {
+  int32_t token_id = 0;
+  float logprob = 0;
+  std::vector<std::pair<int32_t, float>> top;
 };
 
 struct ScheduledRequest {
@@ -65,6 +89,8 @@ struct GenerationEvent {
   std::string text_delta;
   std::vector<int32_t> token_ids;
   std::vector<EmbeddingResult> embeddings;
+  /// Parallel to token_ids; empty unless the request asked for logprobs.
+  std::vector<TokenLogprobs> logprobs;
   uint32_t generated_tokens = 0;
   bool terminal = false;
   FinishReason finish_reason = FinishReason::kNone;

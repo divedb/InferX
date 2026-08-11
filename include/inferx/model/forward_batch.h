@@ -90,6 +90,33 @@ struct ForwardBatch {
   std::vector<float> top_p;
   std::vector<uint64_t> seeds;
 
+  /// Per-row truncation and penalty parameters, parallel to `logits_indices`
+  /// like the vectors above; empty means the feature is off for every row.
+  std::vector<int32_t> top_k;
+  std::vector<float> min_p;
+  std::vector<float> presence_penalty;
+  std::vector<float> frequency_penalty;
+  std::vector<float> repetition_penalty;
+
+  /// Penalty history: at most `kPenaltyHistoryCap` *unique* generated-token
+  /// ids per row with their counts, -1 padded, flattened
+  /// `[rows, kPenaltyHistoryCap]`. Only rows with a penalty active need
+  /// entries; the scheduler keeps the most recent window when a sequence has
+  /// generated more distinct tokens than fit.
+  static constexpr int64_t kPenaltyHistoryCap = 256;
+  std::vector<int32_t> penalty_history_ids;
+  std::vector<int32_t> penalty_history_counts;
+
+  /// Stop-token ids to mask to -inf while a row is under its `min_tokens`
+  /// floor, -1 padded, flattened `[rows, kMaskCap]`.
+  static constexpr int64_t kMaskCap = 16;
+  std::vector<int32_t> mask_token_ids;
+
+  /// Per-row logprob request: -1 off, 0 chosen-token only, k>0 also the top-k
+  /// alternatives (bounded by `kMaxTopLogprobs`). Empty means off everywhere.
+  static constexpr int64_t kMaxTopLogprobs = 20;
+  std::vector<int32_t> logprobs_k;
+
   int64_t num_tokens() const {
     return static_cast<int64_t>(token_ids.size());
   }

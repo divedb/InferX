@@ -12,8 +12,7 @@ int main(int argc, char** argv) {
   inferx::InstallCrashHandler(argv[0]);
 
   int exit_code = 0;
-  std::optional<inferx::ServeOptions> options =
-      inferx::ParseServeOptions(argc, argv, &exit_code);
+  auto options = inferx::ParseServeOptions(argc, argv, &exit_code);
 
   if (!options.has_value()) return exit_code;
 
@@ -66,5 +65,6 @@ int main(int argc, char** argv) {
   }
 
   LOG(INFO) << "shutting down";
+
   return 0;
 }

@@ -52,7 +52,7 @@ review all of the following:
   Monitoring and diagnostic timing overhead are reported separately; repeat
   runs before enforcing the design target of less than 1% steady-state impact.
 - Prometheus sees both ranks and DCGM sees both GPU UUIDs. Rank-to-GPU mapping
-  comes from the configured device order (`--devices 0,1`) and the inventory
+  comes from the configured device order (`--device-ids 0,1`) and the inventory
   captured in the report.
 - Cancellation is exercised through the existing server regression. Before
   production, kill or suspend one rank in a controlled test and confirm the

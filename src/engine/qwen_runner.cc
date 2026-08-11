@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -15,6 +16,7 @@
 
 #include "inferx/comm/nccl_communicator.h"
 #include "inferx/core/cuda_utils.h"
+#include "kv_autosize.h"
 
 namespace inferx::engine {
 namespace {
@@ -30,19 +32,76 @@ double ProgressAgeSeconds(int64_t last_progress_ns) {
   return static_cast<double>(SteadyNowNs() - last_progress_ns) / 1e9;
 }
 
-Status ConfigureModel(model::Qwen2Model* model,
-                      const QwenRunnerConfig& config) {
-  if (config.fp8_weights) {
-    INFERX_RETURN_IF_ERROR(model->QuantizeWeightsToF8());
+/// TP ranks auto-size their KV pool independently but must attach identical
+/// block counts -- the scheduler runs one block table for all ranks -- so
+/// each posts its local answer and everyone proceeds with the minimum. A rank
+/// that fails posts a failure sentinel instead, so its peer errors out rather
+/// than waiting forever.
+class KvSizeRendezvous {
+ public:
+  explicit KvSizeRendezvous(int expected) : expected_(expected) {}
+
+  /// Posts `local_blocks` (<= 0 marks failure) and returns the agreed
+  /// minimum, or a non-positive value when any rank failed or the peer never
+  /// arrived.
+  int64_t Agree(int64_t local_blocks) {
+    std::unique_lock lock(mu_);
+    min_blocks_ = std::min(min_blocks_, local_blocks);
+    ++arrived_;
+    cv_.notify_all();
+    if (!cv_.wait_for(lock, std::chrono::minutes(5),
+                      [this] { return arrived_ >= expected_; })) {
+      return -1;
+    }
+    return min_blocks_;
   }
-  if (config.int4_weights) {
-    INFERX_RETURN_IF_ERROR(model->QuantizeWeightsToInt4());
+
+ private:
+  const int expected_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int arrived_ = 0;
+  int64_t min_blocks_ = std::numeric_limits<int64_t>::max();
+};
+
+/// `agreed` reports whether this rank posted to `rendezvous`, so failure
+/// paths know whether the peer still needs unblocking.
+Status ConfigureModel(model::Qwen2Model* model, const QwenRunnerConfig& config,
+                      KvSizeRendezvous* rendezvous, bool* agreed) {
+  Status prep = OkStatus();
+  if (config.fp8_weights) prep = model->QuantizeWeightsToF8();
+  if (prep.ok() && config.int4_weights) prep = model->QuantizeWeightsToInt4();
+  if (prep.ok() && config.fp8_kv_cache) prep = model->EnableFp8KvCache();
+
+  int64_t blocks = config.kv_blocks;
+  if (blocks <= 0) {
+    StatusOr<int64_t> sized = prep;
+    if (prep.ok()) {
+      KvSizingSpec spec;
+      spec.explicit_bytes = config.kv_cache_memory_bytes;
+      spec.gpu_memory_utilization = config.gpu_memory_utilization;
+      spec.block_bytes = model->KvBlockBytes(config.block_size);
+      spec.min_blocks =
+          (config.max_seq_len + config.block_size - 1) / config.block_size;
+      sized = AutosizeKvBlocksOnCurrentDevice(spec);
+    }
+    if (rendezvous != nullptr) {
+      const int64_t agreed_blocks = rendezvous->Agree(sized.ok() ? *sized : -1);
+      *agreed = true;
+      INFERX_RETURN_IF_ERROR(sized.status());
+      if (agreed_blocks <= 0) {
+        return InternalError("peer rank failed during KV cache sizing");
+      }
+      blocks = agreed_blocks;
+    } else {
+      INFERX_RETURN_IF_ERROR(sized.status());
+      blocks = *sized;
+    }
+  } else {
+    INFERX_RETURN_IF_ERROR(prep);
   }
-  if (config.fp8_kv_cache) {
-    INFERX_RETURN_IF_ERROR(model->EnableFp8KvCache());
-  }
-  INFERX_RETURN_IF_ERROR(
-      model->AttachKvCache(config.kv_blocks, config.block_size));
+  INFERX_RETURN_IF_ERROR(prep);
+  INFERX_RETURN_IF_ERROR(model->AttachKvCache(blocks, config.block_size));
   return model->EnableDeviceSampling(config.max_sampling_rows);
 }
 
@@ -76,6 +135,10 @@ class SingleQwenRunner final : public QwenRunner {
   Status CaptureDecodeGraph(int64_t n, int64_t blocks) override {
     return model_.CaptureDecodeGraph(n, blocks);
   }
+  Status ReadSampledLogprobs(
+      std::vector<model::Qwen2Model::SampledLogprob>* out) override {
+    return model_.ReadSampledLogprobs(out);
+  }
   float last_step_device_ms() const override {
     return last_step_device_ms_.load(std::memory_order_relaxed);
   }
@@ -107,10 +170,12 @@ class RankWorker {
   using Job = std::function<Status(model::Qwen2Model&)>;
 
   RankWorker(const QwenRunnerConfig& config, int rank,
-             const comm::NcclUniqueIdBytes& unique_id)
+             const comm::NcclUniqueIdBytes& unique_id,
+             std::shared_ptr<KvSizeRendezvous> rendezvous)
       : config_(config),
         rank_(rank),
         unique_id_(unique_id),
+        rendezvous_(std::move(rendezvous)),
         communication_(std::make_shared<comm::CommMetrics>()) {
     thread_ = std::thread([this] { ThreadMain(); });
   }
@@ -206,10 +271,17 @@ class RankWorker {
           status = loaded.status();
         } else {
           model_ = std::make_unique<model::Qwen2Model>(std::move(*loaded));
-          status = ConfigureModel(model_.get(), config_);
+          status = ConfigureModel(model_.get(), config_, rendezvous_.get(),
+                                  &agreed_with_peer_);
           if (status.ok()) pool_ = model_->kv_pool();
         }
       }
+    }
+    // A rank that died before posting its KV size would leave the peer
+    // blocked in Agree until its timeout; post the failure sentinel instead.
+    if (!status.ok() && rendezvous_ != nullptr && !agreed_with_peer_) {
+      (void)rendezvous_->Agree(-1);
+      agreed_with_peer_ = true;
     }
     healthy_.store(status.ok(), std::memory_order_relaxed);
     initialized_.set_value(status);
@@ -248,6 +320,8 @@ class RankWorker {
   QwenRunnerConfig config_;
   int rank_;
   comm::NcclUniqueIdBytes unique_id_;
+  std::shared_ptr<KvSizeRendezvous> rendezvous_;
+  bool agreed_with_peer_ = false;
   std::thread thread_;
   std::promise<Status> initialized_;
   std::unique_ptr<model::Qwen2Model> model_;
@@ -284,9 +358,10 @@ class NcclQwenRunner final : public QwenRunner {
                             comm::CreateNcclUniqueId());
 
     auto runner = std::unique_ptr<NcclQwenRunner>(new NcclQwenRunner());
+    auto rendezvous = std::make_shared<KvSizeRendezvous>(2);
     for (int rank = 0; rank < 2; ++rank) {
       runner->workers_.push_back(
-          std::make_unique<RankWorker>(config, rank, id));
+          std::make_unique<RankWorker>(config, rank, id, rendezvous));
     }
     for (auto& worker : runner->workers_) {
       const Status initialized = worker->WaitInitialized();
@@ -323,6 +398,17 @@ class NcclQwenRunner final : public QwenRunner {
     return Dispatch([=](model::Qwen2Model& model) {
       return model.CaptureDecodeGraph(num_seqs, max_blocks_per_seq);
     });
+  }
+
+  Status ReadSampledLogprobs(
+      std::vector<model::Qwen2Model::SampledLogprob>* out) override {
+    // Rank 0 only: every rank samples the same tokens from the same
+    // all-reduced logits, so one readback answers for the pair.
+    INFERX_RETURN_IF_ERROR(workers_[0]->Submit(
+        [out](model::Qwen2Model& model) {
+          return model.ReadSampledLogprobs(out);
+        }));
+    return workers_[0]->Wait();
   }
 
   float last_step_device_ms() const override {
@@ -402,7 +488,8 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   INFERX_ASSIGN_OR_RETURN(model::Qwen2Model model,
                           model::Qwen2Model::LoadFromDirectory(
                               config.model_dir, std::move(observed)));
-  INFERX_RETURN_IF_ERROR(ConfigureModel(&model, config));
+  bool agreed = false;
+  INFERX_RETURN_IF_ERROR(ConfigureModel(&model, config, nullptr, &agreed));
   return std::unique_ptr<QwenRunner>(std::make_unique<SingleQwenRunner>(
       std::move(model), device, std::move(communication)));
 }

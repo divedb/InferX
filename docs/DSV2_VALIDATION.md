@@ -83,8 +83,8 @@ export INFERX_TEST_DEEPSEEK_DECODE=../testdata/deepseek_v2_lite_decode.bin
 ctest -R DeepseekV2Reference --output-on-failure
 
 # 5. Serve, and check the template end to end.
-./build/src/server/inferx-serve --model /ckpt/dsv2-lite-chat \
-    --kv-blocks 8192 --block-size 16 --no-cuda-graphs
+./build/src/main/inferx-serve --model /ckpt/dsv2-lite-chat \
+    --num-gpu-blocks-override 8192 --block-size 16 --enforce-eager
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"dsv2-lite-chat","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":32}'
 

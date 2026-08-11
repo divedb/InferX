@@ -28,8 +28,20 @@ struct EngineConfig {
   /// Blocks in the KV pool. Together with `block_size` and the model's layer
   /// count this is the whole KV budget, and it is a deployment decision -- how
   /// much VRAM is left after the weights -- not a property of the model.
-  int64_t kv_blocks = 4096;
+  /// Zero sizes the pool automatically from `gpu_memory_utilization` (or
+  /// `kv_cache_memory_bytes` when set); a positive count pins it.
+  int64_t kv_blocks = 0;
   int64_t block_size = 16;
+
+  /// Fraction of each device's total memory the engine may occupy, weights
+  /// and activations included; whatever the budget leaves after them becomes
+  /// the KV pool. Matches vLLM's --gpu-memory-utilization (0.92 default).
+  /// Ignored when `kv_blocks` or `kv_cache_memory_bytes` pins the size.
+  double gpu_memory_utilization = 0.92;
+
+  /// Explicit KV pool budget in bytes per rank. Zero defers to
+  /// `gpu_memory_utilization`; `kv_blocks` beats both.
+  int64_t kv_cache_memory_bytes = 0;
 
   /// Tensor-parallel deployment. The first NCCL runtime supports two distinct
   /// GPUs in one process; TP=1 retains the direct single-rank path.
@@ -96,6 +108,14 @@ class Generation {
 
     /// Tokens generated so far, for usage accounting.
     int32_t generated = 0;
+
+    /// The token this event's step sampled (-1 on the terminal event).
+    int32_t token = -1;
+
+    /// Present when the request asked for logprobs.
+    bool has_logprob = false;
+    float logprob = 0.0f;
+    std::vector<std::pair<int32_t, float>> top_logprobs;
   };
 
   Generation();

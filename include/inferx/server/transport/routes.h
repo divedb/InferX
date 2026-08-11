@@ -28,6 +28,8 @@ class RouteGuard {
 };
 
 /// Exact-path router. Query strings are deliberately not stripped implicitly.
+/// The one concession to parameterized paths is AddPrefix, whose routes match
+/// only after every exact route has been tried.
 class Routes final : public RequestHandler {
  public:
   explicit Routes(std::shared_ptr<RouteGuard> guard = nullptr);
@@ -36,6 +38,14 @@ class Routes final : public RequestHandler {
   Status Add(boost::beast::http::verb method, std::string path,
              RouteMetadata metadata,
              std::shared_ptr<RequestHandler> handler);
+
+  /// Registers a trailing-parameter route: any target beginning with `prefix`
+  /// dispatches to `handler`, which reads the remainder from the request
+  /// target itself. The prefix must end with '/' so it can never shadow an
+  /// exact route ("/v1/models" stays exact while "/v1/models/" captures ids).
+  Status AddPrefix(boost::beast::http::verb method, std::string prefix,
+                   RouteMetadata metadata,
+                   std::shared_ptr<RequestHandler> handler);
 
   folly::coro::Task<void> Handle(
       HttpRequest request, RequestContext context, ResponseWriter& response,
@@ -47,7 +57,11 @@ class Routes final : public RequestHandler {
     std::string path;
     RouteMetadata metadata;
     std::shared_ptr<RequestHandler> handler;
+    bool prefix = false;
   };
+  Status AddRoute(boost::beast::http::verb method, std::string path,
+                  RouteMetadata metadata,
+                  std::shared_ptr<RequestHandler> handler, bool prefix);
   std::shared_ptr<RouteGuard> guard_;
   std::vector<Route> routes_;
 };

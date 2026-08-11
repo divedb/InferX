@@ -20,8 +20,15 @@ struct QwenRunnerConfig {
   bool fp8_weights = false;
   bool int4_weights = false;
   bool fp8_kv_cache = false;
-  int64_t kv_blocks = 4096;
+  /// KV pool sizing: an explicit block count pins the pool; zero auto-sizes
+  /// from `kv_cache_memory_bytes` or `gpu_memory_utilization` after weights
+  /// load, with TP ranks agreeing on the minimum across devices.
+  int64_t kv_blocks = 0;
+  int64_t kv_cache_memory_bytes = 0;
+  double gpu_memory_utilization = 0.92;
   int64_t block_size = 16;
+  /// Longest sequence; auto-sizing refuses a pool too small to hold one.
+  int64_t max_seq_len = 2048;
   int64_t max_sampling_rows = 8;
 };
 
@@ -50,6 +57,10 @@ class QwenRunner {
   virtual Status ReserveActivations(int64_t max_tokens) = 0;
   virtual Status StepAsync(const model::ForwardBatch& batch) = 0;
   virtual Status AwaitStep(std::vector<int32_t>* sampled) = 0;
+  /// Valid after `AwaitStep`; rank 0's readback (all ranks sample
+  /// identically). \see Qwen2Model::ReadSampledLogprobs.
+  virtual Status ReadSampledLogprobs(
+      std::vector<model::Qwen2Model::SampledLogprob>* out) = 0;
   virtual Status CaptureDecodeGraph(int64_t num_seqs,
                                     int64_t max_blocks_per_seq) = 0;
   virtual float last_step_device_ms() const = 0;

@@ -61,4 +61,68 @@ TEST(SchedulerContractCompatibilityTest, PreservesLegacyV1WireEncoding) {
   EXPECT_EQ(request.SerializeAsString(), expected);
 }
 
+// The vLLM-compat sampling fields were appended (6+) with defaults that all
+// mean "feature off". A request that does not use them must serialize to the
+// exact legacy bytes, which is what makes new clients readable by old
+// servers; and the new fields must survive a round trip, which is what makes
+// old clients' silence indistinguishable from "off" on new servers.
+TEST(SchedulerContractCompatibilityTest, AppendedSamplingFieldsStayAppended) {
+  wire::SubmitRequest legacy;
+  ASSERT_TRUE(legacy.ParseFromArray(kLegacySubmitRequest.data(),
+                                    kLegacySubmitRequest.size()));
+  const std::string expected(
+      reinterpret_cast<const char*>(kLegacySubmitRequest.data()),
+      kLegacySubmitRequest.size());
+  EXPECT_EQ(legacy.SerializeAsString(), expected);
+
+  wire::SamplingParams sampling;
+  sampling.set_top_k(40);
+  sampling.set_min_p(0.05F);
+  sampling.set_presence_penalty(0.5F);
+  sampling.set_frequency_penalty(-0.5F);
+  sampling.set_repetition_penalty(1.1F);
+  sampling.add_stop_token_ids(7);
+  sampling.set_ignore_eos(true);
+  sampling.set_min_tokens(4);
+  sampling.set_want_logprobs(true);
+  sampling.set_top_logprobs(5);
+  sampling.set_keep_special_tokens(true);
+  sampling.set_include_stop_str_in_output(true);
+
+  wire::SamplingParams round_trip;
+  ASSERT_TRUE(round_trip.ParseFromString(sampling.SerializeAsString()));
+  EXPECT_EQ(round_trip.top_k(), 40);
+  EXPECT_FLOAT_EQ(round_trip.min_p(), 0.05F);
+  EXPECT_FLOAT_EQ(round_trip.presence_penalty(), 0.5F);
+  EXPECT_FLOAT_EQ(round_trip.frequency_penalty(), -0.5F);
+  EXPECT_FLOAT_EQ(round_trip.repetition_penalty(), 1.1F);
+  ASSERT_EQ(round_trip.stop_token_ids_size(), 1);
+  EXPECT_EQ(round_trip.stop_token_ids(0), 7);
+  EXPECT_TRUE(round_trip.ignore_eos());
+  EXPECT_EQ(round_trip.min_tokens(), 4);
+  EXPECT_TRUE(round_trip.want_logprobs());
+  EXPECT_EQ(round_trip.top_logprobs(), 5);
+  EXPECT_TRUE(round_trip.keep_special_tokens());
+  EXPECT_TRUE(round_trip.include_stop_str_in_output());
+}
+
+TEST(SchedulerContractCompatibilityTest, EventLogprobsRoundTrip) {
+  wire::GenerationEvent event;
+  event.set_request_id("req");
+  event.add_token_ids(3);
+  auto* token = event.add_logprobs();
+  token->set_token_id(3);
+  token->set_logprob(-0.25F);
+  auto* top = token->add_top();
+  top->set_token_id(3);
+  top->set_logprob(-0.25F);
+
+  wire::GenerationEvent round_trip;
+  ASSERT_TRUE(round_trip.ParseFromString(event.SerializeAsString()));
+  ASSERT_EQ(round_trip.logprobs_size(), 1);
+  EXPECT_EQ(round_trip.logprobs(0).token_id(), 3);
+  EXPECT_FLOAT_EQ(round_trip.logprobs(0).logprob(), -0.25F);
+  ASSERT_EQ(round_trip.logprobs(0).top_size(), 1);
+}
+
 }  // namespace

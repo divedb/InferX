@@ -1,6 +1,8 @@
 #include "inferx/scheduler/scheduler.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "inferx/scheduler/prefix_cache.h"
@@ -600,12 +602,66 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
       // request a row belongs to -- it just reads the row's parameters.
       out_batch->temperature.push_back(seq.params.temperature);
       out_batch->top_p.push_back(seq.params.top_p);
+      out_batch->top_k.push_back(seq.params.top_k);
+      out_batch->min_p.push_back(seq.params.min_p);
+      out_batch->presence_penalty.push_back(seq.params.presence_penalty);
+      out_batch->frequency_penalty.push_back(seq.params.frequency_penalty);
+      out_batch->repetition_penalty.push_back(seq.params.repetition_penalty);
 
       // Mixed into the position so a request's successive tokens draw
       // differently while staying reproducible from its seed alone.
       out_batch->seeds.push_back(
           seq.params.seed ^
           (0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(seq.tokens.size())));
+
+      // Penalty history: the row's generated tokens as unique (id, count)
+      // pairs, most recent first when more distinct ids exist than fit.
+      // Counts cover the whole generation even when the id set is windowed.
+      constexpr auto kHistCap = model::ForwardBatch::kPenaltyHistoryCap;
+      const size_t hist_base = out_batch->penalty_history_ids.size();
+      out_batch->penalty_history_ids.resize(hist_base + kHistCap, -1);
+      out_batch->penalty_history_counts.resize(hist_base + kHistCap, 0);
+      const bool penalized = seq.params.presence_penalty != 0.0f ||
+                             seq.params.frequency_penalty != 0.0f ||
+                             seq.params.repetition_penalty != 1.0f;
+      if (penalized && seq.generated() > 0) {
+        std::unordered_map<int32_t, int32_t> counts;
+        for (size_t i = static_cast<size_t>(seq.prompt_len);
+             i < seq.tokens.size(); ++i) {
+          ++counts[seq.tokens[i]];
+        }
+        size_t filled = 0;
+        std::unordered_set<int32_t> taken;
+        for (size_t i = seq.tokens.size();
+             i-- > static_cast<size_t>(seq.prompt_len) &&
+             filled < static_cast<size_t>(kHistCap);) {
+          const int32_t token = seq.tokens[i];
+          if (!taken.insert(token).second) continue;
+          out_batch->penalty_history_ids[hist_base + filled] = token;
+          out_batch->penalty_history_counts[hist_base + filled] =
+              counts[token];
+          ++filled;
+        }
+      }
+
+      // min_tokens: stop ids stay masked until the floor is met.
+      constexpr auto kMaskCap = model::ForwardBatch::kMaskCap;
+      const size_t mask_base = out_batch->mask_token_ids.size();
+      out_batch->mask_token_ids.resize(mask_base + kMaskCap, -1);
+      if (seq.generated() < seq.params.min_tokens) {
+        size_t filled = 0;
+        for (const int32_t token : seq.params.stop_tokens) {
+          if (filled >= static_cast<size_t>(kMaskCap)) break;
+          out_batch->mask_token_ids[mask_base + filled++] = token;
+        }
+      }
+
+      out_batch->logprobs_k.push_back(
+          seq.params.want_logprobs
+              ? static_cast<int32_t>(std::min<int64_t>(
+                    seq.params.top_logprobs,
+                    model::ForwardBatch::kMaxTopLogprobs))
+              : -1);
     }
 
     impl_->step.push_back({static_cast<int64_t>(s), take, complete});
@@ -619,10 +675,16 @@ Status Scheduler::PrepareStep(model::ForwardBatch* out_batch) {
 }
 
 Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
-                             std::vector<TokenDelta>* out_deltas) {
+                             std::vector<TokenDelta>* out_deltas,
+                             const std::vector<StepLogprob>* logprobs) {
   if (out_deltas != nullptr) {
     out_deltas->clear();
     out_deltas->reserve(sampled.size());
+  }
+  if (logprobs != nullptr && logprobs->size() != sampled.size()) {
+    return InvalidArgumentError("got ", logprobs->size(),
+                                " logprob entries for ", sampled.size(),
+                                " sampled tokens");
   }
 
   size_t expected = 0;
@@ -668,7 +730,14 @@ Status Scheduler::CommitStep(const std::vector<int32_t>& sampled,
     // Emitted after the stop checks, so `finish` is already decided and a
     // streaming caller can close the stream on this same delta.
     if (out_deltas != nullptr) {
-      out_deltas->push_back({seq.id, token, seq.finish});
+      TokenDelta delta{seq.id, token, seq.finish};
+      if (logprobs != nullptr && (*logprobs)[next - 1].present) {
+        const StepLogprob& lp = (*logprobs)[next - 1];
+        delta.has_logprob = true;
+        delta.logprob = lp.logprob;
+        delta.top_logprobs = lp.top;
+      }
+      out_deltas->push_back(std::move(delta));
     }
   }
 

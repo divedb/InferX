@@ -207,8 +207,26 @@ struct Qwen2Model::Impl {
   DeviceBuffer sample_rows;      // which logits rows to sample
   DeviceBuffer sample_temp;      // per-row temperature
   DeviceBuffer sample_top_p;     // per-row nucleus threshold
+  DeviceBuffer sample_top_k;     // per-row top-k truncation (0 off)
+  DeviceBuffer sample_min_p;     // per-row min-p truncation (0 off)
+  DeviceBuffer sample_presence;    // per-row presence penalty
+  DeviceBuffer sample_frequency;   // per-row frequency penalty
+  DeviceBuffer sample_repetition;  // per-row repetition penalty
+  DeviceBuffer sample_hist_ids;    // [rows, kPenaltyHistoryCap] unique ids
+  DeviceBuffer sample_hist_counts; // [rows, kPenaltyHistoryCap] counts
+  DeviceBuffer sample_mask_ids;    // [rows, kMaskCap] min-tokens stop masks
+  DeviceBuffer sample_logprobs_k;  // per-row logprob request (-1 off)
+  DeviceBuffer lp_chosen;          // [rows] chosen-token logprob
+  DeviceBuffer lp_top_ids;         // [rows, kMaxTopLogprobs]
+  DeviceBuffer lp_top_lps;         // [rows, kMaxTopLogprobs]
   DeviceBuffer sample_seeds;     // per-row RNG seed
   void* pinned_sampled = nullptr;  // host-visible copy, read one step late
+  void* pinned_lp_chosen = nullptr;
+  void* pinned_lp_top_ids = nullptr;
+  void* pinned_lp_top_lps = nullptr;
+  /// Host copy of the last step's per-row logprob request, so the readback
+  /// knows which pinned entries are live.
+  std::vector<int32_t> last_logprob_ks;
   cudaEvent_t sampled_ready = nullptr;
   int64_t sampled_count = 0;
 
@@ -250,6 +268,9 @@ struct Qwen2Model::Impl {
     }
     if (sampled_ready != nullptr) cudaEventDestroy(sampled_ready);
     if (pinned_sampled != nullptr) cudaFreeHost(pinned_sampled);
+    if (pinned_lp_chosen != nullptr) cudaFreeHost(pinned_lp_chosen);
+    if (pinned_lp_top_ids != nullptr) cudaFreeHost(pinned_lp_top_ids);
+    if (pinned_lp_top_lps != nullptr) cudaFreeHost(pinned_lp_top_lps);
     if (step_begin != nullptr) cudaEventDestroy(step_begin);
     if (step_end != nullptr) cudaEventDestroy(step_end);
     if (pinned != nullptr) cudaFreeHost(pinned);
@@ -1087,16 +1108,108 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         TensorView::Create(sample_top_p.data(), DataType::kFloat,
                            Shape({sampled_count}), comm->device()));
     INFERX_ASSIGN_OR_RETURN(
+        const TensorView top_k_in,
+        TensorView::Create(sample_top_k.data(), DataType::kInt32,
+                           Shape({sampled_count}), comm->device()));
+    INFERX_ASSIGN_OR_RETURN(
+        const TensorView min_p_in,
+        TensorView::Create(sample_min_p.data(), DataType::kFloat,
+                           Shape({sampled_count}), comm->device()));
+    INFERX_ASSIGN_OR_RETURN(
         const TensorView seeds_in,
         TensorView::Create(sample_seeds.data(), DataType::kUInt64,
                            Shape({sampled_count}), comm->device()));
+
+    // Penalties and min-tokens masks run first, mutating the logits the
+    // sampler and the logprob pass both read. Unconditional for the same
+    // graph-capture reason as the sampler below: rows with nothing to do
+    // exit in a few reads.
+    {
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView presence_in,
+          TensorView::Create(sample_presence.data(), DataType::kFloat,
+                             Shape({sampled_count}), comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView frequency_in,
+          TensorView::Create(sample_frequency.data(), DataType::kFloat,
+                             Shape({sampled_count}), comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView repetition_in,
+          TensorView::Create(sample_repetition.data(), DataType::kFloat,
+                             Shape({sampled_count}), comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView hist_ids_in,
+          TensorView::Create(
+              sample_hist_ids.data(), DataType::kInt32,
+              Shape({sampled_count, ForwardBatch::kPenaltyHistoryCap}),
+              comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView hist_counts_in,
+          TensorView::Create(
+              sample_hist_counts.data(), DataType::kInt32,
+              Shape({sampled_count, ForwardBatch::kPenaltyHistoryCap}),
+              comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView mask_ids_in,
+          TensorView::Create(sample_mask_ids.data(), DataType::kInt32,
+                             Shape({sampled_count, ForwardBatch::kMaskCap}),
+                             comm->device()));
+      INFERX_RETURN_IF_ERROR(kernels::ApplyPenalties(
+          wanted, rows_in, presence_in, frequency_in, repetition_in,
+          hist_ids_in, hist_counts_in, mask_ids_in, stream));
+    }
 
     // One kernel for both modes rather than a branch between two. Greedy is
     // temperature 0 inside SampleTokens, so a captured graph records the same
     // node whether the batch is sampling or not -- a branch here would bake
     // whichever mode happened to be live at capture.
     INFERX_RETURN_IF_ERROR(kernels::SampleTokens(
-        wanted, rows_in, temp_in, top_p_in, seeds_in, ids_out, stream));
+        wanted, rows_in, temp_in, top_p_in, top_k_in, min_p_in, seeds_in,
+        ids_out, stream));
+
+    // Logprobs of what was just sampled, over the same (post-penalty) logits.
+    // Rows that asked for none exit immediately, so this too stays in the
+    // captured body unconditionally.
+    {
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView k_in,
+          TensorView::Create(sample_logprobs_k.data(), DataType::kInt32,
+                             Shape({sampled_count}), comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView chosen_lp_out,
+          TensorView::Create(lp_chosen.data(), DataType::kFloat,
+                             Shape({sampled_count}), comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView top_ids_out,
+          TensorView::Create(
+              lp_top_ids.data(), DataType::kInt32,
+              Shape({sampled_count, ForwardBatch::kMaxTopLogprobs}),
+              comm->device()));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView top_lps_out,
+          TensorView::Create(
+              lp_top_lps.data(), DataType::kFloat,
+              Shape({sampled_count, ForwardBatch::kMaxTopLogprobs}),
+              comm->device()));
+      INFERX_RETURN_IF_ERROR(kernels::ComputeLogprobs(
+          wanted, rows_in, ids_out, k_in, chosen_lp_out, top_ids_out,
+          top_lps_out, stream));
+
+      const size_t lp_cap =
+          static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
+      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          pinned_lp_chosen, lp_chosen.data(),
+          static_cast<size_t>(sampled_count) * sizeof(float),
+          cudaMemcpyDeviceToHost, stream));
+      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          pinned_lp_top_ids, lp_top_ids.data(),
+          static_cast<size_t>(sampled_count) * lp_cap * sizeof(int32_t),
+          cudaMemcpyDeviceToHost, stream));
+      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          pinned_lp_top_lps, lp_top_lps.data(),
+          static_cast<size_t>(sampled_count) * lp_cap * sizeof(float),
+          cudaMemcpyDeviceToHost, stream));
+    }
 
     INFERX_ASSIGN_OR_RETURN(
         const TensorView next_ids,
@@ -1450,13 +1563,29 @@ Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
                               impl_->pinned_logits, impl_->stream, out_logits);
 }
 
-Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
+namespace {
+
+KvLayout Qwen2KvLayout(int64_t local_kv_heads, int64_t head_dim, bool fp8_kv) {
   KvLayout layout;
   layout.entries_per_token = 2;  // K and V; MLA would say 1 (T11)
-  layout.kv_heads = impl_->LocalKvHeads();
-  layout.head_dim = impl_->config.head_dim;
-  layout.dtype =
-      impl_->fp8_kv ? DataType::kFloat8E4M3FN : DataType::kBFloat16;
+  layout.kv_heads = local_kv_heads;
+  layout.head_dim = head_dim;
+  layout.dtype = fp8_kv ? DataType::kFloat8E4M3FN : DataType::kBFloat16;
+  return layout;
+}
+
+}  // namespace
+
+int64_t Qwen2Model::KvBlockBytes(int64_t block_size) const {
+  return KvBlockPool::BlockBytes(
+      impl_->config.num_hidden_layers, block_size,
+      Qwen2KvLayout(impl_->LocalKvHeads(), impl_->config.head_dim,
+                    impl_->fp8_kv));
+}
+
+Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
+  const KvLayout layout = Qwen2KvLayout(
+      impl_->LocalKvHeads(), impl_->config.head_dim, impl_->fp8_kv);
 
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
@@ -1863,11 +1992,82 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
       DeviceBuffer::Allocate(static_cast<size_t>(max_rows) * sizeof(uint64_t),
                              impl_->comm->device()));
 
+  // The vLLM-compat sampling inputs and logprob outputs. Allocated here, all
+  // of them, whether or not any request will use them: the decode body is
+  // CUDA-graph captured with these addresses baked in, so they must exist --
+  // at fixed addresses -- before the first capture.
+  const size_t rows = static_cast<size_t>(max_rows);
+  constexpr size_t kHistCap =
+      static_cast<size_t>(model::ForwardBatch::kPenaltyHistoryCap);
+  constexpr size_t kMaskCap =
+      static_cast<size_t>(model::ForwardBatch::kMaskCap);
+  constexpr size_t kMaxLp =
+      static_cast<size_t>(model::ForwardBatch::kMaxTopLogprobs);
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_top_k,
+      DeviceBuffer::Allocate(rows * sizeof(int32_t), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_min_p,
+      DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_presence,
+      DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_frequency,
+      DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_repetition,
+      DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_hist_ids,
+      DeviceBuffer::Allocate(rows * kHistCap * sizeof(int32_t),
+                             impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_hist_counts,
+      DeviceBuffer::Allocate(rows * kHistCap * sizeof(int32_t),
+                             impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_mask_ids,
+      DeviceBuffer::Allocate(rows * kMaskCap * sizeof(int32_t),
+                             impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->sample_logprobs_k,
+      DeviceBuffer::Allocate(rows * sizeof(int32_t), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->lp_chosen,
+      DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->lp_top_ids,
+      DeviceBuffer::Allocate(rows * kMaxLp * sizeof(int32_t),
+                             impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->lp_top_lps,
+      DeviceBuffer::Allocate(rows * kMaxLp * sizeof(float),
+                             impl_->comm->device()));
+
   if (impl_->pinned_sampled != nullptr) cudaFreeHost(impl_->pinned_sampled);
   INFERX_CUDA_RETURN_IF_ERROR(
       cudaHostAlloc(&impl_->pinned_sampled,
                     static_cast<size_t>(max_rows) * sizeof(int32_t),
                     cudaHostAllocDefault));
+  if (impl_->pinned_lp_chosen != nullptr) {
+    cudaFreeHost(impl_->pinned_lp_chosen);
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_chosen,
+                                            rows * sizeof(float),
+                                            cudaHostAllocDefault));
+  if (impl_->pinned_lp_top_ids != nullptr) {
+    cudaFreeHost(impl_->pinned_lp_top_ids);
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_top_ids,
+                                            rows * kMaxLp * sizeof(int32_t),
+                                            cudaHostAllocDefault));
+  if (impl_->pinned_lp_top_lps != nullptr) {
+    cudaFreeHost(impl_->pinned_lp_top_lps);
+  }
+  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_top_lps,
+                                            rows * kMaxLp * sizeof(float),
+                                            cudaHostAllocDefault));
 
   if (impl_->sampled_ready == nullptr) {
     INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl_->sampled_ready));
@@ -1875,6 +2075,43 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
 
   impl_->sample_on_device = true;
 
+  return OkStatus();
+}
+
+Status Qwen2Model::ReadSampledLogprobs(
+    std::vector<SampledLogprob>* out) const {
+  out->clear();
+  if (impl_->pinned_lp_chosen == nullptr) {
+    return FailedPreconditionError(
+        "logprob readback requires device sampling; call "
+        "EnableDeviceSampling first");
+  }
+
+  const auto& ks = impl_->last_logprob_ks;
+  const int64_t n = impl_->sampled_count;
+  if (static_cast<int64_t>(ks.size()) != n) {
+    return InternalError("logprob request count ", ks.size(),
+                         " does not match the last step's ", n, " rows");
+  }
+
+  const auto* chosen = static_cast<const float*>(impl_->pinned_lp_chosen);
+  const auto* top_ids = static_cast<const int32_t*>(impl_->pinned_lp_top_ids);
+  const auto* top_lps = static_cast<const float*>(impl_->pinned_lp_top_lps);
+  const size_t cap = static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
+
+  out->resize(static_cast<size_t>(n));
+  for (size_t i = 0; i < static_cast<size_t>(n); ++i) {
+    if (ks[i] < 0) continue;
+    SampledLogprob& lp = (*out)[i];
+    lp.present = true;
+    lp.logprob = chosen[i];
+    const size_t want = std::min<size_t>(static_cast<size_t>(ks[i]), cap);
+    for (size_t j = 0; j < want; ++j) {
+      const int32_t id = top_ids[i * cap + j];
+      if (id < 0) break;
+      lp.top.emplace_back(id, top_lps[i * cap + j]);
+    }
+  }
   return OkStatus();
 }
 
@@ -1920,16 +2157,49 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
         slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
         impl_->stream));
 
-    // Per-row sampling parameters. Absent means greedy, so a caller that never
-    // heard of sampling keeps the behaviour it had.
-    std::vector<float> temps(rows.size(), 0.0f);
-    std::vector<float> tops(rows.size(), 1.0f);
-    std::vector<uint64_t> seeds(rows.size(), 0);
+    // Per-row sampling parameters. Absent means greedy with everything off,
+    // so a caller that never heard of sampling keeps the behaviour it had.
+    const size_t n = rows.size();
+    std::vector<float> temps(n, 0.0f);
+    std::vector<float> tops(n, 1.0f);
+    std::vector<uint64_t> seeds(n, 0);
+    std::vector<int32_t> top_ks(n, 0);
+    std::vector<float> min_ps(n, 0.0f);
+    std::vector<float> presences(n, 0.0f);
+    std::vector<float> frequencies(n, 0.0f);
+    std::vector<float> repetitions(n, 1.0f);
+    std::vector<int32_t> logprob_ks(n, -1);
 
-    for (size_t i = 0; i < rows.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
       if (i < batch.temperature.size()) temps[i] = batch.temperature[i];
       if (i < batch.top_p.size()) tops[i] = batch.top_p[i];
       if (i < batch.seeds.size()) seeds[i] = batch.seeds[i];
+      if (i < batch.top_k.size()) top_ks[i] = batch.top_k[i];
+      if (i < batch.min_p.size()) min_ps[i] = batch.min_p[i];
+      if (i < batch.presence_penalty.size()) {
+        presences[i] = batch.presence_penalty[i];
+      }
+      if (i < batch.frequency_penalty.size()) {
+        frequencies[i] = batch.frequency_penalty[i];
+      }
+      if (i < batch.repetition_penalty.size()) {
+        repetitions[i] = batch.repetition_penalty[i];
+      }
+      if (i < batch.logprobs_k.size()) logprob_ks[i] = batch.logprobs_k[i];
+    }
+
+    const size_t hist_cap =
+        static_cast<size_t>(ForwardBatch::kPenaltyHistoryCap);
+    const size_t mask_cap = static_cast<size_t>(ForwardBatch::kMaskCap);
+    std::vector<int32_t> hist_ids(n * hist_cap, -1);
+    std::vector<int32_t> hist_counts(n * hist_cap, 0);
+    std::vector<int32_t> mask_ids(n * mask_cap, -1);
+    if (batch.penalty_history_ids.size() == hist_ids.size()) {
+      hist_ids = batch.penalty_history_ids;
+      hist_counts = batch.penalty_history_counts;
+    }
+    if (batch.mask_token_ids.size() == mask_ids.size()) {
+      mask_ids = batch.mask_token_ids;
     }
 
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
@@ -1938,6 +2208,42 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         impl_->sample_top_p.data(), tops.data(), tops.size() * sizeof(float),
         cudaMemcpyHostToDevice, impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_top_k.data(), top_ks.data(),
+        top_ks.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_min_p.data(), min_ps.data(),
+        min_ps.size() * sizeof(float), cudaMemcpyHostToDevice, impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_presence.data(), presences.data(),
+        presences.size() * sizeof(float), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_frequency.data(), frequencies.data(),
+        frequencies.size() * sizeof(float), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_repetition.data(), repetitions.data(),
+        repetitions.size() * sizeof(float), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_hist_ids.data(), hist_ids.data(),
+        hist_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_hist_counts.data(), hist_counts.data(),
+        hist_counts.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_mask_ids.data(), mask_ids.data(),
+        mask_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+        impl_->sample_logprobs_k.data(), logprob_ks.data(),
+        logprob_ks.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        impl_->stream));
+    impl_->last_logprob_ks = std::move(logprob_ks);
     INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
         impl_->sample_seeds.data(), seeds.data(),
         seeds.size() * sizeof(uint64_t), cudaMemcpyHostToDevice,

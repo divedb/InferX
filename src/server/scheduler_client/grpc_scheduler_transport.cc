@@ -89,6 +89,21 @@ void Populate(const ScheduledRequest& request, wire::SubmitRequest* output) {
   sampling->set_temperature(request.sampling.temperature);
   sampling->set_top_p(request.sampling.top_p);
   sampling->set_seed(request.sampling.seed);
+  sampling->set_top_k(request.sampling.top_k);
+  sampling->set_min_p(request.sampling.min_p);
+  sampling->set_presence_penalty(request.sampling.presence_penalty);
+  sampling->set_frequency_penalty(request.sampling.frequency_penalty);
+  sampling->set_repetition_penalty(request.sampling.repetition_penalty);
+  for (const int32_t token : request.sampling.stop_token_ids) {
+    sampling->add_stop_token_ids(token);
+  }
+  sampling->set_ignore_eos(request.sampling.ignore_eos);
+  sampling->set_min_tokens(request.sampling.min_tokens);
+  sampling->set_want_logprobs(request.sampling.want_logprobs);
+  sampling->set_top_logprobs(request.sampling.top_logprobs);
+  sampling->set_keep_special_tokens(!request.sampling.skip_special_tokens);
+  sampling->set_include_stop_str_in_output(
+      request.sampling.include_stop_str_in_output);
   for (const std::string& stop : request.sampling.stop) {
     sampling->add_stop(stop);
   }
@@ -111,6 +126,17 @@ GenerationEvent FromWire(const wire::GenerationEvent& input) {
     mapped.index = embedding.index();
     mapped.values.assign(embedding.values().begin(), embedding.values().end());
     result.embeddings.push_back(std::move(mapped));
+  }
+  result.logprobs.reserve(input.logprobs_size());
+  for (const auto& token : input.logprobs()) {
+    TokenLogprobs mapped;
+    mapped.token_id = token.token_id();
+    mapped.logprob = token.logprob();
+    mapped.top.reserve(token.top_size());
+    for (const auto& top : token.top()) {
+      mapped.top.emplace_back(top.token_id(), top.logprob());
+    }
+    result.logprobs.push_back(std::move(mapped));
   }
   result.generated_tokens = input.generated_tokens();
   result.terminal = input.terminal();

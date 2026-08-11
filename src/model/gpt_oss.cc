@@ -1014,12 +1014,26 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
   return OkStatus();
 }
 
-Status GptOssModel::AttachKvCache(int64_t num_blocks, int64_t block_size) {
+namespace {
+
+KvLayout GptOssKvLayout(const ModelConfig& config) {
   KvLayout layout;
   layout.entries_per_token = 2;  // K and V
-  layout.kv_heads = impl_->config.num_key_value_heads;
-  layout.head_dim = impl_->config.head_dim;
+  layout.kv_heads = config.num_key_value_heads;
+  layout.head_dim = config.head_dim;
   layout.dtype = DataType::kBFloat16;
+  return layout;
+}
+
+}  // namespace
+
+int64_t GptOssModel::KvBlockBytes(int64_t block_size) const {
+  return KvBlockPool::BlockBytes(impl_->config.num_hidden_layers, block_size,
+                                 GptOssKvLayout(impl_->config));
+}
+
+Status GptOssModel::AttachKvCache(int64_t num_blocks, int64_t block_size) {
+  const KvLayout layout = GptOssKvLayout(impl_->config);
 
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,

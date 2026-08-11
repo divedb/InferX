@@ -19,7 +19,7 @@ both `nccl.h` and `libnccl.so` are discoverable at configure time. CMake prints
 ./build-cuda/src/main/inferx-serve \
   --model /path/to/checkpoint \
   --tensor-parallel-size 2 \
-  --devices 0,1 \
+  --device-ids 0,1 \
   --comm-backend nccl
 ```
 

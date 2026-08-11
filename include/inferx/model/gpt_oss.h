@@ -75,6 +75,10 @@ class GptOssModel {
   /// one, deferred until R-C's per-layer-lifetime scheduler change.
   Status AttachKvCache(int64_t num_blocks, int64_t block_size = 16);
 
+  /// \brief Bytes one KV block would occupy across all layers, without
+  /// allocating. For sizing the pool before `AttachKvCache`.
+  int64_t KvBlockBytes(int64_t block_size) const;
+
   /// \brief The pool, for the scheduler to allocate blocks from. See Qwen2Model.
   KvBlockPool* kv_pool();
 
