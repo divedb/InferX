@@ -60,7 +60,7 @@ double SecondsSince(std::chrono::steady_clock::time_point start,
 // temperature 1 over the post-penalty logits.
 int32_t HostSampleRow(float* row, int64_t vocab,
                       const model::ForwardBatch& batch, size_t i,
-                      scheduler::StepLogprob* logprob_out) {
+                      SampledLogprob* logprob_out) {
   using FB = model::ForwardBatch;
   const auto at_f = [&](const std::vector<float>& v, float fallback) {
     return i < v.size() ? v[i] : fallback;
@@ -383,7 +383,6 @@ struct Engine::Impl {
   // token, and exists so the engine can serve the checkpoint end to end before
   // Phase 4 makes it fast.
   std::unique_ptr<ModelRunner> model_runner;
-  std::unique_ptr<SyncModelRunner> sync_model_runner;
 
   // The declared architecture, kept because composition needs it after Create
   // (chat-template selection) and the populated pointer alone cannot
@@ -643,8 +642,8 @@ struct Engine::Impl {
 
       if (batch.token_ids.empty()) break;
 
-      INFERX_RETURN_IF_ERROR(model_runner->StepAsync(batch));
-      INFERX_RETURN_IF_ERROR(model_runner->AwaitStep(&sampled));
+      std::vector<SampledLogprob> logprobs;
+      INFERX_RETURN_IF_ERROR(model_runner->Step(batch, &sampled, &logprobs));
       INFERX_RETURN_IF_ERROR(scheduler->CommitStep(sampled, nullptr));
 
       (void)scheduler->TakeCompleted();
@@ -687,7 +686,6 @@ struct Engine::Impl {
   // completion, and accounting remain shared here.
   void RunModel() {
     ForwardBatch batch;
-    std::vector<float> logits;
     std::vector<int32_t> sampled;
     std::vector<TokenDelta> deltas;
 
@@ -769,33 +767,16 @@ struct Engine::Impl {
             std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
                         [](int32_t k) { return k >= 0; });
 
-        Status stepped;
+        std::vector<SampledLogprob> raw_logprobs;
         std::vector<scheduler::StepLogprob> step_logprobs;
-        if (model_runner != nullptr) {
-          stepped = model_runner->StepAsync(batch);
-          if (stepped.ok()) stepped = model_runner->AwaitStep(&sampled);
-
-          if (stepped.ok() && wants_logprobs) {
-            std::vector<SampledLogprob> raw;
-            stepped = model_runner->ReadSampledLogprobs(&raw);
-            step_logprobs.resize(raw.size());
-            for (size_t i = 0; i < raw.size(); ++i) {
-              step_logprobs[i] = {raw[i].present, raw[i].logprob,
-                                  std::move(raw[i].top)};
-            }
-          }
-        } else {
-          stepped = sync_model_runner->Step(batch, &logits);
-          if (stepped.ok()) {
-            const int64_t vocab = sync_model_runner->vocab_size();
-            sampled.clear();
-            sampled.reserve(batch.logits_indices.size());
-            step_logprobs.resize(batch.logits_indices.size());
-            for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
-              float* row = logits.data() + i * static_cast<size_t>(vocab);
-              sampled.push_back(
-                  HostSampleRow(row, vocab, batch, i, &step_logprobs[i]));
-            }
+        const Status stepped =
+            model_runner->Step(batch, &sampled, &raw_logprobs);
+        if (stepped.ok() && wants_logprobs) {
+          step_logprobs.resize(raw_logprobs.size());
+          for (size_t i = 0; i < raw_logprobs.size(); ++i) {
+            step_logprobs[i] = {raw_logprobs[i].present,
+                                raw_logprobs[i].logprob,
+                                std::move(raw_logprobs[i].top)};
           }
         }
 
@@ -817,17 +798,13 @@ struct Engine::Impl {
         }
 
         for (const TokenDelta& delta : deltas) Deliver(delta);
-        if (model_runner != nullptr) {
-          metrics.RecordRankSteps(model_runner->telemetry(),
-                                  batch.num_tokens() > batch.num_seqs);
-        }
+        metrics.RecordRankSteps(model_runner->telemetry(),
+                                batch.num_tokens() > batch.num_seqs);
 
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
         stats.tokens_generated += static_cast<int64_t>(deltas.size());
-        if (model_runner != nullptr) {
-          stats.last_step_ms = model_runner->last_step_device_ms();
-        }
+        stats.last_step_ms = model_runner->last_step_device_ms();
       }
 
       for (const scheduler::Completion& completion :
@@ -978,11 +955,12 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler scheduler,
         Scheduler::Create(config.scheduler, deepseek.kv_pool()));
 
-    impl->sync_model_runner = MakeSyncModelRunner(std::move(deepseek));
+    impl->model_runner =
+        MakeSyncModelRunner(std::move(deepseek), HostSampleRow);
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = kv_blocks;
 
-    INFERX_RETURN_IF_ERROR(impl->sync_model_runner->ReserveActivations(
+    INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
         config.scheduler.max_batch_tokens));
   } else if (model_config.architecture == model::Architecture::kGptOss) {
     if (config.tensor_parallel_size != 1) {
@@ -1024,14 +1002,14 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler scheduler,
         Scheduler::Create(config.scheduler, gpt_oss.kv_pool()));
 
-    impl->sync_model_runner = MakeSyncModelRunner(std::move(gpt_oss));
+    impl->model_runner = MakeSyncModelRunner(std::move(gpt_oss), HostSampleRow);
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = kv_blocks;
 
     // Size the activation scratch once, for the largest batch that will ever
     // run. The scratch only grows, so a later growth inside a step is fine --
     // but doing it up front avoids the first-step reallocation cost.
-    INFERX_RETURN_IF_ERROR(impl->sync_model_runner->ReserveActivations(
+    INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
         config.scheduler.max_batch_tokens));
 
     if (config.capture_graphs) {
@@ -1040,7 +1018,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
           config.block_size;
       for (int64_t seqs = config.scheduler.max_running; seqs >= 1; --seqs) {
         INFERX_RETURN_IF_ERROR(
-            impl->sync_model_runner->CaptureDecodeGraph(seqs, max_blocks));
+            impl->model_runner->CaptureDecodeGraph(seqs, max_blocks));
       }
     }
   } else {

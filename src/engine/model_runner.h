@@ -38,9 +38,9 @@ class ModelRunner {
 
   virtual KvBlockPool* kv_pool() = 0;
   virtual Status ReserveActivations(int64_t max_tokens) = 0;
-  virtual Status StepAsync(const model::ForwardBatch& batch) = 0;
-  virtual Status AwaitStep(std::vector<int32_t>* sampled) = 0;
-  virtual Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) = 0;
+  virtual Status Step(const model::ForwardBatch& batch,
+                      std::vector<int32_t>* sampled,
+                      std::vector<SampledLogprob>* logprobs) = 0;
   virtual Status CaptureDecodeGraph(int64_t num_seqs,
                                     int64_t max_blocks_per_seq) = 0;
   virtual float last_step_device_ms() const = 0;

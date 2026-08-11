@@ -1,5 +1,6 @@
 #include "qwen2_runner.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -117,12 +118,12 @@ class SingleQwen2Runner final : public Qwen2Runner {
   Status ReserveActivations(int64_t n) override {
     return model_.ReserveActivations(n);
   }
-  Status StepAsync(const model::ForwardBatch& batch) override {
+  Status StepAsync(const model::ForwardBatch& batch) {
     Status result = model_.StepAsync(batch);
     if (!result.ok()) healthy_.store(false, std::memory_order_relaxed);
     return result;
   }
-  Status AwaitStep(std::vector<int32_t>* sampled) override {
+  Status AwaitStep(std::vector<int32_t>* sampled) {
     Status result = model_.AwaitStep(sampled);
     healthy_.store(result.ok(), std::memory_order_relaxed);
     if (result.ok()) {
@@ -135,7 +136,7 @@ class SingleQwen2Runner final : public Qwen2Runner {
   Status CaptureDecodeGraph(int64_t n, int64_t blocks) override {
     return model_.CaptureDecodeGraph(n, blocks);
   }
-  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) override {
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) {
     std::vector<model::Qwen2Model::SampledLogprob> raw;
     INFERX_RETURN_IF_ERROR(model_.ReadSampledLogprobs(&raw));
     out->clear();
@@ -146,6 +147,16 @@ class SingleQwen2Runner final : public Qwen2Runner {
                       .top = std::move(item.top)});
     }
     return OkStatus();
+  }
+  Status Step(const model::ForwardBatch& batch, std::vector<int32_t>* sampled,
+              std::vector<SampledLogprob>* logprobs) override {
+    INFERX_RETURN_IF_ERROR(StepAsync(batch));
+    INFERX_RETURN_IF_ERROR(AwaitStep(sampled));
+    logprobs->clear();
+    const bool requested =
+        std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
+                    [](int32_t count) { return count >= 0; });
+    return requested ? ReadSampledLogprobs(logprobs) : OkStatus();
   }
   float last_step_device_ms() const override {
     return last_step_device_ms_.load(std::memory_order_relaxed);
@@ -389,12 +400,12 @@ class NcclQwen2Runner final : public Qwen2Runner {
     });
   }
 
-  Status StepAsync(const model::ForwardBatch& batch) override {
+  Status StepAsync(const model::ForwardBatch& batch) {
     return Dispatch(
         [batch](model::Qwen2Model& model) { return model.StepAsync(batch); });
   }
 
-  Status AwaitStep(std::vector<int32_t>* sampled) override {
+  Status AwaitStep(std::vector<int32_t>* sampled) {
     std::vector<std::vector<int32_t>> outputs(workers_.size());
     INFERX_RETURN_IF_ERROR(
         DispatchIndexed([&outputs](size_t rank, model::Qwen2Model& model) {
@@ -411,7 +422,7 @@ class NcclQwen2Runner final : public Qwen2Runner {
     });
   }
 
-  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) override {
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) {
     // Rank 0 only: every rank samples the same tokens from the same
     // all-reduced logits, so one readback answers for the pair.
     std::vector<model::Qwen2Model::SampledLogprob> raw;
@@ -428,6 +439,16 @@ class NcclQwen2Runner final : public Qwen2Runner {
                       .top = std::move(item.top)});
     }
     return OkStatus();
+  }
+  Status Step(const model::ForwardBatch& batch, std::vector<int32_t>* sampled,
+              std::vector<SampledLogprob>* logprobs) override {
+    INFERX_RETURN_IF_ERROR(StepAsync(batch));
+    INFERX_RETURN_IF_ERROR(AwaitStep(sampled));
+    logprobs->clear();
+    const bool requested =
+        std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
+                    [](int32_t count) { return count >= 0; });
+    return requested ? ReadSampledLogprobs(logprobs) : OkStatus();
   }
 
   float last_step_device_ms() const override {
