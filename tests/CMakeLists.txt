@@ -11,6 +11,28 @@ add_test(NAME public_header_hygiene
     -P ${PROJECT_SOURCE_DIR}/cmake/CheckPublicHeaderHygiene.cmake)
 set_tests_properties(public_header_hygiene PROPERTIES LABELS unit)
 
+add_test(NAME backend_auto_cpu
+  COMMAND ${CMAKE_COMMAND}
+    -DINFERX_BACKEND=AUTO
+    -DINFERX_ENABLE_CUDA=OFF
+    -DINFERX_EXPECTED_BACKEND=CPU
+    -P ${PROJECT_SOURCE_DIR}/tests/cmake/backend_selection_test.cmake)
+add_test(NAME backend_explicit_cpu
+  COMMAND ${CMAKE_COMMAND}
+    -DINFERX_BACKEND=CPU
+    -DINFERX_ENABLE_CUDA=ON
+    -DINFERX_EXPECTED_BACKEND=CPU
+    -P ${PROJECT_SOURCE_DIR}/tests/cmake/backend_selection_test.cmake)
+add_test(NAME backend_explicit_cuda
+  COMMAND ${CMAKE_COMMAND}
+    -DINFERX_BACKEND=CUDA
+    -DINFERX_ENABLE_CUDA=OFF
+    -DINFERX_EXPECTED_BACKEND=CUDA
+    -P ${PROJECT_SOURCE_DIR}/tests/cmake/backend_selection_test.cmake)
+set_tests_properties(
+  backend_auto_cpu backend_explicit_cpu backend_explicit_cuda
+  PROPERTIES LABELS unit)
+
 # Every test here must run to completion on a machine with no GPU. Tests that
 # need a device gate themselves on inferx::cuda::Available() and skip.
 function(inferx_add_test name)
@@ -72,14 +94,14 @@ target_link_libraries(options_test PRIVATE inferx::serve_options)
 
 # GPU-free arithmetic, but its library (inferx::engine) only exists in
 # device-capable builds.
-if(INFERX_CUDA_MEETS_FLOOR)
+if(INFERX_HAS_DEVICE_OPS)
   inferx_add_test(kv_autosize_test     unit/kv_autosize_test.cc)
   target_link_libraries(kv_autosize_test PRIVATE inferx::engine)
   target_include_directories(kv_autosize_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
 endif()
 
-if(INFERX_CUDA_MEETS_FLOOR)
+if(INFERX_HAS_DEVICE_OPS)
   inferx_add_kernel_test(weight_loader_test kernel/weight_loader_test.cc)
   inferx_add_kernel_test(moe_test kernel/moe_test.cc)
   inferx_add_kernel_test(mla_test kernel/mla_test.cc)

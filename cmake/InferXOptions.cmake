@@ -3,7 +3,9 @@
 include_guard(GLOBAL)
 
 option(INFERX_BUILD_BENCH "Build benchmarks (requires CUDA >= the floor)" ON)
-option(INFERX_ENABLE_CUDA "Build the CUDA device layer" ON)
+# Compatibility switch used when INFERX_BACKEND=AUTO. Prefer selecting the
+# backend explicitly for new build configurations.
+option(INFERX_ENABLE_CUDA "Build the CUDA device layer (legacy AUTO selector)" ON)
 option(INFERX_ENABLE_NCCL "Build the NCCL communication backend when found" ON)
 option(INFERX_ENABLE_GRPC "Build the process-separated scheduler gRPC transport when found" ON)
 option(INFERX_WERROR      "Treat warnings as errors" OFF)

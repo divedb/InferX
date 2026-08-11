@@ -21,8 +21,14 @@ if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
 endif()
 
 include(InferXOptions)
+include(InferXBackend)
 include(InferXCuda)
 include(InferXDependencies)
+
+set(INFERX_HAS_DEVICE_OPS OFF)
+if(INFERX_SELECTED_BACKEND STREQUAL "CUDA" AND INFERX_CUDA_MEETS_FLOOR)
+  set(INFERX_HAS_DEVICE_OPS ON)
+endif()
 
 add_subdirectory(src/support)
 add_subdirectory(src/observe)
@@ -30,8 +36,13 @@ add_subdirectory(src/core)
 add_subdirectory(src/comm)
 add_subdirectory(src/tokenizer)
 
-if(INFERX_CUDA_MEETS_FLOOR)
-  add_subdirectory(src/backends/cuda/ops)
+if(INFERX_HAS_DEVICE_OPS)
+  if(INFERX_SELECTED_BACKEND STREQUAL "CUDA")
+    add_subdirectory(src/backends/cuda/ops)
+  else()
+    message(FATAL_ERROR
+      "No ops build dispatch for backend ${INFERX_SELECTED_BACKEND}")
+  endif()
 endif()
 
 # After the selected ops backend: the model's forward pass links inferx::ops
@@ -61,13 +72,13 @@ endif()
 
 # The server owns the model, so it needs device code; the wire format it speaks
 # does not, which is why src/api is unconditional and this is not.
-if(INFERX_CUDA_MEETS_FLOOR)
+if(INFERX_HAS_DEVICE_OPS)
   add_subdirectory(src/engine)
   add_subdirectory(src/server)
   add_subdirectory(src/main)
 endif()
 
-if(INFERX_BUILD_BENCH AND INFERX_CUDA_MEETS_FLOOR)
+if(INFERX_BUILD_BENCH AND INFERX_HAS_DEVICE_OPS)
   add_subdirectory(bench)
 endif()
 
@@ -87,6 +98,7 @@ message(STATUS "==== InferX ${PROJECT_VERSION} ====")
 message(STATUS "  Build type      : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard    : ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Host compiler   : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "  Backend         : ${INFERX_SELECTED_BACKEND}")
 if(INFERX_ENABLE_CUDA)
   message(STATUS "  CUDA toolkit    : ${CUDAToolkit_VERSION} (${CUDAToolkit_BIN_DIR})")
   # Reported separately from the toolkit, and with its path, because these are

@@ -24,7 +24,7 @@ target_link_libraries(inferx_model
     inferx::flags
 )
 
-if(INFERX_CUDA_MEETS_FLOOR)
+if(INFERX_HAS_DEVICE_OPS)
   target_sources(inferx_model PRIVATE qwen2.cc moe_ffn.cc mla.cc gpt_oss.cc
                                       deepseek_v2.cc)
   target_link_libraries(inferx_model PUBLIC inferx::ops)
