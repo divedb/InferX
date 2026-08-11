@@ -18,9 +18,11 @@ The declared strategy layer has started landing: `TpLayout` and `TpDims`
 describe and validate Qwen2's partition, and shard-aware `WeightLoader` verbs
 stream individual and fused heterogeneous shards without materializing the
 discarded ranks. Qwen2 weight loading now consumes that layout and no longer
-contains an imperative axis-selection lambda. Parallel linear/MoE/MLA
-primitives have not landed, so Qwen2 still places its direct collective calls
-manually, while gpt-oss and DeepSeek-V2 still reject TP greater than one.
+contains an imperative axis-selection lambda. `RowParallelLinear` now owns the
+local-BF16-GEMM plus reduction path and the reduction completion seam used by
+quantized GEMMs; it is the only model-layer caller of `AllReduceSum`.
+Column-parallel, MoE, and MLA primitives have not landed, while gpt-oss and
+DeepSeek-V2 still reject TP greater than one.
 
 Relationship to existing documents:
 

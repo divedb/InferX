@@ -114,6 +114,7 @@ endif()
 
 if(INFERX_HAS_DEVICE_OPS)
   inferx_add_kernel_test(weight_loader_test kernel/weight_loader_test.cc)
+  inferx_add_kernel_test(parallel_linear_test kernel/parallel_linear_test.cc)
   inferx_add_kernel_test(moe_test kernel/moe_test.cc)
   inferx_add_kernel_test(mla_test kernel/mla_test.cc)
   inferx_add_kernel_test(sampling_test kernel/sampling_test.cc)

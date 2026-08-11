@@ -13,6 +13,7 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
+#include "inferx/model/parallel/linear.h"
 #include "inferx/model/parallel/tp_dims.h"
 #include "inferx/model/parallel/tp_layout.h"
 #include "inferx/model/weight_loader.h"
@@ -525,8 +526,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
     INFERX_RETURN_IF_ERROR(ops::Attention(q3, k3, v3, a3, attn_scale));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x));
-    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
+    INFERX_RETURN_IF_ERROR(parallel::RowParallelLinear::ForwardBf16(
+        gemm, *comm, av, layer.o_w, x));
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid));
 
     // --- feed-forward block ----------------------------------------------
@@ -539,8 +540,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
     INFERX_RETURN_IF_ERROR(ops::SiluMulFused(gate_up_v, gate_v));
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x));
-    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
+    INFERX_RETURN_IF_ERROR(parallel::RowParallelLinear::ForwardBf16(
+        gemm, *comm, gate_v, layer.down_w, x));
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid));
   }
 
@@ -1022,7 +1023,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s,
                                   layer.o_w4, layer.o_s4, x, 1));
-    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
+    INFERX_RETURN_IF_ERROR(
+        parallel::RowParallelLinear::ReduceOutput(*comm, x, stream));
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid, stream));
 
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
@@ -1042,7 +1044,8 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
                                   layer.down_s, layer.down_w4, layer.down_s4, x,
                                   3));
-    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
+    INFERX_RETURN_IF_ERROR(
+        parallel::RowParallelLinear::ReduceOutput(*comm, x, stream));
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid, stream));
   }
 
