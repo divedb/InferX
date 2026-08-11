@@ -254,6 +254,24 @@ __global__ void CombineRowsKernel(const bf16* __restrict__ y,
   }
 }
 
+__global__ void AddExpertBiasKernel(const int32_t* __restrict__ experts,
+                                    const float* __restrict__ weights,
+                                    const bf16* __restrict__ bias,
+                                    bf16* __restrict__ out, int64_t width,
+                                    int k) {
+  const int64_t token = blockIdx.x;
+  for (int64_t c = threadIdx.x; c < width; c += blockDim.x) {
+    float acc = __bfloat162float(out[token * width + c]);
+    for (int slot = 0; slot < k; ++slot) {
+      const int64_t assignment = token * k + slot;
+      const int expert = experts[assignment];
+      acc += weights[assignment] *
+             __bfloat162float(bias[static_cast<int64_t>(expert) * width + c]);
+    }
+    out[token * width + c] = __float2bfloat16(acc);
+  }
+}
+
 __global__ void AddSharedExpertKernel(const bf16* __restrict__ shared,
                                       const bf16* __restrict__ gate_logits,
                                       bf16* __restrict__ out, int64_t width) {
@@ -561,6 +579,35 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
       static_cast<const float*>(weights.Data()), static_cast<bf16*>(out.Data()),
       width, static_cast<int>(k));
 
+  INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
+  return OkStatus();
+}
+
+Status MoeAddExpertBias(const TensorView& experts, const TensorView& weights,
+                        const TensorView& bias, const TensorView& out,
+                        Stream stream) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(experts, DataType::kInt32, 2, "experts"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(weights, DataType::kFloat, 2, "weights"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(bias, DataType::kBFloat16, 2, "bias"));
+  INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
+
+  const int64_t tokens = out.Dim(0);
+  const int64_t width = out.Dim(1);
+  if (experts.GetShape() != weights.GetShape() || experts.Dim(0) != tokens) {
+    return InvalidArgumentError(
+        "experts and weights must have matching [tokens, top_k] shapes");
+  }
+  if (bias.Dim(1) != width) {
+    return InvalidArgumentError("expert bias is ", bias.Dim(1),
+                                " wide but out is ", width);
+  }
+  if (tokens == 0) return OkStatus();
+
+  AddExpertBiasKernel<<<static_cast<int>(tokens), kBlock, 0, stream>>>(
+      static_cast<const int32_t*>(experts.Data()),
+      static_cast<const float*>(weights.Data()),
+      static_cast<const bf16*>(bias.Data()), static_cast<bf16*>(out.Data()),
+      width, static_cast<int>(weights.Dim(1)));
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }

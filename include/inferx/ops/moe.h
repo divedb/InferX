@@ -105,6 +105,14 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
                       const TensorView& weights, const TensorView& out,
                       Stream stream = {});
 
+/// \brief Adds the routed mixture of per-expert output biases to `out`.
+///
+/// Kept separate from grouped GEMM so tensor parallelism can apply each
+/// replicated bias exactly once after reducing rank-local projection partials.
+Status MoeAddExpertBias(const TensorView& experts, const TensorView& weights,
+                        const TensorView& bias, const TensorView& out,
+                        Stream stream = {});
+
 /// \brief One ragged GEMM over stacked bf16 expert weights, offsets on the
 ///        device.
 ///

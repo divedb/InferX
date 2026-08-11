@@ -160,11 +160,11 @@ Status MoeFfn::ForwardImpl(const TensorView& x, const MoeWeights& weights,
                            comm::Communicator* communicator, Stream stream) {
   if (gemm == nullptr) return InvalidArgumentError("MoeFfn: gemm is null");
 
-  if (communicator != nullptr && communicator->size() > 1 &&
-      weights.down_bias.IsDefined()) {
-    return UnimplementedError(
-        "MoeFfn: tensor-parallel down bias must be applied after reduction");
-  }
+  const bool defer_down_bias = communicator != nullptr &&
+                               communicator->size() > 1 &&
+                               weights.down_bias.IsDefined();
+  const TensorView local_down_bias =
+      defer_down_bias ? TensorView{} : weights.down_bias;
 
   if (!x.IsDefined() || x.Rank() != 2 || x.GetDataType() != kBf16) {
     return InvalidArgumentError("MoeFfn: x must be a 2-D bf16 tensor");
@@ -273,7 +273,7 @@ Status MoeFfn::ForwardImpl(const TensorView& x, const MoeWeights& weights,
     }
     INFERX_RETURN_IF_ERROR(ops::Mxfp4GroupedGemm(
         activated_all, offsets_v, weights.down_blocks, weights.down_scales,
-        weights.down_bias, expert_out_all, /*deinterleave=*/false, stream));
+        local_down_bias, expert_out_all, /*deinterleave=*/false, stream));
   } else {
     // The bf16 grouped path: both ragged projections consume the
     // device-resident offsets, so nothing round-trips to the host and the
@@ -297,7 +297,7 @@ Status MoeFfn::ForwardImpl(const TensorView& x, const MoeWeights& weights,
     }
     INFERX_RETURN_IF_ERROR(
         ops::MoeGroupedGemmBf16(activated_all, offsets_v, weights.down,
-                                weights.down_bias, expert_out_all, stream));
+                                local_down_bias, expert_out_all, stream));
   }
 
   // --- 4. Combine, then the shared expert -----------------------------------
@@ -357,6 +357,10 @@ Status MoeFfn::ForwardImpl(const TensorView& x, const MoeWeights& weights,
   if (communicator != nullptr) {
     INFERX_RETURN_IF_ERROR(
         parallel::RowParallelLinear::ReduceOutput(*communicator, out, stream));
+  }
+  if (defer_down_bias) {
+    INFERX_RETURN_IF_ERROR(ops::MoeAddExpertBias(
+        experts_v, weights_v, weights.down_bias, out, stream));
   }
 
   return OkStatus();

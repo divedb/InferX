@@ -29,8 +29,8 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/ops/gemm.h"
 #include "inferx/model/moe_ffn.h"
+#include "inferx/ops/gemm.h"
 
 namespace inferx {
 namespace {
@@ -225,8 +225,7 @@ TEST_F(MoeTest, RouterWithoutRenormalizationKeepsSoftmaxMass) {
   const TensorView w = Empty(keep, DataType::kFloat, Shape({tokens, k}));
   const TensorView e = Empty(keep, DataType::kInt32, Shape({tokens, k}));
 
-  ASSERT_TRUE(
-      ops::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
+  ASSERT_TRUE(ops::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const Routing want = ReferenceRoute(logits, tokens, num_experts, k, false);
@@ -299,8 +298,7 @@ TEST_F(MoeTest, DispatchGroupsStablyAndInvertsExactly) {
   const TensorView dest = Empty(keep, DataType::kInt32, Shape({assignments}));
 
   ASSERT_TRUE(
-      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
-          .ok());
+      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got_offsets = Download<int32_t>(offsets, num_experts + 1);
@@ -397,8 +395,7 @@ TEST_F(MoeTest, GatherAndCombineRoundTripThroughThePermutation) {
       Empty(keep, DataType::kBFloat16, Shape({tokens, width}));
 
   ASSERT_TRUE(
-      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
-          .ok());
+      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest).ok());
   ASSERT_TRUE(ops::MoeGatherRows(x_v, rows, gathered).ok());
   ASSERT_TRUE(ops::MoeCombineRows(gathered, dest, weights_v, out).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -409,6 +406,44 @@ TEST_F(MoeTest, GatherAndCombineRoundTripThroughThePermutation) {
       const size_t i = static_cast<size_t>(t * width + c);
       EXPECT_NEAR(__bfloat162float(got[i]), x[i], 8e-3f)
           << "token " << t << " column " << c;
+    }
+  }
+}
+
+TEST_F(MoeTest, RoutedExpertBiasIsAppliedAfterCombine) {
+  constexpr int64_t tokens = 2, width = 4, num_experts = 3;
+  constexpr int k = 2;
+  const std::vector<int32_t> experts = {0, 2, 1, 2};
+  const std::vector<float> weights = {0.25f, 0.75f, 0.6f, 0.4f};
+  const std::vector<float> bias = {1, 2,  3,  4,  // expert 0
+                                   5, 6,  7,  8,  // expert 1
+                                   9, 10, 11, 12};
+  const std::vector<float> initial(8, 1.0f);
+
+  std::vector<DeviceBuffer> keep;
+  const TensorView experts_v =
+      Upload(keep, experts, DataType::kInt32, Shape({tokens, k}));
+  const TensorView weights_v =
+      Upload(keep, weights, DataType::kFloat, Shape({tokens, k}));
+  const TensorView bias_v = Upload(keep, ToBf16(bias), DataType::kBFloat16,
+                                   Shape({num_experts, width}));
+  const TensorView out = Upload(keep, ToBf16(initial), DataType::kBFloat16,
+                                Shape({tokens, width}));
+
+  ASSERT_TRUE(ops::MoeAddExpertBias(experts_v, weights_v, bias_v, out).ok());
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  const auto got = Download<bf16>(out, tokens * width);
+
+  for (int64_t token = 0; token < tokens; ++token) {
+    for (int64_t col = 0; col < width; ++col) {
+      float expected = 1.0f;
+      for (int slot = 0; slot < k; ++slot) {
+        const int64_t assignment = token * k + slot;
+        expected +=
+            weights[assignment] *
+            bias[static_cast<size_t>(experts[assignment] * width + col)];
+      }
+      EXPECT_NEAR(__bfloat162float(got[token * width + col]), expected, 0.04f);
     }
   }
 }
