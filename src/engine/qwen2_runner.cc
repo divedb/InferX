@@ -14,6 +14,7 @@
 
 #include "inferx/comm/nccl_communicator.h"
 #include "inferx/core/device_runtime.h"
+#include "inferx/model/qwen2.h"
 #include "kv_autosize.h"
 
 namespace inferx::engine {
@@ -134,9 +135,17 @@ class SingleQwen2Runner final : public Qwen2Runner {
   Status CaptureDecodeGraph(int64_t n, int64_t blocks) override {
     return model_.CaptureDecodeGraph(n, blocks);
   }
-  Status ReadSampledLogprobs(
-      std::vector<model::Qwen2Model::SampledLogprob>* out) override {
-    return model_.ReadSampledLogprobs(out);
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) override {
+    std::vector<model::Qwen2Model::SampledLogprob> raw;
+    INFERX_RETURN_IF_ERROR(model_.ReadSampledLogprobs(&raw));
+    out->clear();
+    out->reserve(raw.size());
+    for (auto& item : raw) {
+      out->push_back({.present = item.present,
+                      .logprob = item.logprob,
+                      .top = std::move(item.top)});
+    }
+    return OkStatus();
   }
   float last_step_device_ms() const override {
     return last_step_device_ms_.load(std::memory_order_relaxed);
@@ -402,14 +411,23 @@ class NcclQwen2Runner final : public Qwen2Runner {
     });
   }
 
-  Status ReadSampledLogprobs(
-      std::vector<model::Qwen2Model::SampledLogprob>* out) override {
+  Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) override {
     // Rank 0 only: every rank samples the same tokens from the same
     // all-reduced logits, so one readback answers for the pair.
-    INFERX_RETURN_IF_ERROR(workers_[0]->Submit([out](model::Qwen2Model& model) {
-      return model.ReadSampledLogprobs(out);
-    }));
-    return workers_[0]->Wait();
+    std::vector<model::Qwen2Model::SampledLogprob> raw;
+    INFERX_RETURN_IF_ERROR(
+        workers_[0]->Submit([&raw](model::Qwen2Model& model) {
+          return model.ReadSampledLogprobs(&raw);
+        }));
+    INFERX_RETURN_IF_ERROR(workers_[0]->Wait());
+    out->clear();
+    out->reserve(raw.size());
+    for (auto& item : raw) {
+      out->push_back({.present = item.present,
+                      .logprob = item.logprob,
+                      .top = std::move(item.top)});
+    }
+    return OkStatus();
   }
 
   float last_step_device_ms() const override {

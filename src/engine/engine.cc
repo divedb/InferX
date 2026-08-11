@@ -21,6 +21,7 @@
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
 #include "kv_autosize.h"
+#include "model_runner.h"
 #include "qwen2_runner.h"
 
 namespace inferx::engine {
@@ -380,7 +381,7 @@ struct Engine::Impl {
   // no paged KV, no continuous batching. It is batch-1, full recompute per
   // token, and exists so the engine can serve the checkpoint end to end before
   // Phase 4 makes it fast.
-  std::unique_ptr<Qwen2Runner> qwen2_model;
+  std::unique_ptr<ModelRunner> model_runner;
   std::unique_ptr<model::GptOssModel> gpt_oss_model;
   std::unique_ptr<model::DeepseekV2Model> deepseek_model;
 
@@ -660,8 +661,8 @@ struct Engine::Impl {
 
       if (batch.token_ids.empty()) break;
 
-      INFERX_RETURN_IF_ERROR(qwen2_model->StepAsync(batch));
-      INFERX_RETURN_IF_ERROR(qwen2_model->AwaitStep(&sampled));
+      INFERX_RETURN_IF_ERROR(model_runner->StepAsync(batch));
+      INFERX_RETURN_IF_ERROR(model_runner->AwaitStep(&sampled));
       INFERX_RETURN_IF_ERROR(scheduler->CommitStep(sampled, nullptr));
 
       (void)scheduler->TakeCompleted();
@@ -790,9 +791,9 @@ struct Engine::Impl {
             std::any_of(batch.logprobs_k.begin(), batch.logprobs_k.end(),
                         [](int32_t k) { return k >= 0; });
 
-        Status stepped = qwen2_model->StepAsync(batch);
+        Status stepped = model_runner->StepAsync(batch);
 
-        if (stepped.ok()) stepped = qwen2_model->AwaitStep(&sampled);
+        if (stepped.ok()) stepped = model_runner->AwaitStep(&sampled);
 
         // A device error is not recoverable per-request: the KV cache state is
         // now unknown, so every in-flight sequence is suspect. Failing them all
@@ -805,8 +806,8 @@ struct Engine::Impl {
 
         std::vector<scheduler::StepLogprob> step_logprobs;
         if (wants_logprobs) {
-          std::vector<model::Qwen2Model::SampledLogprob> raw;
-          if (const Status read = qwen2_model->ReadSampledLogprobs(&raw);
+          std::vector<SampledLogprob> raw;
+          if (const Status read = model_runner->ReadSampledLogprobs(&raw);
               !read.ok()) {
             FailAll(read);
             stopping.store(true, std::memory_order_relaxed);
@@ -828,13 +829,13 @@ struct Engine::Impl {
         }
 
         for (const TokenDelta& delta : deltas) Deliver(delta);
-        metrics.RecordRankSteps(qwen2_model->telemetry(),
+        metrics.RecordRankSteps(model_runner->telemetry(),
                                 batch.num_tokens() > batch.num_seqs);
 
         std::lock_guard<std::mutex> lock(mutex);
         ++stats.steps;
         stats.tokens_generated += static_cast<int64_t>(deltas.size());
-        stats.last_step_ms = qwen2_model->last_step_device_ms();
+        stats.last_step_ms = model_runner->last_step_device_ms();
       }
 
       for (const scheduler::Completion& completion :
@@ -1231,17 +1232,16 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     runner_config.block_size = config.block_size;
     runner_config.max_seq_len = config.scheduler.max_seq_len;
     runner_config.max_sampling_rows = config.scheduler.max_running;
-    INFERX_ASSIGN_OR_RETURN(std::unique_ptr<Qwen2Runner> model,
-                            Qwen2Runner::Create(runner_config));
+    INFERX_ASSIGN_OR_RETURN(auto model, Qwen2Runner::Create(runner_config));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,
         Scheduler::Create(config.scheduler, model->kv_pool()));
 
-    impl->qwen2_model = std::move(model);
-    impl->metrics.ConfigureRanks(impl->qwen2_model->telemetry());
+    impl->model_runner = std::move(model);
+    impl->metrics.ConfigureRanks(impl->model_runner->telemetry());
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = impl->qwen2_model->kv_pool()->num_blocks();
+    impl->stats.blocks_total = impl->model_runner->kv_pool()->num_blocks();
 
     // One graph per batch size. The block-table width is fixed for the whole
     // scheduler, so the only shape that varies between decode steps is the
@@ -1253,7 +1253,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       // batch that will ever run, because they only grow and a later growth
       // would strand every captured pointer. Then run one real request through,
       // so that everything allocated on first use has been allocated.
-      INFERX_RETURN_IF_ERROR(impl->qwen2_model->ReserveActivations(
+      INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
           config.scheduler.max_batch_tokens));
 
       INFERX_RETURN_IF_ERROR(impl->Warmup());
@@ -1279,7 +1279,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         // Best-effort: a shape that will not capture still runs un-graphed, and
         // refusing to start the server over it would trade a working slow path
         // for no path at all.
-        (void)impl->qwen2_model->CaptureDecodeGraph(seqs, max_blocks);
+        (void)impl->model_runner->CaptureDecodeGraph(seqs, max_blocks);
       }
     }
   }
@@ -1364,8 +1364,8 @@ Engine::Stats Engine::stats() const {
 
 std::string Engine::metrics() const {
   std::string output = impl_->metrics.registry.Render();
-  if (impl_->qwen2_model != nullptr) {
-    output += RenderRankMetrics(impl_->qwen2_model->telemetry());
+  if (impl_->model_runner != nullptr) {
+    output += RenderRankMetrics(impl_->model_runner->telemetry());
   }
   return output;
 }

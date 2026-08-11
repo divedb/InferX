@@ -5,10 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "inferx/comm/communicator.h"
-#include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
-#include "inferx/model/qwen2.h"
+#include "model_runner.h"
 
 namespace inferx::engine {
 
@@ -33,39 +31,14 @@ struct Qwen2RunnerConfig {
   int64_t max_sampling_rows = 8;
 };
 
-struct RankTelemetry {
-  int rank = 0;
-  int device = 0;
-  int world_size = 1;
-  comm::CommBackend backend = comm::CommBackend::kSingleRank;
-  bool healthy = true;
-  double last_progress_age_seconds = 0.0;
-  float last_step_device_ms = 0.0f;
-  uint64_t timeouts = 0;
-  comm::CommMetricSnapshot communication;
-};
-
 /// Model execution boundary used by the server. TP=1 calls the model directly;
 /// TP=2 dispatches the same operation to two persistent rank workers.
-class Qwen2Runner {
+class Qwen2Runner : public ModelRunner {
  public:
-  virtual ~Qwen2Runner() = default;
+  ~Qwen2Runner() override = default;
 
   static StatusOr<std::unique_ptr<Qwen2Runner>> Create(
       const Qwen2RunnerConfig& config);
-
-  virtual KvBlockPool* kv_pool() = 0;
-  virtual Status ReserveActivations(int64_t max_tokens) = 0;
-  virtual Status StepAsync(const model::ForwardBatch& batch) = 0;
-  virtual Status AwaitStep(std::vector<int32_t>* sampled) = 0;
-  /// Valid after `AwaitStep`; rank 0's readback (all ranks sample
-  /// identically). \see Qwen2Model::ReadSampledLogprobs.
-  virtual Status ReadSampledLogprobs(
-      std::vector<model::Qwen2Model::SampledLogprob>* out) = 0;
-  virtual Status CaptureDecodeGraph(int64_t num_seqs,
-                                    int64_t max_blocks_per_seq) = 0;
-  virtual float last_step_device_ms() const = 0;
-  virtual std::vector<RankTelemetry> telemetry() const = 0;
 };
 
 }  // namespace inferx::engine
