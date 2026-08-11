@@ -23,6 +23,7 @@ if(INFERX_CUDA_MEETS_FLOOR)
     ../backends/cuda/cuda_utils.cc
     ../backends/cuda/device_runtime.cc
   )
+  target_link_libraries(inferx_core PRIVATE CUDA::cudart)
 endif()
 add_library(inferx::core ALIAS inferx_core)
 

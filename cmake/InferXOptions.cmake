@@ -40,7 +40,8 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 # ---------------------------------------------------------------------------
-# inferx_flags: carried by every first-party target, never by third_party.
+# inferx_flags: compiler policy carried by every first-party target, never by
+# third_party. Backend libraries must be linked by their concrete owners.
 # ---------------------------------------------------------------------------
 add_library(inferx_flags INTERFACE)
 add_library(inferx::flags ALIAS inferx_flags)

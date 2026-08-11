@@ -173,5 +173,3 @@ target_compile_options(inferx_flags INTERFACE
     $<$<BOOL:${INFERX_WERROR}>:-Werror=all-warnings>
   >
 )
-
-target_link_libraries(inferx_flags INTERFACE CUDA::cudart)
