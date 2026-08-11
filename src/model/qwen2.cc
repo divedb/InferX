@@ -14,16 +14,16 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/layers.h"
-#include "inferx/kernels/quantize.h"
-#include "inferx/kernels/w4a16_gemm.h"
 #include "inferx/model/weight_loader.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/layers.h"
+#include "inferx/ops/quantize.h"
+#include "inferx/ops/w4a16_gemm.h"
 
 #ifdef INFERX_WITH_FLASHINFER
 #include "absl/types/span.h"
-#include "inferx/kernels/flashinfer_attention.h"
-#include "inferx/kernels/flashinfer_prefill.h"
+#include "inferx/ops/flashinfer_attention.h"
+#include "inferx/ops/flashinfer_prefill.h"
 #endif
 
 namespace inferx::model {
@@ -91,7 +91,7 @@ struct Qwen2Model::Impl {
   TensorView final_norm;  // [hidden]
   TensorView lm_head;     // == embed when tie_word_embeddings
 
-  kernels::CublasLtGemm gemm;
+  ops::CublasLtGemm gemm;
 
   // Activation scratch, sized for the longest prompt seen so far and grown on
   // demand. Reused across layers: the stack is a chain of same-shaped buffers,
@@ -107,7 +107,7 @@ struct Qwen2Model::Impl {
 
   size_t weight_bytes = 0;
 
-  explicit Impl(kernels::CublasLtGemm g,
+  explicit Impl(ops::CublasLtGemm g,
                 std::unique_ptr<comm::Communicator> communicator)
       : comm(std::move(communicator)), gemm(std::move(g)) {}
 
@@ -170,8 +170,8 @@ struct Qwen2Model::Impl {
 #ifdef INFERX_WITH_FLASHINFER
   // The fast decode path. Absent when the submodule is not vendored, in which
   // case every batch takes the reference kernel and the engine still works.
-  std::unique_ptr<kernels::FlashInferDecode> flashinfer;
-  std::unique_ptr<kernels::FlashInferPrefill> flashinfer_prefill;
+  std::unique_ptr<ops::FlashInferDecode> flashinfer;
+  std::unique_ptr<ops::FlashInferPrefill> flashinfer_prefill;
 
   // CSR view of this step's block table, which is the form FlashInfer wants
   // (our own kernel reads the dense grid directly). Rebuilt per step.
@@ -293,8 +293,7 @@ struct Qwen2Model::Impl {
                 const TensorView& w_int4, const TensorView& int4_scales,
                 const TensorView& out, int scale_slot) {
     if (weights_int4 && w_int4.IsDefined()) {
-      return kernels::W4A16Gemm(in, w_int4, int4_scales, out, kInt4Group,
-                                stream);
+      return ops::W4A16Gemm(in, w_int4, int4_scales, out, kInt4Group, stream);
     }
     if (!weights_f8 || !w_f8.IsDefined()) {
       return gemm.LinearBF16(in, w_bf16, out, stream);
@@ -308,7 +307,7 @@ struct Qwen2Model::Impl {
                            in.GetShape(), comm->device()));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::QuantizeToF8E4M3Dynamic(in, in_f8, act_scale, stream));
+        ops::QuantizeToF8E4M3Dynamic(in, in_f8, act_scale, stream));
 
     return gemm.LinearF8E4M3(in_f8, w_f8, out, act_scale, w_scale, stream);
   }
@@ -508,7 +507,7 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
   const float attn_scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x));
+  INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(embed, ids_v, x));
 
   for (const LayerWeights& layer : layers) {
     // --- attention block -------------------------------------------------
@@ -516,41 +515,41 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                          static_cast<size_t>(x.NBytes()),
                                          CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.qkv_w, qkv_v));
     INFERX_RETURN_IF_ERROR(
-        kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv));
+        ops::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv));
 
     // RoPE before attention and after the bias: the bias is part of the
     // projection, and rotating a biased Q is what the reference does.
-    INFERX_RETURN_IF_ERROR(kernels::RotaryEmbedding(
+    INFERX_RETURN_IF_ERROR(ops::RotaryEmbedding(
         q3, k3, pos_v, static_cast<float>(config.rope_theta)));
 
-    INFERX_RETURN_IF_ERROR(kernels::Attention(q3, k3, v3, a3, attn_scale));
+    INFERX_RETURN_IF_ERROR(ops::Attention(q3, k3, v3, a3, attn_scale));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(av, layer.o_w, x));
     INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid));
 
     // --- feed-forward block ----------------------------------------------
     INFERX_RETURN_IF_ERROR(runtime->Copy(resid.Data(), x.Data(),
                                          static_cast<size_t>(x.NBytes()),
                                          CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v));
+    INFERX_RETURN_IF_ERROR(ops::SiluMulFused(gate_up_v, gate_v));
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(gate_v, layer.down_w, x));
     INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid));
   }
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-      x, final_norm, norm, static_cast<float>(config.rms_norm_eps)));
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, final_norm, norm,
+                                      static_cast<float>(config.rms_norm_eps)));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView logits_v,
@@ -745,7 +744,7 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
                         (every_sequence_contributes || !batch.seq_lens.empty());
 
     std::vector<int32_t> indices;
-    INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
+    INFERX_RETURN_IF_ERROR(ops::BuildCsrBlockTable(
         batch.block_table, batch.num_seqs, batch.max_blocks_per_seq,
         blocks_used, &indices, &fi_indptr_host));
 
@@ -901,7 +900,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   const bool use_flashinfer_prefill = fi_prefill_usable && allow_flashinfer;
 #endif
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(embed, ids_v, x, stream));
+  INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(embed, ids_v, x, stream));
 
   for (int64_t layer_index = 0;
        layer_index < static_cast<int64_t>(layers.size()); ++layer_index) {
@@ -911,9 +910,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(
-        kernels::RmsNorm(x, layer.input_norm, norm,
-                         static_cast<float>(config.rms_norm_eps), stream));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, layer.input_norm, norm,
+                                        static_cast<float>(config.rms_norm_eps),
+                                        stream));
 
     // One GEMM and one split, where this used to be three GEMMs and three bias
     // adds. The split is unavoidable -- a fused row interleaves Q, K and V per
@@ -922,9 +921,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(Linear(norm, layer.qkv_w, layer.qkv_w8, layer.qkv_s,
                                   layer.qkv_w4, layer.qkv_s4, qkv_v, 0));
     INFERX_RETURN_IF_ERROR(
-        kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
+        ops::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RotaryEmbedding(
+    INFERX_RETURN_IF_ERROR(ops::RotaryEmbedding(
         q3, k3, pos_v, static_cast<float>(config.rope_theta), stream));
 
     // The cache is written *after* RoPE and *before* attention. Storing rotated
@@ -950,10 +949,10 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
             const TensorView k_fp8_tmp,
             TensorView::Create(fp8_scratch.data(), DataType::kFloat8E4M3FN,
                                k3.GetShape(), comm->device()));
-        INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
-            k3, k_fp8_tmp, k_scale_dev, stream));
-        INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
-            v3, k_fp8_tmp, v_scale_dev, stream));
+        INFERX_RETURN_IF_ERROR(
+            ops::QuantizeToF8E4M3Dynamic(k3, k_fp8_tmp, k_scale_dev, stream));
+        INFERX_RETURN_IF_ERROR(
+            ops::QuantizeToF8E4M3Dynamic(v3, k_fp8_tmp, v_scale_dev, stream));
         INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
         INFERX_RETURN_IF_ERROR(runtime->Copy(&layer.k_scale, k_scale_dev,
                                              sizeof(float),
@@ -962,12 +961,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                                              sizeof(float),
                                              CopyKind::kDeviceToHost));
       }
-      INFERX_RETURN_IF_ERROR(kernels::AppendBf16AsFp8(k3, v3, k_cache, v_cache,
-                                                      slots_v, layer.k_scale,
-                                                      layer.v_scale, stream));
+      INFERX_RETURN_IF_ERROR(ops::AppendBf16AsFp8(k3, v3, k_cache, v_cache,
+                                                  slots_v, layer.k_scale,
+                                                  layer.v_scale, stream));
     } else {
       INFERX_RETURN_IF_ERROR(
-          kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
+          ops::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
     }
 
 #ifdef INFERX_WITH_FLASHINFER
@@ -1020,35 +1019,35 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
       // The batch's own longest context, not the block table's width. See
       // PagedAttention's contract: sizing the tile from the table made a short
       // prompt demand shared memory proportional to max_seq_len.
-      INFERX_RETURN_IF_ERROR(
-          kernels::PagedAttention(q3, k_cache, v_cache, table_v, seq_v, pos_v,
-                                  a3, attn_scale, batch_max_context, stream));
+      INFERX_RETURN_IF_ERROR(ops::PagedAttention(q3, k_cache, v_cache, table_v,
+                                                 seq_v, pos_v, a3, attn_scale,
+                                                 batch_max_context, stream));
     }
 
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s,
                                   layer.o_w4, layer.o_s4, x, 1));
     INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid, stream));
 
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(
-        kernels::RmsNorm(x, layer.post_norm, norm,
-                         static_cast<float>(config.rms_norm_eps), stream));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, layer.post_norm, norm,
+                                        static_cast<float>(config.rms_norm_eps),
+                                        stream));
 
     // Gate and up need no split: SiluMul is elementwise, so it reads both
     // halves straight out of the fused buffer. This fusion is free.
     INFERX_RETURN_IF_ERROR(Linear(norm, layer.gate_up_w, layer.gate_up_w8,
                                   layer.gate_up_s, layer.gate_up_w4,
                                   layer.gate_up_s4, gate_up_v, 2));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v, stream));
+    INFERX_RETURN_IF_ERROR(ops::SiluMulFused(gate_up_v, gate_v, stream));
     INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
                                   layer.down_s, layer.down_w4, layer.down_s4, x,
                                   3));
     INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(x, resid, stream));
   }
 
   // The first forward (warmup) freezes every layer's K/V scale inline; once it
@@ -1056,7 +1055,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   // captured decode graph -- use the frozen scales verbatim.
   if (fp8_kv) kv_scales_frozen = true;
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(
       x, final_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
 
   INFERX_ASSIGN_OR_RETURN(
@@ -1147,7 +1146,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           TensorView::Create(sample_mask_ids.data(), DataType::kInt32,
                              Shape({sampled_count, ForwardBatch::kMaskCap}),
                              comm->device()));
-      INFERX_RETURN_IF_ERROR(kernels::ApplyPenalties(
+      INFERX_RETURN_IF_ERROR(ops::ApplyPenalties(
           wanted, rows_in, presence_in, frequency_in, repetition_in,
           hist_ids_in, hist_counts_in, mask_ids_in, stream));
     }
@@ -1156,9 +1155,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // temperature 0 inside SampleTokens, so a captured graph records the same
     // node whether the batch is sampling or not -- a branch here would bake
     // whichever mode happened to be live at capture.
-    INFERX_RETURN_IF_ERROR(kernels::SampleTokens(wanted, rows_in, temp_in,
-                                                 top_p_in, top_k_in, min_p_in,
-                                                 seeds_in, ids_out, stream));
+    INFERX_RETURN_IF_ERROR(ops::SampleTokens(wanted, rows_in, temp_in, top_p_in,
+                                             top_k_in, min_p_in, seeds_in,
+                                             ids_out, stream));
 
     // Logprobs of what was just sampled, over the same (post-penalty) logits.
     // Rows that asked for none exit immediately, so this too stays in the
@@ -1184,9 +1183,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
               lp_top_lps.data(), DataType::kFloat,
               Shape({sampled_count, ForwardBatch::kMaxTopLogprobs}),
               comm->device()));
-      INFERX_RETURN_IF_ERROR(kernels::ComputeLogprobs(
-          wanted, rows_in, ids_out, k_in, chosen_lp_out, top_ids_out,
-          top_lps_out, stream));
+      INFERX_RETURN_IF_ERROR(
+          ops::ComputeLogprobs(wanted, rows_in, ids_out, k_in, chosen_lp_out,
+                               top_ids_out, top_lps_out, stream));
 
       const size_t lp_cap = static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
       INFERX_RETURN_IF_ERROR(
@@ -1209,7 +1208,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                            comm->device()));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::ScatterTokens(ids_out, next_ids, slots_out, stream));
+        ops::ScatterTokens(ids_out, next_ids, slots_out, stream));
 
     // A single async copy out, not waited on here. The host reads it a step
     // later, which is §4 step 8: results from step N are consumed at the start
@@ -1303,8 +1302,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->SetDevice(device));
 
-  INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
-                          kernels::CublasLtGemm::Create());
+  INFERX_ASSIGN_OR_RETURN(ops::CublasLtGemm gemm, ops::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(std::move(gemm), std::move(communicator));
   impl->config = config;
@@ -1453,11 +1451,11 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
 #ifdef INFERX_WITH_FLASHINFER
-  INFERX_ASSIGN_OR_RETURN(kernels::FlashInferDecode fi,
-                          kernels::FlashInferDecode::Create());
-  impl->flashinfer = std::make_unique<kernels::FlashInferDecode>(std::move(fi));
+  INFERX_ASSIGN_OR_RETURN(ops::FlashInferDecode fi,
+                          ops::FlashInferDecode::Create());
+  impl->flashinfer = std::make_unique<ops::FlashInferDecode>(std::move(fi));
   INFERX_ASSIGN_OR_RETURN(impl->flashinfer_prefill,
-                          kernels::FlashInferPrefill::Create());
+                          ops::FlashInferPrefill::Create());
 #endif
 
   for (const DeviceBuffer& b : impl->weight_buffers) {
@@ -1787,7 +1785,7 @@ Status Qwen2Model::QuantizeWeightsToF8() {
     // cannot saturate memory, so this costs on the order of a second across
     // all 144 tensors. Paid once at load, which is the right place for it; a
     // multi-block variant would be the fix if load time ever mattered.
-    return kernels::QuantizeToF8E4M3Dynamic(src, *dst, *scale, impl_->stream);
+    return ops::QuantizeToF8E4M3Dynamic(src, *dst, *scale, impl_->stream);
   };
 
   int index = 0;
@@ -1882,7 +1880,7 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
                                     Shape({rows, cols / Impl::kInt4Group}),
                                     impl_->comm->device()));
 
-    return kernels::QuantizeBf16ToInt4(src, *packed, *scales, impl_->stream);
+    return ops::QuantizeBf16ToInt4(src, *packed, *scales, impl_->stream);
   };
 
   for (LayerWeights& w : impl_->layers) {

@@ -77,7 +77,8 @@ class Checkpoint {
   ///
   /// Loading is where a shape mismatch is cheap to diagnose and expensive to
   /// miss: an unchecked wrong shape becomes a silently wrong GEMM much later.
-  StatusOr<Tensor> GetChecked(std::string_view name, const Shape& expected) const;
+  StatusOr<Tensor> GetChecked(std::string_view name,
+                              const Shape& expected) const;
 
   bool Contains(std::string_view name) const;
 

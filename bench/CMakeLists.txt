@@ -11,7 +11,7 @@ function(inferx_add_bench name)
     inferx::core
     inferx::support
     inferx::model
-    inferx::kernels
+    inferx::ops
     inferx::scheduler
     inferx::flags
   )

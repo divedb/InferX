@@ -12,12 +12,12 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/tensor.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/layers.h"
 #include "inferx/model/mla.h"
 #include "inferx/model/moe_ffn.h"
 #include "inferx/model/safetensors.h"
 #include "inferx/model/weight_loader.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/layers.h"
 #include "inferx/support/log.h"
 
 namespace inferx::model {
@@ -103,7 +103,7 @@ struct SeqRange {
 }  // namespace
 
 struct DeepseekV2Model::Impl {
-  Impl(ModelConfig c, kernels::CublasLtGemm g)
+  Impl(ModelConfig c, ops::CublasLtGemm g)
       : config(std::move(c)), gemm(std::move(g)) {}
   ~Impl() {
     if (runtime != nullptr && stream.handle != nullptr) {
@@ -121,7 +121,7 @@ struct DeepseekV2Model::Impl {
   TensorView final_norm;
   TensorView lm_head;
 
-  kernels::CublasLtGemm gemm;
+  ops::CublasLtGemm gemm;
   std::unique_ptr<MlaAttentionLayer> mla;
   std::unique_ptr<MoeFfn> moe;
   DeviceRuntime* runtime = nullptr;
@@ -270,7 +270,7 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   INFERX_ASSIGN_OR_RETURN(const TensorView ffn,
                           m.ffn_out.View(kBf16, Shape({tokens, h})));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x, stream));
+  INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(m.embed, ids_v, x, stream));
 
   const float eps = static_cast<float>(c.rms_norm_eps);
   const size_t row_bytes = DataTypeByteSize(kBf16, tokens * h);
@@ -281,8 +281,7 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
     // --- MLA attention ------------------------------------------------------
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
-    INFERX_RETURN_IF_ERROR(
-        kernels::RmsNorm(x, w.input_norm, normed, eps, stream));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, w.input_norm, normed, eps, stream));
 
     INFERX_ASSIGN_OR_RETURN(const TensorView cache, m.pool->KeyCache(layer));
 
@@ -310,15 +309,14 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
                                             stream));
     }
 
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(attn, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(attn, resid, stream));
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), attn.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
 
     // --- FFN: dense below first_k_dense_replace, routed after --------------
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
-    INFERX_RETURN_IF_ERROR(
-        kernels::RmsNorm(x, w.post_norm, normed, eps, stream));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, w.post_norm, normed, eps, stream));
 
     if (c.IsMoeLayer(layer)) {
       MoeWeights mw;
@@ -339,17 +337,16 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
       INFERX_RETURN_IF_ERROR(
           m.gemm.LinearBF16(normed, w.dense_gate_up, gu, stream));
-      INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu, act, stream));
+      INFERX_RETURN_IF_ERROR(ops::SiluMulFused(gu, act, stream));
       INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(act, w.dense_down, ffn, stream));
     }
 
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(ffn, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(ffn, resid, stream));
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), ffn.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
   }
 
-  INFERX_RETURN_IF_ERROR(
-      kernels::RmsNorm(x, m.final_norm, normed, eps, stream));
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, m.final_norm, normed, eps, stream));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView logits_v,
                           m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
@@ -373,8 +370,7 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir,
   }
 
   INFERX_ASSIGN_OR_RETURN(Checkpoint ckpt, Checkpoint::Open(dir));
-  INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
-                          kernels::CublasLtGemm::Create());
+  INFERX_ASSIGN_OR_RETURN(ops::CublasLtGemm gemm, ops::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(gemm));
   impl->device = device;

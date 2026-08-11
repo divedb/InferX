@@ -65,11 +65,16 @@ StatusOr<DataType> ParseTorchDtype(std::string_view name) {
 
 const char* ArchitectureName(Architecture arch) {
   switch (arch) {
-    case Architecture::kQwen2: return "Qwen2ForCausalLM";
-    case Architecture::kLlama: return "LlamaForCausalLM";
-    case Architecture::kQwen2Moe: return "Qwen2MoeForCausalLM";
-    case Architecture::kGptOss: return "GptOssForCausalLM";
-    case Architecture::kDeepSeekV2: return "DeepseekV2ForCausalLM";
+    case Architecture::kQwen2:
+      return "Qwen2ForCausalLM";
+    case Architecture::kLlama:
+      return "LlamaForCausalLM";
+    case Architecture::kQwen2Moe:
+      return "Qwen2MoeForCausalLM";
+    case Architecture::kGptOss:
+      return "GptOssForCausalLM";
+    case Architecture::kDeepSeekV2:
+      return "DeepseekV2ForCausalLM";
   }
   return "?";
 }
@@ -83,10 +88,10 @@ Status ModelConfig::Validate() const {
   }
 
   if (num_attention_heads % num_key_value_heads != 0) {
-    return InvalidArgumentError(
-        "num_attention_heads (", num_attention_heads,
-        ") is not a multiple of num_key_value_heads (", num_key_value_heads,
-        "), so the GQA group size is not an integer");
+    return InvalidArgumentError("num_attention_heads (", num_attention_heads,
+                                ") is not a multiple of num_key_value_heads (",
+                                num_key_value_heads,
+                                "), so the GQA group size is not an integer");
   }
 
   if (num_key_value_heads > num_attention_heads) {
@@ -120,9 +125,9 @@ Status ModelConfig::Validate() const {
   }
 
   if (num_experts < 0 || num_experts_per_tok < 0) {
-    return InvalidArgumentError("negative expert counts: num_experts=",
-                                num_experts, " num_experts_per_tok=",
-                                num_experts_per_tok);
+    return InvalidArgumentError(
+        "negative expert counts: num_experts=", num_experts,
+        " num_experts_per_tok=", num_experts_per_tok);
   }
 
   // A router that has to pick more experts than exist cannot; and a model
@@ -139,8 +144,10 @@ Status ModelConfig::Validate() const {
                                   ") exceeds num_experts (", num_experts, ")");
     }
     if (moe_intermediate_size <= 0) {
-      return InvalidArgumentError("moe_intermediate_size must be positive for "
-                                  "a MoE model, got ", moe_intermediate_size);
+      return InvalidArgumentError(
+          "moe_intermediate_size must be positive for "
+          "a MoE model, got ",
+          moe_intermediate_size);
     }
     if (first_k_dense_replace < 0 || moe_layer_freq < 1) {
       return InvalidArgumentError(
@@ -160,8 +167,9 @@ Status ModelConfig::Validate() const {
           " and moe_layer_freq=", moe_layer_freq, " leave no MoE layer");
     }
     if (routed_scaling_factor <= 0.0) {
-      return InvalidArgumentError("routed_scaling_factor must be positive, got ",
-                                  routed_scaling_factor);
+      return InvalidArgumentError(
+          "routed_scaling_factor must be positive, got ",
+          routed_scaling_factor);
     }
   } else if (num_experts_per_tok > 0) {
     return InvalidArgumentError("num_experts_per_tok is ", num_experts_per_tok,
@@ -175,9 +183,9 @@ Status ModelConfig::Validate() const {
     }
     if (!layer_is_sliding.empty() &&
         static_cast<int64_t>(layer_is_sliding.size()) != num_hidden_layers) {
-      return InvalidArgumentError(
-          "layer_types lists ", layer_is_sliding.size(),
-          " layers but the model has ", num_hidden_layers);
+      return InvalidArgumentError("layer_types lists ", layer_is_sliding.size(),
+                                  " layers but the model has ",
+                                  num_hidden_layers);
     }
   }
 
@@ -203,14 +211,14 @@ Status ModelConfig::Validate() const {
     if (qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0 || v_head_dim <= 0) {
       return InvalidArgumentError(
           "MLA needs positive qk_nope_head_dim, qk_rope_head_dim and "
-          "v_head_dim; got ", qk_nope_head_dim, ", ", qk_rope_head_dim, ", ",
-          v_head_dim);
+          "v_head_dim; got ",
+          qk_nope_head_dim, ", ", qk_rope_head_dim, ", ", v_head_dim);
     }
 
     // The decoupled RoPE key is rotated in half-split pairs like any other.
     if (qk_rope_head_dim % 2 != 0) {
-      return InvalidArgumentError("qk_rope_head_dim must be even for RoPE, got ",
-                                  qk_rope_head_dim);
+      return InvalidArgumentError(
+          "qk_rope_head_dim must be even for RoPE, got ", qk_rope_head_dim);
     }
 
     // MLA reconstructs K and V from the latent, so a latent narrower than one
@@ -219,8 +227,8 @@ Status ModelConfig::Validate() const {
     if (kv_lora_rank < qk_nope_head_dim || kv_lora_rank < v_head_dim) {
       return InvalidArgumentError("kv_lora_rank (", kv_lora_rank,
                                   ") is narrower than a single reconstructed "
-                                  "head (nope ", qk_nope_head_dim, ", v ",
-                                  v_head_dim, ")");
+                                  "head (nope ",
+                                  qk_nope_head_dim, ", v ", v_head_dim, ")");
     }
   } else if (qk_nope_head_dim > 0 || qk_rope_head_dim > 0 || v_head_dim > 0) {
     return InvalidArgumentError(
@@ -234,15 +242,15 @@ Status ModelConfig::Validate() const {
 std::string ModelConfig::ToString() const {
   std::string moe;
   if (is_moe()) {
-    moe = absl::StrCat(" experts=", num_experts, "/", num_experts_per_tok,
-                       " moe_inter=", moe_intermediate_size,
-                       shared_expert_intermediate_size > 0
-                           ? absl::StrCat(" shared=",
-                                          shared_expert_intermediate_size)
-                           : "",
-                       first_k_dense_replace > 0
-                           ? absl::StrCat(" first_dense=", first_k_dense_replace)
-                           : "");
+    moe = absl::StrCat(
+        " experts=", num_experts, "/", num_experts_per_tok,
+        " moe_inter=", moe_intermediate_size,
+        shared_expert_intermediate_size > 0
+            ? absl::StrCat(" shared=", shared_expert_intermediate_size)
+            : "",
+        first_k_dense_replace > 0
+            ? absl::StrCat(" first_dense=", first_k_dense_replace)
+            : "");
   }
 
   std::string mla;
@@ -255,9 +263,8 @@ std::string ModelConfig::ToString() const {
       ArchitectureName(architecture), "{hidden=", hidden_size,
       " inter=", intermediate_size, " layers=", num_hidden_layers,
       " heads=", num_attention_heads, " kv_heads=", num_key_value_heads,
-      " head_dim=", head_dim, " vocab=", vocab_size,
-      " rope_theta=", rope_theta, " eps=", rms_norm_eps,
-      " tied=", tie_word_embeddings ? "yes" : "no",
+      " head_dim=", head_dim, " vocab=", vocab_size, " rope_theta=", rope_theta,
+      " eps=", rms_norm_eps, " tied=", tie_word_embeddings ? "yes" : "no",
       " attn_bias=", attention_bias ? "yes" : "no",
       " dtype=", DataTypeName(weight_dtype), moe, mla, "}");
 }
@@ -391,7 +398,8 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
 
   INFERX_ASSIGN_OR_RETURN(c.first_k_dense_replace,
                           root.OptionalInt("first_k_dense_replace", 0));
-  INFERX_ASSIGN_OR_RETURN(c.moe_layer_freq, root.OptionalInt("moe_layer_freq", 1));
+  INFERX_ASSIGN_OR_RETURN(c.moe_layer_freq,
+                          root.OptionalInt("moe_layer_freq", 1));
 
   if (const JsonValue* v = root.Find("routed_scaling_factor");
       v != nullptr && !v->IsNull()) {
@@ -399,7 +407,7 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
   }
 
   // Routing variants. Only softmax scoring with plain greedy top-k is
-  // implemented (\see kernels::MoeRouteTopK); DeepSeek-V3's sigmoid /
+  // implemented (\see ops::MoeRouteTopK); DeepSeek-V3's sigmoid /
   // `noaux_tc` and DeepSeek-V2-236B's `group_limited_greedy` select different
   // experts, and running one as another routes tokens to the wrong experts
   // with no error anywhere downstream.
@@ -468,7 +476,8 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
                                 "' is not implemented; only 'yarn' is");
     }
 
-    INFERX_ASSIGN_OR_RETURN(const double factor, rope->RequiredDouble("factor"));
+    INFERX_ASSIGN_OR_RETURN(const double factor,
+                            rope->RequiredDouble("factor"));
     c.yarn_factor = factor;
 
     if (const JsonValue* v = rope->Find("beta_fast"); v != nullptr) {
@@ -486,7 +495,8 @@ StatusOr<ModelConfig> ModelConfig::FromJson(std::string_view json_text) {
 
     // DeepSeek's mscale pair. Read only inside rope_scaling, where DeepSeek
     // puts it; the HF defaults (1, 0) leave the softmax scale untouched.
-    if (const JsonValue* v = rope->Find("mscale"); v != nullptr && !v->IsNull()) {
+    if (const JsonValue* v = rope->Find("mscale");
+        v != nullptr && !v->IsNull()) {
       INFERX_ASSIGN_OR_RETURN(c.yarn_mscale, v->AsDouble());
     }
     if (const JsonValue* v = rope->Find("mscale_all_dim");

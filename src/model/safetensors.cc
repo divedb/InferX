@@ -11,8 +11,8 @@
 #include <utility>
 
 #include "absl/strings/str_cat.h"
-#include "inferx/support/json.h"
 #include "inferx/core/storage.h"
+#include "inferx/support/json.h"
 
 namespace inferx::model {
 namespace {
@@ -127,18 +127,18 @@ StatusOr<DataType> SafetensorsDataType(std::string_view name) {
   // The format's own spelling, which is not ours. Only the types a checkpoint
   // can actually contain are listed; anything else is rejected rather than
   // guessed, because a wrong dtype here reinterprets the whole tensor.
-  if (name == "F16")  return DataType::kFloat16;
+  if (name == "F16") return DataType::kFloat16;
   if (name == "BF16") return DataType::kBFloat16;
-  if (name == "F32")  return DataType::kFloat;
-  if (name == "F64")  return DataType::kDouble;
-  if (name == "I8")   return DataType::kInt8;
-  if (name == "U8")   return DataType::kUInt8;
-  if (name == "I16")  return DataType::kInt16;
-  if (name == "U16")  return DataType::kUInt16;
-  if (name == "I32")  return DataType::kInt32;
-  if (name == "U32")  return DataType::kUInt32;
-  if (name == "I64")  return DataType::kInt64;
-  if (name == "U64")  return DataType::kUInt64;
+  if (name == "F32") return DataType::kFloat;
+  if (name == "F64") return DataType::kDouble;
+  if (name == "I8") return DataType::kInt8;
+  if (name == "U8") return DataType::kUInt8;
+  if (name == "I16") return DataType::kInt16;
+  if (name == "U16") return DataType::kUInt16;
+  if (name == "I32") return DataType::kInt32;
+  if (name == "U32") return DataType::kUInt32;
+  if (name == "I64") return DataType::kInt64;
+  if (name == "U64") return DataType::kUInt64;
   if (name == "BOOL") return DataType::kBool;
   if (name == "F8_E4M3") return DataType::kFloat8E4M3FN;
   if (name == "F8_E5M2") return DataType::kFloat8E5M2;
@@ -207,8 +207,10 @@ struct Checkpoint::Impl {
       for (const JsonValue& d : *dims_json) {
         INFERX_ASSIGN_OR_RETURN(const int64_t extent, d.AsInt());
         if (extent < 0) {
-          return InvalidArgumentError("tensor '", name, "' has a negative "
-                                      "extent ", extent);
+          return InvalidArgumentError("tensor '", name,
+                                      "' has a negative "
+                                      "extent ",
+                                      extent);
         }
         dims.push_back(extent);
       }
@@ -228,8 +230,9 @@ struct Checkpoint::Impl {
       INFERX_ASSIGN_OR_RETURN(const int64_t end, (*offsets)[1].AsInt());
 
       if (begin < 0 || end < begin) {
-        return InvalidArgumentError("tensor '", name, "' has inverted offsets [",
-                                    begin, ", ", end, ")");
+        return InvalidArgumentError("tensor '", name,
+                                    "' has inverted offsets [", begin, ", ",
+                                    end, ")");
       }
 
       // Bounds-checked against the mapping before anything is allowed to point
@@ -256,8 +259,8 @@ struct Checkpoint::Impl {
       if (entry.nbytes() != expected) {
         return InvalidArgumentError(
             "tensor '", name, "' spans ", entry.nbytes(), " bytes but its ",
-            DataTypeName(dtype), " shape ", entry.shape.ToString(),
-            " needs ", expected);
+            DataTypeName(dtype), " shape ", entry.shape.ToString(), " needs ",
+            expected);
       }
 
       if (!entries.emplace(name, std::move(entry)).second) {
@@ -302,7 +305,8 @@ StatusOr<Checkpoint> Checkpoint::Open(std::string_view dir) {
     // error messages and test expectations reproducible.
     std::vector<std::string> files;
     for (const auto& [tensor_name, file_value] : *mapping) {
-      INFERX_ASSIGN_OR_RETURN(const std::string_view file, file_value.AsString());
+      INFERX_ASSIGN_OR_RETURN(const std::string_view file,
+                              file_value.AsString());
       (void)tensor_name;
       files.emplace_back(file);
     }
@@ -331,8 +335,10 @@ StatusOr<Checkpoint> Checkpoint::Open(std::string_view dir) {
     return Checkpoint(std::move(impl));
   }
 
-  return NotFoundError("no model.safetensors or model.safetensors.index.json "
-                       "in '", dir, "'");
+  return NotFoundError(
+      "no model.safetensors or model.safetensors.index.json "
+      "in '",
+      dir, "'");
 }
 
 Checkpoint::Checkpoint(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -386,7 +392,8 @@ StatusOr<Tensor> Checkpoint::Get(std::string_view name) const {
   }
 
   const MappedFile& file = *impl_->shards[static_cast<size_t>(entry->shard)];
-  const size_t data_start = impl_->data_offsets[static_cast<size_t>(entry->shard)];
+  const size_t data_start =
+      impl_->data_offsets[static_cast<size_t>(entry->shard)];
 
   // Borrowed, not copied: the bytes stay in the mapping and the OS pages them
   // in on demand. This is the whole point of the class (T17) -- a 3B checkpoint

@@ -7,7 +7,7 @@
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
+#include "inferx/ops/gemm.h"
 
 namespace inferx::model {
 
@@ -155,7 +155,7 @@ class MoeFfn {
   ///             than owned because plan caches are per device and per process,
   ///             and every layer sharing one is the point of that cache.
   Status Forward(const TensorView& x, const MoeWeights& weights,
-                 const TensorView& out, kernels::CublasLtGemm* gemm,
+                 const TensorView& out, ops::CublasLtGemm* gemm,
                  Stream stream = {});
 
   /// \brief The per-expert row counts of the last `Forward`, for tests and

@@ -117,9 +117,7 @@ struct ForwardBatch {
   static constexpr int64_t kMaxTopLogprobs = 20;
   std::vector<int32_t> logprobs_k;
 
-  int64_t num_tokens() const {
-    return static_cast<int64_t>(token_ids.size());
-  }
+  int64_t num_tokens() const { return static_cast<int64_t>(token_ids.size()); }
 
   /// \brief Checks the internal consistency the model would otherwise trust.
   Status Validate(int64_t vocab_size, int64_t total_slots) const;

@@ -8,8 +8,8 @@
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
 #include "inferx/model/config.h"
+#include "inferx/ops/gemm.h"
 
 namespace inferx::model {
 
@@ -62,7 +62,7 @@ struct MlaWeights {
 /// `kv_b` GEMM, then ordinary attention — the reconstruction amortizes over
 /// the chunk's queries. A single-token (decode) call runs the **absorbed**
 /// form: `kv_b` folds into the query and the output
-/// (\see kernels::MlaAbsorbQ), and attention reads the paged latent directly
+/// (\see ops::MlaAbsorbQ), and attention reads the paged latent directly
 /// — no gather, no per-step reconstruction, no context-sized scratch. The two
 /// are the same computation with the projections hoisted, and the
 /// decode-equals-prefill test is precisely the assertion that they agree
@@ -134,7 +134,7 @@ class MlaAttentionLayer {
                  const TensorView& slot_mapping, const TensorView& block_table,
                  int64_t context_len, const TensorView& cache,
                  const MlaWeights& weights, const TensorView& out,
-                 kernels::CublasLtGemm* gemm, Stream stream = {});
+                 ops::CublasLtGemm* gemm, Stream stream = {});
 
  private:
   struct Impl;

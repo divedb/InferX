@@ -6,9 +6,9 @@
 
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/kernels/gpt_oss.h"
-#include "inferx/kernels/layers.h"
-#include "inferx/kernels/mla.h"
+#include "inferx/ops/gpt_oss.h"
+#include "inferx/ops/layers.h"
+#include "inferx/ops/mla.h"
 
 namespace inferx::model {
 namespace {
@@ -82,11 +82,11 @@ struct MlaAttentionLayer::Impl {
           const TensorView table,
           TensorView::Create(inv_freq.data(), DataType::kFloat,
                              Shape({rope_dim / 2}), device));
-      return kernels::MlaRopeFromTable(x, rope_dim, positions, table,
-                                       rope_attn_factor, stream);
+      return ops::MlaRopeFromTable(x, rope_dim, positions, table,
+                                   rope_attn_factor, stream);
     }
-    return kernels::MlaRopeInPlace(
-        x, rope_dim, positions, static_cast<float>(config.rope_theta), stream);
+    return ops::MlaRopeInPlace(x, rope_dim, positions,
+                               static_cast<float>(config.rope_theta), stream);
   }
 };
 
@@ -181,7 +181,7 @@ StatusOr<MlaAttentionLayer> MlaAttentionLayer::Create(const ModelConfig& config,
   if (config.is_yarn()) {
     if (config.yarn_mscale_all_dim != 0.0) {
       const float m =
-          kernels::YarnMscale(config.yarn_factor, config.yarn_mscale_all_dim);
+          ops::YarnMscale(config.yarn_factor, config.yarn_mscale_all_dim);
       impl->softmax_scale *= m * m;
     }
 
@@ -189,13 +189,13 @@ StatusOr<MlaAttentionLayer> MlaAttentionLayer::Create(const ModelConfig& config,
     // cancel to exactly 1, moving the whole mscale effect into the softmax
     // scale above.
     impl->rope_attn_factor =
-        kernels::YarnMscale(config.yarn_factor, config.yarn_mscale) /
-        kernels::YarnMscale(config.yarn_factor, config.yarn_mscale_all_dim);
+        ops::YarnMscale(config.yarn_factor, config.yarn_mscale) /
+        ops::YarnMscale(config.yarn_factor, config.yarn_mscale_all_dim);
 
     // The blended frequency ladder, over the rope sub-vector's own width.
     const int64_t half = config.qk_rope_head_dim / 2;
     std::vector<float> table(static_cast<size_t>(half));
-    kernels::ComputeYarnInvFreq(
+    ops::ComputeYarnInvFreq(
         config.qk_rope_head_dim, config.rope_theta, config.yarn_factor,
         config.yarn_beta_fast, config.yarn_beta_slow,
         config.yarn_original_max_position, config.yarn_truncate, table.data());
@@ -225,7 +225,7 @@ Status MlaAttentionLayer::Forward(
     const TensorView& x, const TensorView& positions,
     const TensorView& slot_mapping, const TensorView& block_table,
     int64_t context_len, const TensorView& cache, const MlaWeights& weights,
-    const TensorView& out, kernels::CublasLtGemm* gemm, Stream stream) {
+    const TensorView& out, ops::CublasLtGemm* gemm, Stream stream) {
   if (gemm == nullptr) return InvalidArgumentError("MLA: gemm is null");
 
   const ModelConfig& c = impl_->config;
@@ -274,9 +274,9 @@ Status MlaAttentionLayer::Forward(
         impl_->q_a.View(kBf16, Shape({tokens, c.q_lora_rank})));
 
     INFERX_RETURN_IF_ERROR(gemm->LinearBF16(x, weights.q_a, q_a_v, stream));
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(q_a_v, weights.q_a_norm, q_a_v,
-                                            static_cast<float>(c.rms_norm_eps),
-                                            stream));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(q_a_v, weights.q_a_norm, q_a_v,
+                                        static_cast<float>(c.rms_norm_eps),
+                                        stream));
     INFERX_RETURN_IF_ERROR(gemm->LinearBF16(q_a_v, weights.q_b, q_v, stream));
   } else {
     INFERX_RETURN_IF_ERROR(gemm->LinearBF16(x, weights.q_b, q_v, stream));
@@ -296,7 +296,7 @@ Status MlaAttentionLayer::Forward(
       impl_->q_rope.View(kBf16, Shape({tokens, heads, rope})));
 
   INFERX_RETURN_IF_ERROR(
-      kernels::SplitTrailing(q_heads, q_nope_v, q_rope_v, stream));
+      ops::SplitTrailing(q_heads, q_nope_v, q_rope_v, stream));
 
   // --- KV: down-project to the latent, norm it, rotate the shared key ------
 
@@ -324,16 +324,16 @@ Status MlaAttentionLayer::Forward(
   // `heads` times the cache and change nothing.
   INFERX_RETURN_IF_ERROR(impl_->RotateTail(kv_a_3d, rope, positions, stream));
   INFERX_RETURN_IF_ERROR(
-      kernels::SplitTrailing(kv_a_3d, latent_3d, new_rope_3d, stream));
+      ops::SplitTrailing(kv_a_3d, latent_3d, new_rope_3d, stream));
 
   // Normalized *before* caching, so a cache hit needs no norm on the way out
   // and the cached bytes are the same bytes attention will use.
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(latent_v, weights.kv_a_norm, latent_v,
-                                          static_cast<float>(c.rms_norm_eps),
-                                          stream));
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(latent_v, weights.kv_a_norm, latent_v,
+                                      static_cast<float>(c.rms_norm_eps),
+                                      stream));
 
-  INFERX_RETURN_IF_ERROR(kernels::MlaAppendLatent(latent_v, new_rope_v, cache,
-                                                  slot_mapping, stream));
+  INFERX_RETURN_IF_ERROR(
+      ops::MlaAppendLatent(latent_v, new_rope_v, cache, slot_mapping, stream));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView attn_v,
                           impl_->attn.View(kBf16, Shape({tokens, heads, vd})));
@@ -349,12 +349,12 @@ Status MlaAttentionLayer::Forward(
         impl_->attn_lat.View(kBf16, Shape({tokens, heads, latent_dim})));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::MlaAbsorbQ(q_nope_v, weights.kv_b, q_lat_v, vd, stream));
-    INFERX_RETURN_IF_ERROR(kernels::MlaLatentAttention(
+        ops::MlaAbsorbQ(q_nope_v, weights.kv_b, q_lat_v, vd, stream));
+    INFERX_RETURN_IF_ERROR(ops::MlaLatentAttention(
         q_lat_v, q_rope_v, cache, block_table, context_len, attn_lat_v,
         context_len - tokens, impl_->softmax_scale, stream));
-    INFERX_RETURN_IF_ERROR(kernels::MlaUnabsorbOut(attn_lat_v, weights.kv_b,
-                                                   attn_v, nope, stream));
+    INFERX_RETURN_IF_ERROR(
+        ops::MlaUnabsorbOut(attn_lat_v, weights.kv_b, attn_v, nope, stream));
   } else {
     // --- Unabsorbed: reconstruct K and V for the whole context -------------
     //
@@ -364,7 +364,7 @@ Status MlaAttentionLayer::Forward(
     INFERX_ASSIGN_OR_RETURN(
         const TensorView gathered_v,
         impl_->gathered.View(kBf16, Shape({context_len, latent_dim + rope})));
-    INFERX_RETURN_IF_ERROR(kernels::MlaGatherLatents(
+    INFERX_RETURN_IF_ERROR(ops::MlaGatherLatents(
         cache, block_table, context_len, gathered_v, stream));
 
     INFERX_ASSIGN_OR_RETURN(
@@ -383,8 +383,8 @@ Status MlaAttentionLayer::Forward(
     INFERX_ASSIGN_OR_RETURN(const TensorView ctx_rope_3d,
                             ctx_rope_v.Reshape(Shape({context_len, 1, rope})));
 
-    INFERX_RETURN_IF_ERROR(kernels::SplitTrailing(gathered_3d, ctx_latent_3d,
-                                                  ctx_rope_3d, stream));
+    INFERX_RETURN_IF_ERROR(
+        ops::SplitTrailing(gathered_3d, ctx_latent_3d, ctx_rope_3d, stream));
 
     INFERX_ASSIGN_OR_RETURN(
         const TensorView kv_v,
@@ -403,11 +403,11 @@ Status MlaAttentionLayer::Forward(
         impl_->v.View(kBf16, Shape({context_len, heads, vd})));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::SplitTrailing(kv_heads_v, k_nope_v, v_v, stream));
+        ops::SplitTrailing(kv_heads_v, k_nope_v, v_v, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::MlaAttention(
-        q_nope_v, q_rope_v, k_nope_v, ctx_rope_v, v_v, attn_v,
-        context_len - tokens, impl_->softmax_scale, stream));
+    INFERX_RETURN_IF_ERROR(
+        ops::MlaAttention(q_nope_v, q_rope_v, k_nope_v, ctx_rope_v, v_v, attn_v,
+                          context_len - tokens, impl_->softmax_scale, stream));
   }
 
   // --- Project out ----------------------------------------------------------

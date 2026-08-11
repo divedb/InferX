@@ -26,8 +26,8 @@ enum class Architecture {
   kQwen2Moe,
   /// gpt-oss: MoE, plus four things nothing else here does — per-head learned
   /// attention **sinks**, **sliding-window** attention on alternating layers,
-  /// **YaRN** position scaling, and a clamped `(up+1)·gate·σ(αgate)` activation.
-  /// Its expert weights are MXFP4 (\see kernels/mxfp4.h).
+  /// **YaRN** position scaling, and a clamped `(up+1)·gate·σ(αgate)`
+  /// activation. Its expert weights are MXFP4 (\see kernels/mxfp4.h).
   kGptOss,
   /// DeepSeek-V2: **MLA** attention over a compressed latent cache, and
   /// DeepSeekMoE — routed experts behind the first `first_k_dense_replace`
@@ -204,11 +204,12 @@ struct ModelConfig {
 
   /// \brief Bytes one token occupies in one layer's KV cache.
   ///
-  /// A property of the model, never a formula the scheduler applies (§7.3, T11).
-  /// For GQA it is `2 · kv_heads · head_dim`; for MLA it is the latent plus the
-  /// one shared RoPE key, with no factor of two and no head count — and, the
-  /// part that catches people, **it does not shrink under tensor parallelism**,
-  /// because the latent is replicated across ranks rather than sharded.
+  /// A property of the model, never a formula the scheduler applies (§7.3,
+  /// T11). For GQA it is `2 · kv_heads · head_dim`; for MLA it is the latent
+  /// plus the one shared RoPE key, with no factor of two and no head count —
+  /// and, the part that catches people, **it does not shrink under tensor
+  /// parallelism**, because the latent is replicated across ranks rather than
+  /// sharded.
   int64_t KvElementsPerTokenPerLayer() const {
     if (is_mla()) return kv_lora_rank + qk_rope_head_dim;
     return 2 * num_key_value_heads * head_dim;

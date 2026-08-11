@@ -6,10 +6,10 @@
 
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/kernels/gpt_oss.h"
-#include "inferx/kernels/layers.h"
-#include "inferx/kernels/moe.h"
-#include "inferx/kernels/mxfp4_gemm.h"
+#include "inferx/ops/gpt_oss.h"
+#include "inferx/ops/layers.h"
+#include "inferx/ops/moe.h"
+#include "inferx/ops/mxfp4_gemm.h"
 
 namespace inferx::model {
 namespace {
@@ -142,7 +142,7 @@ MoeFfn::MoeFfn(MoeFfn&&) noexcept = default;
 MoeFfn& MoeFfn::operator=(MoeFfn&&) noexcept = default;
 
 Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
-                       const TensorView& out, kernels::CublasLtGemm* gemm,
+                       const TensorView& out, ops::CublasLtGemm* gemm,
                        Stream stream) {
   if (gemm == nullptr) return InvalidArgumentError("MoeFfn: gemm is null");
 
@@ -193,12 +193,12 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
   // because it shifts which experts win and not merely by how much.
   if (weights.router_bias.IsDefined()) {
     INFERX_RETURN_IF_ERROR(
-        kernels::AddBiasInPlace(logits_v, weights.router_bias, stream));
+        ops::AddBiasInPlace(logits_v, weights.router_bias, stream));
   }
 
-  INFERX_RETURN_IF_ERROR(
-      kernels::MoeRouteTopK(logits_v, weights_v, experts_v, c.norm_topk_prob,
-                            c.routed_scaling_factor, stream));
+  INFERX_RETURN_IF_ERROR(ops::MoeRouteTopK(logits_v, weights_v, experts_v,
+                                           c.norm_topk_prob,
+                                           c.routed_scaling_factor, stream));
 
   // --- 2. Group by expert ---------------------------------------------------
 
@@ -212,13 +212,13 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       const TensorView dest_v,
       impl_->dest.View(DataType::kInt32, Shape({assignments})));
 
-  INFERX_RETURN_IF_ERROR(kernels::MoeBuildDispatch(
+  INFERX_RETURN_IF_ERROR(ops::MoeBuildDispatch(
       experts_v, c.num_experts, offsets_v, rows_v, dest_v, stream));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView gathered_v,
       impl_->gathered.View(kBf16, Shape({assignments, c.hidden})));
-  INFERX_RETURN_IF_ERROR(kernels::MoeGatherRows(x, rows_v, gathered_v, stream));
+  INFERX_RETURN_IF_ERROR(ops::MoeGatherRows(x, rows_v, gathered_v, stream));
 
   // --- 3. Expert projections ------------------------------------------------
   INFERX_ASSIGN_OR_RETURN(
@@ -236,22 +236,22 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     // Both ragged projections consume device-resident offsets. Bias is fused
     // into each projection, leaving only one dense activation launch between
     // them and no host involvement in expert dispatch.
-    INFERX_RETURN_IF_ERROR(kernels::Mxfp4GroupedGemm(
+    INFERX_RETURN_IF_ERROR(ops::Mxfp4GroupedGemm(
         gathered_v, offsets_v, weights.gate_up_blocks, weights.gate_up_scales,
         weights.gate_up_bias, gate_up_all,
         /*deinterleave=*/true, stream));
     switch (c.activation) {
       case Activation::kSiluMul:
         INFERX_RETURN_IF_ERROR(
-            kernels::SiluMulFused(gate_up_all, activated_all, stream));
+            ops::SiluMulFused(gate_up_all, activated_all, stream));
         break;
       case Activation::kGptOssClamped:
-        INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(gate_up_all, activated_all,
-                                                     c.swiglu_limit,
-                                                     c.swiglu_alpha, stream));
+        INFERX_RETURN_IF_ERROR(ops::GptOssSwiGlu(gate_up_all, activated_all,
+                                                 c.swiglu_limit, c.swiglu_alpha,
+                                                 stream));
         break;
     }
-    INFERX_RETURN_IF_ERROR(kernels::Mxfp4GroupedGemm(
+    INFERX_RETURN_IF_ERROR(ops::Mxfp4GroupedGemm(
         activated_all, offsets_v, weights.down_blocks, weights.down_scales,
         weights.down_bias, expert_out_all, /*deinterleave=*/false, stream));
   } else {
@@ -262,28 +262,28 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     // step -- and the reason the bf16 FFN could not be graph-captured.
     // Bias is fused into each projection, as on the MXFP4 path.
     INFERX_RETURN_IF_ERROR(
-        kernels::MoeGroupedGemmBf16(gathered_v, offsets_v, weights.gate_up,
-                                    weights.gate_up_bias, gate_up_all, stream));
+        ops::MoeGroupedGemmBf16(gathered_v, offsets_v, weights.gate_up,
+                                weights.gate_up_bias, gate_up_all, stream));
     switch (c.activation) {
       case Activation::kSiluMul:
         INFERX_RETURN_IF_ERROR(
-            kernels::SiluMulFused(gate_up_all, activated_all, stream));
+            ops::SiluMulFused(gate_up_all, activated_all, stream));
         break;
       case Activation::kGptOssClamped:
-        INFERX_RETURN_IF_ERROR(kernels::GptOssSwiGlu(gate_up_all, activated_all,
-                                                     c.swiglu_limit,
-                                                     c.swiglu_alpha, stream));
+        INFERX_RETURN_IF_ERROR(ops::GptOssSwiGlu(gate_up_all, activated_all,
+                                                 c.swiglu_limit, c.swiglu_alpha,
+                                                 stream));
         break;
     }
     INFERX_RETURN_IF_ERROR(
-        kernels::MoeGroupedGemmBf16(activated_all, offsets_v, weights.down,
-                                    weights.down_bias, expert_out_all, stream));
+        ops::MoeGroupedGemmBf16(activated_all, offsets_v, weights.down,
+                                weights.down_bias, expert_out_all, stream));
   }
 
   // --- 4. Combine, then the shared expert -----------------------------------
 
   INFERX_RETURN_IF_ERROR(
-      kernels::MoeCombineRows(expert_out_all, dest_v, weights_v, out, stream));
+      ops::MoeCombineRows(expert_out_all, dest_v, weights_v, out, stream));
 
   if (c.shared_intermediate > 0) {
     if (!weights.shared_gate_up.IsDefined() ||
@@ -317,7 +317,7 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
 
     INFERX_RETURN_IF_ERROR(
         gemm->LinearBF16(x, weights.shared_gate_up, sgu, stream));
-    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(sgu, sact, stream));
+    INFERX_RETURN_IF_ERROR(ops::SiluMulFused(sgu, sact, stream));
     INFERX_RETURN_IF_ERROR(
         gemm->LinearBF16(sact, weights.shared_down, sout, stream));
 
@@ -327,11 +327,10 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
           impl_->shared_gate.View(kBf16, Shape({tokens, 1})));
       INFERX_RETURN_IF_ERROR(
           gemm->LinearBF16(x, weights.shared_gate, sgate, stream));
-      INFERX_RETURN_IF_ERROR(
-          kernels::MoeAddSharedExpert(sout, sgate, out, stream));
+      INFERX_RETURN_IF_ERROR(ops::MoeAddSharedExpert(sout, sgate, out, stream));
     } else {
       // DeepSeek adds the shared experts unconditionally; there is no gate.
-      INFERX_RETURN_IF_ERROR(kernels::AddInPlace(out, sout, stream));
+      INFERX_RETURN_IF_ERROR(ops::AddInPlace(out, sout, stream));
     }
   }
 

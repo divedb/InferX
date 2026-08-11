@@ -43,7 +43,7 @@ function(inferx_add_kernel_test name)
     inferx::support
     inferx::model
     inferx::scheduler
-    inferx::kernels
+    inferx::ops
     inferx::flags
     GTest::gtest_main
   )

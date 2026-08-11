@@ -1,11 +1,11 @@
-# inferx_kernels -- device code.
+# inferx_cuda_ops -- CUDA implementation of the backend-neutral ops API.
 #
 # This is the first target in the tree compiled by nvcc. It is added only when
 # the toolkit meets INFERX_CUDA_MIN_VERSION (see cmake/InferXCuda.cmake): below
 # the floor our core headers do not survive nvcc's frontend, so there is nothing
 # to be gained by attempting the build.
 
-add_library(inferx_kernels
+add_library(inferx_cuda_ops
   gemm_cublaslt.cc
   gpt_oss.cu
   layers.cu
@@ -17,15 +17,17 @@ add_library(inferx_kernels
   smoke.cu
   w4a16_gemm.cu
 )
-add_library(inferx::kernels ALIAS inferx_kernels)
+add_library(inferx::ops ALIAS inferx_cuda_ops)
+# Transitional compatibility name. New consumers depend on inferx::ops.
+add_library(inferx::kernels ALIAS inferx_cuda_ops)
 
 if(INFERX_HAVE_FLASHINFER)
-  target_sources(inferx_kernels PRIVATE
+  target_sources(inferx_cuda_ops PRIVATE
     flashinfer_attention.cu
     flashinfer_prefill.cu)
 endif()
 
-target_link_libraries(inferx_kernels
+target_link_libraries(inferx_cuda_ops
   PUBLIC
     inferx::core
     inferx::flags
@@ -45,7 +47,7 @@ target_link_libraries(inferx_kernels
 # Device code is compiled once per architecture in INFERX_CUDA_ARCHS. Set here
 # rather than globally so that host targets are not dragged through the CUDA
 # language settings.
-set_target_properties(inferx_kernels PROPERTIES
+set_target_properties(inferx_cuda_ops PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   CUDA_SEPARABLE_COMPILATION OFF
 )

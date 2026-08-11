@@ -10,12 +10,12 @@
 #include "absl/strings/str_cat.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/gpt_oss.h"
-#include "inferx/kernels/layers.h"
-#include "inferx/kernels/mxfp4.h"
 #include "inferx/model/moe_ffn.h"
 #include "inferx/model/weight_loader.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/gpt_oss.h"
+#include "inferx/ops/layers.h"
+#include "inferx/ops/mxfp4.h"
 #include "inferx/support/log.h"
 
 namespace inferx::model {
@@ -160,7 +160,7 @@ struct LayerWeights {
 }  // namespace
 
 struct GptOssModel::Impl {
-  Impl(ModelConfig c, Checkpoint ck, kernels::CublasLtGemm g)
+  Impl(ModelConfig c, Checkpoint ck, ops::CublasLtGemm g)
       : config(std::move(c)), ckpt(std::move(ck)), gemm(std::move(g)) {}
   ~Impl() {
     for (DecodeGraph& graph : graphs) {
@@ -182,7 +182,7 @@ struct GptOssModel::Impl {
   TensorView final_norm;
   TensorView lm_head;
 
-  kernels::CublasLtGemm gemm;
+  ops::CublasLtGemm gemm;
   std::unique_ptr<MoeFfn> moe;
   // Paged serving owns a nonblocking stream so its device half can be captured
   // without involving the legacy default stream. Forward() remains the
@@ -347,15 +347,14 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
         INFERX_ASSIGN_OR_RETURN(const TensorView eo,
                                 all.Slice(e * rows, (e + 1) * rows));
 
-        INFERX_RETURN_IF_ERROR(
-            kernels::DequantizeMxfp4GateUpToBf16(eb, es, eo));
+        INFERX_RETURN_IF_ERROR(ops::DequantizeMxfp4GateUpToBf16(eb, es, eo));
       }
     } else {
       INFERX_ASSIGN_OR_RETURN(
           const TensorView all,
           dest_scratch->View(kBf16, Shape({experts * rows, width})));
       INFERX_RETURN_IF_ERROR(
-          kernels::DequantizeMxfp4ToBf16(blocks_v, scales_v, all));
+          ops::DequantizeMxfp4ToBf16(blocks_v, scales_v, all));
     }
 
     INFERX_ASSIGN_OR_RETURN(
@@ -508,7 +507,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
       const TensorView qkv_v,
       m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x, stream));
+  INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(m.embed, ids_v, x, stream));
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
@@ -529,15 +528,15 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, w.input_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
     // One fused QKV GEMM instead of three, then split + bias in one pass.
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v, stream));
     INFERX_RETURN_IF_ERROR(
-        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2, stream));
+        ops::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
+    INFERX_RETURN_IF_ERROR(ops::RotaryEmbeddingFromTable(
         q, k, pos_v, inv_freq, m.attn_factor, stream));
     if (profiling) prof.tick(prof.attn_proj);
 
@@ -548,7 +547,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
                             m.pool->ValueCache(layer));
 
     INFERX_RETURN_IF_ERROR(
-        kernels::AppendToKvCache(k, v, k_cache, v_cache, slots_v, stream));
+        ops::AppendToKvCache(k, v, k_cache, v_cache, slots_v, stream));
 
     // Per-layer window: gpt-oss alternates full and sliding (128). The tile is
     // sized from `window` on a sliding layer, which is also the smem win.
@@ -559,20 +558,20 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     const int64_t max_ctx =
         window > 0 ? window : batch.max_blocks_per_seq * m.pool->block_size();
 
-    INFERX_RETURN_IF_ERROR(kernels::PagedAttentionWithLse(
+    INFERX_RETURN_IF_ERROR(ops::PagedAttentionWithLse(
         q, k_cache, v_cache, table_v, seq_v, pos_v, attn, lse_v, scale, window,
         max_ctx, stream));
 
     // The sink, folded in using the lse the kernel just wrote. Natural-log
     // convention here (the kernel computes max + ln(sum)), so lse_is_log2 is
     // false -- unlike the FlashInfer path, which is base-2.
-    INFERX_RETURN_IF_ERROR(kernels::ApplyAttentionSinks(
+    INFERX_RETURN_IF_ERROR(ops::ApplyAttentionSinks(
         attn, lse_v, w.sinks, /*lse_is_log2=*/false, stream));
     if (profiling) prof.tick(prof.attn_kernel);
 
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj, stream));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b, stream));
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddBiasInPlace(proj, w.o_b, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(proj, resid, stream));
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), proj.Data(), DataTypeByteSize(kBf16, tokens * h),
         CopyKind::kDeviceToDevice, stream));
@@ -583,7 +582,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
     MoeWeights mw;
@@ -604,7 +603,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
         m.moe->Forward(normed, mw, moe_out, &m.gemm, stream));
     if (profiling) prof.tick(prof.moe_forward);
 
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid, stream));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(moe_out, resid, stream));
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), moe_out.Data(), DataTypeByteSize(kBf16, tokens * h),
         CopyKind::kDeviceToDevice, stream));
@@ -613,7 +612,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   if (profiling) prof.report(tokens);
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(
       x, m.final_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView logits,
@@ -632,8 +631,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir, DeviceId device) {
   }
 
   INFERX_ASSIGN_OR_RETURN(Checkpoint ckpt, Checkpoint::Open(dir));
-  INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
-                          kernels::CublasLtGemm::Create());
+  INFERX_ASSIGN_OR_RETURN(ops::CublasLtGemm gemm, ops::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm));
   impl->device = device;
@@ -755,7 +753,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir, DeviceId device) {
   std::vector<float> inv_freq(static_cast<size_t>(hd / 2));
 
   if (config.is_yarn()) {
-    impl->attn_factor = kernels::ComputeYarnInvFreq(
+    impl->attn_factor = ops::ComputeYarnInvFreq(
         hd, config.rope_theta, config.yarn_factor, config.yarn_beta_fast,
         config.yarn_beta_slow, config.yarn_original_max_position,
         config.yarn_truncate, inv_freq.data());
@@ -871,7 +869,7 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
       const TensorView qkv_v,
       m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
 
-  INFERX_RETURN_IF_ERROR(kernels::EmbeddingLookup(m.embed, ids_v, x));
+  INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(m.embed, ids_v, x));
 
   // Debugging aid, off unless asked: dump the hidden state after every layer so
   // it can be diffed against HuggingFace's `output_hidden_states`. Localizing a
@@ -906,34 +904,33 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
                                            DataTypeByteSize(kBf16, tokens * h),
                                            CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, w.input_norm, normed, static_cast<float>(c.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, w.input_norm, normed,
+                                        static_cast<float>(c.rms_norm_eps)));
 
     // One fused QKV GEMM instead of three, then split + bias in one pass.
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v));
-    INFERX_RETURN_IF_ERROR(
-        kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2));
+    INFERX_RETURN_IF_ERROR(ops::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2));
 
-    INFERX_RETURN_IF_ERROR(kernels::RotaryEmbeddingFromTable(
-        q, k, pos_v, inv_freq, m.attn_factor));
+    INFERX_RETURN_IF_ERROR(
+        ops::RotaryEmbeddingFromTable(q, k, pos_v, inv_freq, m.attn_factor));
     if (profiling) prof.tick(prof.attn_proj);
 
     const int64_t window = c.IsSlidingLayer(layer) ? c.sliding_window : 0;
 
     INFERX_RETURN_IF_ERROR(
-        kernels::GptOssAttentionRef(q, k, v, attn, lse_v, window, scale));
+        ops::GptOssAttentionRef(q, k, v, attn, lse_v, window, scale));
 
     // The sink, folded in afterwards using the lse the kernel just wrote.
     // \see kernels/gpt_oss.h for why this is a rescale rather than a change
     // inside the softmax.
-    INFERX_RETURN_IF_ERROR(kernels::ApplyAttentionSinks(attn, lse_v, w.sinks,
-                                                        /*lse_is_log2=*/true));
+    INFERX_RETURN_IF_ERROR(ops::ApplyAttentionSinks(attn, lse_v, w.sinks,
+                                                    /*lse_is_log2=*/true));
     if (profiling) prof.tick(prof.attn_kernel);
 
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
-    INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b));
+    INFERX_RETURN_IF_ERROR(ops::AddBiasInPlace(proj, w.o_b));
     dump_hidden(proj);  // attention output, after o_proj, before the residual
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(proj, resid));
     INFERX_RETURN_IF_ERROR(m.runtime->Copy(x.Data(), proj.Data(),
                                            DataTypeByteSize(kBf16, tokens * h),
                                            CopyKind::kDeviceToDevice));
@@ -944,8 +941,8 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
                                            DataTypeByteSize(kBf16, tokens * h),
                                            CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, w.post_norm, normed,
+                                        static_cast<float>(c.rms_norm_eps)));
 
     MoeWeights mw;
     mw.router = w.router_w;
@@ -964,7 +961,7 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     INFERX_RETURN_IF_ERROR(m.moe->Forward(normed, mw, moe_out, &m.gemm));
     if (profiling) prof.tick(prof.moe_forward);
 
-    INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid));
+    INFERX_RETURN_IF_ERROR(ops::AddInPlace(moe_out, resid));
     INFERX_RETURN_IF_ERROR(m.runtime->Copy(x.Data(), moe_out.Data(),
                                            DataTypeByteSize(kBf16, tokens * h),
                                            CopyKind::kDeviceToDevice));
@@ -979,8 +976,8 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
 
   if (dump != nullptr) std::fclose(dump);
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, m.final_norm, normed,
-                                          static_cast<float>(c.rms_norm_eps)));
+  INFERX_RETURN_IF_ERROR(ops::RmsNorm(x, m.final_norm, normed,
+                                      static_cast<float>(c.rms_norm_eps)));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView logits,
                           m.logits.View(kBf16, Shape({tokens, c.vocab_size})));

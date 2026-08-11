@@ -27,5 +27,5 @@ target_link_libraries(inferx_model
 if(INFERX_CUDA_MEETS_FLOOR)
   target_sources(inferx_model PRIVATE qwen2.cc moe_ffn.cc mla.cc gpt_oss.cc
                                       deepseek_v2.cc)
-  target_link_libraries(inferx_model PUBLIC inferx::kernels)
+  target_link_libraries(inferx_model PUBLIC inferx::ops)
 endif()

@@ -10,8 +10,10 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
   const auto same_size = [&](const std::vector<int32_t>& v, const char* name) {
     return static_cast<int64_t>(v.size()) == n
                ? OkStatus()
-               : InvalidArgumentError(name, " has ", v.size(), " entries but "
-                                      "there are ", n, " tokens");
+               : InvalidArgumentError(name, " has ", v.size(),
+                                      " entries but "
+                                      "there are ",
+                                      n, " tokens");
   };
 
   INFERX_RETURN_IF_ERROR(same_size(positions, "positions"));
@@ -30,8 +32,7 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
                                 num_seqs * max_blocks_per_seq);
   }
 
-  if (!seq_lens.empty() &&
-      static_cast<int64_t>(seq_lens.size()) != num_seqs) {
+  if (!seq_lens.empty() && static_cast<int64_t>(seq_lens.size()) != num_seqs) {
     return InvalidArgumentError("seq_lens has ", seq_lens.size(),
                                 " entries, expected ", num_seqs);
   }
@@ -60,11 +61,10 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
     // plan says is not there.
     if (!seq_lens.empty() &&
         positions[u] >= seq_lens[static_cast<size_t>(seq_of_token[u])]) {
-      return InvalidArgumentError("positions[", i, "] = ", positions[u],
-                                  " is past the end of sequence ",
-                                  seq_of_token[u], ", declared ",
-                                  seq_lens[static_cast<size_t>(seq_of_token[u])],
-                                  " tokens long");
+      return InvalidArgumentError(
+          "positions[", i, "] = ", positions[u],
+          " is past the end of sequence ", seq_of_token[u], ", declared ",
+          seq_lens[static_cast<size_t>(seq_of_token[u])], " tokens long");
     }
     // A slot outside the pool would scatter this token's keys into whatever
     // follows the cache in device memory.
@@ -83,9 +83,9 @@ Status ForwardBatch::Validate(int64_t vocab_size, int64_t total_slots) const {
 
   for (size_t i = 0; i < logits_indices.size(); ++i) {
     if (logits_indices[i] < 0 || logits_indices[i] >= n) {
-      return InvalidArgumentError("logits_indices[", i, "] = ",
-                                  logits_indices[i], " is outside [0, ", n,
-                                  ")");
+      return InvalidArgumentError("logits_indices[", i,
+                                  "] = ", logits_indices[i], " is outside [0, ",
+                                  n, ")");
     }
   }
 
