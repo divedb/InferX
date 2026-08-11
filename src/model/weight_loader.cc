@@ -452,6 +452,102 @@ StatusOr<TensorView> WeightLoader::LoadStacked(
   return UploadStacked(parts, out);
 }
 
+StatusOr<TensorView> WeightLoader::LoadStacked(
+    absl::Span<const std::string> names, absl::Span<const Shape> global_parts,
+    const Shape& global_out, const parallel::ShardSpec& shard, int tp_rank,
+    int tp_size) {
+  if (names.empty() || names.size() != global_parts.size()) {
+    return InvalidArgumentError(
+        "LoadStacked: names and shapes must have the "
+        "same non-zero size");
+  }
+  if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size) {
+    return InvalidArgumentError(
+        "LoadStacked: invalid TP topology rank=", tp_rank, " size=", tp_size);
+  }
+  if (shard.partition == parallel::Partition::kReplicated || tp_size == 1) {
+    std::vector<Tensor> parts;
+    parts.reserve(names.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+      INFERX_ASSIGN_OR_RETURN(
+          Tensor tensor, impl_->ckpt->GetChecked(names[i], global_parts[i]));
+      parts.push_back(std::move(tensor));
+    }
+    return UploadStacked(parts, global_out);
+  }
+  if (shard.unit <= 0) {
+    return InvalidArgumentError("LoadStacked: shard unit must be positive");
+  }
+
+  std::vector<Tensor> parts;
+  parts.reserve(names.size());
+  std::vector<Extent>& extents = impl_->extents;
+  extents.clear();
+  Shape local_out = global_out;
+  INFERX_ASSIGN_OR_RETURN(const int out_axis,
+                          ShardAxis(shard.partition, global_out.Rank()));
+  if (global_out.Dim(out_axis) % tp_size != 0) {
+    return InvalidArgumentError("LoadStacked: output dimension ",
+                                global_out.Dim(out_axis), " on axis ", out_axis,
+                                " is not divisible by TP size ", tp_size);
+  }
+  local_out.SetDim(out_axis, global_out.Dim(out_axis) / tp_size);
+
+  DataType dtype = DataType::kUndefined;
+  size_t total = 0;
+  for (size_t part_index = 0; part_index < names.size(); ++part_index) {
+    INFERX_ASSIGN_OR_RETURN(
+        Tensor tensor,
+        impl_->ckpt->GetChecked(names[part_index], global_parts[part_index]));
+    if (part_index == 0) {
+      dtype = tensor.dtype();
+    } else if (tensor.dtype() != dtype) {
+      return InvalidArgumentError("LoadStacked: mixed dtypes");
+    }
+    if (DataTypeBitWidth(dtype) % 8 != 0) {
+      return UnimplementedError("LoadStacked: packed dtype ",
+                                DataTypeName(dtype),
+                                " cannot be sharded before unpacking");
+    }
+    INFERX_ASSIGN_OR_RETURN(const int axis,
+                            ShardAxis(shard.partition, tensor.rank()));
+    const int64_t global_axis = tensor.dim(axis);
+    if (global_axis % tp_size != 0) {
+      return InvalidArgumentError("LoadStacked: dimension ", global_axis,
+                                  " on axis ", axis, " of ", names[part_index],
+                                  " is not divisible by TP size ", tp_size);
+    }
+    const int64_t local_axis = global_axis / tp_size;
+    if (local_axis % shard.unit != 0) {
+      return InvalidArgumentError("LoadStacked: local dimension ", local_axis,
+                                  " of ", names[part_index],
+                                  " is not aligned to shard unit ", shard.unit);
+    }
+    const int64_t inner = tensor.shape().InnerNumel(axis) / global_axis;
+    const int64_t outer = tensor.numel() / (global_axis * inner);
+    const size_t element_bytes = DataTypeBitWidth(dtype) / 8;
+    const size_t extent_bytes =
+        static_cast<size_t>(local_axis * inner) * element_bytes;
+    const size_t source_stride =
+        static_cast<size_t>(global_axis * inner) * element_bytes;
+    const size_t rank_offset = static_cast<size_t>(tp_rank) * extent_bytes;
+    const auto* source = static_cast<const std::byte*>(tensor.data());
+    for (int64_t i = 0; i < outer; ++i) {
+      extents.push_back(
+          Extent{source + static_cast<size_t>(i) * source_stride + rank_offset,
+                 extent_bytes});
+      total += extent_bytes;
+    }
+    parts.push_back(std::move(tensor));
+  }
+  if (total !=
+      static_cast<size_t>(DataTypeByteSize(dtype, local_out.Numel()))) {
+    return InvalidArgumentError("LoadStacked: local shards do not fill ",
+                                local_out.ToString());
+  }
+  return impl_->FinishLoad(extents, total, dtype, local_out);
+}
+
 StatusOr<TensorView> WeightLoader::Upload(const Tensor& host) {
   if (!host.defined() || !host.is_cpu()) {
     return InvalidArgumentError("Upload: source must be a defined host tensor");

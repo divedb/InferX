@@ -14,10 +14,13 @@ Implementation in progress. The engine-facing mechanism is now generalized:
   the architecture factory rather than a runner type. There is no
   `qwen2_runner.cc` or `Qwen2Runner` API.
 
-The declared strategy half remains: `TpLayout`, `TpDims`, shard-aware loader
-verbs, and parallel linear/MoE/MLA primitives have not landed. Consequently,
-Qwen2 still contains its existing imperative sharding and direct collective
-calls, while gpt-oss and DeepSeek-V2 still reject TP greater than one.
+The declared strategy layer has started landing: `TpLayout` and `TpDims`
+describe and validate Qwen2's partition, and shard-aware `WeightLoader` verbs
+stream individual and fused heterogeneous shards without materializing the
+discarded ranks. Qwen2 weight loading now consumes that layout and no longer
+contains an imperative axis-selection lambda. Parallel linear/MoE/MLA
+primitives have not landed, so Qwen2 still places its direct collective calls
+manually, while gpt-oss and DeepSeek-V2 still reject TP greater than one.
 
 Relationship to existing documents:
 

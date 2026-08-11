@@ -9,7 +9,6 @@
 
 #include "absl/strings/str_cat.h"
 #include "inferx/comm/communicator.h"
-#include "inferx/comm/tensor_parallel.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
@@ -1312,11 +1311,6 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
 
   const int64_t h = config.hidden_size;
   const int64_t inter = config.intermediate_size;
-  const auto shard = [&](Tensor tensor, int axis) -> StatusOr<Tensor> {
-    if (tp_size == 1) return tensor;
-    return comm::ShardHostTensor(tensor, axis, tp_rank, tp_size);
-  };
-
   // The shared movement layer, in per-tensor-buffer mode
   // (device_chunk_bytes = 0): QuantizeWeightsToF8/Int4 later free the bf16
   // originals buffer by buffer, and a shared chunk would keep freed bytes
@@ -1367,38 +1361,40 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     // concatenated along dim 0, which is contiguous, so the fused weight is
     // byte-identical to the three laid end to end.
     {
-      std::vector<Tensor> qkv;
+      std::vector<std::string> names;
+      std::vector<Shape> shapes;
       for (const auto& [name, rows] :
            {std::pair<std::string_view, int64_t>{"self_attn.q_proj.weight",
                                                  config.q_dim()},
             {"self_attn.k_proj.weight", config.kv_dim()},
             {"self_attn.v_proj.weight", config.kv_dim()}}) {
-        INFERX_ASSIGN_OR_RETURN(
-            Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows, h})));
-        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
-        qkv.push_back(std::move(local));
+        names.push_back(absl::StrCat(p, name));
+        shapes.emplace_back(Shape({rows, h}));
       }
-      INFERX_ASSIGN_OR_RETURN(const Shape qkv_shape, ConcatenatedShape(qkv));
-      INFERX_ASSIGN_OR_RETURN(w.qkv_w, loader.UploadStacked(qkv, qkv_shape));
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_w,
+          loader.LoadStacked(
+              names, shapes, Shape({config.q_dim() + 2 * config.kv_dim(), h}),
+              tp_layout.SpecFor(names.front()), tp_rank, tp_size));
       w.qkv_buf = static_cast<int>(loader.buffer_count()) - 1;
     }
 
     if (config.attention_bias) {
-      std::vector<Tensor> qkv_bias;
+      std::vector<std::string> names;
+      std::vector<Shape> shapes;
       for (const auto& [name, rows] :
            {std::pair<std::string_view, int64_t>{"self_attn.q_proj.bias",
                                                  config.q_dim()},
             {"self_attn.k_proj.bias", config.kv_dim()},
             {"self_attn.v_proj.bias", config.kv_dim()}}) {
-        INFERX_ASSIGN_OR_RETURN(
-            Tensor t, ckpt.GetChecked(absl::StrCat(p, name), Shape({rows})));
-        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
-        qkv_bias.push_back(std::move(local));
+        names.push_back(absl::StrCat(p, name));
+        shapes.emplace_back(Shape({rows}));
       }
-      INFERX_ASSIGN_OR_RETURN(const Shape bias_shape,
-                              ConcatenatedShape(qkv_bias));
-      INFERX_ASSIGN_OR_RETURN(w.qkv_b,
-                              loader.UploadStacked(qkv_bias, bias_shape));
+      INFERX_ASSIGN_OR_RETURN(
+          w.qkv_b,
+          loader.LoadStacked(
+              names, shapes, Shape({config.q_dim() + 2 * config.kv_dim()}),
+              tp_layout.SpecFor(names.front()), tp_rank, tp_size));
     }
 
     {
@@ -1410,18 +1406,17 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
     w.o_buf = static_cast<int>(loader.buffer_count()) - 1;
 
     {
-      std::vector<Tensor> gate_up;
+      std::vector<std::string> names;
+      std::vector<Shape> shapes;
       for (const std::string_view name :
            {"mlp.gate_proj.weight", "mlp.up_proj.weight"}) {
-        INFERX_ASSIGN_OR_RETURN(Tensor t, ckpt.GetChecked(absl::StrCat(p, name),
-                                                          Shape({inter, h})));
-        INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
-        gate_up.push_back(std::move(local));
+        names.push_back(absl::StrCat(p, name));
+        shapes.emplace_back(Shape({inter, h}));
       }
-      INFERX_ASSIGN_OR_RETURN(const Shape gate_up_shape,
-                              ConcatenatedShape(gate_up));
-      INFERX_ASSIGN_OR_RETURN(w.gate_up_w,
-                              loader.UploadStacked(gate_up, gate_up_shape));
+      INFERX_ASSIGN_OR_RETURN(
+          w.gate_up_w, loader.LoadStacked(names, shapes, Shape({2 * inter, h}),
+                                          tp_layout.SpecFor(names.front()),
+                                          tp_rank, tp_size));
       w.gate_up_buf = static_cast<int>(loader.buffer_count()) - 1;
     }
 

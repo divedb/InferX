@@ -106,6 +106,14 @@ class WeightLoader {
   StatusOr<TensorView> LoadStacked(absl::Span<const std::string> names,
                                    const Shape& part, const Shape& out);
 
+  /// \brief Loads and concatenates local shards of possibly heterogeneous
+  ///        global tensors. Parts concatenate along dimension zero.
+  StatusOr<TensorView> LoadStacked(absl::Span<const std::string> names,
+                                   absl::Span<const Shape> global_parts,
+                                   const Shape& global_out,
+                                   const parallel::ShardSpec& shard,
+                                   int tp_rank, int tp_size);
+
   /// \brief Uploads a 2-D tensor with destination row `i` reading source row
   ///        `row_map[i]` — the RoPE de-interleave case.
   StatusOr<TensorView> LoadRowPermuted(std::string_view name,

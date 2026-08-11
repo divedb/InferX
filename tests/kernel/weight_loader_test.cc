@@ -110,6 +110,7 @@ class WeightLoaderTest : public ::testing::Test {
 
   void SetUp() override {
     ckpt_.Add("a", {6, 4}, Iota(24, 0.0f));
+    ckpt_.Add("b", {2, 4}, Iota(8, 100.0f));
     ckpt_.Add("p0", {2, 3}, Iota(6, 100.0f));
     ckpt_.Add("p1", {2, 3}, Iota(6, 200.0f));
     ckpt_.Add("p2", {2, 3}, Iota(6, 300.0f));
@@ -206,6 +207,26 @@ TEST_F(WeightLoaderTest, CpuStackedConcatenatesInNameOrder) {
   expected.insert(expected.end(), tail.begin(), tail.end());
 
   EXPECT_EQ(ReadBack(*view, 18, DeviceId::Cpu()), expected);
+}
+
+TEST_F(WeightLoaderTest, CpuStackedShardsHeterogeneousPartsBeforeFusion) {
+  auto loader =
+      WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cpu()));
+  ASSERT_TRUE(loader.ok());
+
+  const std::vector<std::string> names = {"a", "b"};
+  const std::vector<Shape> shapes = {Shape({6, 4}), Shape({2, 4})};
+  auto view = loader->LoadStacked(
+      names, shapes, Shape({8, 4}),
+      model::parallel::ShardSpec{model::parallel::Partition::kRows, 1}, 1, 2);
+  ASSERT_TRUE(view.ok()) << view.status().ToString();
+  EXPECT_EQ(view->Dim(0), 4);
+  EXPECT_EQ(view->Dim(1), 4);
+
+  std::vector<float> expected = Iota(12, 12.0f);
+  const std::vector<float> tail = Iota(4, 104.0f);
+  expected.insert(expected.end(), tail.begin(), tail.end());
+  EXPECT_EQ(ReadBack(*view, 16, DeviceId::Cpu()), expected);
 }
 
 TEST_F(WeightLoaderTest, CpuRowPermutedGathersRows) {
