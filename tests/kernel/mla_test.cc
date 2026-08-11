@@ -386,9 +386,9 @@ TEST(MlaLayout, PoolRefusesToHandOutAValueCache) {
   if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
 
   const ModelConfig c = SmallMlaConfig();
-  auto pool =
-      KvBlockPool::Create(/*num_layers=*/1, /*num_blocks=*/4,
-                          /*block_size=*/8, MlaAttentionLayer::LayoutFor(c));
+  auto pool = KvBlockPool::Create(
+      /*num_layers=*/1, /*num_blocks=*/4,
+      /*block_size=*/8, MlaAttentionLayer::LayoutFor(c), DeviceId::Cuda(0));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   EXPECT_TRUE(pool->KeyCache(0).ok());
@@ -414,8 +414,8 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
   const std::vector<float> x =
       RandomTensor(static_cast<size_t>(tokens * c.hidden_size), 0.33f);
 
-  auto pool =
-      KvBlockPool::Create(1, 8, block_size, MlaAttentionLayer::LayoutFor(c));
+  auto pool = KvBlockPool::Create(
+      1, 8, block_size, MlaAttentionLayer::LayoutFor(c), DeviceId::Cuda(0));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   std::vector<int32_t> blocks;
@@ -507,8 +507,8 @@ void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto run = [&](bool one_at_a_time) {
-    auto pool =
-        KvBlockPool::Create(1, 8, block_size, MlaAttentionLayer::LayoutFor(c));
+    auto pool = KvBlockPool::Create(
+        1, 8, block_size, MlaAttentionLayer::LayoutFor(c), DeviceId::Cuda(0));
     EXPECT_TRUE(pool.ok()) << pool.status();
 
     std::vector<int32_t> blocks;
@@ -803,8 +803,8 @@ TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
   c.kv_lora_rank = latent_dim;
   c.qk_rope_head_dim = rope_dim;
 
-  auto pool =
-      KvBlockPool::Create(1, 6, block_size, MlaAttentionLayer::LayoutFor(c));
+  auto pool = KvBlockPool::Create(
+      1, 6, block_size, MlaAttentionLayer::LayoutFor(c), DeviceId::Cuda(0));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   // Blocks allocated out of order, which is the case a block-table walk that
@@ -880,8 +880,8 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   c.kv_lora_rank = latent_dim;
   c.qk_rope_head_dim = rope;
 
-  auto pool =
-      KvBlockPool::Create(1, 6, block_size, MlaAttentionLayer::LayoutFor(c));
+  auto pool = KvBlockPool::Create(
+      1, 6, block_size, MlaAttentionLayer::LayoutFor(c), DeviceId::Cuda(0));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   std::vector<int32_t> blocks;

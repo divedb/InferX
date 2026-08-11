@@ -265,7 +265,8 @@ Run Measure(model::Qwen2Model* model, int64_t budget, bool with_prompt) {
       }
 
       const auto it = last_token_at.find(delta.id);
-      if (it != last_token_at.end()) run.gaps_ms.push_back(elapsed - it->second);
+      if (it != last_token_at.end())
+        run.gaps_ms.push_back(elapsed - it->second);
 
       last_token_at[delta.id] = elapsed;
     }
@@ -294,7 +295,8 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());
@@ -380,8 +382,8 @@ int Main(int argc, char** argv) {
 
     std::printf("%8ld %9.2f %9.2f %10.2f %9.1f %8d %11.0f\n",
                 static_cast<long>(budget), Percentile(run.gaps_ms, 0.50),
-                Percentile(run.gaps_ms, 0.99), run.longest_step_ms,
-                run.ttft_ms, run.prefill_steps, prefill_tps);
+                Percentile(run.gaps_ms, 0.99), run.longest_step_ms, run.ttft_ms,
+                run.prefill_steps, prefill_tps);
   }
 
   std::printf(
@@ -396,9 +398,12 @@ int Main(int argc, char** argv) {
     const double floor = Percentile(control.gaps_ms, 0.99);
 
     std::printf(
-        "\nThe trade, across the sweep: p99 TBT %.1f -> %.1f ms (%.1fx, against\n"
-        "a %.1f ms floor), TTFT %.0f -> %.0f ms (%.2fx). Chunking does not make\n"
-        "the prefill cheaper and is not meant to -- it decides who waits for it.\n",
+        "\nThe trade, across the sweep: p99 TBT %.1f -> %.1f ms (%.1fx, "
+        "against\n"
+        "a %.1f ms floor), TTFT %.0f -> %.0f ms (%.2fx). Chunking does not "
+        "make\n"
+        "the prefill cheaper and is not meant to -- it decides who waits for "
+        "it.\n",
         tbt_before, tbt_after, tbt_before / tbt_after, floor, largest.ttft_ms,
         smallest.ttft_ms, smallest.ttft_ms / largest.ttft_ms);
   }

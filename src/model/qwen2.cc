@@ -35,8 +35,8 @@ struct LayerWeights {
   // Q, K and V concatenated along dim 0 into one [q_dim + 2*kv_dim, hidden]
   // tensor, and likewise gate and up into [2*intermediate, hidden]. Weights
   // concatenate along their output dimension, which is contiguous, so this is a
-  // load-time arrangement rather than a runtime one -- and it turns six launches
-  // per layer into two.
+  // load-time arrangement rather than a runtime one -- and it turns six
+  // launches per layer into two.
   TensorView qkv_w;
   TensorView qkv_b;  // undefined when the architecture has no attention bias
   TensorView o_w;
@@ -62,7 +62,8 @@ struct LayerWeights {
 
   // FP8 KV cache dequant scales, frozen from the first warmup forward. Host
   // values: the attention kernels and AppendBf16AsFp8 take them as scalar args,
-  // so the value baked into a captured decode graph is whatever was frozen here.
+  // so the value baked into a captured decode graph is whatever was frozen
+  // here.
   float k_scale = 1.0f;
   float v_scale = 1.0f;
 };
@@ -155,7 +156,8 @@ struct Qwen2Model::Impl {
   Status EnsurePinned(size_t bytes) {
     if (bytes <= pinned_bytes) return OkStatus();
 
-    if (pinned != nullptr) INFERX_RETURN_IF_ERROR(runtime->FreePinnedHost(pinned));
+    if (pinned != nullptr)
+      INFERX_RETURN_IF_ERROR(runtime->FreePinnedHost(pinned));
     pinned = nullptr;
     pinned_bytes = 0;
 
@@ -200,25 +202,25 @@ struct Qwen2Model::Impl {
   // On-device sampling, and the buffers that let a decode step feed its own
   // successor without the host in between.
   bool sample_on_device = false;
-  DeviceBuffer sampled_ids;      // [logits rows] int32, this step's tokens
-  DeviceBuffer sample_slots;     // where each sampled token lands in token_ids
-  DeviceBuffer sample_rows;      // which logits rows to sample
-  DeviceBuffer sample_temp;      // per-row temperature
-  DeviceBuffer sample_top_p;     // per-row nucleus threshold
-  DeviceBuffer sample_top_k;     // per-row top-k truncation (0 off)
-  DeviceBuffer sample_min_p;     // per-row min-p truncation (0 off)
-  DeviceBuffer sample_presence;    // per-row presence penalty
-  DeviceBuffer sample_frequency;   // per-row frequency penalty
-  DeviceBuffer sample_repetition;  // per-row repetition penalty
-  DeviceBuffer sample_hist_ids;    // [rows, kPenaltyHistoryCap] unique ids
-  DeviceBuffer sample_hist_counts; // [rows, kPenaltyHistoryCap] counts
-  DeviceBuffer sample_mask_ids;    // [rows, kMaskCap] min-tokens stop masks
-  DeviceBuffer sample_logprobs_k;  // per-row logprob request (-1 off)
-  DeviceBuffer lp_chosen;          // [rows] chosen-token logprob
-  DeviceBuffer lp_top_ids;         // [rows, kMaxTopLogprobs]
-  DeviceBuffer lp_top_lps;         // [rows, kMaxTopLogprobs]
-  DeviceBuffer sample_seeds;     // per-row RNG seed
-  void* pinned_sampled = nullptr;  // host-visible copy, read one step late
+  DeviceBuffer sampled_ids;       // [logits rows] int32, this step's tokens
+  DeviceBuffer sample_slots;      // where each sampled token lands in token_ids
+  DeviceBuffer sample_rows;       // which logits rows to sample
+  DeviceBuffer sample_temp;       // per-row temperature
+  DeviceBuffer sample_top_p;      // per-row nucleus threshold
+  DeviceBuffer sample_top_k;      // per-row top-k truncation (0 off)
+  DeviceBuffer sample_min_p;      // per-row min-p truncation (0 off)
+  DeviceBuffer sample_presence;   // per-row presence penalty
+  DeviceBuffer sample_frequency;  // per-row frequency penalty
+  DeviceBuffer sample_repetition;   // per-row repetition penalty
+  DeviceBuffer sample_hist_ids;     // [rows, kPenaltyHistoryCap] unique ids
+  DeviceBuffer sample_hist_counts;  // [rows, kPenaltyHistoryCap] counts
+  DeviceBuffer sample_mask_ids;     // [rows, kMaskCap] min-tokens stop masks
+  DeviceBuffer sample_logprobs_k;   // per-row logprob request (-1 off)
+  DeviceBuffer lp_chosen;           // [rows] chosen-token logprob
+  DeviceBuffer lp_top_ids;          // [rows, kMaxTopLogprobs]
+  DeviceBuffer lp_top_lps;          // [rows, kMaxTopLogprobs]
+  DeviceBuffer sample_seeds;        // per-row RNG seed
+  void* pinned_sampled = nullptr;   // host-visible copy, read one step late
   void* pinned_lp_chosen = nullptr;
   void* pinned_lp_top_ids = nullptr;
   void* pinned_lp_top_lps = nullptr;
@@ -230,8 +232,8 @@ struct Qwen2Model::Impl {
 
   bool weights_f8 = false;
   std::vector<DeviceBuffer> f8_buffers;
-  DeviceBuffer act_f8;        // quantized activations, reused every GEMM
-  DeviceBuffer act_scales;    // one float per GEMM input per layer
+  DeviceBuffer act_f8;      // quantized activations, reused every GEMM
+  DeviceBuffer act_scales;  // one float per GEMM input per layer
 
   bool weights_int4 = false;
   std::vector<DeviceBuffer> int4_buffers;
@@ -241,9 +243,9 @@ struct Qwen2Model::Impl {
   // flag; the per-layer K/V dequant scales are frozen from the first warmup
   // forward (kv_scales_frozen), so the value baked into a captured decode graph
   // is stable. kv_scale_dev is scratch the freeze path writes the dynamic
-  // quantize's scale into before reading it back to the host; fp8_scratch is the
-  // throwaway contiguous fp8 buffer that same quantize writes (only its scale is
-  // kept).
+  // quantize's scale into before reading it back to the host; fp8_scratch is
+  // the throwaway contiguous fp8 buffer that same quantize writes (only its
+  // scale is kept).
   bool fp8_kv = false;
   bool kv_scales_frozen = false;
   DeviceBuffer kv_scale_dev;
@@ -266,10 +268,14 @@ struct Qwen2Model::Impl {
     }
     if (sampled_ready.handle != nullptr)
       (void)runtime->DestroyEvent(sampled_ready);
-    if (pinned_sampled != nullptr) (void)runtime->FreePinnedHost(pinned_sampled);
-    if (pinned_lp_chosen != nullptr) (void)runtime->FreePinnedHost(pinned_lp_chosen);
-    if (pinned_lp_top_ids != nullptr) (void)runtime->FreePinnedHost(pinned_lp_top_ids);
-    if (pinned_lp_top_lps != nullptr) (void)runtime->FreePinnedHost(pinned_lp_top_lps);
+    if (pinned_sampled != nullptr)
+      (void)runtime->FreePinnedHost(pinned_sampled);
+    if (pinned_lp_chosen != nullptr)
+      (void)runtime->FreePinnedHost(pinned_lp_chosen);
+    if (pinned_lp_top_ids != nullptr)
+      (void)runtime->FreePinnedHost(pinned_lp_top_ids);
+    if (pinned_lp_top_lps != nullptr)
+      (void)runtime->FreePinnedHost(pinned_lp_top_lps);
     if (step_begin.handle != nullptr) (void)runtime->DestroyEvent(step_begin);
     if (step_end.handle != nullptr) (void)runtime->DestroyEvent(step_end);
     if (pinned != nullptr) (void)runtime->FreePinnedHost(pinned);
@@ -361,7 +367,8 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   const int64_t inter = LocalIntermediate();
   const int64_t vocab = config.vocab_size;
 
-  const auto alloc = [&](Scratch* s, int64_t elems, size_t elem_size) -> Status {
+  const auto alloc = [&](Scratch* s, int64_t elems,
+                         size_t elem_size) -> Status {
     INFERX_ASSIGN_OR_RETURN(
         s->buf, DeviceBuffer::Allocate(static_cast<size_t>(elems) * elem_size,
                                        comm->device()));
@@ -387,23 +394,22 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
   // one token's-worth of K (== V) at a time. Only its scale is kept.
   if (fp8_kv) {
     INFERX_ASSIGN_OR_RETURN(
-        fp8_scratch,
-        DeviceBuffer::Allocate(static_cast<size_t>(tokens * kvd),
-                               comm->device()));
+        fp8_scratch, DeviceBuffer::Allocate(static_cast<size_t>(tokens * kvd),
+                                            comm->device()));
   }
 
   INFERX_ASSIGN_OR_RETURN(
-      positions, DeviceBuffer::Allocate(
-                     static_cast<size_t>(tokens) * sizeof(int32_t),
-                     comm->device()));
+      positions,
+      DeviceBuffer::Allocate(static_cast<size_t>(tokens) * sizeof(int32_t),
+                             comm->device()));
   INFERX_ASSIGN_OR_RETURN(
-      token_ids, DeviceBuffer::Allocate(
-                     static_cast<size_t>(tokens) * sizeof(int32_t),
-                     comm->device()));
+      token_ids,
+      DeviceBuffer::Allocate(static_cast<size_t>(tokens) * sizeof(int32_t),
+                             comm->device()));
 
   // Sized for the largest download any caller can ask for: every token's row.
-  const size_t logits_bytes = static_cast<size_t>(tokens) *
-                              static_cast<size_t>(vocab) * 2;
+  const size_t logits_bytes =
+      static_cast<size_t>(tokens) * static_cast<size_t>(vocab) * 2;
 
   if (logits_bytes > pinned_logits_bytes) {
     if (pinned_logits != nullptr)
@@ -435,8 +441,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
   // Positions are 0..n-1: there is no cache to continue from at M2.
   std::vector<int32_t> pos(static_cast<size_t>(tokens));
-  for (int64_t i = 0; i < tokens; ++i) pos[static_cast<size_t>(i)] =
-      static_cast<int32_t>(i);
+  for (int64_t i = 0; i < tokens; ++i)
+    pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
 
   INFERX_RETURN_IF_ERROR(runtime->Copy(positions.data(), pos.data(),
                                        pos.size() * sizeof(int32_t),
@@ -445,14 +451,12 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                        ids.size() * sizeof(int32_t),
                                        CopyKind::kHostToDevice));
 
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView ids_v,
-      TensorView::Create(token_ids.data(), DataType::kInt32, Shape({tokens}),
-                         comm->device()));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView pos_v,
-      TensorView::Create(positions.data(), DataType::kInt32, Shape({tokens}),
-                         comm->device()));
+  INFERX_ASSIGN_OR_RETURN(const TensorView ids_v,
+                          TensorView::Create(token_ids.data(), DataType::kInt32,
+                                             Shape({tokens}), comm->device()));
+  INFERX_ASSIGN_OR_RETURN(const TensorView pos_v,
+                          TensorView::Create(positions.data(), DataType::kInt32,
+                                             Shape({tokens}), comm->device()));
 
   const Shape hidden_shape({tokens, h});
   INFERX_ASSIGN_OR_RETURN(const TensorView x,
@@ -512,9 +516,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                          static_cast<size_t>(x.NBytes()),
                                          CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, layer.input_norm, norm,
-                                            static_cast<float>(
-                                                config.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+        x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.qkv_w, qkv_v));
     INFERX_RETURN_IF_ERROR(
@@ -536,9 +539,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
                                          static_cast<size_t>(x.NBytes()),
                                          CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, layer.post_norm, norm,
-                                            static_cast<float>(
-                                                config.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+        x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
     INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
     INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v));
@@ -547,9 +549,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
   }
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, final_norm, norm,
-                                          static_cast<float>(
-                                              config.rms_norm_eps)));
+  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+      x, final_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView logits_v,
@@ -573,22 +574,21 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 
   if (table_elems > block_table_capacity) {
     INFERX_ASSIGN_OR_RETURN(
-        block_table_buf,
-        DeviceBuffer::Allocate(static_cast<size_t>(table_elems) *
-                                   sizeof(int32_t),
-                               comm->device()));
+        block_table_buf, DeviceBuffer::Allocate(
+                             static_cast<size_t>(table_elems) * sizeof(int32_t),
+                             comm->device()));
     block_table_capacity = table_elems;
   }
 
   if (slots_buf.size() < static_cast<size_t>(tokens) * sizeof(int32_t)) {
     INFERX_ASSIGN_OR_RETURN(
-        slots_buf, DeviceBuffer::Allocate(
-                       static_cast<size_t>(tokens) * sizeof(int32_t),
-                       comm->device()));
+        slots_buf,
+        DeviceBuffer::Allocate(static_cast<size_t>(tokens) * sizeof(int32_t),
+                               comm->device()));
     INFERX_ASSIGN_OR_RETURN(
-        seq_of_token_buf, DeviceBuffer::Allocate(
-                              static_cast<size_t>(tokens) * sizeof(int32_t),
-                              comm->device()));
+        seq_of_token_buf,
+        DeviceBuffer::Allocate(static_cast<size_t>(tokens) * sizeof(int32_t),
+                               comm->device()));
   }
 
   // Reserved before anything is staged, and generously: four per-token arrays,
@@ -627,9 +627,9 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 
     std::memcpy(static_cast<std::byte*>(pinned) + staged, src.data(), bytes);
 
-    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
-        buf.data(), static_cast<std::byte*>(pinned) + staged, bytes,
-        CopyKind::kHostToDevice, stream));
+    INFERX_RETURN_IF_ERROR(
+        runtime->CopyAsync(buf.data(), static_cast<std::byte*>(pinned) + staged,
+                           bytes, CopyKind::kHostToDevice, stream));
 
     staged += bytes;
     return OkStatus();
@@ -706,9 +706,8 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     for (int64_t seq = 0; seq < batch.num_seqs; ++seq) {
       const size_t u = static_cast<size_t>(seq);
 
-      const int64_t len = batch.seq_lens.empty()
-                              ? derived_len[u]
-                              : batch.seq_lens[u];
+      const int64_t len =
+          batch.seq_lens.empty() ? derived_len[u] : batch.seq_lens[u];
 
       // A sequence with no keys at all -- admitted this step and skipped by the
       // budget before it ran a single token. There is no page to point the
@@ -732,7 +731,6 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
       exactly_one_query_per_sequence &= count == 1;
       fi_qo_indptr_host[static_cast<size_t>(seq + 1)] =
           fi_qo_indptr_host[static_cast<size_t>(seq)] + count;
-
     }
 
     fi_usable = flashinfer != nullptr && exactly_one_query_per_sequence;
@@ -742,9 +740,9 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
     // stated it is just an empty range in `qo_indptr`, and chunked prefill
     // produces those constantly -- every step where the budget runs out before
     // the last sequence is reached.
-    fi_prefill_usable =
-        flashinfer_prefill != nullptr && !fi_usable && lengths_are_known &&
-        (every_sequence_contributes || !batch.seq_lens.empty());
+    fi_prefill_usable = flashinfer_prefill != nullptr && !fi_usable &&
+                        lengths_are_known &&
+                        (every_sequence_contributes || !batch.seq_lens.empty());
 
     std::vector<int32_t> indices;
     INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
@@ -797,13 +795,13 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
       if (fp8_kv) {
         INFERX_RETURN_IF_ERROR(flashinfer->PlanFp8(
             batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
-            block_size,
-            absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+            block_size, absl::MakeConstSpan(fi_indptr_host),
+            /*graph_safe=*/true, stream));
       } else {
         INFERX_RETURN_IF_ERROR(flashinfer->Plan(
             batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
-            block_size,
-            absl::MakeConstSpan(fi_indptr_host), /*graph_safe=*/true, stream));
+            block_size, absl::MakeConstSpan(fi_indptr_host),
+            /*graph_safe=*/true, stream));
       }
     } else if (fi_prefill_usable && !fp8_kv) {
       // FP8 prefill is one-shot -- PrefillFp8 plans and runs in one call -- so
@@ -811,8 +809,7 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
       // calls PrefillFp8 directly.
       INFERX_RETURN_IF_ERROR(flashinfer_prefill->Plan(
           batch.num_seqs, LocalHeads(), LocalKvHeads(), config.head_dim,
-          block_size,
-          absl::MakeConstSpan(fi_qo_indptr_host),
+          block_size, absl::MakeConstSpan(fi_qo_indptr_host),
           absl::MakeConstSpan(fi_indptr_host), tokens, stream));
     }
   }
@@ -845,8 +842,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                           i32(seq_of_token_buf, Shape({tokens})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView table_v,
-      i32(block_table_buf,
-          Shape({num_seqs, max_blocks_per_seq})));
+      i32(block_table_buf, Shape({num_seqs, max_blocks_per_seq})));
 
   const Shape hidden_shape({tokens, h});
   INFERX_ASSIGN_OR_RETURN(const TensorView x,
@@ -915,16 +911,16 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::RmsNorm(x, layer.input_norm, norm,
+                         static_cast<float>(config.rms_norm_eps), stream));
 
     // One GEMM and one split, where this used to be three GEMMs and three bias
     // adds. The split is unavoidable -- a fused row interleaves Q, K and V per
     // token, so Q is strided for more than one token -- but folding the bias
     // into it means the fused path still costs four launches fewer per layer.
-    INFERX_RETURN_IF_ERROR(Linear(norm, layer.qkv_w, layer.qkv_w8,
-                                  layer.qkv_s, layer.qkv_w4, layer.qkv_s4,
-                                  qkv_v, 0));
+    INFERX_RETURN_IF_ERROR(Linear(norm, layer.qkv_w, layer.qkv_w8, layer.qkv_s,
+                                  layer.qkv_w4, layer.qkv_s4, qkv_v, 0));
     INFERX_RETURN_IF_ERROR(
         kernels::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv, stream));
 
@@ -947,9 +943,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
         // Warmup freeze (uncaptured): learn this layer's K/V scale from the
         // data, then write the cache with it. The readback needs a sync, which
         // is why the freeze runs only here -- before capture, in warmup -- and
-        // never inside a recorded graph. fp8_scratch is the throwaway contiguous
-        // fp8 the dynamic quantize writes; only the scale it leaves behind is
-        // kept.
+        // never inside a recorded graph. fp8_scratch is the throwaway
+        // contiguous fp8 the dynamic quantize writes; only the scale it leaves
+        // behind is kept.
         INFERX_ASSIGN_OR_RETURN(
             const TensorView k_fp8_tmp,
             TensorView::Create(fp8_scratch.data(), DataType::kFloat8E4M3FN,
@@ -966,9 +962,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                                              sizeof(float),
                                              CopyKind::kDeviceToHost));
       }
-      INFERX_RETURN_IF_ERROR(kernels::AppendBf16AsFp8(
-          k3, v3, k_cache, v_cache, slots_v, layer.k_scale, layer.v_scale,
-          stream));
+      INFERX_RETURN_IF_ERROR(kernels::AppendBf16AsFp8(k3, v3, k_cache, v_cache,
+                                                      slots_v, layer.k_scale,
+                                                      layer.v_scale, stream));
     } else {
       INFERX_RETURN_IF_ERROR(
           kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slots_v, stream));
@@ -978,10 +974,10 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     if (use_flashinfer || use_flashinfer_prefill) {
       INFERX_ASSIGN_OR_RETURN(
           const TensorView fi_indices,
-          TensorView::Create(fi_indices_buf.data(), DataType::kInt32,
-                             Shape({static_cast<int64_t>(
-                                 fi_indptr_host.back())}),
-                             comm->device()));
+          TensorView::Create(
+              fi_indices_buf.data(), DataType::kInt32,
+              Shape({static_cast<int64_t>(fi_indptr_host.back())}),
+              comm->device()));
       INFERX_ASSIGN_OR_RETURN(
           const TensorView fi_indptr,
           TensorView::Create(fi_indptr_buf.data(), DataType::kInt32,
@@ -997,9 +993,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
               q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
               attn_scale, layer.k_scale, layer.v_scale, stream));
         } else {
-          INFERX_RETURN_IF_ERROR(flashinfer->Run(
-              q3, k_cache, v_cache, fi_indices, fi_indptr, fi_last_page, a3,
-              attn_scale, stream));
+          INFERX_RETURN_IF_ERROR(
+              flashinfer->Run(q3, k_cache, v_cache, fi_indices, fi_indptr,
+                              fi_last_page, a3, attn_scale, stream));
         }
       } else {
         INFERX_ASSIGN_OR_RETURN(
@@ -1024,36 +1020,34 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
       // The batch's own longest context, not the block table's width. See
       // PagedAttention's contract: sizing the tile from the table made a short
       // prompt demand shared memory proportional to max_seq_len.
-      INFERX_RETURN_IF_ERROR(kernels::PagedAttention(
-          q3, k_cache, v_cache, table_v, seq_v, pos_v, a3, attn_scale,
-          batch_max_context, stream));
+      INFERX_RETURN_IF_ERROR(
+          kernels::PagedAttention(q3, k_cache, v_cache, table_v, seq_v, pos_v,
+                                  a3, attn_scale, batch_max_context, stream));
     }
 
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s,
                                   layer.o_w4, layer.o_s4, x, 1));
-    INFERX_RETURN_IF_ERROR(
-        comm->AllReduceSum(x, stream));
+    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
 
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
         CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
-        x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::RmsNorm(x, layer.post_norm, norm,
+                         static_cast<float>(config.rms_norm_eps), stream));
 
     // Gate and up need no split: SiluMul is elementwise, so it reads both
     // halves straight out of the fused buffer. This fusion is free.
     INFERX_RETURN_IF_ERROR(Linear(norm, layer.gate_up_w, layer.gate_up_w8,
                                   layer.gate_up_s, layer.gate_up_w4,
                                   layer.gate_up_s4, gate_up_v, 2));
-    INFERX_RETURN_IF_ERROR(
-        kernels::SiluMulFused(gate_up_v, gate_v, stream));
+    INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gate_up_v, gate_v, stream));
     INFERX_RETURN_IF_ERROR(Linear(gate_v, layer.down_w, layer.down_w8,
-                                  layer.down_s, layer.down_w4, layer.down_s4,
-                                  x, 3));
-    INFERX_RETURN_IF_ERROR(
-        comm->AllReduceSum(x, stream));
+                                  layer.down_s, layer.down_w4, layer.down_s4, x,
+                                  3));
+    INFERX_RETURN_IF_ERROR(comm->AllReduceSum(x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
 
@@ -1083,8 +1077,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
   if (sample_on_device && sampled_count > 0) {
     INFERX_ASSIGN_OR_RETURN(
         const TensorView wanted,
-        logits.View(DataType::kBFloat16,
-                    Shape({tokens, config.vocab_size})));
+        logits.View(DataType::kBFloat16, Shape({tokens, config.vocab_size})));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView ids_out,
         TensorView::Create(sampled_ids.data(), DataType::kInt32,
@@ -1163,9 +1156,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // temperature 0 inside SampleTokens, so a captured graph records the same
     // node whether the batch is sampling or not -- a branch here would bake
     // whichever mode happened to be live at capture.
-    INFERX_RETURN_IF_ERROR(kernels::SampleTokens(
-        wanted, rows_in, temp_in, top_p_in, top_k_in, min_p_in, seeds_in,
-        ids_out, stream));
+    INFERX_RETURN_IF_ERROR(kernels::SampleTokens(wanted, rows_in, temp_in,
+                                                 top_p_in, top_k_in, min_p_in,
+                                                 seeds_in, ids_out, stream));
 
     // Logprobs of what was just sampled, over the same (post-penalty) logits.
     // Rows that asked for none exit immediately, so this too stays in the
@@ -1195,12 +1188,11 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
           wanted, rows_in, ids_out, k_in, chosen_lp_out, top_ids_out,
           top_lps_out, stream));
 
-      const size_t lp_cap =
-          static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
-      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
-          pinned_lp_chosen, lp_chosen.data(),
-          static_cast<size_t>(sampled_count) * sizeof(float),
-          CopyKind::kDeviceToHost, stream));
+      const size_t lp_cap = static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
+      INFERX_RETURN_IF_ERROR(
+          runtime->CopyAsync(pinned_lp_chosen, lp_chosen.data(),
+                             static_cast<size_t>(sampled_count) * sizeof(float),
+                             CopyKind::kDeviceToHost, stream));
       INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
           pinned_lp_top_ids, lp_top_ids.data(),
           static_cast<size_t>(sampled_count) * lp_cap * sizeof(int32_t),
@@ -1229,23 +1221,21 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // returns immediately on something that was never set, and generation
     // reports thousands of tokens a second while reading a stale buffer. The
     // record lives in StepAsync, after the launch.
-    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
-        pinned_sampled, sampled_ids.data(),
-        static_cast<size_t>(sampled_count) * sizeof(int32_t),
-        CopyKind::kDeviceToHost, stream));
+    INFERX_RETURN_IF_ERROR(
+        runtime->CopyAsync(pinned_sampled, sampled_ids.data(),
+                           static_cast<size_t>(sampled_count) * sizeof(int32_t),
+                           CopyKind::kDeviceToHost, stream));
   }
 
   return OkStatus();
 }
-
 
 Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   INFERX_RETURN_IF_ERROR(PrepareBatchInputs(batch));
 
   const int64_t tokens = batch.num_tokens();
 
-  GraphExec graph =
-      FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
+  GraphExec graph = FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
 
   INFERX_RETURN_IF_ERROR(runtime->RecordEvent(step_begin, stream));
 
@@ -1258,8 +1248,8 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
     // shape may not.
     INFERX_RETURN_IF_ERROR(runtime->LaunchGraph(graph, stream));
   } else {
-    INFERX_RETURN_IF_ERROR(LaunchDecodeBody(tokens, batch.num_seqs,
-                                            batch.max_blocks_per_seq));
+    INFERX_RETURN_IF_ERROR(
+        LaunchDecodeBody(tokens, batch.num_seqs, batch.max_blocks_per_seq));
   }
 
   INFERX_RETURN_IF_ERROR(runtime->RecordEvent(step_end, stream));
@@ -1271,8 +1261,8 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 }
 
 StatusOr<Qwen2Model> Qwen2Model::Load(const ModelConfig& config,
-                                      const Checkpoint& ckpt) {
-  return Load(config, ckpt, std::make_unique<comm::SingleRankComm>());
+                                      const Checkpoint& ckpt, DeviceId device) {
+  return Load(config, ckpt, std::make_unique<comm::SingleRankComm>(device));
 }
 
 StatusOr<Qwen2Model> Qwen2Model::Load(
@@ -1286,16 +1276,15 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   const int tp_rank = communicator->rank();
   const DeviceId device = communicator->device();
   if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size)
-    return InvalidArgumentError("Qwen2Model: invalid TP topology rank=",
-                                tp_rank, " size=", tp_size);
+    return InvalidArgumentError(
+        "Qwen2Model: invalid TP topology rank=", tp_rank, " size=", tp_size);
   if (config.num_attention_heads % tp_size != 0 ||
       config.num_key_value_heads % tp_size != 0 ||
       config.intermediate_size % tp_size != 0) {
     return InvalidArgumentError(
-        "Qwen2Model: TP size ", tp_size,
-        " must divide attention heads ", config.num_attention_heads,
-        ", KV heads ", config.num_key_value_heads, " and intermediate size ",
-        config.intermediate_size);
+        "Qwen2Model: TP size ", tp_size, " must divide attention heads ",
+        config.num_attention_heads, ", KV heads ", config.num_key_value_heads,
+        " and intermediate size ", config.intermediate_size);
   }
 
   if (config.weight_dtype != DataType::kBFloat16) {
@@ -1306,8 +1295,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         "that what runs is what the file contains.");
   }
   if (!device.IsAccelerator()) {
-    return InvalidArgumentError("Qwen2Model requires an accelerator "
-                                "communicator device, got ", device.ToString());
+    return InvalidArgumentError(
+        "Qwen2Model requires an accelerator "
+        "communicator device, got ",
+        device.ToString());
   }
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->SetDevice(device));
@@ -1315,8 +1306,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
                           kernels::CublasLtGemm::Create());
 
-  auto impl =
-      std::make_unique<Impl>(std::move(gemm), std::move(communicator));
+  auto impl = std::make_unique<Impl>(std::move(gemm), std::move(communicator));
   impl->config = config;
   impl->runtime = runtime;
 
@@ -1377,10 +1367,10 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
       return OkStatus();
     };
 
-    INFERX_RETURN_IF_ERROR(load("input_layernorm.weight", Shape({h}),
-                                &w.input_norm));
-    INFERX_RETURN_IF_ERROR(load("post_attention_layernorm.weight", Shape({h}),
-                                &w.post_norm));
+    INFERX_RETURN_IF_ERROR(
+        load("input_layernorm.weight", Shape({h}), &w.input_norm));
+    INFERX_RETURN_IF_ERROR(
+        load("post_attention_layernorm.weight", Shape({h}), &w.post_norm));
 
     // Fetch the three projections and upload them as one tensor. They are
     // concatenated along dim 0, which is contiguous, so the fused weight is
@@ -1434,9 +1424,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
       std::vector<Tensor> gate_up;
       for (const std::string_view name :
            {"mlp.gate_proj.weight", "mlp.up_proj.weight"}) {
-        INFERX_ASSIGN_OR_RETURN(
-            Tensor t,
-            ckpt.GetChecked(absl::StrCat(p, name), Shape({inter, h})));
+        INFERX_ASSIGN_OR_RETURN(Tensor t, ckpt.GetChecked(absl::StrCat(p, name),
+                                                          Shape({inter, h})));
         INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(t), 0));
         gate_up.push_back(std::move(local));
       }
@@ -1449,9 +1438,8 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
 
     {
       INFERX_ASSIGN_OR_RETURN(
-          Tensor host,
-          ckpt.GetChecked(absl::StrCat(p, "mlp.down_proj.weight"),
-                          Shape({h, inter})));
+          Tensor host, ckpt.GetChecked(absl::StrCat(p, "mlp.down_proj.weight"),
+                                       Shape({h, inter})));
       INFERX_ASSIGN_OR_RETURN(Tensor local, shard(std::move(host), 1));
       INFERX_ASSIGN_OR_RETURN(w.down_w, loader.Upload(local));
     }
@@ -1467,8 +1455,7 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
 #ifdef INFERX_WITH_FLASHINFER
   INFERX_ASSIGN_OR_RETURN(kernels::FlashInferDecode fi,
                           kernels::FlashInferDecode::Create());
-  impl->flashinfer =
-      std::make_unique<kernels::FlashInferDecode>(std::move(fi));
+  impl->flashinfer = std::make_unique<kernels::FlashInferDecode>(std::move(fi));
   INFERX_ASSIGN_OR_RETURN(impl->flashinfer_prefill,
                           kernels::FlashInferPrefill::Create());
 #endif
@@ -1480,8 +1467,9 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   return Qwen2Model(std::move(impl));
 }
 
-StatusOr<Qwen2Model> Qwen2Model::LoadFromDirectory(std::string_view dir) {
-  return LoadFromDirectory(dir, std::make_unique<comm::SingleRankComm>());
+StatusOr<Qwen2Model> Qwen2Model::LoadFromDirectory(std::string_view dir,
+                                                   DeviceId device) {
+  return LoadFromDirectory(dir, std::make_unique<comm::SingleRankComm>(device));
 }
 
 StatusOr<Qwen2Model> Qwen2Model::LoadFromDirectory(
@@ -1522,13 +1510,12 @@ Status ValidateIds(const std::vector<int32_t>& ids, int64_t vocab) {
 
 /// Copies a bf16 logits row back to the host as fp32, through pinned memory.
 ///
-/// A vocabulary row is 304 KB, and from pageable memory that copy costs 0.054 ms
-/// of host time per step. Pinned, it is a stream-ordered transfer like any
+/// A vocabulary row is 304 KB, and from pageable memory that copy costs 0.054
+/// ms of host time per step. Pinned, it is a stream-ordered transfer like any
 /// other.
 Status DownloadLogitsPinned(const DeviceBuffer& buf, int64_t offset_elems,
                             int64_t count, void* pinned, DeviceRuntime* runtime,
-                            Stream stream,
-                            std::vector<float>* out) {
+                            Stream stream, std::vector<float>* out) {
   const auto* bits = static_cast<const uint16_t*>(pinned);
 
   INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
@@ -1560,10 +1547,9 @@ Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
   int64_t tokens = 0;
   INFERX_RETURN_IF_ERROR(impl_->RunForward(token_ids, &tokens));
 
-  return DownloadLogitsPinned(impl_->logits.buf, 0,
-                              tokens * impl_->config.vocab_size,
-                              impl_->pinned_logits, impl_->runtime,
-                              impl_->stream, out_logits);
+  return DownloadLogitsPinned(
+      impl_->logits.buf, 0, tokens * impl_->config.vocab_size,
+      impl_->pinned_logits, impl_->runtime, impl_->stream, out_logits);
 }
 
 namespace {
@@ -1587,8 +1573,8 @@ int64_t Qwen2Model::KvBlockBytes(int64_t block_size) const {
 }
 
 Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
-  const KvLayout layout = Qwen2KvLayout(
-      impl_->LocalKvHeads(), impl_->config.head_dim, impl_->fp8_kv);
+  const KvLayout layout = Qwen2KvLayout(impl_->LocalKvHeads(),
+                                        impl_->config.head_dim, impl_->fp8_kv);
 
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
@@ -1601,7 +1587,6 @@ Status Qwen2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
 }
 
 KvBlockPool* Qwen2Model::kv_pool() { return impl_->pool.get(); }
-
 
 Status Qwen2Model::ReserveActivations(int64_t max_tokens) {
   if (max_tokens <= 0) {
@@ -1633,16 +1618,17 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   }
 
   if (num_seqs <= 0 || max_blocks_per_seq <= 0) {
-    return InvalidArgumentError("graph shape must be positive, got num_seqs=",
-                                num_seqs, " max_blocks_per_seq=",
-                                max_blocks_per_seq);
+    return InvalidArgumentError(
+        "graph shape must be positive, got num_seqs=", num_seqs,
+        " max_blocks_per_seq=", max_blocks_per_seq);
   }
 
   // Decode is one token per sequence, which is the only shape worth capturing:
   // prefill lengths vary per request and would need a graph each.
   const int64_t tokens = num_seqs;
 
-  if (impl_->FindGraph(tokens, num_seqs, max_blocks_per_seq).handle != nullptr) {
+  if (impl_->FindGraph(tokens, num_seqs, max_blocks_per_seq).handle !=
+      nullptr) {
     return OkStatus();
   }
 
@@ -1676,8 +1662,8 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   ForwardBatch probe;
   probe.num_seqs = num_seqs;
   probe.max_blocks_per_seq = max_blocks_per_seq;
-  probe.block_table.assign(
-      static_cast<size_t>(num_seqs * max_blocks_per_seq), scratch_block);
+  probe.block_table.assign(static_cast<size_t>(num_seqs * max_blocks_per_seq),
+                           scratch_block);
 
   // The probe stands at the *end* of the longest sequence this shape can serve,
   // not at position 0.
@@ -1691,7 +1677,8 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   // graph reading freed memory. Standing at the last position instead makes the
   // probe span `max_blocks_per_seq` blocks, which is the most any batch of this
   // shape will ever need.
-  const int64_t last_position = max_blocks_per_seq * impl_->pool->block_size() - 1;
+  const int64_t last_position =
+      max_blocks_per_seq * impl_->pool->block_size() - 1;
 
   for (int64_t s = 0; s < num_seqs; ++s) {
     probe.token_ids.push_back(0);
@@ -1739,7 +1726,6 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
 int64_t Qwen2Model::captured_graphs() const {
   return static_cast<int64_t>(impl_->graphs.size());
 }
-
 
 // The M2 full-recompute path predates the KV cache and runs everything on the
 // default stream. It is a reference and debugging path, not a serving one, and
@@ -1839,7 +1825,8 @@ Status Qwen2Model::QuantizeWeightsToF8() {
   for (const DeviceBuffer& b : impl_->weight_buffers) {
     impl_->weight_bytes += b.size();
   }
-  for (const DeviceBuffer& b : impl_->f8_buffers) impl_->weight_bytes += b.size();
+  for (const DeviceBuffer& b : impl_->f8_buffers)
+    impl_->weight_bytes += b.size();
 
   impl_->weights_f8 = true;
 
@@ -1879,9 +1866,9 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
                                impl_->comm->device()));
     impl_->int4_buffers.push_back(std::move(packed_buf));
     INFERX_ASSIGN_OR_RETURN(
-        *packed, TensorView::Create(impl_->int4_buffers.back().data(),
-                                    DataType::kInt4, src.GetShape(),
-                                    impl_->comm->device()));
+        *packed,
+        TensorView::Create(impl_->int4_buffers.back().data(), DataType::kInt4,
+                           src.GetShape(), impl_->comm->device()));
 
     INFERX_ASSIGN_OR_RETURN(
         DeviceBuffer scale_buf,
@@ -1890,11 +1877,10 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
             impl_->comm->device()));
     impl_->int4_buffers.push_back(std::move(scale_buf));
     INFERX_ASSIGN_OR_RETURN(
-        *scales,
-        TensorView::Create(impl_->int4_buffers.back().data(),
-                           DataType::kBFloat16,
-                           Shape({rows, cols / Impl::kInt4Group}),
-                           impl_->comm->device()));
+        *scales, TensorView::Create(impl_->int4_buffers.back().data(),
+                                    DataType::kBFloat16,
+                                    Shape({rows, cols / Impl::kInt4Group}),
+                                    impl_->comm->device()));
 
     return kernels::QuantizeBf16ToInt4(src, *packed, *scales, impl_->stream);
   };
@@ -1902,23 +1888,25 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
   for (LayerWeights& w : impl_->layers) {
     INFERX_RETURN_IF_ERROR(quantize(w.qkv_w, &w.qkv_w4, &w.qkv_s4));
     INFERX_RETURN_IF_ERROR(quantize(w.o_w, &w.o_w4, &w.o_s4));
-    INFERX_RETURN_IF_ERROR(
-        quantize(w.gate_up_w, &w.gate_up_w4, &w.gate_up_s4));
+    INFERX_RETURN_IF_ERROR(quantize(w.gate_up_w, &w.gate_up_w4, &w.gate_up_s4));
     INFERX_RETURN_IF_ERROR(quantize(w.down_w, &w.down_w4, &w.down_s4));
   }
   INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
   for (const LayerWeights& w : impl_->layers) {
     for (const int index : {w.qkv_buf, w.o_buf, w.gate_up_buf, w.down_buf}) {
-      if (index >= 0 && index < static_cast<int>(impl_->weight_buffers.size())) {
+      if (index >= 0 &&
+          index < static_cast<int>(impl_->weight_buffers.size())) {
         impl_->weight_buffers[static_cast<size_t>(index)].Reset();
       }
     }
   }
 
   impl_->weight_bytes = 0;
-  for (const DeviceBuffer& b : impl_->weight_buffers) impl_->weight_bytes += b.size();
-  for (const DeviceBuffer& b : impl_->int4_buffers) impl_->weight_bytes += b.size();
+  for (const DeviceBuffer& b : impl_->weight_buffers)
+    impl_->weight_bytes += b.size();
+  for (const DeviceBuffer& b : impl_->int4_buffers)
+    impl_->weight_bytes += b.size();
   impl_->weights_int4 = true;
   return OkStatus();
 }
@@ -2033,21 +2021,18 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
       impl_->lp_chosen,
       DeviceBuffer::Allocate(rows * sizeof(float), impl_->comm->device()));
   INFERX_ASSIGN_OR_RETURN(
-      impl_->lp_top_ids,
-      DeviceBuffer::Allocate(rows * kMaxLp * sizeof(int32_t),
-                             impl_->comm->device()));
-  INFERX_ASSIGN_OR_RETURN(
-      impl_->lp_top_lps,
-      DeviceBuffer::Allocate(rows * kMaxLp * sizeof(float),
-                             impl_->comm->device()));
+      impl_->lp_top_ids, DeviceBuffer::Allocate(rows * kMaxLp * sizeof(int32_t),
+                                                impl_->comm->device()));
+  INFERX_ASSIGN_OR_RETURN(impl_->lp_top_lps,
+                          DeviceBuffer::Allocate(rows * kMaxLp * sizeof(float),
+                                                 impl_->comm->device()));
 
   if (impl_->pinned_sampled != nullptr)
     INFERX_RETURN_IF_ERROR(
         impl_->runtime->FreePinnedHost(impl_->pinned_sampled));
-  INFERX_ASSIGN_OR_RETURN(
-      impl_->pinned_sampled,
-      impl_->runtime->AllocatePinnedHost(
-          static_cast<size_t>(max_rows) * sizeof(int32_t)));
+  INFERX_ASSIGN_OR_RETURN(impl_->pinned_sampled,
+                          impl_->runtime->AllocatePinnedHost(
+                              static_cast<size_t>(max_rows) * sizeof(int32_t)));
   if (impl_->pinned_lp_chosen != nullptr) {
     INFERX_RETURN_IF_ERROR(
         impl_->runtime->FreePinnedHost(impl_->pinned_lp_chosen));
@@ -2080,8 +2065,7 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
   return OkStatus();
 }
 
-Status Qwen2Model::ReadSampledLogprobs(
-    std::vector<SampledLogprob>* out) const {
+Status Qwen2Model::ReadSampledLogprobs(std::vector<SampledLogprob>* out) const {
   out->clear();
   if (impl_->pinned_lp_chosen == nullptr) {
     return FailedPreconditionError(
@@ -2156,10 +2140,10 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
       return impl_->runtime->CopyAsync(dst.data(), src, bytes,
                                        CopyKind::kHostToDevice, impl_->stream);
     };
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_rows, rows.data(), rows.size() * sizeof(int32_t)));
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_slots, slots.data(), slots.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(
+        upload(impl_->sample_rows, rows.data(), rows.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_slots, slots.data(),
+                                  slots.size() * sizeof(int32_t)));
 
     // Per-row sampling parameters. Absent means greedy with everything off,
     // so a caller that never heard of sampling keeps the behaviour it had.
@@ -2206,14 +2190,14 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
       mask_ids = batch.mask_token_ids;
     }
 
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_temp, temps.data(), temps.size() * sizeof(float)));
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_top_p, tops.data(), tops.size() * sizeof(float)));
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_top_k, top_ks.data(), top_ks.size() * sizeof(int32_t)));
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_min_p, min_ps.data(), min_ps.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(
+        upload(impl_->sample_temp, temps.data(), temps.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(
+        upload(impl_->sample_top_p, tops.data(), tops.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_top_k, top_ks.data(),
+                                  top_ks.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_min_p, min_ps.data(),
+                                  min_ps.size() * sizeof(float)));
     INFERX_RETURN_IF_ERROR(upload(impl_->sample_presence, presences.data(),
                                   presences.size() * sizeof(float)));
     INFERX_RETURN_IF_ERROR(upload(impl_->sample_frequency, frequencies.data(),
@@ -2229,8 +2213,8 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
     INFERX_RETURN_IF_ERROR(upload(impl_->sample_logprobs_k, logprob_ks.data(),
                                   logprob_ks.size() * sizeof(int32_t)));
     impl_->last_logprob_ks = std::move(logprob_ks);
-    INFERX_RETURN_IF_ERROR(upload(
-        impl_->sample_seeds, seeds.data(), seeds.size() * sizeof(uint64_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_seeds, seeds.data(),
+                                  seeds.size() * sizeof(uint64_t)));
   }
 
   const int64_t tokens = batch.num_tokens();
@@ -2239,11 +2223,10 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
       impl_->FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
 
   if (graph.handle != nullptr) {
-    INFERX_RETURN_IF_ERROR(
-        impl_->runtime->LaunchGraph(graph, impl_->stream));
+    INFERX_RETURN_IF_ERROR(impl_->runtime->LaunchGraph(graph, impl_->stream));
   } else {
-    INFERX_RETURN_IF_ERROR(impl_->LaunchDecodeBody(
-        tokens, batch.num_seqs, batch.max_blocks_per_seq));
+    INFERX_RETURN_IF_ERROR(impl_->LaunchDecodeBody(tokens, batch.num_seqs,
+                                                   batch.max_blocks_per_seq));
   }
 
   // Recorded here rather than inside the body, so it is a real host-visible
@@ -2270,9 +2253,7 @@ Status Qwen2Model::AwaitStep(std::vector<int32_t>* out_tokens) {
   return OkStatus();
 }
 
-double Qwen2Model::last_step_device_ms() const {
-  return impl_->last_device_ms;
-}
+double Qwen2Model::last_step_device_ms() const { return impl_->last_device_ms; }
 
 Status Qwen2Model::Step(const ForwardBatch& batch,
                         std::vector<float>* out_logits) {
@@ -2284,8 +2265,7 @@ Status Qwen2Model::Step(const ForwardBatch& batch,
   const int64_t total_slots =
       impl_->pool->num_blocks() * impl_->pool->block_size();
 
-  INFERX_RETURN_IF_ERROR(
-      batch.Validate(impl_->config.vocab_size, total_slots));
+  INFERX_RETURN_IF_ERROR(batch.Validate(impl_->config.vocab_size, total_slots));
 
   INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(batch));
 
@@ -2295,8 +2275,7 @@ Status Qwen2Model::Step(const ForwardBatch& batch,
   const int64_t vocab = impl_->config.vocab_size;
 
   out_logits->clear();
-  out_logits->reserve(batch.logits_indices.size() *
-                      static_cast<size_t>(vocab));
+  out_logits->reserve(batch.logits_indices.size() * static_cast<size_t>(vocab));
 
   for (const int32_t index : batch.logits_indices) {
     std::vector<float> row;

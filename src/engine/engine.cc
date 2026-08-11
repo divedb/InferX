@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "inferx/api/openai.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/model/deepseek_v2.h"
 #include "inferx/model/forward_batch.h"
 #include "inferx/model/gpt_oss.h"
@@ -1070,6 +1071,14 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     return InvalidArgumentError(
         "TP=1 requires comm_backend=single and TP=2 requires nccl");
   }
+  if (config.comm_backend == "nccl" &&
+      config.device_kind != DeviceKind::kCuda) {
+    return InvalidArgumentError("comm_backend=nccl requires device_kind=cuda");
+  }
+  const DeviceId primary_device = DeviceId::For(
+      config.device_kind, static_cast<int8_t>(config.devices.front()));
+  INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(primary_device));
+  INFERX_RETURN_IF_ERROR(runtime->SetDevice(primary_device));
 
   INFERX_ASSIGN_OR_RETURN(std::unique_ptr<tokenizer::Tokenizer> tok,
                           tokenizer::Tokenizer::LoadFrom(config.model_dir));
@@ -1113,8 +1122,9 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       LOG(INFO) << "DeepSeek-V2 serves without CUDA graphs by design; "
                    "graph capture is skipped";
     }
-    INFERX_ASSIGN_OR_RETURN(model::DeepseekV2Model deepseek,
-                            model::DeepseekV2Model::Load(config.model_dir));
+    INFERX_ASSIGN_OR_RETURN(
+        model::DeepseekV2Model deepseek,
+        model::DeepseekV2Model::Load(config.model_dir, primary_device));
 
     // The latent cache: 576 elements/token/layer for V2-Lite against a GQA
     // model's thousands, so the same block count buys ~14x the cached context.
@@ -1129,7 +1139,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
                 .min_blocks =
                     (config.scheduler.max_seq_len + config.block_size - 1) /
                     config.block_size},
-            DeviceId::Cuda(static_cast<int8_t>(config.devices.front()))));
+            primary_device));
     INFERX_RETURN_IF_ERROR(
         deepseek.AttachKvCache(kv_blocks, config.block_size));
 
@@ -1158,8 +1168,9 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
           "gpt-oss architecture");
     }
 
-    INFERX_ASSIGN_OR_RETURN(model::GptOssModel gpt_oss,
-                            model::GptOssModel::Load(config.model_dir));
+    INFERX_ASSIGN_OR_RETURN(
+        model::GptOssModel gpt_oss,
+        model::GptOssModel::Load(config.model_dir, primary_device));
 
     // Attach a paged KV cache so the scheduler can batch multiple sequences.
     // gpt-oss has 24 layers × 8 kv_heads × 64 head_dim × 2 (bf16) = 2048
@@ -1176,7 +1187,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
                 .min_blocks =
                     (config.scheduler.max_seq_len + config.block_size - 1) /
                     config.block_size},
-            DeviceId::Cuda(static_cast<int8_t>(config.devices.front()))));
+            primary_device));
     INFERX_RETURN_IF_ERROR(gpt_oss.AttachKvCache(kv_blocks, config.block_size));
 
     INFERX_ASSIGN_OR_RETURN(
@@ -1206,6 +1217,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
   } else {
     QwenRunnerConfig runner_config;
     runner_config.model_dir = config.model_dir;
+    runner_config.device_kind = config.device_kind;
     runner_config.devices = config.devices;
     runner_config.use_nccl = config.comm_backend == "nccl";
     runner_config.collective_timing_sample_every =

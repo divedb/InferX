@@ -29,14 +29,13 @@ struct Scratch {
   DeviceBuffer buf;
 
   StatusOr<TensorView> View(DataType dtype, const Shape& shape) const {
-    return TensorView::Create(buf.data(), dtype, shape, DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), dtype, shape, buf.device());
   }
 };
 
-Status Grow(Scratch* s, size_t bytes) {
+Status Grow(Scratch* s, size_t bytes, DeviceId device) {
   if (s->buf.size() >= bytes) return OkStatus();
-  INFERX_ASSIGN_OR_RETURN(s->buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(s->buf, DeviceBuffer::Allocate(bytes, device));
   return OkStatus();
 }
 
@@ -113,6 +112,7 @@ struct DeepseekV2Model::Impl {
   }
 
   ModelConfig config;
+  DeviceId device;
 
   std::vector<DeviceBuffer> weight_buffers;
   std::vector<LayerWeights> layers;
@@ -157,16 +157,18 @@ Status DeepseekV2Model::Impl::EnsureCapacity(int64_t tokens) {
   // expert's 1408.
   const int64_t dense_inter = config.intermediate_size;
 
-  INFERX_RETURN_IF_ERROR(Grow(&ids, sizeof(int32_t) * tokens));
-  INFERX_RETURN_IF_ERROR(Grow(&positions, sizeof(int32_t) * tokens));
-  INFERX_RETURN_IF_ERROR(Grow(&hidden, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&residual, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&normed, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&ffn_out, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&dense_gate_up, sz * tokens * 2 * dense_inter));
-  INFERX_RETURN_IF_ERROR(Grow(&dense_act, sz * tokens * dense_inter));
-  INFERX_RETURN_IF_ERROR(Grow(&logits, sz * tokens * config.vocab_size));
+  INFERX_RETURN_IF_ERROR(Grow(&ids, sizeof(int32_t) * tokens, device));
+  INFERX_RETURN_IF_ERROR(Grow(&positions, sizeof(int32_t) * tokens, device));
+  INFERX_RETURN_IF_ERROR(Grow(&hidden, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&residual, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&normed, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&ffn_out, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&dense_gate_up, sz * tokens * 2 * dense_inter, device));
+  INFERX_RETURN_IF_ERROR(Grow(&dense_act, sz * tokens * dense_inter, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&logits, sz * tokens * config.vocab_size, device));
 
   capacity_tokens = tokens;
   return OkStatus();
@@ -180,16 +182,16 @@ Status DeepseekV2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   const int64_t table_elems = batch.num_seqs * batch.max_blocks_per_seq;
   if (table_elems > block_table_capacity) {
     INFERX_ASSIGN_OR_RETURN(
-        block_table_buf, DeviceBuffer::Allocate(
-                             static_cast<size_t>(table_elems) * sizeof(int32_t),
-                             DeviceId::Cuda(0)));
+        block_table_buf,
+        DeviceBuffer::Allocate(
+            static_cast<size_t>(table_elems) * sizeof(int32_t), device));
     block_table_capacity = table_elems;
   }
 
   const size_t tok_bytes = static_cast<size_t>(tokens) * sizeof(int32_t);
   if (slots_buf.size() < tok_bytes) {
-    INFERX_ASSIGN_OR_RETURN(
-        slots_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(slots_buf,
+                            DeviceBuffer::Allocate(tok_bytes, device));
   }
 
   INFERX_RETURN_IF_ERROR(runtime->CopyAsync(ids.buf.data(),
@@ -243,8 +245,7 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   const auto i32 = [&](const DeviceBuffer& buf,
                        const Shape& shape) -> StatusOr<TensorView> {
-    return TensorView::Create(buf.data(), DataType::kInt32, shape,
-                              DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), DataType::kInt32, shape, device);
   };
 
   INFERX_ASSIGN_OR_RETURN(const TensorView ids_v,
@@ -358,7 +359,8 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
   return OkStatus();
 }
 
-StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
+StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir,
+                                                DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(ModelConfig config, ModelConfig::FromDirectory(dir));
 
   if (config.architecture != Architecture::kDeepSeekV2) {
@@ -375,9 +377,9 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                           kernels::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(gemm));
-  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(DeviceId::Cuda(0)));
-  INFERX_ASSIGN_OR_RETURN(impl->stream,
-                          impl->runtime->CreateStream(DeviceId::Cuda(0)));
+  impl->device = device;
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
+  INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream(device));
 
   const int64_t h = config.hidden_size;
   const int64_t heads = config.num_attention_heads;
@@ -393,7 +395,10 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   // copies, chunked device allocation. Views it returns are not readable
   // until Finish()/Release() below — everything loads, then the pipeline
   // drains once.
-  INFERX_ASSIGN_OR_RETURN(WeightLoader loader, WeightLoader::Create(&ckpt));
+  WeightLoader::Options loader_options;
+  loader_options.device = device;
+  INFERX_ASSIGN_OR_RETURN(WeightLoader loader,
+                          WeightLoader::Create(&ckpt, loader_options));
 
   INFERX_ASSIGN_OR_RETURN(
       impl->embed,
@@ -572,9 +577,8 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
 
   INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
-  INFERX_ASSIGN_OR_RETURN(
-      MlaAttentionLayer mla,
-      MlaAttentionLayer::Create(config, 1, 1, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(MlaAttentionLayer mla,
+                          MlaAttentionLayer::Create(config, 1, 1, device));
   impl->mla = std::make_unique<MlaAttentionLayer>(std::move(mla));
 
   MoeFfn::Config moe_config;
@@ -589,8 +593,7 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       static_cast<float>(config.routed_scaling_factor);
   moe_config.activation = MoeFfn::Activation::kSiluMul;
 
-  INFERX_ASSIGN_OR_RETURN(MoeFfn moe,
-                          MoeFfn::Create(moe_config, 1, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(MoeFfn moe, MoeFfn::Create(moe_config, 1, device));
   impl->moe = std::make_unique<MoeFfn>(std::move(moe));
 
   return DeepseekV2Model(std::move(impl));
@@ -613,9 +616,9 @@ int64_t DeepseekV2Model::KvBlockBytes(int64_t block_size) const {
 Status DeepseekV2Model::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
-      KvBlockPool::Create(impl_->config.num_hidden_layers, num_blocks,
-                          block_size,
-                          MlaAttentionLayer::LayoutFor(impl_->config)));
+      KvBlockPool::Create(
+          impl_->config.num_hidden_layers, num_blocks, block_size,
+          MlaAttentionLayer::LayoutFor(impl_->config), impl_->device));
 
   impl_->pool = std::make_unique<KvBlockPool>(std::move(pool));
   return OkStatus();
@@ -702,7 +705,8 @@ Status DeepseekV2Model::Forward(const std::vector<int32_t>& token_ids,
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,
       KvBlockPool::Create(impl_->config.num_hidden_layers, blocks, kBlockSize,
-                          MlaAttentionLayer::LayoutFor(impl_->config)));
+                          MlaAttentionLayer::LayoutFor(impl_->config),
+                          impl_->device));
   auto temp = std::make_unique<KvBlockPool>(std::move(pool));
 
   ForwardBatch batch;

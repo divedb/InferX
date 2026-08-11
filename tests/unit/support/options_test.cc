@@ -42,13 +42,27 @@ class ServeOptionsTest : public ::testing::Test {
 
 TEST_F(ServeOptionsTest, VllmCanonicalNamesPopulateConfig) {
   int exit_code = 0;
-  auto options = ParseWithModel(
-      {"--max-num-seqs", "4", "--max-model-len", "4096",
-       "--num-gpu-blocks-override", "512", "--enforce-eager", "--dtype",
-       "bfloat16", "--quantization", "fp8", "--kv-cache-dtype", "fp8",
-       "--device-ids", "0", "--gpu-memory-utilization", "0.5",
-       "--max-num-batched-tokens", "1024", "--no-enable-prefix-caching"},
-      &exit_code);
+  auto options = ParseWithModel({"--max-num-seqs",
+                                 "4",
+                                 "--max-model-len",
+                                 "4096",
+                                 "--num-gpu-blocks-override",
+                                 "512",
+                                 "--enforce-eager",
+                                 "--dtype",
+                                 "bfloat16",
+                                 "--quantization",
+                                 "fp8",
+                                 "--kv-cache-dtype",
+                                 "fp8",
+                                 "--device-ids",
+                                 "0",
+                                 "--gpu-memory-utilization",
+                                 "0.5",
+                                 "--max-num-batched-tokens",
+                                 "1024",
+                                 "--no-enable-prefix-caching"},
+                                &exit_code);
   ASSERT_TRUE(options.has_value());
   EXPECT_EQ(options->engine.model_dir, model_dir_.string());
   EXPECT_EQ(options->engine.scheduler.max_running, 4);
@@ -93,22 +107,28 @@ TEST_F(ServeOptionsTest, DeprecatedAliasesStillParse) {
 
 TEST_F(ServeOptionsTest, AliasAndCanonicalTogetherIsAnError) {
   int exit_code = 0;
-  EXPECT_FALSE(ParseWithModel({"--max-running", "5", "--max-num-seqs", "6"},
-                              &exit_code)
-                   .has_value());
+  EXPECT_FALSE(
+      ParseWithModel({"--max-running", "5", "--max-num-seqs", "6"}, &exit_code)
+          .has_value());
   EXPECT_EQ(exit_code, 2);
 }
 
 TEST_F(ServeOptionsTest, DerivationsPreserved) {
   int exit_code = 0;
-  auto options = ParseWithModel(
-      {"--tensor-parallel-size", "2", "--device-ids", "0,1", "--max-model-len",
-       "8192"},
-      &exit_code);
+  auto options = ParseWithModel({"--tensor-parallel-size", "2", "--device-ids",
+                                 "0,1", "--max-model-len", "8192"},
+                                &exit_code);
   ASSERT_TRUE(options.has_value());
   EXPECT_EQ(options->engine.comm_backend, "nccl");
   // Unset, the token budget still derives from the sequence cap.
   EXPECT_EQ(options->engine.scheduler.max_batch_tokens, 8192);
+}
+
+TEST_F(ServeOptionsTest, ParsesExecutionBackend) {
+  int exit_code = 0;
+  auto options = ParseWithModel({"--device", "rocm"}, &exit_code);
+  ASSERT_TRUE(options.has_value());
+  EXPECT_EQ(options->engine.device_kind, DeviceKind::kRocm);
 }
 
 TEST_F(ServeOptionsTest, DtypeOtherThanBf16IsAnError) {
@@ -126,15 +146,15 @@ TEST_F(ServeOptionsTest, UnsupportedQuantizationIsAnError) {
 
 TEST_F(ServeOptionsTest, UnsupportedKvCacheDtypeIsAnError) {
   int exit_code = 0;
-  EXPECT_FALSE(ParseWithModel({"--kv-cache-dtype", "fp8_e5m2"}, &exit_code)
-                   .has_value());
+  EXPECT_FALSE(
+      ParseWithModel({"--kv-cache-dtype", "fp8_e5m2"}, &exit_code).has_value());
   EXPECT_EQ(exit_code, 2);
 }
 
 TEST_F(ServeOptionsTest, ChunkedPrefillCannotBeDisabled) {
   int exit_code = 0;
-  EXPECT_FALSE(ParseWithModel({"--no-enable-chunked-prefill"}, &exit_code)
-                   .has_value());
+  EXPECT_FALSE(
+      ParseWithModel({"--no-enable-chunked-prefill"}, &exit_code).has_value());
   EXPECT_EQ(exit_code, 2);
   auto options = ParseWithModel({"--enable-chunked-prefill"}, &exit_code);
   EXPECT_TRUE(options.has_value());
@@ -171,17 +191,17 @@ TEST_F(ServeOptionsTest, CompatStubAtNonDefaultIsAnError) {
 
 TEST_F(ServeOptionsTest, AcceptAnyStubParses) {
   int exit_code = 0;
-  EXPECT_TRUE(ParseWithModel({"--trust-remote-code", "--disable-log-stats"},
-                             &exit_code)
-                  .has_value());
+  EXPECT_TRUE(
+      ParseWithModel({"--trust-remote-code", "--disable-log-stats"}, &exit_code)
+          .has_value());
 }
 
 TEST_F(ServeOptionsTest, HttpExtensionKnobs) {
   int exit_code = 0;
-  auto options = ParseWithModel(
-      {"--max-active-requests", "64", "--request-timeout", "120",
-       "--io-threads", "2"},
-      &exit_code);
+  auto options =
+      ParseWithModel({"--max-active-requests", "64", "--request-timeout", "120",
+                      "--io-threads", "2"},
+                     &exit_code);
   ASSERT_TRUE(options.has_value());
   EXPECT_EQ(options->http.max_active_requests, 64u);
   EXPECT_EQ(options->http.request_timeout_seconds, 120);
@@ -196,8 +216,7 @@ TEST_F(ServeOptionsTest, TomlConfigFileRoundTrips) {
     out << "max-num-seqs = 6\nmax-model-len = 4096\n";
   }
   int exit_code = 0;
-  auto options =
-      ParseWithModel({"--config", config.string()}, &exit_code);
+  auto options = ParseWithModel({"--config", config.string()}, &exit_code);
   ASSERT_TRUE(options.has_value());
   EXPECT_EQ(options->engine.scheduler.max_running, 6);
   EXPECT_EQ(options->engine.scheduler.max_seq_len, 4096);

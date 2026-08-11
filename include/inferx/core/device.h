@@ -73,6 +73,10 @@ struct DeviceId {
     return DeviceId(DeviceKind::kAscend, ordinal);
   }
 
+  static constexpr DeviceId For(DeviceKind kind, int8_t ordinal = 0) {
+    return kind == DeviceKind::kCpu ? Cpu() : DeviceId(kind, ordinal);
+  }
+
   /// \brief True if this device is the host (CPU).
   constexpr bool IsCpu() const { return kind == DeviceKind::kCpu; }
 

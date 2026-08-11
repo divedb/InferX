@@ -249,11 +249,11 @@ class RankWorker {
  private:
   void ThreadMain() {
     const int device = config_.devices[static_cast<size_t>(rank_)];
-    auto runtime = RuntimeFor(DeviceId::Cuda(static_cast<int8_t>(device)));
+    const DeviceId placement =
+        DeviceId::For(config_.device_kind, static_cast<int8_t>(device));
+    auto runtime = RuntimeFor(placement);
     Status status =
-        runtime.ok()
-            ? (*runtime)->SetDevice(DeviceId::Cuda(static_cast<int8_t>(device)))
-            : runtime.status();
+        runtime.ok() ? (*runtime)->SetDevice(placement) : runtime.status();
     if (status.ok()) {
       comm::NcclCommConfig comm_config;
       comm_config.rank = rank_;
@@ -273,8 +273,7 @@ class RankWorker {
           status = loaded.status();
         } else {
           model_ = std::make_unique<model::Qwen2Model>(std::move(*loaded));
-          status = ConfigureModel(model_.get(), config_,
-                                  DeviceId::Cuda(static_cast<int8_t>(device)),
+          status = ConfigureModel(model_.get(), config_, placement,
                                   rendezvous_.get(), &agreed_with_peer_);
           if (status.ok()) pool_ = model_->kv_pool();
         }
@@ -472,6 +471,9 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
     return InvalidArgumentError("FP8 and int4 weights are mutually exclusive");
   }
   if (config.use_nccl) {
+    if (config.device_kind != DeviceKind::kCuda) {
+      return InvalidArgumentError("NCCL requires CUDA devices");
+    }
     INFERX_ASSIGN_OR_RETURN(auto runner, NcclQwenRunner::Create(config));
     return std::unique_ptr<QwenRunner>(std::move(runner));
   }
@@ -480,13 +482,11 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   }
 
   const int device = config.devices.front();
-  INFERX_ASSIGN_OR_RETURN(
-      DeviceRuntime * runtime,
-      RuntimeFor(DeviceId::Cuda(static_cast<int8_t>(device))));
-  INFERX_RETURN_IF_ERROR(
-      runtime->SetDevice(DeviceId::Cuda(static_cast<int8_t>(device))));
-  auto communicator = std::make_unique<comm::SingleRankComm>(
-      DeviceId::Cuda(static_cast<int8_t>(device)));
+  const DeviceId placement =
+      DeviceId::For(config.device_kind, static_cast<int8_t>(device));
+  INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(placement));
+  INFERX_RETURN_IF_ERROR(runtime->SetDevice(placement));
+  auto communicator = std::make_unique<comm::SingleRankComm>(placement);
   auto communication = std::make_shared<comm::CommMetrics>();
   std::unique_ptr<comm::Communicator> observed = comm::ObserveCommunicator(
       std::move(communicator), communication,
@@ -495,9 +495,8 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
                           model::Qwen2Model::LoadFromDirectory(
                               config.model_dir, std::move(observed)));
   bool agreed = false;
-  INFERX_RETURN_IF_ERROR(ConfigureModel(
-      &model, config, DeviceId::Cuda(static_cast<int8_t>(device)), nullptr,
-      &agreed));
+  INFERX_RETURN_IF_ERROR(
+      ConfigureModel(&model, config, placement, nullptr, &agreed));
   return std::unique_ptr<QwenRunner>(std::make_unique<SingleQwenRunner>(
       std::move(model), device, std::move(communication)));
 }

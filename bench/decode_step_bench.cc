@@ -64,9 +64,9 @@ model::ForwardBatch MakeDecodeBatch(int64_t batch, int64_t context,
     }
 
     const int64_t pos = context - 1;
-    const int32_t block = static_cast<int32_t>(
-        b.block_table[static_cast<size_t>(s * max_blocks_per_seq +
-                                          pos / block_size)]);
+    const int32_t block =
+        static_cast<int32_t>(b.block_table[static_cast<size_t>(
+            s * max_blocks_per_seq + pos / block_size)]);
 
     b.token_ids.push_back(785);
     b.positions.push_back(static_cast<int32_t>(pos));
@@ -87,12 +87,17 @@ int Main(int argc, char** argv) {
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg == "--warmup" && i + 1 < argc) warmup = std::atoi(argv[++i]);
-    else if (arg == "--iters" && i + 1 < argc) iters = std::atoi(argv[++i]);
-    else if (arg == "--fp8") fp8 = true;
-    else if (arg == "--fp8-kv") fp8_kv = true;
+    if (arg == "--warmup" && i + 1 < argc)
+      warmup = std::atoi(argv[++i]);
+    else if (arg == "--iters" && i + 1 < argc)
+      iters = std::atoi(argv[++i]);
+    else if (arg == "--fp8")
+      fp8 = true;
+    else if (arg == "--fp8-kv")
+      fp8_kv = true;
     else {
-      std::fprintf(stderr, "usage: %s [--warmup N] [--iters N] [--fp8] [--fp8-kv]\n",
+      std::fprintf(stderr,
+                   "usage: %s [--warmup N] [--iters N] [--fp8] [--fp8-kv]\n",
                    argv[0]);
       return 2;
     }
@@ -103,7 +108,8 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());
@@ -126,8 +132,7 @@ int Main(int argc, char** argv) {
   }
 
   if (const Status s = model.AttachKvCache(2048, block_size); !s.ok()) {
-    std::fprintf(stderr, "cannot attach KV cache: %s\n",
-                 s.ToString().c_str());
+    std::fprintf(stderr, "cannot attach KV cache: %s\n", s.ToString().c_str());
     return 1;
   }
 
@@ -137,8 +142,8 @@ int Main(int argc, char** argv) {
   // one output slot per logits row, so a smaller reservation made the last two
   // batches fail inside the timing loop -- reported as a capture error, which
   // reads like a graph bug and is not one.
-  constexpr int64_t kMaxBatch = *std::max_element(std::begin(kBatches),
-                                                  std::end(kBatches));
+  constexpr int64_t kMaxBatch =
+      *std::max_element(std::begin(kBatches), std::end(kBatches));
 
   // Sized for the largest batch before anything is captured. FP8's activation
   // staging buffer is allocated on demand, so capturing batch 1 and then
@@ -167,10 +172,10 @@ int Main(int argc, char** argv) {
   std::printf("weights: %s, %.2f GB\n", fp8 ? "fp8 e4m3" : "bf16",
               model.WeightBytes() / 1e9);
   std::printf("kv cache: %s, %.2f GB (%.0fM tokens at this pool size)\n",
-              fp8_kv ? "fp8 e4m3" : "bf16",
-              model.kv_pool()->bytes() / 1e9,
+              fp8_kv ? "fp8 e4m3" : "bf16", model.kv_pool()->bytes() / 1e9,
               static_cast<double>(model.kv_pool()->num_blocks() *
-                                  model.kv_pool()->block_size()) / 1e6);
+                                  model.kv_pool()->block_size()) /
+                  1e6);
   std::printf("decode step, context %ld, one token per sequence\n\n",
               static_cast<long>(kContext));
 
@@ -191,8 +196,8 @@ int Main(int argc, char** argv) {
     std::vector<float> logits;
 
     // Launch-by-launch, before any graph exists for this shape.
-    auto launches = TimeLaunch([&] { return model.Step(b, &logits); },
-                               warmup, iters);
+    auto launches =
+        TimeLaunch([&] { return model.Step(b, &logits); }, warmup, iters);
     if (!launches.ok()) {
       std::fprintf(stderr, "batch %ld failed: %s\n", static_cast<long>(batch),
                    launches.status().ToString().c_str());
@@ -209,8 +214,8 @@ int Main(int argc, char** argv) {
     }
 
     // The same call: Step now finds a graph for this shape and replays it.
-    auto graphed = TimeLaunch([&] { return model.Step(b, &logits); }, warmup,
-                              iters);
+    auto graphed =
+        TimeLaunch([&] { return model.Step(b, &logits); }, warmup, iters);
     if (!graphed.ok()) {
       std::fprintf(stderr, "batch %ld graphed failed: %s\n",
                    static_cast<long>(batch),
@@ -232,8 +237,7 @@ int Main(int argc, char** argv) {
     std::printf("%6ld %14.4f %14.4f %9.4f %9.4f %9.1f  %6.2fx\n",
                 static_cast<long>(batch), launches->min_ms, graphed->min_ms,
                 device_ms, graphed->min_ms - device_ms,
-                graphed->noise() * 100.0,
-                launches->min_ms / graphed->min_ms);
+                graphed->noise() * 100.0, launches->min_ms / graphed->min_ms);
   }
 
   std::printf("\ncaptured graphs: %ld\n",
@@ -328,9 +332,10 @@ int Main(int argc, char** argv) {
     const double sync_ms = best_host;
     const double sampled_ms = best_gpu;
 
-    std::printf("\nsustained generation, batch 1 (interleaved, per-burst minima):\n");
-    std::printf("  host sampling  %.4f ms/token  %6.1f tok/s\n",
-                sync_ms, 1000.0 / sync_ms);
+    std::printf(
+        "\nsustained generation, batch 1 (interleaved, per-burst minima):\n");
+    std::printf("  host sampling  %.4f ms/token  %6.1f tok/s\n", sync_ms,
+                1000.0 / sync_ms);
     std::printf("  gpu sampling   %.4f ms/token  %6.1f tok/s   %.2fx\n",
                 sampled_ms, 1000.0 / sampled_ms, sync_ms / sampled_ms);
   }

@@ -14,6 +14,7 @@ namespace inferx::engine {
 
 struct QwenRunnerConfig {
   std::string model_dir;
+  DeviceKind device_kind = DeviceKind::kCuda;
   std::vector<int> devices{0};
   bool use_nccl = false;
   uint64_t collective_timing_sample_every = 0;

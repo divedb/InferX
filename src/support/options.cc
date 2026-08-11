@@ -27,6 +27,7 @@ struct ServeParseState {
   std::string log_level = "info";
   std::string model_positional;
   std::string dtype = "auto";
+  std::string device_backend = "cuda";
   std::string kv_cache_dtype = "auto";
   std::string quantization;
   std::vector<std::string> served_model_names;
@@ -48,9 +49,9 @@ void AddEngineOptions(CLI::App& app, engine::EngineConfig& config,
   app.add_option("model_tag", state.model_positional,
                  "checkpoint directory (vLLM positional form)")
       ->check(CLI::ExistingDirectory);
-  state.model = app.add_option("--model", config.model_dir,
-                               "checkpoint directory")
-                    ->check(CLI::ExistingDirectory);
+  state.model =
+      app.add_option("--model", config.model_dir, "checkpoint directory")
+          ->check(CLI::ExistingDirectory);
   app.add_option("--served-model-name", state.served_model_names,
                  "name reported in responses");
   app.add_option("--dtype", state.dtype,
@@ -82,11 +83,10 @@ void AddEngineOptions(CLI::App& app, engine::EngineConfig& config,
           ->group(std::string(kHiddenGroup))
           ->excludes(max_model_len));
 
-  state.max_batch_tokens =
-      app.add_option("--max-num-batched-tokens",
-                     config.scheduler.max_batch_tokens,
-                     "token budget per scheduler step")
-          ->check(CLI::PositiveNumber);
+  state.max_batch_tokens = app.add_option("--max-num-batched-tokens",
+                                          config.scheduler.max_batch_tokens,
+                                          "token budget per scheduler step")
+                               ->check(CLI::PositiveNumber);
 
   app.add_flag("--enable-prefix-caching,!--no-enable-prefix-caching",
                config.scheduler.enable_prefix_cache,
@@ -120,9 +120,12 @@ void AddEngineOptions(CLI::App& app, engine::EngineConfig& config,
   app.add_option("--tensor-parallel-size", config.tensor_parallel_size,
                  "tensor-parallel ranks")
       ->check(CLI::Range(1, 2));
+  app.add_option("--device", state.device_backend,
+                 "execution backend: cuda, rocm, or ascend")
+      ->check(CLI::IsMember({"cuda", "rocm", "ascend"}));
   CLI::Option* device_ids =
       app.add_option("--device-ids", config.devices,
-                     "comma-separated CUDA devices")
+                     "comma-separated backend device ordinals")
           ->delimiter(',')
           ->check(CLI::NonNegativeNumber);
   state.deprecated.emplace_back(
@@ -165,10 +168,9 @@ void AddEngineOptions(CLI::App& app, engine::EngineConfig& config,
   app.add_flag("--enforce-eager,!--no-enforce-eager", state.enforce_eager,
                "skip decode graph capture at startup");
   state.deprecated.emplace_back(
-      "--no-cuda-graphs",
-      app.add_flag("--no-cuda-graphs", state.enforce_eager,
-                   "deprecated spelling of --enforce-eager")
-          ->group(std::string(kHiddenGroup)));
+      "--no-cuda-graphs", app.add_flag("--no-cuda-graphs", state.enforce_eager,
+                                       "deprecated spelling of --enforce-eager")
+                              ->group(std::string(kHiddenGroup)));
 }
 
 void AddHttpOptions(CLI::App& app, server::HttpServerConfig& config,
@@ -225,6 +227,14 @@ void AddLogOptions(CLI::App& app, LogOptions& options, ServeParseState& state) {
 }
 
 Status FinalizeOptions(ServeOptions& options, const ServeParseState& state) {
+  if (state.device_backend == "cuda") {
+    options.engine.device_kind = DeviceKind::kCuda;
+  } else if (state.device_backend == "rocm") {
+    options.engine.device_kind = DeviceKind::kRocm;
+  } else if (state.device_backend == "ascend") {
+    options.engine.device_kind = DeviceKind::kAscend;
+  }
+
   for (const auto& [name, option] : state.deprecated) {
     if (option->count() > 0) {
       LOG(WARNING) << name << " is deprecated; see --help for the vLLM name";
@@ -267,9 +277,9 @@ Status FinalizeOptions(ServeOptions& options, const ServeParseState& state) {
     } else if (state.quantization == "w4a16") {
       options.engine.int4_weights = true;
     } else {
-      return InvalidArgumentError(absl::StrCat(
-          "--quantization ", state.quantization,
-          " is not supported by InferX (supported: fp8, w4a16)"));
+      return InvalidArgumentError(
+          absl::StrCat("--quantization ", state.quantization,
+                       " is not supported by InferX (supported: fp8, w4a16)"));
     }
   }
   if (options.engine.fp8_weights && options.engine.int4_weights) {
@@ -294,8 +304,7 @@ Status FinalizeOptions(ServeOptions& options, const ServeParseState& state) {
   }
 
   if (state.chunked_prefill->count() > 0 && !state.enable_chunked_prefill) {
-    return InvalidArgumentError(
-        "chunked prefill cannot be disabled in InferX");
+    return InvalidArgumentError("chunked prefill cannot be disabled in InferX");
   }
 
   if (options.engine.gpu_memory_utilization <= 0.0) {

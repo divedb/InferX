@@ -108,8 +108,7 @@ std::unique_ptr<Communicator> ObserveCommunicator(
 /// otherwise a no-op, so model code always exercises the communicator call.
 class SingleRankComm final : public Communicator {
  public:
-  explicit SingleRankComm(DeviceId device = DeviceId::Cuda(0))
-      : device_(device) {}
+  explicit SingleRankComm(DeviceId device) : device_(device) {}
   int rank() const override { return 0; }
   int size() const override { return 1; }
   DeviceId device() const override { return device_; }

@@ -22,7 +22,8 @@ int main(int argc, char** argv) {
   // The model reads this env var itself; set it so the caller does not have to.
   setenv("INFERX_GPTOSS_PROFILE", "1", 1);
 
-  auto model = inferx::model::GptOssModel::Load(argv[1]);
+  auto model =
+      inferx::model::GptOssModel::Load(argv[1], inferx::DeviceId::Cuda(0));
   if (!model.ok()) {
     std::cerr << "load failed: " << model.status().ToString() << "\n";
     return 1;

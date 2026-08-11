@@ -5,9 +5,9 @@
 /// to run the scheduler one step ahead, so that planning step N+1 happens while
 /// step N is on the GPU rather than after it. The most that can buy is whatever
 /// the host is currently doing *serially* with the device -- so before building
-/// the pipeline it is worth knowing how large that is, because a 400 microsecond
-/// saving against an 11 millisecond step is a different project from a 4
-/// millisecond one.
+/// the pipeline it is worth knowing how large that is, because a 400
+/// microsecond saving against an 11 millisecond step is a different project
+/// from a 4 millisecond one.
 ///
 /// One engine step is four host-visible phases:
 ///
@@ -117,7 +117,8 @@ Phases Measure(model::Qwen2Model* model, int64_t batch, bool graphs) {
 
   auto created = Scheduler::Create(config, model->kv_pool());
   if (!created.ok()) {
-    std::fprintf(stderr, "scheduler: %s\n", created.status().ToString().c_str());
+    std::fprintf(stderr, "scheduler: %s\n",
+                 created.status().ToString().c_str());
     return out;
   }
   Scheduler sched = *std::move(created);
@@ -192,8 +193,10 @@ Phases Measure(model::Qwen2Model* model, int64_t batch, bool graphs) {
   // Captured after the shape is live: a graph can only be recorded for a shape
   // that has already been executed.
   if (graphs) {
-    const int64_t max_blocks = (config.max_seq_len + kBlockSize - 1) / kBlockSize;
-    if (const Status s = model->CaptureDecodeGraph(batch, max_blocks); !s.ok()) {
+    const int64_t max_blocks =
+        (config.max_seq_len + kBlockSize - 1) / kBlockSize;
+    if (const Status s = model->CaptureDecodeGraph(batch, max_blocks);
+        !s.ok()) {
       std::fprintf(stderr, "capture: %s\n", s.ToString().c_str());
       return out;
     }
@@ -273,8 +276,9 @@ Mixed MeasureMixed(model::Qwen2Model* model) {
   RequestId next = 1;
 
   for (int64_t i = 0; i < kMixedDecoders; ++i) {
-    if (!sched.AddRequest(next++, make(kPrompt, static_cast<uint64_t>(i)),
-                          params)
+    if (!sched
+             .AddRequest(next++, make(kPrompt, static_cast<uint64_t>(i)),
+                         params)
              .ok()) {
       return out;
     }
@@ -310,7 +314,8 @@ Mixed MeasureMixed(model::Qwen2Model* model) {
   for (int step = 0; step < kMixedSteps; ++step) {
     if (step % kArrivalPeriod == 0) {
       (void)sched.AddRequest(
-          next++, make(kMixedPrompt, static_cast<uint64_t>(500 + step)), params);
+          next++, make(kMixedPrompt, static_cast<uint64_t>(500 + step)),
+          params);
     }
 
     ForwardBatch b;
@@ -336,10 +341,14 @@ Mixed MeasureMixed(model::Qwen2Model* model) {
 
     (void)sched.TakeCompleted();
 
-    const double prep = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    const double issue = std::chrono::duration<double, std::milli>(t2 - t1).count();
-    const double await = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    const double commit = std::chrono::duration<double, std::milli>(t4 - t3).count();
+    const double prep =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const double issue =
+        std::chrono::duration<double, std::milli>(t2 - t1).count();
+    const double await =
+        std::chrono::duration<double, std::milli>(t3 - t2).count();
+    const double commit =
+        std::chrono::duration<double, std::milli>(t4 - t3).count();
 
     out.total_host_ms += prep + issue + commit;
     out.total_wall_ms += prep + issue + await + commit;
@@ -371,8 +380,7 @@ Mixed MeasureMixed(model::Qwen2Model* model) {
 void ReportRow(int64_t batch, const Phases& p) {
   std::printf("%6ld %9.3f %9.3f %9.3f %9.3f %9.3f %8.1f%% %9.2f%%\n",
               static_cast<long>(batch), p.prepare_ms, p.issue_ms, p.await_ms,
-              p.commit_ms, p.step_ms(),
-              100.0 * p.host_ms() / p.step_ms(),
+              p.commit_ms, p.step_ms(), 100.0 * p.host_ms() / p.step_ms(),
               100.0 * p.hideable_ms() / p.step_ms());
 }
 
@@ -387,7 +395,8 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());
@@ -468,8 +477,9 @@ int Main(int argc, char** argv) {
     if (!m.ok) {
       ++failures;
     } else {
-      std::printf("mixed workload: 8 decoding, a 1024-token prompt every %d steps\n",
-                  kArrivalPeriod);
+      std::printf(
+          "mixed workload: 8 decoding, a 1024-token prompt every %d steps\n",
+          kArrivalPeriod);
       std::printf("%14s %7s %9s %9s %9s %9s\n", "steps", "count", "prepare",
                   "issue", "await", "host_%");
       std::printf("%s\n", std::string(62, '-').c_str());
@@ -486,9 +496,9 @@ int Main(int argc, char** argv) {
                   100.0 * (m.prefill_prepare + m.prefill_issue) /
                       (m.prefill_prepare + m.prefill_issue + m.prefill_await));
 
-      std::printf(
-          "%14s %7d %9s %9s %9s %8.1f%%\n", "all", m.decode_steps + m.prefill_steps,
-          "", "", "", 100.0 * m.total_host_ms / m.total_wall_ms);
+      std::printf("%14s %7d %9s %9s %9s %8.1f%%\n", "all",
+                  m.decode_steps + m.prefill_steps, "", "", "",
+                  100.0 * m.total_host_ms / m.total_wall_ms);
     }
   }
 

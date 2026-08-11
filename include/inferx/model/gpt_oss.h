@@ -45,7 +45,7 @@ class GptOssModel {
   /// The non-expert weights (attention, norms, router, embedding, lm_head —
   /// 3.6 GB) go to the device once. The expert weights are left in the
   /// checkpoint's mapping and read per layer per call.
-  static StatusOr<GptOssModel> Load(std::string_view dir);
+  static StatusOr<GptOssModel> Load(std::string_view dir, DeviceId device);
 
   ~GptOssModel();
   GptOssModel(const GptOssModel&) = delete;
@@ -55,7 +55,8 @@ class GptOssModel {
 
   const ModelConfig& config() const;
 
-  /// \brief Runs the stack over `token_ids` and returns every position's logits.
+  /// \brief Runs the stack over `token_ids` and returns every position's
+  /// logits.
   ///
   /// \param token_ids  The prompt. Positions are `0..n-1`.
   /// \param out_logits Receives `[tokens × vocab]` fp32, row-major. fp32
@@ -79,7 +80,8 @@ class GptOssModel {
   /// allocating. For sizing the pool before `AttachKvCache`.
   int64_t KvBlockBytes(int64_t block_size) const;
 
-  /// \brief The pool, for the scheduler to allocate blocks from. See Qwen2Model.
+  /// \brief The pool, for the scheduler to allocate blocks from. See
+  /// Qwen2Model.
   KvBlockPool* kv_pool();
 
   /// \brief Runs one batched step, reading and writing the paged KV cache.
@@ -88,8 +90,8 @@ class GptOssModel {
   /// prefill, a set of decode steps, or both, across multiple sequences. The
   /// expert dequantize-and-forward path is unchanged from `Forward` -- it
   /// already processes whatever tokens it is handed -- so a batch of N tokens
-  /// pays one ~10 GB PCIe expert upload rather than N, which is the whole reason
-  /// batching helps gpt-oss before Phase 4's fused GEMM lands.
+  /// pays one ~10 GB PCIe expert upload rather than N, which is the whole
+  /// reason batching helps gpt-oss before Phase 4's fused GEMM lands.
   ///
   /// Attention runs through our own `PagedAttentionWithLse` (the reference
   /// kernel, with the lse output and per-layer sliding window gpt-oss needs)

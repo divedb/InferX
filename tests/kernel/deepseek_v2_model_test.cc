@@ -9,6 +9,9 @@
 /// milliseconds, written to disk in the real safetensors + config.json format
 /// so the loader's name and shape mapping is exercised too.
 
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -19,10 +22,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <gtest/gtest.h>
 
 #include "absl/strings/str_cat.h"
 #include "inferx/core/cuda_utils.h"
@@ -155,8 +154,8 @@ HostWeights MakeWeights() {
     l.kv_a_norm = NormWeight(static_cast<size_t>(kLatent), 1.21f * s);
     l.kv_b = RandomTensor(
         static_cast<size_t>(kHeads * (kNope + kVDim) * kLatent), 1.39f * s);
-    l.o = RandomTensor(static_cast<size_t>(kHidden * kHeads * kVDim),
-                       1.57f * s);
+    l.o =
+        RandomTensor(static_cast<size_t>(kHidden * kHeads * kVDim), 1.57f * s);
 
     if (i == 0) {
       l.gate = RandomTensor(static_cast<size_t>(kDenseInter * kHidden), 1.73f);
@@ -175,8 +174,7 @@ HostWeights MakeWeights() {
       }
       l.s_gate =
           RandomTensor(static_cast<size_t>(kSharedInter * kHidden), 3.51f);
-      l.s_up =
-          RandomTensor(static_cast<size_t>(kSharedInter * kHidden), 3.67f);
+      l.s_up = RandomTensor(static_cast<size_t>(kSharedInter * kHidden), 3.67f);
       l.s_down =
           RandomTensor(static_cast<size_t>(kHidden * kSharedInter), 3.83f);
     }
@@ -301,8 +299,8 @@ void WriteCheckpoint(TempCheckpoint& ckpt, const HostWeights& w) {
       }
       ckpt.Add(p + "mlp.shared_experts.gate_proj.weight",
                {kSharedInter, kHidden}, l.s_gate);
-      ckpt.Add(p + "mlp.shared_experts.up_proj.weight",
-               {kSharedInter, kHidden}, l.s_up);
+      ckpt.Add(p + "mlp.shared_experts.up_proj.weight", {kSharedInter, kHidden},
+               l.s_up);
       ckpt.Add(p + "mlp.shared_experts.down_proj.weight",
                {kHidden, kSharedInter}, l.s_down);
     }
@@ -430,9 +428,9 @@ std::vector<float> ReferenceAttention(const HostWeights::Layer& l,
       for (int64_t j = 0; j <= i; ++j) {
         float dot = 0.0f;
         for (int64_t d = 0; d < kNope; ++d) {
-          dot += q[static_cast<size_t>((i * kHeads + hd) * kQk + d)] *
-                 kv[static_cast<size_t>((j * kHeads + hd) * (kNope + kVDim) +
-                                        d)];
+          dot +=
+              q[static_cast<size_t>((i * kHeads + hd) * kQk + d)] *
+              kv[static_cast<size_t>((j * kHeads + hd) * (kNope + kVDim) + d)];
         }
         for (int64_t d = 0; d < kRope; ++d) {
           dot += q[static_cast<size_t>((i * kHeads + hd) * kQk + kNope + d)] *
@@ -488,9 +486,9 @@ std::vector<float> ReferenceMoe(const HostWeights::Layer& l,
     for (float& p : probs) p /= sum;
 
     std::vector<float> masked(probs);
-    const std::vector<float> row(x.begin() + static_cast<ptrdiff_t>(t * kHidden),
-                                 x.begin() +
-                                     static_cast<ptrdiff_t>((t + 1) * kHidden));
+    const std::vector<float> row(
+        x.begin() + static_cast<ptrdiff_t>(t * kHidden),
+        x.begin() + static_cast<ptrdiff_t>((t + 1) * kHidden));
     for (int64_t slot = 0; slot < kTopK; ++slot) {
       int64_t best = -1;
       float best_v = -INFINITY;
@@ -502,10 +500,10 @@ std::vector<float> ReferenceMoe(const HostWeights::Layer& l,
       }
       masked[static_cast<size_t>(best)] = -INFINITY;
 
-      const std::vector<float> y = SiluMlp(
-          row, l.e_gate[static_cast<size_t>(best)],
-          l.e_up[static_cast<size_t>(best)],
-          l.e_down[static_cast<size_t>(best)], 1, kHidden, kMoeInter);
+      const std::vector<float> y =
+          SiluMlp(row, l.e_gate[static_cast<size_t>(best)],
+                  l.e_up[static_cast<size_t>(best)],
+                  l.e_down[static_cast<size_t>(best)], 1, kHidden, kMoeInter);
       for (int64_t d = 0; d < kHidden; ++d) {
         out[static_cast<size_t>(t * kHidden + d)] +=
             probs[static_cast<size_t>(best)] * y[static_cast<size_t>(d)];
@@ -527,25 +525,25 @@ std::vector<float> ReferenceModel(const HostWeights& w,
   std::vector<float> x(static_cast<size_t>(tokens * kHidden));
   for (int64_t t = 0; t < tokens; ++t) {
     for (int64_t d = 0; d < kHidden; ++d) {
-      x[static_cast<size_t>(t * kHidden + d)] =
-          w.embed[static_cast<size_t>(token_ids[static_cast<size_t>(t)] *
-                                          kHidden +
-                                      d)];
+      x[static_cast<size_t>(t * kHidden + d)] = w.embed[static_cast<size_t>(
+          token_ids[static_cast<size_t>(t)] * kHidden + d)];
     }
   }
 
   for (int64_t i = 0; i < kLayers; ++i) {
     const HostWeights::Layer& l = w.layers[static_cast<size_t>(i)];
 
-    const std::vector<float> normed = RmsNormed(x, l.input_norm, tokens, kHidden);
+    const std::vector<float> normed =
+        RmsNormed(x, l.input_norm, tokens, kHidden);
     const std::vector<float> attn = ReferenceAttention(l, normed, tokens);
     for (size_t j = 0; j < x.size(); ++j) x[j] += attn[j];
 
-    const std::vector<float> normed2 = RmsNormed(x, l.post_norm, tokens, kHidden);
-    const std::vector<float> ffn =
-        i == 0 ? SiluMlp(normed2, l.gate, l.up, l.down, tokens, kHidden,
-                         kDenseInter)
-               : ReferenceMoe(l, normed2, tokens);
+    const std::vector<float> normed2 =
+        RmsNormed(x, l.post_norm, tokens, kHidden);
+    const std::vector<float> ffn = i == 0
+                                       ? SiluMlp(normed2, l.gate, l.up, l.down,
+                                                 tokens, kHidden, kDenseInter)
+                                       : ReferenceMoe(l, normed2, tokens);
     for (size_t j = 0; j < x.size(); ++j) x[j] += ffn[j];
   }
 
@@ -620,7 +618,7 @@ TEST_F(DeepseekV2ModelTest, PrefillMatchesTheHostReference) {
   ASSERT_FALSE(ckpt.dir().empty());
   WriteCheckpoint(ckpt, w);
 
-  auto m = DeepseekV2Model::Load(ckpt.dir());
+  auto m = DeepseekV2Model::Load(ckpt.dir(), DeviceId::Cuda(0));
   ASSERT_TRUE(m.ok()) << m.status();
   ASSERT_TRUE(m->AttachKvCache(/*num_blocks=*/4, /*block_size=*/4).ok());
 
@@ -644,7 +642,7 @@ TEST_F(DeepseekV2ModelTest, DecodingTokenByTokenEqualsPrefillingAtOnce) {
   ASSERT_FALSE(ckpt.dir().empty());
   WriteCheckpoint(ckpt, w);
 
-  auto m = DeepseekV2Model::Load(ckpt.dir());
+  auto m = DeepseekV2Model::Load(ckpt.dir(), DeviceId::Cuda(0));
   ASSERT_TRUE(m.ok()) << m.status();
 
   const std::vector<int32_t> prompt{11, 2, 30, 8, 55, 21};
@@ -653,8 +651,8 @@ TEST_F(DeepseekV2ModelTest, DecodingTokenByTokenEqualsPrefillingAtOnce) {
   ASSERT_TRUE(m->AttachKvCache(4, 4).ok());
   std::vector<float> prefilled;
   ASSERT_TRUE(m->Step(PrefillBatch(*m, prompt), &prefilled).ok());
-  const std::vector<float> last_prefill(
-      prefilled.end() - kVocab, prefilled.end());
+  const std::vector<float> last_prefill(prefilled.end() - kVocab,
+                                        prefilled.end());
 
   // Same tokens one at a time, through a fresh cache.
   ASSERT_TRUE(m->AttachKvCache(4, 4).ok());
@@ -690,7 +688,7 @@ TEST_F(DeepseekV2ModelTest, ForwardMatchesThePagedStep) {
   ASSERT_FALSE(ckpt.dir().empty());
   WriteCheckpoint(ckpt, w);
 
-  auto m = DeepseekV2Model::Load(ckpt.dir());
+  auto m = DeepseekV2Model::Load(ckpt.dir(), DeviceId::Cuda(0));
   ASSERT_TRUE(m.ok()) << m.status();
 
   const std::vector<int32_t> prompt{7, 40, 1, 60};
@@ -717,7 +715,7 @@ TEST_F(DeepseekV2ModelTest, BatchedSequencesMatchTheirSoloRuns) {
   ASSERT_FALSE(ckpt.dir().empty());
   WriteCheckpoint(ckpt, w);
 
-  auto m = DeepseekV2Model::Load(ckpt.dir());
+  auto m = DeepseekV2Model::Load(ckpt.dir(), DeviceId::Cuda(0));
   ASSERT_TRUE(m.ok()) << m.status();
 
   const std::vector<int32_t> a{5, 17, 3, 42};
@@ -748,9 +746,8 @@ TEST_F(DeepseekV2ModelTest, BatchedSequencesMatchTheirSoloRuns) {
       batch.token_ids.push_back(prompt[t]);
       batch.positions.push_back(static_cast<int32_t>(t));
       batch.seq_of_token.push_back(seq);
-      batch.slots.push_back(
-          batch.block_table[static_cast<size_t>(seq)] * 4 +
-          static_cast<int32_t>(t));
+      batch.slots.push_back(batch.block_table[static_cast<size_t>(seq)] * 4 +
+                            static_cast<int32_t>(t));
       batch.logits_indices.push_back(
           static_cast<int32_t>(batch.token_ids.size() - 1));
     }

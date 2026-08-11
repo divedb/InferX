@@ -9,16 +9,16 @@
 /// Two questions, then, and this measures both:
 ///
 ///   1. What does a prompt cost, as a function of its length? Decode is
-///      weight-bandwidth bound and flat in context; prefill is compute bound and
-///      quadratic in it, so the two have nothing in common and the decode
+///      weight-bandwidth bound and flat in context; prefill is compute bound
+///      and quadratic in it, so the two have nothing in common and the decode
 ///      numbers say nothing about time-to-first-token.
 ///   2. Does the tiled kernel keep scaling through the 16k context that the
 ///      reference kernel could not launch at all?
 ///
 /// The arithmetic intensity line is the point of comparison. A prefill of N
 /// tokens does the same weight reads as a decode step but N times the work, so
-/// past a few hundred tokens it should leave the bandwidth floor behind entirely
-/// and become a matter of how good the GEMMs are.
+/// past a few hundred tokens it should leave the bandwidth floor behind
+/// entirely and become a matter of how good the GEMMs are.
 
 #include <cstdint>
 #include <cstdio>
@@ -52,8 +52,8 @@ std::string CheckpointDir() {
 }
 
 /// One sequence of `length` tokens, positions 0..length-1, laid out in
-/// consecutive blocks. Only the last position's logits are wanted, which is what
-/// a real prefill asks for.
+/// consecutive blocks. Only the last position's logits are wanted, which is
+/// what a real prefill asks for.
 model::ForwardBatch MakePrefillBatch(int64_t length,
                                      int64_t max_blocks_per_seq) {
   model::ForwardBatch b;
@@ -90,7 +90,7 @@ model::ForwardBatch MakePrefillBatch(int64_t length,
 }  // namespace inferx
 
 int main(int argc, char** argv) {
-  using namespace inferx;        // NOLINT(build/namespaces)
+  using namespace inferx;         // NOLINT(build/namespaces)
   using namespace inferx::bench;  // NOLINT(build/namespaces) -- TimeLaunch
 
   int warmup = 3;
@@ -117,7 +117,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());
@@ -135,13 +136,13 @@ int main(int argc, char** argv) {
 
   // The pool has to cover the longest prompt measured, and the block table has
   // to be wide enough for it.
-  constexpr int64_t kLongest = kLengths[sizeof(kLengths) / sizeof(*kLengths) - 1];
+  constexpr int64_t kLongest =
+      kLengths[sizeof(kLengths) / sizeof(*kLengths) - 1];
   const int64_t max_blocks_per_seq = (kLongest + kBlockSize - 1) / kBlockSize;
 
   if (const Status s = model.AttachKvCache(max_blocks_per_seq + 8, kBlockSize);
       !s.ok()) {
-    std::fprintf(stderr, "cannot attach KV cache: %s\n",
-                 s.ToString().c_str());
+    std::fprintf(stderr, "cannot attach KV cache: %s\n", s.ToString().c_str());
     return 1;
   }
 
@@ -160,20 +161,18 @@ int main(int argc, char** argv) {
 
   for (const int64_t length : kLengths) {
     // Sized to this prompt, as a scheduler's active block table would be.
-    const int64_t blocks_for_this =
-        (length + kBlockSize - 1) / kBlockSize;
+    const int64_t blocks_for_this = (length + kBlockSize - 1) / kBlockSize;
 
     model::ForwardBatch b = MakePrefillBatch(length, blocks_for_this);
 
-    auto timing = TimeLaunch([&] { return model.Step(b, &logits); }, warmup,
-                             iters);
+    auto timing =
+        TimeLaunch([&] { return model.Step(b, &logits); }, warmup, iters);
 
     if (!timing.ok()) {
       // Keep failures in the table so a future context-length ceiling is a
       // benchmark result rather than a lost stack trace.
       std::printf("%8ld %12s %12s %12s %10s  %s\n", static_cast<long>(length),
-                  "-", "-", "-", "-",
-                  timing.status().message().data());
+                  "-", "-", "-", "-", timing.status().message().data());
       continue;
     }
 
@@ -182,18 +181,18 @@ int main(int argc, char** argv) {
     std::printf("%8ld %12.3f %12.1f %12.4f %10.1f  %s\n",
                 static_cast<long>(length), ms,
                 static_cast<double>(length) / (ms * 1e-3), ms / length,
-                timing->noise() * 100.0,
-                length <= 512 ? "" : "");
+                timing->noise() * 100.0, length <= 512 ? "" : "");
   }
 
   // For contrast: one decode step at the same context, which is the same weight
   // traffic and one token of work. The ratio is what says whether prefill is
   // paying for compute or for weights.
-  std::printf("\nfor contrast, a single decode step is ~%.1f ms at this "
-              "weight size,\nso a prompt is worth roughly that many decode "
-              "steps' bandwidth regardless\nof its length -- everything above "
-              "that is compute.\n",
-              model.WeightBytes() / 736e9 * 1e3);
+  std::printf(
+      "\nfor contrast, a single decode step is ~%.1f ms at this "
+      "weight size,\nso a prompt is worth roughly that many decode "
+      "steps' bandwidth regardless\nof its length -- everything above "
+      "that is compute.\n",
+      model.WeightBytes() / 736e9 * 1e3);
 
   return 0;
 }

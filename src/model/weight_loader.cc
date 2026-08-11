@@ -303,10 +303,6 @@ StatusOr<TensorView> WeightLoader::Impl::FinishLoad(
   return TensorView::Create(dst, dtype, shape, opts.device);
 }
 
-StatusOr<WeightLoader> WeightLoader::Create(const Checkpoint* checkpoint) {
-  return Create(checkpoint, Options());
-}
-
 StatusOr<WeightLoader> WeightLoader::Create(const Checkpoint* checkpoint,
                                             const Options& options) {
   if (checkpoint == nullptr) {

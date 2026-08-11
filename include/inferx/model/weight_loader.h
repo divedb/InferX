@@ -55,7 +55,7 @@ struct WeightLoaderStats {
 class WeightLoader {
  public:
   struct Options {
-    DeviceId device = DeviceId::Cuda(0);
+    DeviceId device;
 
     /// Pinned staging: `staging_slots` × `staging_slot_bytes`, the loader's
     /// entire pinned footprint. Two slots suffice for overlap; three keep the
@@ -75,12 +75,6 @@ class WeightLoader {
   /// \brief Creates a loader over `checkpoint`, which must outlive it.
   static StatusOr<WeightLoader> Create(const Checkpoint* checkpoint,
                                        const Options& options);
-
-  /// \brief Creates a loader with default options.
-  ///
-  /// An overload rather than a default argument: the nested aggregate's
-  /// member initializers are not usable as a default inside this class.
-  static StatusOr<WeightLoader> Create(const Checkpoint* checkpoint);
 
   ~WeightLoader();
 

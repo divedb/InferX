@@ -7,8 +7,8 @@
 
 #include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
-#include "inferx/model/forward_batch.h"
 #include "inferx/model/config.h"
+#include "inferx/model/forward_batch.h"
 #include "inferx/model/safetensors.h"
 
 namespace inferx::comm {
@@ -40,7 +40,7 @@ class Qwen2Model {
   /// \return       The model, or the first weight that was missing, misshaped,
   ///               or would not fit.
   static StatusOr<Qwen2Model> Load(const ModelConfig& config,
-                                   const Checkpoint& ckpt);
+                                   const Checkpoint& ckpt, DeviceId device);
 
   /// Loads one tensor-parallel rank. The model takes ownership of `comm`.
   /// All ranks must load the same checkpoint with communicators from the same
@@ -50,7 +50,8 @@ class Qwen2Model {
                                    std::unique_ptr<comm::Communicator> comm);
 
   /// \brief Convenience: parse the config and open the checkpoint in one step.
-  static StatusOr<Qwen2Model> LoadFromDirectory(std::string_view dir);
+  static StatusOr<Qwen2Model> LoadFromDirectory(std::string_view dir,
+                                                DeviceId device);
   static StatusOr<Qwen2Model> LoadFromDirectory(
       std::string_view dir, std::unique_ptr<comm::Communicator> comm);
 

@@ -49,7 +49,7 @@ class DeepseekV2Model {
   /// host staging buffer (one upload per stacked tensor, not one per expert),
   /// and the fused shared-expert MLP. V2-Lite is ~31 GB bf16 — whether that
   /// fits is the caller's capacity planning (§18.6), not this loader's.
-  static StatusOr<DeepseekV2Model> Load(std::string_view dir);
+  static StatusOr<DeepseekV2Model> Load(std::string_view dir, DeviceId device);
 
   ~DeepseekV2Model();
   DeepseekV2Model(const DeepseekV2Model&) = delete;

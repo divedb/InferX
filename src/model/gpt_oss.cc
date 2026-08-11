@@ -71,14 +71,13 @@ struct Scratch {
   DeviceBuffer buf;
 
   StatusOr<TensorView> View(DataType dtype, const Shape& shape) const {
-    return TensorView::Create(buf.data(), dtype, shape, DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), dtype, shape, buf.device());
   }
 };
 
-Status Grow(Scratch* s, size_t bytes) {
+Status Grow(Scratch* s, size_t bytes, DeviceId device) {
   if (s->buf.size() >= bytes) return OkStatus();
-  INFERX_ASSIGN_OR_RETURN(s->buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(s->buf, DeviceBuffer::Allocate(bytes, device));
   return OkStatus();
 }
 
@@ -173,6 +172,7 @@ struct GptOssModel::Impl {
   }
 
   ModelConfig config;
+  DeviceId device;
   Checkpoint ckpt;
 
   std::vector<DeviceBuffer> weight_buffers;
@@ -270,21 +270,23 @@ Status GptOssModel::Impl::EnsureCapacity(int64_t tokens) {
   const int64_t heads = config.num_attention_heads;
   const int64_t hd = config.head_dim;
 
-  INFERX_RETURN_IF_ERROR(Grow(&ids, sizeof(int32_t) * tokens));
-  INFERX_RETURN_IF_ERROR(Grow(&positions, sizeof(int32_t) * tokens));
-  INFERX_RETURN_IF_ERROR(Grow(&hidden, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&residual, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&normed, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * config.q_dim()));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * config.kv_dim()));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * config.kv_dim()));
+  INFERX_RETURN_IF_ERROR(Grow(&ids, sizeof(int32_t) * tokens, device));
+  INFERX_RETURN_IF_ERROR(Grow(&positions, sizeof(int32_t) * tokens, device));
+  INFERX_RETURN_IF_ERROR(Grow(&hidden, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&residual, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&normed, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * config.q_dim(), device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * config.kv_dim(), device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * config.kv_dim(), device));
   INFERX_RETURN_IF_ERROR(
-      Grow(&qkv_fused, sz * tokens * (config.q_dim() + 2 * config.kv_dim())));
-  INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * heads * hd));
-  INFERX_RETURN_IF_ERROR(Grow(&lse, sizeof(float) * tokens * heads));
-  INFERX_RETURN_IF_ERROR(Grow(&proj, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&moe_out, sz * tokens * h));
-  INFERX_RETURN_IF_ERROR(Grow(&logits, sz * tokens * config.vocab_size));
+      Grow(&qkv_fused, sz * tokens * (config.q_dim() + 2 * config.kv_dim()),
+           device));
+  INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * heads * hd, device));
+  INFERX_RETURN_IF_ERROR(Grow(&lse, sizeof(float) * tokens * heads, device));
+  INFERX_RETURN_IF_ERROR(Grow(&proj, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(Grow(&moe_out, sz * tokens * h, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&logits, sz * tokens * config.vocab_size, device));
 
   capacity_tokens = tokens;
   return OkStatus();
@@ -326,8 +328,8 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
     const int64_t num_blocks = blocks_dev.Dim(blocks_dev.Rank() - 2);
     const int64_t width = num_blocks * kMxfp4ValuesPerBlock;
 
-    INFERX_RETURN_IF_ERROR(
-        Grow(dest_scratch, DataTypeByteSize(kBf16, experts * rows * width)));
+    INFERX_RETURN_IF_ERROR(Grow(
+        dest_scratch, DataTypeByteSize(kBf16, experts * rows * width), device));
 
     // The de-interleave splits even/odd rows into the two halves of *its*
     // output, so it has to see one expert at a time -- flattening across
@@ -386,19 +388,19 @@ Status GptOssModel::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   const int64_t table_elems = batch.num_seqs * batch.max_blocks_per_seq;
   if (table_elems > block_table_capacity) {
     INFERX_ASSIGN_OR_RETURN(
-        block_table_buf, DeviceBuffer::Allocate(
-                             static_cast<size_t>(table_elems) * sizeof(int32_t),
-                             DeviceId::Cuda(0)));
+        block_table_buf,
+        DeviceBuffer::Allocate(
+            static_cast<size_t>(table_elems) * sizeof(int32_t), device));
     block_table_capacity = table_elems;
   }
 
   const size_t tok_bytes = static_cast<size_t>(tokens) * sizeof(int32_t);
 
   if (slots_buf.size() < tok_bytes) {
-    INFERX_ASSIGN_OR_RETURN(
-        slots_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
-    INFERX_ASSIGN_OR_RETURN(
-        seq_of_token_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(slots_buf,
+                            DeviceBuffer::Allocate(tok_bytes, device));
+    INFERX_ASSIGN_OR_RETURN(seq_of_token_buf,
+                            DeviceBuffer::Allocate(tok_bytes, device));
   }
 
   // Pageable copies rather than the Qwen2 path's pinned staging. A gpt-oss
@@ -454,8 +456,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   const auto i32 = [&](const DeviceBuffer& buf,
                        const Shape& shape) -> StatusOr<TensorView> {
-    return TensorView::Create(buf.data(), DataType::kInt32, shape,
-                              DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), DataType::kInt32, shape, device);
   };
 
   INFERX_ASSIGN_OR_RETURN(const TensorView ids_v,
@@ -622,7 +623,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
   return OkStatus();
 }
 
-StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
+StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir, DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(ModelConfig config, ModelConfig::FromDirectory(dir));
 
   if (config.architecture != Architecture::kGptOss) {
@@ -635,9 +636,9 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
                           kernels::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm));
-  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(DeviceId::Cuda(0)));
-  INFERX_ASSIGN_OR_RETURN(impl->stream,
-                          impl->runtime->CreateStream(DeviceId::Cuda(0)));
+  impl->device = device;
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
+  INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream(device));
 
   const int64_t h = config.hidden_size;
   const int64_t heads = config.num_attention_heads;
@@ -650,8 +651,10 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
   // The shared movement layer, borrowing the checkpoint Impl owns. Unchecked
   // (shape-free) loads on purpose: this loader validates its shapes
   // downstream, at the kernels, as it always has.
+  WeightLoader::Options loader_options;
+  loader_options.device = device;
   INFERX_ASSIGN_OR_RETURN(WeightLoader loader,
-                          WeightLoader::Create(&impl->ckpt));
+                          WeightLoader::Create(&impl->ckpt, loader_options));
 
   INFERX_ASSIGN_OR_RETURN(impl->embed,
                           loader.Load("model.embed_tokens.weight"));
@@ -765,7 +768,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
   }
 
   INFERX_RETURN_IF_ERROR(
-      Grow(&impl->inv_freq, sizeof(float) * inv_freq.size()));
+      Grow(&impl->inv_freq, sizeof(float) * inv_freq.size(), device));
   INFERX_RETURN_IF_ERROR(impl->runtime->Copy(
       impl->inv_freq.buf.data(), inv_freq.data(),
       sizeof(float) * inv_freq.size(), CopyKind::kHostToDevice));
@@ -780,8 +783,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
   moe_config.swiglu_limit = static_cast<float>(config.swiglu_limit);
   moe_config.swiglu_alpha = static_cast<float>(config.swiglu_alpha);
 
-  INFERX_ASSIGN_OR_RETURN(MoeFfn moe,
-                          MoeFfn::Create(moe_config, 1, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(MoeFfn moe, MoeFfn::Create(moe_config, 1, device));
   impl->moe = std::make_unique<MoeFfn>(std::move(moe));
 
   (void)heads;
@@ -1025,9 +1027,10 @@ int64_t GptOssModel::KvBlockBytes(int64_t block_size) const {
 Status GptOssModel::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   const KvLayout layout = GptOssKvLayout(impl_->config);
 
-  INFERX_ASSIGN_OR_RETURN(KvBlockPool pool,
-                          KvBlockPool::Create(impl_->config.num_hidden_layers,
-                                              num_blocks, block_size, layout));
+  INFERX_ASSIGN_OR_RETURN(
+      KvBlockPool pool,
+      KvBlockPool::Create(impl_->config.num_hidden_layers, num_blocks,
+                          block_size, layout, impl_->device));
 
   impl_->pool = std::make_unique<KvBlockPool>(std::move(pool));
   return OkStatus();

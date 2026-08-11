@@ -37,7 +37,8 @@ struct KvLayout {
   }
 };
 
-/// \brief The single device allocation holding all KV blocks, plus its free list.
+/// \brief The single device allocation holding all KV blocks, plus its free
+/// list.
 ///
 /// One `cudaMalloc` at startup, never freed and never grown: §6.1's rule is
 /// that a `cudaFree` in the steady state implicitly synchronizes the device and
@@ -71,15 +72,14 @@ class KvBlockPool {
   /// \param block_size  Tokens per block. 16 by default (T10).
   /// \param layout      Per-token geometry. \see KvLayout.
   /// \return            The pool, or ResourceExhausted if it will not fit.
-  /// \param device      Where the pool lives. Defaults to the GPU; `Cpu()`
-  ///                    exists so the scheduler's block bookkeeping can be
+  /// \param device      Where the pool lives. `Cpu()` exists so the scheduler's
+  /// block bookkeeping can be
   ///                    unit-tested on a machine with no device at all, which
   ///                    §3.1 calls the highest-leverage testability decision in
   ///                    the design. The free list is the same code either way.
   static StatusOr<KvBlockPool> Create(int64_t num_layers, int64_t num_blocks,
                                       int64_t block_size,
-                                      const KvLayout& layout,
-                                      DeviceId device = DeviceId::Cuda(0));
+                                      const KvLayout& layout, DeviceId device);
 
   /// \brief Takes a free block. The contents are whatever was there before.
   ///
@@ -112,7 +112,9 @@ class KvBlockPool {
   int64_t block_size() const { return block_size_; }
   const KvLayout& layout() const { return layout_; }
 
-  int64_t free_blocks() const { return static_cast<int64_t>(free_list_.size()); }
+  int64_t free_blocks() const {
+    return static_cast<int64_t>(free_list_.size());
+  }
   int64_t used_blocks() const { return num_blocks_ - free_blocks(); }
 
   size_t bytes() const { return storage_.size(); }
@@ -165,7 +167,8 @@ class BlockTable {
   /// \return false when `pos` is past what has been allocated.
   bool Locate(int64_t pos, int32_t* block, int64_t* slot) const {
     const int64_t index = pos / block_size_;
-    if (index < 0 || index >= static_cast<int64_t>(blocks_.size())) return false;
+    if (index < 0 || index >= static_cast<int64_t>(blocks_.size()))
+      return false;
 
     *block = blocks_[static_cast<size_t>(index)];
     *slot = pos % block_size_;

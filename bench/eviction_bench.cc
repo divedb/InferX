@@ -154,7 +154,8 @@ Result RunBurst(model::Qwen2Model* model, bool cache, bool shared) {
 
   auto created = Scheduler::Create(config, model->kv_pool());
   if (!created.ok()) {
-    std::fprintf(stderr, "scheduler: %s\n", created.status().ToString().c_str());
+    std::fprintf(stderr, "scheduler: %s\n",
+                 created.status().ToString().c_str());
     return result;
   }
   Scheduler sched = *std::move(created);
@@ -262,7 +263,8 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());
@@ -288,8 +290,8 @@ int Main(int argc, char** argv) {
       "%d tokens generated each.\n\n"
       "Working set uncached: 4 x 71 = 284 blocks. Cached: ~96, because the\n"
       "four resident sequences share one copy of the preamble.\n\n",
-      kRequests, static_cast<long>(kSystemPrompt), static_cast<long>(kMaxRunning),
-      kGenerate);
+      kRequests, static_cast<long>(kSystemPrompt),
+      static_cast<long>(kMaxRunning), kGenerate);
 
   // One throwaway burst so that allocator growth and cuBLASLt's per-shape
   // heuristic are paid for before the first measured row.
@@ -302,8 +304,8 @@ int Main(int argc, char** argv) {
   const auto sweep = [&](const char* title, bool shared,
                          absl::Span<const int64_t> sizes) {
     std::printf("%s\n", title);
-    std::printf("%7s %6s %10s %11s %8s %8s %9s\n", "blocks", "cache",
-                "wall_ms", "mean_ttft", "hit_%", "preempt", "evicted");
+    std::printf("%7s %6s %10s %11s %8s %8s %9s\n", "blocks", "cache", "wall_ms",
+                "mean_ttft", "hit_%", "preempt", "evicted");
     std::printf("%s\n", std::string(70, '-').c_str());
 
     for (const int64_t blocks : sizes) {
@@ -332,11 +334,10 @@ int Main(int argc, char** argv) {
         continue;
       }
 
-      std::printf("%7ld %6s %10.0f %11.0f %8.0f %8ld %9ld\n",
-                  static_cast<long>(blocks), "off", off.wall_ms,
-                  off.mean_ttft_ms, off.hit_rate(),
-                  static_cast<long>(off.preemptions),
-                  static_cast<long>(off.evicted));
+      std::printf(
+          "%7ld %6s %10.0f %11.0f %8.0f %8ld %9ld\n", static_cast<long>(blocks),
+          "off", off.wall_ms, off.mean_ttft_ms, off.hit_rate(),
+          static_cast<long>(off.preemptions), static_cast<long>(off.evicted));
 
       std::printf("%7s %6s %10.0f %11.0f %8.0f %8ld %9ld   %.2fx\n", "", "on",
                   on.wall_ms, on.mean_ttft_ms, on.hit_rate(),

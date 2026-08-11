@@ -169,7 +169,8 @@ Served Serve(model::Qwen2Model* model, Scheduler* sched, RequestId id,
 
       if (!seen_first) {
         const auto t1 = std::chrono::steady_clock::now();
-        out.ttft_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        out.ttft_ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
         seen_first = true;
       }
 
@@ -302,9 +303,10 @@ Result DistinctPrompts(model::Qwen2Model* model, bool cache) {
   std::vector<Served> served;
 
   for (int i = 0; i < kRequests; ++i) {
-    served.push_back(Serve(model, &sched, static_cast<RequestId>(i + 1),
-                           Tokens(kDistinctPrompt, static_cast<uint64_t>(9000 + i)),
-                           /*max_tokens=*/8));
+    served.push_back(
+        Serve(model, &sched, static_cast<RequestId>(i + 1),
+              Tokens(kDistinctPrompt, static_cast<uint64_t>(9000 + i)),
+              /*max_tokens=*/8));
   }
 
   Result r = Summarize(served);
@@ -319,7 +321,8 @@ void Report(const char* name, int64_t prompt_tokens, const Result& off,
     return;
   }
 
-  std::printf("%s (prompt %ld tokens)\n", name, static_cast<long>(prompt_tokens));
+  std::printf("%s (prompt %ld tokens)\n", name,
+              static_cast<long>(prompt_tokens));
   std::printf("  %-14s %11s %11s %13s %10s\n", "", "cold TTFT", "warm TTFT",
               "prefill tok", "reused");
 
@@ -328,17 +331,16 @@ void Report(const char* name, int64_t prompt_tokens, const Result& off,
               static_cast<long>(off.forwarded), static_cast<long>(off.hit));
 
   std::printf("  %-14s %9.1f ms %9.1f ms %13ld %10ld\n", "cache on",
-              on.cold_ttft_ms, on.warm_ttft_ms,
-              static_cast<long>(on.forwarded), static_cast<long>(on.hit));
+              on.cold_ttft_ms, on.warm_ttft_ms, static_cast<long>(on.forwarded),
+              static_cast<long>(on.hit));
 
   const double speedup =
       on.warm_ttft_ms > 0.0 ? off.warm_ttft_ms / on.warm_ttft_ms : 0.0;
 
   std::printf("  warm TTFT %.2fx, %.0f%% of prompt tokens reused\n\n", speedup,
-              on.forwarded > 0
-                  ? 100.0 * static_cast<double>(on.hit) /
-                        static_cast<double>(on.hit + on.forwarded)
-                  : 0.0);
+              on.forwarded > 0 ? 100.0 * static_cast<double>(on.hit) /
+                                     static_cast<double>(on.hit + on.forwarded)
+                               : 0.0);
 }
 
 int Main(int argc, char** argv) {
@@ -359,7 +361,8 @@ int Main(int argc, char** argv) {
     return 1;
   }
 
-  auto loaded = model::Qwen2Model::LoadFromDirectory(CheckpointDir());
+  auto loaded =
+      model::Qwen2Model::LoadFromDirectory(CheckpointDir(), DeviceId::Cuda(0));
   if (!loaded.ok()) {
     std::fprintf(stderr, "cannot load model: %s\n",
                  loaded.status().ToString().c_str());

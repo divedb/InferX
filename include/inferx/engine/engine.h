@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/model/config.h"
 #include "inferx/scheduler/scheduler.h"
@@ -46,6 +47,7 @@ struct EngineConfig {
   /// Tensor-parallel deployment. The first NCCL runtime supports two distinct
   /// GPUs in one process; TP=1 retains the direct single-rank path.
   int tensor_parallel_size = 1;
+  DeviceKind device_kind = DeviceKind::kCuda;
   std::vector<int> devices{0};
   std::string comm_backend = "single";
 
