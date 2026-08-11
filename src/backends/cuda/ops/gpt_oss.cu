@@ -1,13 +1,12 @@
-#include "inferx/ops/gpt_oss.h"
-
-#include <cmath>
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "inferx/backends/cuda/cuda_utils.h"
+#include <cmath>
 
-namespace inferx::kernels {
+#include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/gpt_oss.h"
+
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -78,7 +77,8 @@ __global__ void AttentionRefKernel(const bf16* __restrict__ q,
   for (int64_t j = first + threadIdx.x; j <= last; j += blockDim.x) {
     float dot = 0.0f;
     const bf16* krow = k + (j * kv_heads + kv_head) * head_dim;
-    for (int64_t d = 0; d < head_dim; ++d) dot += ToF32(qrow[d]) * ToF32(krow[d]);
+    for (int64_t d = 0; d < head_dim; ++d)
+      dot += ToF32(qrow[d]) * ToF32(krow[d]);
     local_max = fmaxf(local_max, dot * scale);
   }
 
@@ -86,7 +86,8 @@ __global__ void AttentionRefKernel(const bf16* __restrict__ q,
   __syncthreads();
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+      reduce[threadIdx.x] =
+          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
     }
     __syncthreads();
   }
@@ -109,7 +110,8 @@ __global__ void AttentionRefKernel(const bf16* __restrict__ q,
     reduce[threadIdx.x] = dot;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+      if (threadIdx.x < stride)
+        reduce[threadIdx.x] += reduce[threadIdx.x + stride];
       __syncthreads();
     }
 
@@ -238,8 +240,8 @@ Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
   const int64_t head_dim = out.Dim(2);
 
   if (lse.Dim(0) != tokens || lse.Dim(1) != heads) {
-    return InvalidArgumentError("lse must be [", tokens, ", ", heads,
-                                "], got ", lse.GetShape().ToString());
+    return InvalidArgumentError("lse must be [", tokens, ", ", heads, "], got ",
+                                lse.GetShape().ToString());
   }
 
   if (sinks.Dim(0) != heads) {
@@ -303,7 +305,8 @@ Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
 
   if (tokens == 0) return OkStatus();
 
-  const dim3 grid(static_cast<unsigned>(tokens), static_cast<unsigned>(q_heads));
+  const dim3 grid(static_cast<unsigned>(tokens),
+                  static_cast<unsigned>(q_heads));
   const size_t shared = static_cast<size_t>(head_dim) * sizeof(float);
 
   AttentionRefKernel<<<grid, kBlock, shared, stream>>>(
@@ -352,7 +355,8 @@ Status RotaryEmbeddingFromTable(const TensorView& q, const TensorView& k,
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(positions, DataType::kInt32, 1, "positions"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(inv_freq, DataType::kFloat, 1, "inv_freq"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(inv_freq, DataType::kFloat, 1, "inv_freq"));
 
   const int64_t tokens = q.Dim(0);
   const int64_t q_heads = q.Dim(1);
@@ -381,8 +385,9 @@ Status RotaryEmbeddingFromTable(const TensorView& q, const TensorView& k,
 
   if (tokens == 0) return OkStatus();
 
-  const dim3 grid(static_cast<unsigned>(tokens),
-                  static_cast<unsigned>(q_heads > kv_heads ? q_heads : kv_heads));
+  const dim3 grid(
+      static_cast<unsigned>(tokens),
+      static_cast<unsigned>(q_heads > kv_heads ? q_heads : kv_heads));
 
   RopeTableKernel<<<grid, kBlock, 0, stream>>>(
       static_cast<bf16*>(q.Data()), static_cast<bf16*>(k.Data()),
@@ -424,11 +429,11 @@ float ComputeYarnInvFreq(int64_t head_dim, double base, double factor,
   high = std::min(high, static_cast<double>(head_dim) - 1.0);
 
   for (int64_t j = 0; j < half; ++j) {
-    const double exponent = 2.0 * static_cast<double>(j) /
-                            static_cast<double>(head_dim);
+    const double exponent =
+        2.0 * static_cast<double>(j) / static_cast<double>(head_dim);
     const double pos_freq = std::pow(base, exponent);
 
-    const double extrapolation = 1.0 / pos_freq;       // the original frequency
+    const double extrapolation = 1.0 / pos_freq;  // the original frequency
     const double interpolation = 1.0 / (factor * pos_freq);  // stretched
 
     // A linear ramp between the two correction dimensions: low-frequency
@@ -442,9 +447,8 @@ float ComputeYarnInvFreq(int64_t head_dim, double base, double factor,
 
     const double extrapolation_factor = 1.0 - ramp;
 
-    out[j] = static_cast<float>(
-        interpolation * (1.0 - extrapolation_factor) +
-        extrapolation * extrapolation_factor);
+    out[j] = static_cast<float>(interpolation * (1.0 - extrapolation_factor) +
+                                extrapolation * extrapolation_factor);
   }
 
   // YaRN's attention temperature. Reached by default rather than by
@@ -457,4 +461,4 @@ float YarnMscale(double factor, double mscale) {
   return static_cast<float>(0.1 * mscale * std::log(factor) + 1.0);
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

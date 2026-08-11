@@ -1,13 +1,12 @@
-#include "inferx/ops/smoke.h"
+#include <cuda_runtime.h>
 
 #include <type_traits>
 
-#include <cuda_runtime.h>
-
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/tensor_view.h"
+#include "inferx/ops/smoke.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 // Included and asserted here rather than in a .cc, because the question is
@@ -71,7 +70,8 @@ Status LaunchScale(const TensorView& view, float scale) {
 
   if (!view.IsCuda()) {
     return InvalidArgumentError("LaunchScale: view is on ",
-                                view.Device().ToString(), ", not a CUDA device");
+                                view.Device().ToString(),
+                                ", not a CUDA device");
   }
 
   if (view.GetDataType() != DataType::kFloat) {
@@ -92,4 +92,4 @@ Status LaunchScale(const TensorView& view, float scale) {
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

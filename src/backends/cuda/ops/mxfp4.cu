@@ -1,11 +1,10 @@
-#include "inferx/ops/mxfp4.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/mxfp4.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -20,9 +19,10 @@ constexpr int kBytesPerBlock = 16;
 
 // FP4 E2M1, in nibble order: sign in bit 3, then a 2-bit exponent and a 1-bit
 // mantissa. Written as a table because that is what it is -- sixteen values --
-// and because decoding the fields arithmetically would be slower and no clearer.
+// and because decoding the fields arithmetically would be slower and no
+// clearer.
 __device__ __constant__ float kFp4Lut[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 // One block per source row. `dest_row` is computed by the caller's mapping so
@@ -149,9 +149,8 @@ Status DequantizeMxfp4ToBf16(const TensorView& blocks, const TensorView& scales,
 
 Status DequantizeMxfp4GateUpToBf16(const TensorView& blocks,
                                    const TensorView& scales,
-                                   const TensorView& out,
-                                   Stream stream) {
+                                   const TensorView& out, Stream stream) {
   return Launch(blocks, scales, out, /*deinterleave=*/true, stream);
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

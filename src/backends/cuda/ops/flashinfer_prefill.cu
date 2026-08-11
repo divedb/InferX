@@ -16,7 +16,7 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/ops/flashinfer_prefill.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -454,9 +454,9 @@ Status FlashInferPrefill::PrefillFp8(
   // == q·k -- but only the Q form keeps sm_scale at 1/sqrt(head_dim), which fa2
   // prefill's causal/length mask depends on: it suppresses masked K positions
   // inside exp2(logit*sm_scale_log2), and folding k_scale into sm_scale instead
-  // drives sm_scale_log2 to ~1e-4 and lets those positions leak into the softmax
-  // denominator (the bf16 path collapses the same way at an equally tiny
-  // sm_scale, so this is not fp8-specific). Decode needs none of this: it
+  // drives sm_scale_log2 to ~1e-4 and lets those positions leak into the
+  // softmax denominator (the bf16 path collapses the same way at an equally
+  // tiny sm_scale, so this is not fp8-specific). Decode needs none of this: it
   // excludes invalid slots structurally, with no soft mask to defeat.
   INFERX_ASSIGN_OR_RETURN(
       DeviceBuffer q_scaled,
@@ -541,4 +541,4 @@ Status FlashInferPrefill::PrefillFp8(
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

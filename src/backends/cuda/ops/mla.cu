@@ -1,11 +1,10 @@
-#include "inferx/ops/mla.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/mla.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -131,15 +130,12 @@ __global__ void GatherLatentsKernel(const bf16* __restrict__ cache,
 // in layers.cu, and for the same reason -- this is the correctness path, and a
 // flash-style single pass belongs behind the same interface once there is a
 // checkpoint to measure it against.
-__global__ void MlaAttentionKernel(const bf16* __restrict__ q_nope,
-                                   const bf16* __restrict__ q_rope,
-                                   const bf16* __restrict__ k_nope,
-                                   const bf16* __restrict__ k_rope,
-                                   const bf16* __restrict__ v,
-                                   bf16* __restrict__ out, int64_t heads,
-                                   int64_t nope_dim, int64_t rope_dim,
-                                   int64_t v_dim, int64_t context,
-                                   int64_t query_base, float scale) {
+__global__ void MlaAttentionKernel(
+    const bf16* __restrict__ q_nope, const bf16* __restrict__ q_rope,
+    const bf16* __restrict__ k_nope, const bf16* __restrict__ k_rope,
+    const bf16* __restrict__ v, bf16* __restrict__ out, int64_t heads,
+    int64_t nope_dim, int64_t rope_dim, int64_t v_dim, int64_t context,
+    int64_t query_base, float scale) {
   const int64_t query = blockIdx.x;
   const int64_t head = blockIdx.y;
 
@@ -170,7 +166,8 @@ __global__ void MlaAttentionKernel(const bf16* __restrict__ q_nope,
   __syncthreads();
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+      reduce[threadIdx.x] =
+          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
     }
     __syncthreads();
   }
@@ -205,7 +202,8 @@ __global__ void MlaAttentionKernel(const bf16* __restrict__ q_nope,
     reduce[threadIdx.x] = dot;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+      if (threadIdx.x < stride)
+        reduce[threadIdx.x] += reduce[threadIdx.x + stride];
       __syncthreads();
     }
 
@@ -269,14 +267,11 @@ __global__ void AbsorbQKernel(const bf16* __restrict__ q_nope,
 // part plus q_rope against the tail, and the "V" accumulated is the latent
 // itself. Same two-pass score-recomputing shape as MlaAttentionKernel, for
 // the same correctness-first reason.
-__global__ void LatentAttentionKernel(const bf16* __restrict__ q_lat,
-                                      const bf16* __restrict__ q_rope,
-                                      const bf16* __restrict__ cache,
-                                      const int32_t* __restrict__ block_table,
-                                      bf16* __restrict__ out_lat,
-                                      int64_t heads, int64_t latent_dim,
-                                      int64_t rope_dim, int64_t block_size,
-                                      int64_t query_base, float scale) {
+__global__ void LatentAttentionKernel(
+    const bf16* __restrict__ q_lat, const bf16* __restrict__ q_rope,
+    const bf16* __restrict__ cache, const int32_t* __restrict__ block_table,
+    bf16* __restrict__ out_lat, int64_t heads, int64_t latent_dim,
+    int64_t rope_dim, int64_t block_size, int64_t query_base, float scale) {
   const int64_t query = blockIdx.x;
   const int64_t head = blockIdx.y;
   const int64_t width = latent_dim + rope_dim;
@@ -425,8 +420,7 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
 }  // namespace
 
 Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
-                      const TensorView& positions, float theta,
-                      Stream stream) {
+                      const TensorView& positions, float theta, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 3, "x"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(positions, DataType::kInt32, 1, "positions"));
@@ -518,9 +512,13 @@ Status SplitTrailing(const TensorView& src, const TensorView& head,
   if (head.Dim(0) != rows || tail.Dim(0) != rows || head.Dim(1) != heads ||
       tail.Dim(1) != heads) {
     return InvalidArgumentError("SplitTrailing: src ",
-                                src.GetShape().ToString(), " does not match "
-                                "head ", head.GetShape().ToString(), " and "
-                                "tail ", tail.GetShape().ToString());
+                                src.GetShape().ToString(),
+                                " does not match "
+                                "head ",
+                                head.GetShape().ToString(),
+                                " and "
+                                "tail ",
+                                tail.GetShape().ToString());
   }
 
   if (head_width + tail_width != src.Dim(2)) {
@@ -555,9 +553,13 @@ Status MlaAppendLatent(const TensorView& latent, const TensorView& rope_key,
   const int64_t rope_dim = rope_key.Dim(1);
 
   if (rope_key.Dim(0) != tokens || slot_mapping.Dim(0) != tokens) {
-    return InvalidArgumentError("latent has ", tokens, " tokens but rope_key "
-                                "has ", rope_key.Dim(0), " and slot_mapping "
-                                "has ", slot_mapping.Dim(0));
+    return InvalidArgumentError("latent has ", tokens,
+                                " tokens but rope_key "
+                                "has ",
+                                rope_key.Dim(0),
+                                " and slot_mapping "
+                                "has ",
+                                slot_mapping.Dim(0));
   }
 
   // The pool hands MLA a [blocks, block_size, 1, width] view: one entry per
@@ -592,16 +594,15 @@ Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
   const int64_t width = cache.Dim(3);
 
   if (out.Dim(0) < context_len || out.Dim(1) != width) {
-    return InvalidArgumentError("out is ", out.GetShape().ToString(),
-                                " but ", context_len, " x ", width,
-                                " was asked for");
+    return InvalidArgumentError("out is ", out.GetShape().ToString(), " but ",
+                                context_len, " x ", width, " was asked for");
   }
 
   const int64_t blocks_needed = (context_len + block_size - 1) / block_size;
   if (block_table.Dim(0) < blocks_needed) {
     return InvalidArgumentError("block_table holds ", block_table.Dim(0),
-                                " blocks but ", context_len,
-                                " tokens need ", blocks_needed);
+                                " blocks but ", context_len, " tokens need ",
+                                blocks_needed);
   }
 
   if (context_len == 0) return OkStatus();
@@ -652,8 +653,8 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
 
   if (v.Dim(0) != context || v.Dim(1) != heads) {
     return InvalidArgumentError("v is ", v.GetShape().ToString(),
-                                " but the context is ", context,
-                                " over ", heads, " heads");
+                                " but the context is ", context, " over ",
+                                heads, " heads");
   }
 
   if (out.Dim(0) != q_tokens || out.Dim(1) != heads || out.Dim(2) != v_dim) {
@@ -678,16 +679,15 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
       static_cast<const bf16*>(q_rope.Data()),
       static_cast<const bf16*>(k_nope.Data()),
       static_cast<const bf16*>(k_rope.Data()),
-      static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()),
-      heads, nope_dim, rope_dim, v_dim, context, query_base, scale);
+      static_cast<const bf16*>(v.Data()), static_cast<bf16*>(out.Data()), heads,
+      nope_dim, rope_dim, v_dim, context, query_base, scale);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }
 
 Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
-                  const TensorView& q_lat, int64_t v_head_dim,
-                  Stream stream) {
+                  const TensorView& q_lat, int64_t v_head_dim, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q_nope, DataType::kBFloat16, 3, "q_nope"));
   INFERX_RETURN_IF_ERROR(CheckTensor(kv_b, DataType::kBFloat16, 2, "kv_b"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_lat, DataType::kBFloat16, 3, "q_lat"));
@@ -697,8 +697,7 @@ Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
   const int64_t nope_dim = q_nope.Dim(2);
   const int64_t latent_dim = kv_b.Dim(1);
 
-  if (v_head_dim <= 0 ||
-      kv_b.Dim(0) != heads * (nope_dim + v_head_dim)) {
+  if (v_head_dim <= 0 || kv_b.Dim(0) != heads * (nope_dim + v_head_dim)) {
     return InvalidArgumentError("kv_b is ", kv_b.GetShape().ToString(),
                                 ", expected [", heads, " * (", nope_dim, " + ",
                                 v_head_dim, "), latent]");
@@ -718,9 +717,8 @@ Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
 
   AbsorbQKernel<<<grid, kBlock, shared, stream>>>(
       static_cast<const bf16*>(q_nope.Data()),
-      static_cast<const bf16*>(kv_b.Data()),
-      static_cast<bf16*>(q_lat.Data()), heads, nope_dim, v_head_dim,
-      latent_dim);
+      static_cast<const bf16*>(kv_b.Data()), static_cast<bf16*>(q_lat.Data()),
+      heads, nope_dim, v_head_dim, latent_dim);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -746,9 +744,9 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
   const int64_t block_size = cache.Dim(1);
 
   if (cache.Dim(2) != 1 || cache.Dim(3) != latent_dim + rope_dim) {
-    return InvalidArgumentError(
-        "cache is ", cache.GetShape().ToString(),
-        ", expected [*, block_size, 1, ", latent_dim + rope_dim, "]");
+    return InvalidArgumentError("cache is ", cache.GetShape().ToString(),
+                                ", expected [*, block_size, 1, ",
+                                latent_dim + rope_dim, "]");
   }
 
   if (q_rope.Dim(0) != tokens || q_rope.Dim(1) != heads ||
@@ -760,19 +758,17 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
                                 " disagree");
   }
 
-  if (context_len <= 0 || query_base < 0 ||
-      query_base + tokens > context_len) {
+  if (context_len <= 0 || query_base < 0 || query_base + tokens > context_len) {
     return InvalidArgumentError("context_len ", context_len,
                                 " cannot hold queries at base ", query_base,
                                 " for ", tokens, " tokens");
   }
 
-  const int64_t blocks_needed =
-      (context_len + block_size - 1) / block_size;
+  const int64_t blocks_needed = (context_len + block_size - 1) / block_size;
   if (block_table.Dim(0) < blocks_needed) {
     return InvalidArgumentError("block_table holds ", block_table.Dim(0),
-                                " blocks but context ", context_len,
-                                " needs ", blocks_needed);
+                                " blocks but context ", context_len, " needs ",
+                                blocks_needed);
   }
 
   if (tokens == 0) return OkStatus();
@@ -808,9 +804,8 @@ Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
   if (qk_nope_head_dim <= 0 || kv_b.Dim(1) != latent_dim ||
       kv_b.Dim(0) != heads * (qk_nope_head_dim + v_dim)) {
     return InvalidArgumentError("kv_b is ", kv_b.GetShape().ToString(),
-                                ", expected [", heads, " * (",
-                                qk_nope_head_dim, " + ", v_dim, "), ",
-                                latent_dim, "]");
+                                ", expected [", heads, " * (", qk_nope_head_dim,
+                                " + ", v_dim, "), ", latent_dim, "]");
   }
 
   if (out.Dim(0) != tokens || out.Dim(1) != heads) {
@@ -832,4 +827,4 @@ Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

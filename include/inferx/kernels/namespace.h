@@ -1,6 +1,6 @@
 #pragma once
 
 namespace inferx {
-namespace kernels {}
-namespace ops = kernels;
+namespace ops {}
+namespace kernels = ops;
 }  // namespace inferx

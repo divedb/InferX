@@ -1,11 +1,10 @@
-#include "inferx/ops/w4a16_gemm.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/w4a16_gemm.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -35,8 +34,7 @@ __global__ void W4A16GemmScalarKernel(const bf16* __restrict__ x,
       const uint8_t byte = wr[kk >> 1];
       int q = (kk & 1) ? (byte >> 4) : (byte & 0xF);
       if (q >= 8) q -= 16;
-      acc += __bfloat162float(xr[kk]) * q *
-             __bfloat162float(ws[kk / group]);
+      acc += __bfloat162float(xr[kk]) * q * __bfloat162float(ws[kk / group]);
     }
     y[static_cast<int64_t>(i) * n + j] = __float2bfloat16(acc);
   }
@@ -52,10 +50,10 @@ __global__ void W4A16GemmScalarKernel(const bf16* __restrict__ x,
 // once for the whole batch. That is the structural difference from the unfused
 // dequant-then-bf16-GEMM baseline, and the reason W4A16 can beat bf16 on
 // weight-bandwidth-bound decode.
-constexpr int kWarpsPerBlock = 4;       // output columns per block
-constexpr int kVecElems = 8;            // one uint32 load = 8 int4 elements
+constexpr int kWarpsPerBlock = 4;           // output columns per block
+constexpr int kVecElems = 8;                // one uint32 load = 8 int4 elements
 constexpr int kVecStride = 32 * kVecElems;  // elements per warp per step (256)
-constexpr int kMaxRows = 16;            // accumulators per lane; decode batch
+constexpr int kMaxRows = 16;  // accumulators per lane; decode batch
 
 __global__ void W4A16GemmVectorKernel(const bf16* __restrict__ x,
                                       const uint8_t* __restrict__ w,
@@ -83,8 +81,7 @@ __global__ void W4A16GemmVectorKernel(const bf16* __restrict__ x,
   // Vectorized main loop: 256 elements per warp per step, coalesced.
   for (int base = 0; base + kVecStride <= k; base += kVecStride) {
     const int byte_off = base / 2 + lane * (kVecElems / 2);  // 4-byte aligned
-    const uint32_t packed =
-        *reinterpret_cast<const uint32_t*>(wr + byte_off);
+    const uint32_t packed = *reinterpret_cast<const uint32_t*>(wr + byte_off);
     const int k0 = base + lane * kVecElems;
 #pragma unroll
     for (int e = 0; e < kVecElems; ++e) {
@@ -131,14 +128,15 @@ Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
     return InvalidArgumentError("W4A16Gemm: x must be a defined CUDA tensor");
   }
   if (x.GetDataType() != DataType::kBFloat16) {
-    return InvalidArgumentError("W4A16Gemm: x is ", DataTypeName(x.GetDataType()),
-                                ", expected bf16");
+    return InvalidArgumentError(
+        "W4A16Gemm: x is ", DataTypeName(x.GetDataType()), ", expected bf16");
   }
   if (x.Rank() != 2) {
     return InvalidArgumentError("W4A16Gemm: x must be rank 2");
   }
   if (w_int4.GetDataType() != DataType::kInt4) {
-    return InvalidArgumentError("W4A16Gemm: w is ", DataTypeName(w_int4.GetDataType()),
+    return InvalidArgumentError("W4A16Gemm: w is ",
+                                DataTypeName(w_int4.GetDataType()),
                                 ", expected int4");
   }
   if (w_int4.Rank() != 2) {
@@ -156,7 +154,8 @@ Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
 
   if (w_int4.Dim(1) != k) {
     return InvalidArgumentError("W4A16Gemm: w is [", w_int4.Dim(0), ", ",
-                                w_int4.Dim(1), "], expected [", n, ", ", k, "]");
+                                w_int4.Dim(1), "], expected [", n, ", ", k,
+                                "]");
   }
   if (y.Rank() != 2 || y.Dim(0) != m || y.Dim(1) != n) {
     return InvalidArgumentError("W4A16Gemm: y is [", y.Dim(0), ", ", y.Dim(1),
@@ -166,8 +165,7 @@ Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
     return InvalidArgumentError("W4A16Gemm: group ", group,
                                 " must divide k=", k);
   }
-  if (scales.Rank() != 2 || scales.Dim(0) != n ||
-      scales.Dim(1) != k / group) {
+  if (scales.Rank() != 2 || scales.Dim(0) != n || scales.Dim(1) != k / group) {
     return InvalidArgumentError("W4A16Gemm: scales is [", scales.Dim(0), ", ",
                                 scales.Dim(1), "], expected [", n, ", ",
                                 k / group, "]");
@@ -185,30 +183,33 @@ Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
   // reference the vector path is diffed against.
   constexpr int64_t kMaxSmemBytes = 48 * 1024;
   const bool vector_ok =
-      m <= kMaxRows && static_cast<int64_t>(m) * k * sizeof(bf16) <= kMaxSmemBytes;
+      m <= kMaxRows &&
+      static_cast<int64_t>(m) * k * sizeof(bf16) <= kMaxSmemBytes;
 
   if (vector_ok) {
-    const int blocks = static_cast<int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    const int blocks =
+        static_cast<int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock);
     W4A16GemmVectorKernel<<<blocks, kWarpsPerBlock * 32,
-                           static_cast<size_t>(m) * static_cast<size_t>(k) * sizeof(bf16),
-                           stream>>>(
+                            static_cast<size_t>(m) * static_cast<size_t>(k) *
+                                sizeof(bf16),
+                            stream>>>(
         static_cast<const bf16*>(x.Data()),
         static_cast<const uint8_t*>(w_int4.Data()),
-        static_cast<const bf16*>(scales.Data()),
-        static_cast<bf16*>(y.Data()), static_cast<int>(m), static_cast<int>(n),
-        static_cast<int>(k), static_cast<int>(group));
+        static_cast<const bf16*>(scales.Data()), static_cast<bf16*>(y.Data()),
+        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+        static_cast<int>(group));
   } else {
     const int blocks = static_cast<int>((n + kScalarBN - 1) / kScalarBN);
     W4A16GemmScalarKernel<<<blocks, kScalarBN, 0, stream>>>(
         static_cast<const bf16*>(x.Data()),
         static_cast<const uint8_t*>(w_int4.Data()),
-        static_cast<const bf16*>(scales.Data()),
-        static_cast<bf16*>(y.Data()), static_cast<int>(m), static_cast<int>(n),
-        static_cast<int>(k), static_cast<int>(group));
+        static_cast<const bf16*>(scales.Data()), static_cast<bf16*>(y.Data()),
+        static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+        static_cast<int>(group));
   }
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

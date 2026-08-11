@@ -1,9 +1,9 @@
-#include "inferx/ops/flashinfer_attention.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <utility>
+
+#include "inferx/ops/flashinfer_attention.h"
 
 // FlashInfer's template layer. These are the only headers we take from it; the
 // wrapper layer under flashinfer/ (python, JIT, torch bindings) is deliberately
@@ -19,7 +19,7 @@
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -142,9 +142,8 @@ StatusOr<FlashInferDecode> FlashInferDecode::Create(
       DeviceBuffer::Allocate(int_workspace_bytes, DeviceId::Cuda(0)));
 
   impl->page_locked_bytes = int_workspace_bytes;
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaHostAlloc(&impl->page_locked, int_workspace_bytes,
-                    cudaHostAllocDefault));
+  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(
+      &impl->page_locked, int_workspace_bytes, cudaHostAllocDefault));
 
   return FlashInferDecode(std::move(impl));
 }
@@ -156,9 +155,8 @@ FlashInferDecode::FlashInferDecode(FlashInferDecode&&) noexcept = default;
 FlashInferDecode& FlashInferDecode::operator=(FlashInferDecode&&) noexcept =
     default;
 
-Status FlashInferDecode::Plan(int64_t batch, int64_t q_heads,
-                              int64_t kv_heads, int64_t head_dim,
-                              int64_t page_size,
+Status FlashInferDecode::Plan(int64_t batch, int64_t q_heads, int64_t kv_heads,
+                              int64_t head_dim, int64_t page_size,
                               absl::Span<const int32_t> kv_indptr_host,
                               bool graph_safe, Stream stream) {
   if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || page_size <= 0) {
@@ -201,13 +199,14 @@ Status FlashInferDecode::Plan(int64_t batch, int64_t q_heads,
         impl_->int_workspace.size(), impl_->plan,
         const_cast<IdType*>(kv_indptr_host.data()),
         static_cast<uint32_t>(batch), static_cast<uint32_t>(q_heads),
-        static_cast<uint32_t>(page_size), graph_safe, stream,
-        work_estimation);
+        static_cast<uint32_t>(page_size), graph_safe, stream, work_estimation);
   });
 
   if (!group_size_supported) {
-    return UnimplementedError("FlashInfer has no instantiation for a GQA group "
-                              "size of ", q_heads / kv_heads);
+    return UnimplementedError(
+        "FlashInfer has no instantiation for a GQA group "
+        "size of ",
+        q_heads / kv_heads);
   }
 
   INFERX_CUDA_RETURN_IF_ERROR(status);
@@ -259,11 +258,12 @@ Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
       page_size != impl_->planned_page_size) {
     return InvalidArgumentError(
         "these tensors are [batch=", batch, " q_heads=", q_heads,
-        " kv_heads=", kv_heads, " head_dim=", head_dim,
-        " page=", page_size, "] but the last plan was for [batch=",
-        impl_->planned_batch, " q_heads=", impl_->planned_q_heads,
-        " kv_heads=", impl_->planned_kv_heads, " head_dim=",
-        impl_->planned_head_dim, " page=", impl_->planned_page_size, "]");
+        " kv_heads=", kv_heads, " head_dim=", head_dim, " page=", page_size,
+        "] but the last plan was for [batch=", impl_->planned_batch,
+        " q_heads=", impl_->planned_q_heads,
+        " kv_heads=", impl_->planned_kv_heads,
+        " head_dim=", impl_->planned_head_dim,
+        " page=", impl_->planned_page_size, "]");
   }
 
   if (k_cache.Dim(3) != head_dim) {
@@ -278,8 +278,7 @@ Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
     return InvalidArgumentError("last_page_len has ", last_page_len.Dim(0),
                                 " entries, expected ", batch);
   }
-  if (out.Dim(0) != batch || out.Dim(1) != q_heads ||
-      out.Dim(2) != head_dim) {
+  if (out.Dim(0) != batch || out.Dim(1) != q_heads || out.Dim(2) != head_dim) {
     return InvalidArgumentError("out is ", out.GetShape().ToString(),
                                 ", expected [", batch, ", ", q_heads, ", ",
                                 head_dim, "]");
@@ -325,10 +324,9 @@ Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
   params.partition_kv = impl_->plan.split_kv;
 
   params.block_valid_mask =
-      impl_->plan.split_kv
-          ? reinterpret_cast<bool*>(int_base +
-                                    impl_->plan.block_valid_mask_offset)
-          : nullptr;
+      impl_->plan.split_kv ? reinterpret_cast<bool*>(
+                                 int_base + impl_->plan.block_valid_mask_offset)
+                           : nullptr;
 
   auto* float_base = static_cast<std::byte*>(impl_->float_workspace.data());
 
@@ -349,14 +347,11 @@ Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
   return OkStatus();
 }
 
-Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
-                                const TensorView& v_cache,
-                                const TensorView& kv_indices,
-                                const TensorView& kv_indptr,
-                                absl::Span<const int32_t> kv_indptr_host,
-                                const TensorView& last_page_len,
-                                const TensorView& out, float scale,
-                                Stream stream) {
+Status FlashInferDecode::Decode(
+    const TensorView& q, const TensorView& k_cache, const TensorView& v_cache,
+    const TensorView& kv_indices, const TensorView& kv_indptr,
+    absl::Span<const int32_t> kv_indptr_host, const TensorView& last_page_len,
+    const TensorView& out, float scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
 
@@ -422,9 +417,10 @@ Status FlashInferDecode::PlanFp8(int64_t batch, int64_t q_heads,
   });
 
   if (!group_size_supported) {
-    return UnimplementedError("FlashInfer has no instantiation for a GQA group "
-                              "size of ",
-                              q_heads / kv_heads);
+    return UnimplementedError(
+        "FlashInfer has no instantiation for a GQA group "
+        "size of ",
+        q_heads / kv_heads);
   }
   INFERX_CUDA_RETURN_IF_ERROR(status);
 
@@ -444,8 +440,7 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
                                 const TensorView& kv_indptr,
                                 const TensorView& last_page_len,
                                 const TensorView& out, float scale,
-                                float k_scale, float v_scale,
-                                Stream stream) {
+                                float k_scale, float v_scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckFp8(k_cache, 4, "k_cache"));
   INFERX_RETURN_IF_ERROR(CheckFp8(v_cache, 4, "v_cache"));
@@ -475,11 +470,12 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
       page_size != impl_->planned_page_size) {
     return InvalidArgumentError(
         "FP8 tensors are [batch=", batch, " q_heads=", q_heads,
-        " kv_heads=", kv_heads, " head_dim=", head_dim,
-        " page=", page_size, "] but the last FP8 plan was for [batch=",
-        impl_->planned_batch, " q_heads=", impl_->planned_q_heads,
-        " kv_heads=", impl_->planned_kv_heads, " head_dim=",
-        impl_->planned_head_dim, " page=", impl_->planned_page_size, "]");
+        " kv_heads=", kv_heads, " head_dim=", head_dim, " page=", page_size,
+        "] but the last FP8 plan was for [batch=", impl_->planned_batch,
+        " q_heads=", impl_->planned_q_heads,
+        " kv_heads=", impl_->planned_kv_heads,
+        " head_dim=", impl_->planned_head_dim,
+        " page=", impl_->planned_page_size, "]");
   }
   if (k_cache.Dim(3) != head_dim) {
     return InvalidArgumentError("q head_dim ", head_dim,
@@ -493,8 +489,7 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
     return InvalidArgumentError("last_page_len has ", last_page_len.Dim(0),
                                 " entries, expected ", batch);
   }
-  if (out.Dim(0) != batch || out.Dim(1) != q_heads ||
-      out.Dim(2) != head_dim) {
+  if (out.Dim(0) != batch || out.Dim(1) != q_heads || out.Dim(2) != head_dim) {
     return InvalidArgumentError("out is ", out.GetShape().ToString(),
                                 ", expected [", batch, ", ", q_heads, ", ",
                                 head_dim, "]");
@@ -519,9 +514,9 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
   params.q_stride_h = static_cast<IdType>(head_dim);
   params.window_left = -1;
   params.logits_soft_cap = 0.f;
-  // K's dequant scale is absorbed into the softmax scale: attention is invariant
-  // to a rescaling of K, so sm_scale * k_scale lands the QK products in the
-  // right units before the softmax normalizes them away.
+  // K's dequant scale is absorbed into the softmax scale: attention is
+  // invariant to a rescaling of K, so sm_scale * k_scale lands the QK products
+  // in the right units before the softmax normalizes them away.
   params.sm_scale = scale * k_scale;
   params.rope_rcp_scale = 1.f;
   params.rope_rcp_theta = 1.f;
@@ -540,10 +535,9 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
   params.partition_kv = impl_->plan.split_kv;
 
   params.block_valid_mask =
-      impl_->plan.split_kv
-          ? reinterpret_cast<bool*>(int_base +
-                                    impl_->plan.block_valid_mask_offset)
-          : nullptr;
+      impl_->plan.split_kv ? reinterpret_cast<bool*>(
+                                 int_base + impl_->plan.block_valid_mask_offset)
+                           : nullptr;
 
   auto* float_base = static_cast<std::byte*>(impl_->float_workspace.data());
 
@@ -636,4 +630,4 @@ Status BuildCsrBlockTable(const std::vector<int32_t>& block_table,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

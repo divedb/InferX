@@ -1,18 +1,15 @@
-#include "inferx/ops/layers.h"
-
-#include <curand_kernel.h>
-
-#include <utility>
-
-#include <algorithm>
-
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+#include <algorithm>
+#include <utility>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/layers.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -48,7 +45,8 @@ struct SumOp {
 };
 
 // One block per token. hidden is a multiple of the block size in every model we
-// target, but the loops are written as grid-strides so an odd width still works.
+// target, but the loops are written as grid-strides so an odd width still
+// works.
 __global__ void RmsNormKernel(const bf16* __restrict__ x,
                               const bf16* __restrict__ weight,
                               bf16* __restrict__ out, int64_t hidden,
@@ -91,8 +89,8 @@ __global__ void RopeKernel(bf16* __restrict__ q, bf16* __restrict__ k,
   for (int64_t j = threadIdx.x; j < half; j += blockDim.x) {
     // inv_freq[j] = theta^(-2j/d). __powf is fine here: the exponent is small
     // and the result feeds a sinf/cosf whose own error dominates.
-    const float inv_freq =
-        __powf(theta, -2.0f * static_cast<float>(j) / static_cast<float>(head_dim));
+    const float inv_freq = __powf(
+        theta, -2.0f * static_cast<float>(j) / static_cast<float>(head_dim));
     const float angle = pos * inv_freq;
 
     float s, c;
@@ -139,7 +137,7 @@ __global__ void AttentionKernel(const bf16* __restrict__ q,
                                 int64_t q_heads, int64_t kv_heads,
                                 int64_t head_dim, float scale) {
   extern __shared__ float smem[];
-  float* tile = smem;              // blockDim.x floats for reductions
+  float* tile = smem;                 // blockDim.x floats for reductions
   float* scores = smem + blockDim.x;  // one float per key
 
   const int64_t token = blockIdx.x;
@@ -227,12 +225,14 @@ __global__ void AppendKvKernel(const bf16* __restrict__ k,
 // bound, and a separate fp8 scratch the scatter would then read back doubles
 // the K/V traffic for nothing. The scale is fixed at warmup, so baking it into
 // the kernel argument pins a stable value for any captured decode graph.
-__global__ void AppendBf16AsFp8Kernel(
-    const bf16* __restrict__ k, const bf16* __restrict__ v,
-    __nv_fp8_storage_t* __restrict__ k_cache,
-    __nv_fp8_storage_t* __restrict__ v_cache,
-    const int32_t* __restrict__ slots, int64_t kv_heads, int64_t head_dim,
-    int64_t total_slots, float inv_k_scale, float inv_v_scale) {
+__global__ void AppendBf16AsFp8Kernel(const bf16* __restrict__ k,
+                                      const bf16* __restrict__ v,
+                                      __nv_fp8_storage_t* __restrict__ k_cache,
+                                      __nv_fp8_storage_t* __restrict__ v_cache,
+                                      const int32_t* __restrict__ slots,
+                                      int64_t kv_heads, int64_t head_dim,
+                                      int64_t total_slots, float inv_k_scale,
+                                      float inv_v_scale) {
   const int64_t token = blockIdx.x;
   const int64_t head = blockIdx.y;
   const int64_t slot = slots[token];
@@ -257,9 +257,8 @@ __global__ void PagedAttentionKernel(
     const bf16* __restrict__ q, const bf16* __restrict__ k_cache,
     const bf16* __restrict__ v_cache, const int32_t* __restrict__ block_table,
     const int32_t* __restrict__ seq_of_token, const int32_t* __restrict__ q_pos,
-    bf16* __restrict__ out, int64_t q_heads, int64_t kv_heads,
-    int64_t head_dim, int64_t block_size, int64_t max_blocks, float scale,
-    int64_t max_keys) {
+    bf16* __restrict__ out, int64_t q_heads, int64_t kv_heads, int64_t head_dim,
+    int64_t block_size, int64_t max_blocks, float scale, int64_t max_keys) {
   extern __shared__ float smem[];
   float* tile = smem;
   float* scores = smem + blockDim.x;
@@ -311,7 +310,8 @@ __global__ void PagedAttentionKernel(
     for (int64_t j = 0; j < n_keys; ++j) {
       const int32_t block = table[j / block_size];
       const int64_t slot = block * block_size + (j % block_size);
-      acc += scores[j] * ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
+      acc += scores[j] *
+             ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
     }
     out[(token * q_heads + head) * head_dim + d] = ToBf16(acc * inv_sum);
   }
@@ -343,10 +343,10 @@ __global__ void PagedAttentionWithLseKernel(
   const int64_t group = q_heads / kv_heads;
   const int64_t kv_head = head / group;
 
-  // A query at absolute position p sees keys [start_key, p]. With no window that
-  // is 0..p (the plain causal mask); with a window of W it is max(0, p-W+1)..p,
-  // so the oldest keys fall out of view rather than out of memory -- the cache
-  // still holds them, this kernel just stops reading them.
+  // A query at absolute position p sees keys [start_key, p]. With no window
+  // that is 0..p (the plain causal mask); with a window of W it is max(0,
+  // p-W+1)..p, so the oldest keys fall out of view rather than out of memory --
+  // the cache still holds them, this kernel just stops reading them.
   const int64_t pos = static_cast<int64_t>(q_pos[token]);
   const int64_t back = (window > 0 && pos + 1 > window) ? pos + 1 - window : 0;
   const int64_t start_key = back;
@@ -399,7 +399,8 @@ __global__ void PagedAttentionWithLseKernel(
       const int64_t key = start_key + j;
       const int32_t block = table[key / block_size];
       const int64_t slot = block * block_size + (key % block_size);
-      acc += scores[j] * ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
+      acc += scores[j] *
+             ToF32(v_cache[(slot * kv_heads + kv_head) * head_dim + d]);
     }
     out[(token * q_heads + head) * head_dim + d] = ToBf16(acc * inv_sum);
   }
@@ -489,7 +490,8 @@ __global__ void SplitQkvKernel(const bf16* __restrict__ fused,
   const int64_t width = q_dim + 2 * kv_dim;
   const int64_t total = tokens * width;
 
-  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (int64_t idx =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t token = idx / width;
     const int64_t col = idx % width;
@@ -512,7 +514,8 @@ __global__ void SiluMulFusedKernel(const bf16* __restrict__ fused,
                                    int64_t inter) {
   const int64_t total = tokens * inter;
 
-  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (int64_t idx =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        idx < total; idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t token = idx / inter;
     const int64_t col = idx % inter;
@@ -565,14 +568,14 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
 
   if (t.Rank() != rank) {
     return InvalidArgumentError(name, " has rank ", t.Rank(), ", expected ",
-                               rank);
+                                rank);
   }
 
   return OkStatus();
 }
 
-Status CheckSameShape(const TensorView& a, const TensorView& b,
-                      const char* an, const char* bn) {
+Status CheckSameShape(const TensorView& a, const TensorView& b, const char* an,
+                      const char* bn) {
   if (a.Rank() != b.Rank()) {
     return InvalidArgumentError(an, " has rank ", a.Rank(), " but ", bn,
                                 " has rank ", b.Rank());
@@ -609,19 +612,20 @@ Status RmsNorm(const TensorView& x, const TensorView& weight,
   const int64_t hidden = x.Dim(1);
 
   if (weight.Dim(0) != hidden) {
-    return InvalidArgumentError("weight has ", weight.Dim(0), " elements but "
-                                "hidden is ", hidden);
+    return InvalidArgumentError("weight has ", weight.Dim(0),
+                                " elements but "
+                                "hidden is ",
+                                hidden);
   }
 
   if (tokens == 0) return OkStatus();
 
   const int block = BlockFor(hidden);
 
-  RmsNormKernel<<<static_cast<unsigned>(tokens), block,
-                  block * sizeof(float), stream>>>(
-      static_cast<const bf16*>(x.Data()),
-      static_cast<const bf16*>(weight.Data()),
-      static_cast<bf16*>(out.Data()), hidden, eps);
+  RmsNormKernel<<<static_cast<unsigned>(tokens), block, block * sizeof(float),
+                  stream>>>(static_cast<const bf16*>(x.Data()),
+                            static_cast<const bf16*>(weight.Data()),
+                            static_cast<bf16*>(out.Data()), hidden, eps);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -632,8 +636,8 @@ Status RotaryEmbedding(const TensorView& q, const TensorView& k,
                        Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(positions, DataType::kInt32, 1,
-                                     "positions"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(positions, DataType::kInt32, 1, "positions"));
 
   const int64_t tokens = q.Dim(0);
   const int64_t q_heads = q.Dim(1);
@@ -686,13 +690,12 @@ Status SiluMul(const TensorView& gate, const TensorView& up,
 
   constexpr int kBlock = 256;
   const int64_t grid_want = (n + kBlock - 1) / kBlock;
-  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
-                                                               : grid_want);
+  const unsigned grid =
+      static_cast<unsigned>(grid_want > 4096 ? 4096 : grid_want);
 
   SiluMulKernel<<<grid, kBlock, 0, stream>>>(
       static_cast<const bf16*>(gate.Data()),
-      static_cast<const bf16*>(up.Data()),
-      static_cast<bf16*>(out.Data()), n);
+      static_cast<const bf16*>(up.Data()), static_cast<bf16*>(out.Data()), n);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -721,8 +724,10 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
                                 k.Dim(2));
   }
   if (kv_heads == 0 || q_heads % kv_heads != 0) {
-    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
-                                "kv_heads (", kv_heads, ")");
+    return InvalidArgumentError("q_heads (", q_heads,
+                                ") is not a multiple of "
+                                "kv_heads (",
+                                kv_heads, ")");
   }
 
   if (tokens == 0) return OkStatus();
@@ -731,8 +736,9 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
 
   // Shared memory holds the reduction tile plus one score per key. The score
   // array is sized for the longest query, which is the last token.
-  const size_t smem = (static_cast<size_t>(block) +
-                       static_cast<size_t>(tokens)) * sizeof(float);
+  const size_t smem =
+      (static_cast<size_t>(block) + static_cast<size_t>(tokens)) *
+      sizeof(float);
 
   // 48 KB is the default per-block limit without opting in to more. At bf16
   // this caps M2 at ~11k tokens, well past the 32k context we would need a
@@ -760,22 +766,24 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
                        const TensorView& slots, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
-                                     "k_cache"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
-                                     "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(k_cache, DataType::kBFloat16, 4, "k_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(v_cache, DataType::kBFloat16, 4, "v_cache"));
   INFERX_RETURN_IF_ERROR(CheckTensor(slots, DataType::kInt32, 1, "slots"));
   INFERX_RETURN_IF_ERROR(CheckSameShape(k, v, "k", "v"));
-  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
-                                        "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckSameShape(k_cache, v_cache, "k_cache", "v_cache"));
 
   const int64_t tokens = k.Dim(0);
   const int64_t kv_heads = k.Dim(1);
   const int64_t head_dim = k.Dim(2);
 
   if (slots.Dim(0) != tokens) {
-    return InvalidArgumentError("slots has ", slots.Dim(0), " entries but "
-                                "there are ", tokens, " tokens");
+    return InvalidArgumentError("slots has ", slots.Dim(0),
+                                " entries but "
+                                "there are ",
+                                tokens, " tokens");
   }
   if (k_cache.Dim(2) != kv_heads || k_cache.Dim(3) != head_dim) {
     return InvalidArgumentError("cache is [.., .., ", k_cache.Dim(2), ", ",
@@ -816,9 +824,10 @@ Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
       CheckSameShape(k_cache, v_cache, "k_cache", "v_cache"));
 
   if (k_scale <= 0.0f || v_scale <= 0.0f) {
-    return InvalidArgumentError("AppendBf16AsFp8: scales must be positive, got "
-                                "k_scale=",
-                                k_scale, " v_scale=", v_scale);
+    return InvalidArgumentError(
+        "AppendBf16AsFp8: scales must be positive, got "
+        "k_scale=",
+        k_scale, " v_scale=", v_scale);
   }
 
   const int64_t tokens = k.Dim(0);
@@ -859,19 +868,19 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& out, float scale, int64_t max_context,
                       Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
-                                     "k_cache"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
-                                     "v_cache"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(block_table, DataType::kInt32, 2,
-                                     "block_table"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(seq_of_token, DataType::kInt32, 1,
-                                     "seq_of_token"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(k_cache, DataType::kBFloat16, 4, "k_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(v_cache, DataType::kBFloat16, 4, "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(block_table, DataType::kInt32, 2, "block_table"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(seq_of_token, DataType::kInt32, 1, "seq_of_token"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_pos, DataType::kInt32, 1, "q_pos"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
   INFERX_RETURN_IF_ERROR(CheckSameShape(q, out, "q", "out"));
-  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
-                                        "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckSameShape(k_cache, v_cache, "k_cache", "v_cache"));
 
   const int64_t tokens = q.Dim(0);
   const int64_t q_heads = q.Dim(1);
@@ -881,17 +890,21 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
   const int64_t max_blocks = block_table.Dim(1);
 
   if (k_cache.Dim(3) != head_dim) {
-    return InvalidArgumentError("q head_dim is ", head_dim, " but the cache's "
-                                "is ", k_cache.Dim(3));
+    return InvalidArgumentError("q head_dim is ", head_dim,
+                                " but the cache's "
+                                "is ",
+                                k_cache.Dim(3));
   }
   if (kv_heads == 0 || q_heads % kv_heads != 0) {
-    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
-                                "kv_heads (", kv_heads, ")");
+    return InvalidArgumentError("q_heads (", q_heads,
+                                ") is not a multiple of "
+                                "kv_heads (",
+                                kv_heads, ")");
   }
   if (seq_of_token.Dim(0) != tokens || q_pos.Dim(0) != tokens) {
-    return InvalidArgumentError("seq_of_token/q_pos have ",
-                                seq_of_token.Dim(0), "/", q_pos.Dim(0),
-                                " entries but there are ", tokens, " tokens");
+    return InvalidArgumentError("seq_of_token/q_pos have ", seq_of_token.Dim(0),
+                                "/", q_pos.Dim(0), " entries but there are ",
+                                tokens, " tokens");
   }
 
   if (tokens == 0) return OkStatus();
@@ -912,9 +925,9 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
   // a problem yet: this is the correctness path, and the tiled kernel that
   // lifts the limit is the one FlashInfer provides.
   if (smem > 48u * 1024u) {
-    return ResourceExhaustedError(
-        "paged attention needs ", smem, " B of shared memory for ", max_keys,
-        " keys, over the 48 KB limit");
+    return ResourceExhaustedError("paged attention needs ", smem,
+                                  " B of shared memory for ", max_keys,
+                                  " keys, over the 48 KB limit");
   }
 
   PagedAttentionKernel<<<dim3(static_cast<unsigned>(tokens),
@@ -925,9 +938,8 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
       static_cast<const bf16*>(v_cache.Data()),
       static_cast<const int32_t*>(block_table.Data()),
       static_cast<const int32_t*>(seq_of_token.Data()),
-      static_cast<const int32_t*>(q_pos.Data()),
-      static_cast<bf16*>(out.Data()), q_heads, kv_heads, head_dim, block_size,
-      max_blocks, scale, max_keys);
+      static_cast<const int32_t*>(q_pos.Data()), static_cast<bf16*>(out.Data()),
+      q_heads, kv_heads, head_dim, block_size, max_blocks, scale, max_keys);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -938,23 +950,22 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
                              const TensorView& block_table,
                              const TensorView& seq_of_token,
                              const TensorView& q_pos, const TensorView& out,
-                             const TensorView& lse, float scale,
-                             int64_t window, int64_t max_context,
-                             Stream stream) {
+                             const TensorView& lse, float scale, int64_t window,
+                             int64_t max_context, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
-                                      "k_cache"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(v_cache, DataType::kBFloat16, 4,
-                                      "v_cache"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(block_table, DataType::kInt32, 2,
-                                      "block_table"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(seq_of_token, DataType::kInt32, 1,
-                                      "seq_of_token"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(k_cache, DataType::kBFloat16, 4, "k_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(v_cache, DataType::kBFloat16, 4, "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(block_table, DataType::kInt32, 2, "block_table"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(seq_of_token, DataType::kInt32, 1, "seq_of_token"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_pos, DataType::kInt32, 1, "q_pos"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
   INFERX_RETURN_IF_ERROR(CheckSameShape(q, out, "q", "out"));
-  INFERX_RETURN_IF_ERROR(CheckSameShape(k_cache, v_cache, "k_cache",
-                                         "v_cache"));
+  INFERX_RETURN_IF_ERROR(
+      CheckSameShape(k_cache, v_cache, "k_cache", "v_cache"));
 
   // lse is optional: an empty TensorView means "do not write it", which keeps a
   // caller that only wants the window from allocating a scratch it never reads.
@@ -962,9 +973,9 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
   if (lse.IsDefined()) {
     INFERX_RETURN_IF_ERROR(CheckTensor(lse, DataType::kFloat, 2, "lse"));
     if (lse.Dim(0) != q.Dim(0) || lse.Dim(1) != q.Dim(1)) {
-      return InvalidArgumentError(
-          "lse is [", lse.Dim(0), ", ", lse.Dim(1),
-          "] but expected [", q.Dim(0), ", ", q.Dim(1), "]");
+      return InvalidArgumentError("lse is [", lse.Dim(0), ", ", lse.Dim(1),
+                                  "] but expected [", q.Dim(0), ", ", q.Dim(1),
+                                  "]");
     }
     lse_ptr = static_cast<float*>(lse.Data());
   }
@@ -977,17 +988,21 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
   const int64_t max_blocks = block_table.Dim(1);
 
   if (k_cache.Dim(3) != head_dim) {
-    return InvalidArgumentError("q head_dim is ", head_dim, " but the cache's "
-                                "is ", k_cache.Dim(3));
+    return InvalidArgumentError("q head_dim is ", head_dim,
+                                " but the cache's "
+                                "is ",
+                                k_cache.Dim(3));
   }
   if (kv_heads == 0 || q_heads % kv_heads != 0) {
-    return InvalidArgumentError("q_heads (", q_heads, ") is not a multiple of "
-                                "kv_heads (", kv_heads, ")");
+    return InvalidArgumentError("q_heads (", q_heads,
+                                ") is not a multiple of "
+                                "kv_heads (",
+                                kv_heads, ")");
   }
   if (seq_of_token.Dim(0) != tokens || q_pos.Dim(0) != tokens) {
-    return InvalidArgumentError("seq_of_token/q_pos have ",
-                                seq_of_token.Dim(0), "/", q_pos.Dim(0),
-                                " entries but there are ", tokens, " tokens");
+    return InvalidArgumentError("seq_of_token/q_pos have ", seq_of_token.Dim(0),
+                                "/", q_pos.Dim(0), " entries but there are ",
+                                tokens, " tokens");
   }
 
   if (tokens == 0) return OkStatus();
@@ -1006,22 +1021,22 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
       sizeof(float);
 
   if (smem > 48u * 1024u) {
-    return ResourceExhaustedError(
-        "paged attention (lse) needs ", smem, " B of shared memory for ",
-        max_keys, " keys, over the 48 KB limit");
+    return ResourceExhaustedError("paged attention (lse) needs ", smem,
+                                  " B of shared memory for ", max_keys,
+                                  " keys, over the 48 KB limit");
   }
 
   PagedAttentionWithLseKernel<<<dim3(static_cast<unsigned>(tokens),
-                                      static_cast<unsigned>(q_heads)),
-                                 block, smem, stream>>>(
+                                     static_cast<unsigned>(q_heads)),
+                                block, smem, stream>>>(
       static_cast<const bf16*>(q.Data()),
       static_cast<const bf16*>(k_cache.Data()),
       static_cast<const bf16*>(v_cache.Data()),
       static_cast<const int32_t*>(block_table.Data()),
       static_cast<const int32_t*>(seq_of_token.Data()),
-      static_cast<const int32_t*>(q_pos.Data()),
-      static_cast<bf16*>(out.Data()), lse_ptr, q_heads, kv_heads, head_dim,
-      block_size, max_blocks, scale, window, max_keys);
+      static_cast<const int32_t*>(q_pos.Data()), static_cast<bf16*>(out.Data()),
+      lse_ptr, q_heads, kv_heads, head_dim, block_size, max_blocks, scale,
+      window, max_keys);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -1097,8 +1112,8 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      shared[threadIdx.x] = fmaxf(shared[threadIdx.x],
-                                  shared[threadIdx.x + stride]);
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
     }
     __syncthreads();
   }
@@ -1116,7 +1131,8 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
   __syncthreads();
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
     __syncthreads();
   }
 
@@ -1235,7 +1251,8 @@ __global__ void SampleKernel(const bf16* __restrict__ logits,
     shared[threadIdx.x] = local;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+      if (threadIdx.x < stride)
+        shared[threadIdx.x] += shared[threadIdx.x + stride];
       __syncthreads();
     }
     mass = shared[0];
@@ -1356,8 +1373,8 @@ __global__ void ComputeLogprobsKernel(
   __syncthreads();
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      shared[threadIdx.x] = fmaxf(shared[threadIdx.x],
-                                  shared[threadIdx.x + stride]);
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
     }
     __syncthreads();
   }
@@ -1371,7 +1388,8 @@ __global__ void ComputeLogprobsKernel(
   shared[threadIdx.x] = local_sum;
   __syncthreads();
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    if (threadIdx.x < stride)
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
     __syncthreads();
   }
   const float log_z = __logf(shared[0]) + max_logit;
@@ -1396,8 +1414,7 @@ __global__ void ComputeLogprobsKernel(
     for (int64_t i = threadIdx.x; i < vocab; i += blockDim.x) {
       const float v = __bfloat162float(row[i]);
       const bool after_prev =
-          v < prev_val ||
-          (v == prev_val && static_cast<int>(i) > prev_idx);
+          v < prev_val || (v == prev_val && static_cast<int>(i) > prev_idx);
       if (!after_prev) continue;
       if (v > best || (v == best && static_cast<int>(i) < best_i)) {
         best = v;
@@ -1465,7 +1482,6 @@ Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
   return OkStatus();
 }
 
-
 Status SampleTokens(const TensorView& logits, const TensorView& rows,
                     const TensorView& temperature, const TensorView& top_p,
                     const TensorView& top_k, const TensorView& min_p,
@@ -1483,9 +1499,9 @@ Status SampleTokens(const TensorView& logits, const TensorView& rows,
   const int64_t n = rows.Dim(0);
   const int64_t vocab = logits.Dim(1);
 
-  for (const auto& [t, name] : {std::pair{temperature, "temperature"},
-                                std::pair{top_p, "top_p"},
-                                std::pair{min_p, "min_p"}}) {
+  for (const auto& [t, name] :
+       {std::pair{temperature, "temperature"}, std::pair{top_p, "top_p"},
+        std::pair{min_p, "min_p"}}) {
     if (t.Dim(0) != n) {
       return InvalidArgumentError(name, " has ", t.Dim(0), " entries but ", n,
                                   " rows were requested");
@@ -1558,8 +1574,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
     }
   }
   if (history_ids.Dim(0) != n || history_counts.Dim(0) != n ||
-      mask_ids.Dim(0) != n ||
-      history_counts.Dim(1) != hist_cap) {
+      mask_ids.Dim(0) != n || history_counts.Dim(1) != hist_cap) {
     return InvalidArgumentError(
         "penalty history/mask shapes disagree with the row count");
   }
@@ -1574,8 +1589,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
       static_cast<const float*>(repetition.Data()),
       static_cast<const int32_t*>(history_ids.Data()),
       static_cast<const int32_t*>(history_counts.Data()),
-      static_cast<int>(hist_cap),
-      static_cast<const int32_t*>(mask_ids.Data()),
+      static_cast<int>(hist_cap), static_cast<const int32_t*>(mask_ids.Data()),
       static_cast<int>(mask_cap), vocab);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
@@ -1602,8 +1616,9 @@ Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
 
   if (chosen.Dim(0) != n || k_wanted.Dim(0) != n || chosen_lp.Dim(0) != n ||
       top_ids.Dim(0) != n || top_lps.Dim(0) != n || top_lps.Dim(1) != max_k) {
-    return InvalidArgumentError("logprob output shapes disagree with the row "
-                                "count");
+    return InvalidArgumentError(
+        "logprob output shapes disagree with the row "
+        "count");
   }
 
   if (n == 0) return OkStatus();
@@ -1630,8 +1645,10 @@ Status ScatterTokens(const TensorView& src, const TensorView& dst,
   const int64_t n = src.Dim(0);
 
   if (slots.Dim(0) != n) {
-    return InvalidArgumentError("slots has ", slots.Dim(0), " entries but src "
-                                "has ", n);
+    return InvalidArgumentError("slots has ", slots.Dim(0),
+                                " entries but src "
+                                "has ",
+                                n);
   }
 
   if (n == 0) return OkStatus();
@@ -1669,8 +1686,8 @@ Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
 
   EmbeddingKernel<<<static_cast<unsigned>(tokens), block, 0, stream>>>(
       static_cast<const bf16*>(table.Data()),
-      static_cast<const int32_t*>(ids.Data()),
-      static_cast<bf16*>(out.Data()), hidden, vocab);
+      static_cast<const int32_t*>(ids.Data()), static_cast<bf16*>(out.Data()),
+      hidden, vocab);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -1704,8 +1721,10 @@ Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
   if (bias.IsDefined()) {
     INFERX_RETURN_IF_ERROR(CheckTensor(bias, DataType::kBFloat16, 1, "bias"));
     if (bias.Dim(0) != fused.Dim(1)) {
-      return InvalidArgumentError("bias has ", bias.Dim(0), " entries but "
-                                  "fused is ", fused.Dim(1), " wide");
+      return InvalidArgumentError("bias has ", bias.Dim(0),
+                                  " entries but "
+                                  "fused is ",
+                                  fused.Dim(1), " wide");
     }
     bias_ptr = static_cast<const bf16*>(bias.Data());
   }
@@ -1763,16 +1782,18 @@ Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
   const int64_t width = out.Dim(1);
 
   if (bias.Dim(0) != width) {
-    return InvalidArgumentError("bias has ", bias.Dim(0), " elements but out "
-                                "is ", width, " wide");
+    return InvalidArgumentError("bias has ", bias.Dim(0),
+                                " elements but out "
+                                "is ",
+                                width, " wide");
   }
 
   if (tokens == 0) return OkStatus();
 
   constexpr int kBlock = 256;
   const int64_t grid_want = (tokens * width + kBlock - 1) / kBlock;
-  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
-                                                               : grid_want);
+  const unsigned grid =
+      static_cast<unsigned>(grid_want > 4096 ? 4096 : grid_want);
 
   AddBiasKernel<<<grid, kBlock, 0, stream>>>(
       static_cast<bf16*>(out.Data()), static_cast<const bf16*>(bias.Data()),
@@ -1785,8 +1806,8 @@ Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
 Status AddInPlace(const TensorView& out, const TensorView& residual,
                   Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(residual, DataType::kBFloat16, 2,
-                                     "residual"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(residual, DataType::kBFloat16, 2, "residual"));
   INFERX_RETURN_IF_ERROR(CheckSameShape(out, residual, "out", "residual"));
 
   const int64_t n = out.Numel();
@@ -1794,15 +1815,15 @@ Status AddInPlace(const TensorView& out, const TensorView& residual,
 
   constexpr int kBlock = 256;
   const int64_t grid_want = (n + kBlock - 1) / kBlock;
-  const unsigned grid = static_cast<unsigned>(grid_want > 4096 ? 4096
-                                                               : grid_want);
+  const unsigned grid =
+      static_cast<unsigned>(grid_want > 4096 ? 4096 : grid_want);
 
   AddKernel<<<grid, kBlock, 0, stream>>>(
-      static_cast<bf16*>(out.Data()),
-      static_cast<const bf16*>(residual.Data()), n);
+      static_cast<bf16*>(out.Data()), static_cast<const bf16*>(residual.Data()),
+      n);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

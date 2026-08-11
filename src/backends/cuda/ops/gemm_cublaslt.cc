@@ -10,25 +10,36 @@
 #include "inferx/core/shape.h"
 #include "inferx/ops/gemm.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 // Spelled out rather than calling cublasGetStatusName/String, which live in
-// libcublas -- linking the whole of cuBLAS to render two strings would widen the
-// dependency for no benefit, and cuBLASLt is the only part of it we want.
+// libcublas -- linking the whole of cuBLAS to render two strings would widen
+// the dependency for no benefit, and cuBLASLt is the only part of it we want.
 const char* CublasStatusName(cublasStatus_t s) {
   switch (s) {
-    case CUBLAS_STATUS_SUCCESS:          return "CUBLAS_STATUS_SUCCESS";
-    case CUBLAS_STATUS_NOT_INITIALIZED:  return "CUBLAS_STATUS_NOT_INITIALIZED";
-    case CUBLAS_STATUS_ALLOC_FAILED:     return "CUBLAS_STATUS_ALLOC_FAILED";
-    case CUBLAS_STATUS_INVALID_VALUE:    return "CUBLAS_STATUS_INVALID_VALUE";
-    case CUBLAS_STATUS_ARCH_MISMATCH:    return "CUBLAS_STATUS_ARCH_MISMATCH";
-    case CUBLAS_STATUS_MAPPING_ERROR:    return "CUBLAS_STATUS_MAPPING_ERROR";
-    case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
-    case CUBLAS_STATUS_INTERNAL_ERROR:   return "CUBLAS_STATUS_INTERNAL_ERROR";
-    case CUBLAS_STATUS_NOT_SUPPORTED:    return "CUBLAS_STATUS_NOT_SUPPORTED";
-    case CUBLAS_STATUS_LICENSE_ERROR:    return "CUBLAS_STATUS_LICENSE_ERROR";
-    default:                             return "CUBLAS_STATUS_UNKNOWN";
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+    default:
+      return "CUBLAS_STATUS_UNKNOWN";
   }
 }
 
@@ -56,14 +67,13 @@ Status CublasErrorToStatus(cublasStatus_t s, const char* expr, const char* file,
   }
 }
 
-#define INFERX_CUBLAS_RETURN_IF_ERROR(expr)                                 \
-  do {                                                                      \
-    cublasStatus_t _inferx_bl_status = (expr);                              \
-    if (_inferx_bl_status != CUBLAS_STATUS_SUCCESS) [[unlikely]] {          \
-      return ::inferx::kernels::CublasErrorToStatus(_inferx_bl_status,      \
-                                                    #expr, __FILE__,        \
-                                                    __LINE__);              \
-    }                                                                       \
+#define INFERX_CUBLAS_RETURN_IF_ERROR(expr)                               \
+  do {                                                                    \
+    cublasStatus_t _inferx_bl_status = (expr);                            \
+    if (_inferx_bl_status != CUBLAS_STATUS_SUCCESS) [[unlikely]] {        \
+      return ::inferx::ops::CublasErrorToStatus(_inferx_bl_status, #expr, \
+                                                __FILE__, __LINE__);      \
+    }                                                                     \
   } while (0)
 
 // FP8 and FP16 plans for the same shape are different plans: the layouts carry
@@ -82,8 +92,7 @@ struct ShapeKey {
 
   template <typename H>
   friend H AbslHashValue(H h, const ShapeKey& s) {
-    return H::combine(std::move(h), s.m, s.n, s.k,
-                      static_cast<int>(s.path));
+    return H::combine(std::move(h), s.m, s.n, s.k, static_cast<int>(s.path));
   }
 };
 
@@ -290,10 +299,9 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
   // preference above, so all of them fit the buffer handed to cublasLtMatmul.
   const cublasStatus_t heur_status =
       pref_status == CUBLAS_STATUS_SUCCESS
-          ? cublasLtMatmulAlgoGetHeuristic(lt, plan->desc, plan->a, plan->b,
-                                           plan->c, plan->c, pref,
-                                           Plan::kMaxAlgos, plan->candidates,
-                                           &plan->num_candidates)
+          ? cublasLtMatmulAlgoGetHeuristic(
+                lt, plan->desc, plan->a, plan->b, plan->c, plan->c, pref,
+                Plan::kMaxAlgos, plan->candidates, &plan->num_candidates)
           : pref_status;
 
   // Destroyed before the error checks below so that neither early return leaks
@@ -309,7 +317,7 @@ StatusOr<const Plan*> CublasLtGemm::Impl::GetOrBuild(int64_t m, int64_t n,
     return UnimplementedError(
         "cuBLASLt has no algorithm for m=", m, " n=", n, " k=", k, " (",
         (path == Path::kF8E4M3 || path == Path::kF8E4M3BF16Out) ? "f8e4m3"
-                                                                 : "f16",
+                                                                : "f16",
         " in, f32 accumulate, workspace ", ws_bytes, " B)");
   }
 
@@ -347,16 +355,18 @@ Status CublasLtGemm::Impl::Tune(Plan& plan, int64_t m, int64_t n, int64_t k,
   constexpr int64_t kTuneMaxTokens = 64;
   if (m > kTuneMaxTokens) return OkStatus();
 
-  const DataType out_dt = (path == Path::kF8E4M3BF16Out) ? DataType::kBFloat16
-                                                          : DataType::kFloat16;
+  const DataType out_dt =
+      (path == Path::kF8E4M3BF16Out) ? DataType::kBFloat16 : DataType::kFloat16;
 
   // Operand scratch. Values do not affect FP8-GEMM timing -- the tensor cores
   // have no data-dependent path, and the scale folds into a fixed epilogue --
   // so zeroed buffers time identically to real ones and avoid a quantize pass
   // per candidate. The descriptor already carries the unit scales bound in
   // GetOrBuild, which is all timing needs.
-  auto xb = DeviceBuffer::Allocate(static_cast<size_t>(m * k), DeviceId::Cuda(0));
-  auto wb = DeviceBuffer::Allocate(static_cast<size_t>(n * k), DeviceId::Cuda(0));
+  auto xb =
+      DeviceBuffer::Allocate(static_cast<size_t>(m * k), DeviceId::Cuda(0));
+  auto wb =
+      DeviceBuffer::Allocate(static_cast<size_t>(n * k), DeviceId::Cuda(0));
   auto yb =
       DeviceBuffer::Allocate(static_cast<size_t>(m * n) * 2, DeviceId::Cuda(0));
   if (!xb.ok() || !wb.ok() || !yb.ok()) return OkStatus();
@@ -371,8 +381,8 @@ Status CublasLtGemm::Impl::Tune(Plan& plan, int64_t m, int64_t n, int64_t k,
                               Shape({m, k}), DeviceId::Cuda(0));
   auto w = TensorView::Create(wb->data(), DataType::kFloat8E4M3FN,
                               Shape({n, k}), DeviceId::Cuda(0));
-  auto y = TensorView::Create(yb->data(), out_dt, Shape({m, n}),
-                              DeviceId::Cuda(0));
+  auto y =
+      TensorView::Create(yb->data(), out_dt, Shape({m, n}), DeviceId::Cuda(0));
   if (!x.ok() || !w.ok() || !y.ok()) return OkStatus();
 
   EventPair events;
@@ -408,7 +418,8 @@ Status CublasLtGemm::Impl::Tune(Plan& plan, int64_t m, int64_t n, int64_t k,
   // Size the batch from a pilot on candidate 0 -- now that the clock has
   // settled -- so every candidate is measured over the same launch count.
   // Clamped because m=1 shapes would otherwise ask for thousands of launches,
-  // and a millisecond of device time is all the resolution the comparison needs.
+  // and a millisecond of device time is all the resolution the comparison
+  // needs.
   constexpr int kWarmup = 5;
   constexpr double kTargetSampleMs = 1.0;
   int batch = 1;
@@ -421,8 +432,8 @@ Status CublasLtGemm::Impl::Tune(Plan& plan, int64_t m, int64_t n, int64_t k,
     if (cudaEventElapsedTime(&pilot_ms, events.a, events.b) == cudaSuccess &&
         pilot_ms > 0.0f) {
       const double want = kTargetSampleMs / static_cast<double>(pilot_ms);
-      batch = static_cast<int>(
-          want < 1.0 ? 1.0 : (want > 256.0 ? 256.0 : want));
+      batch =
+          static_cast<int>(want < 1.0 ? 1.0 : (want > 256.0 ? 256.0 : want));
     }
   }
 
@@ -593,11 +604,12 @@ Status CublasLtGemm::LinearF16(const TensorView& x, const TensorView& w,
   // extent here is a silent out-of-bounds read on the device, which surfaces
   // later as a corrupted tensor somewhere unrelated.
   for (const auto& [name, t] : {std::pair{"x", &x}, {"w", &w}, {"y", &y}}) {
-    if (!t->IsDefined()) return InvalidArgumentError("LinearF16: ", name,
-                                                     " is undefined");
+    if (!t->IsDefined())
+      return InvalidArgumentError("LinearF16: ", name, " is undefined");
     if (!t->IsCuda()) {
       return InvalidArgumentError("LinearF16: ", name, " is on ",
-                                  t->Device().ToString(), ", not a CUDA device");
+                                  t->Device().ToString(),
+                                  ", not a CUDA device");
     }
     if (t->GetDataType() != DataType::kFloat16) {
       return InvalidArgumentError("LinearF16: ", name, " is ",
@@ -641,8 +653,7 @@ Status CublasLtGemm::LinearF16(const TensorView& x, const TensorView& w,
 
 Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
                                   const TensorView& y, const float* x_scale_dev,
-                                  const float* w_scale_dev,
-                                  Stream stream) {
+                                  const float* w_scale_dev, Stream stream) {
   // The output dtype selects the path. f16 is M1's benchmark form; bf16 is what
   // the model uses, and having one entry point means the two cannot drift.
   if (y.GetDataType() != DataType::kFloat16 &&
@@ -670,8 +681,8 @@ Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
     }
     if (t->GetDataType() != want) {
       return InvalidArgumentError("LinearF8E4M3: ", name, " is ",
-                                  DataTypeName(t->GetDataType()),
-                                  ", expected ", DataTypeName(want));
+                                  DataTypeName(t->GetDataType()), ", expected ",
+                                  DataTypeName(want));
     }
     if (t->Rank() != 2) {
       return InvalidArgumentError("LinearF8E4M3: ", name, " has rank ",
@@ -680,7 +691,8 @@ Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
   }
 
   if (x_scale_dev == nullptr || w_scale_dev == nullptr) {
-    return InvalidArgumentError("LinearF8E4M3: scale pointers must be non-null");
+    return InvalidArgumentError(
+        "LinearF8E4M3: scale pointers must be non-null");
   }
 
   const int64_t m = x.Dim(0);
@@ -732,4 +744,4 @@ Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

@@ -1,13 +1,12 @@
-#include "inferx/ops/quantize.h"
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/quantize.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -74,8 +73,8 @@ __global__ void QuantizeKernel(const Src* __restrict__ src,
        i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     // __NV_SATFINITE clamps to ±448 instead of producing inf/NaN, so a scale
     // that turns out too small costs accuracy rather than correctness.
-    dst[i] = __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE,
-                                   __NV_E4M3);
+    dst[i] =
+        __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
@@ -115,7 +114,8 @@ Status CheckDeviceTensor(const TensorView& t, DataType expected,
 template <typename Src>
 __global__ void QuantizeDynamicKernel(const Src* __restrict__ src,
                                       __nv_fp8_storage_t* __restrict__ dst,
-                                      int64_t n, float* __restrict__ scale_out) {
+                                      int64_t n,
+                                      float* __restrict__ scale_out) {
   __shared__ float tile[1024];
 
   float local = 0.0f;
@@ -141,15 +141,14 @@ __global__ void QuantizeDynamicKernel(const Src* __restrict__ src,
   const float inv = 1.0f / scale;
 
   for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
-    dst[i] = __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE,
-                                   __NV_E4M3);
+    dst[i] =
+        __nv_cvt_float_to_fp8(Widen(src[i]) * inv, __NV_SATFINITE, __NV_E4M3);
   }
 }
 
 }  // namespace
 
-Status ComputeF8Scale(const TensorView& src, float* scale_dev,
-                      Stream stream) {
+Status ComputeF8Scale(const TensorView& src, float* scale_dev, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kFloat16, "src"));
 
   if (scale_dev == nullptr) {
@@ -162,8 +161,8 @@ Status ComputeF8Scale(const TensorView& src, float* scale_dev,
 
   // Zeroed rather than assumed: the kernel only ever raises this value, so a
   // stale maximum from a previous call would silently survive.
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemsetAsync(scale_dev, 0, sizeof(float),
-                                              stream));
+  INFERX_CUDA_RETURN_IF_ERROR(
+      cudaMemsetAsync(scale_dev, 0, sizeof(float), stream));
 
   AbsMaxKernel<<<GridFor(n), kBlock, 0, stream>>>(
       static_cast<const __half*>(src.Data()), n, scale_dev);
@@ -308,8 +307,7 @@ __device__ __forceinline__ __half Int4FromFloat<__half>(float x) {
   return __float2half(x);
 }
 template <>
-__device__ __forceinline__ __nv_bfloat16 Int4FromFloat<__nv_bfloat16>(
-    float x) {
+__device__ __forceinline__ __nv_bfloat16 Int4FromFloat<__nv_bfloat16>(float x) {
   return __float2bfloat16(x);
 }
 
@@ -325,8 +323,8 @@ __global__ void Int4GroupScaleKernel(const H* __restrict__ w, int64_t n,
   const int g = blockIdx.x % groups_per_row;
   if (row >= n) return;
 
-  const int64_t base = static_cast<int64_t>(row) * k +
-                       static_cast<int64_t>(g) * group;
+  const int64_t base =
+      static_cast<int64_t>(row) * k + static_cast<int64_t>(g) * group;
 
   float local = 0.0f;
   for (int i = threadIdx.x; i < group; i += blockDim.x) {
@@ -366,18 +364,15 @@ __global__ void QuantizeInt4Kernel(const H* __restrict__ w, int64_t n,
                                    uint8_t* __restrict__ q) {
   const int64_t nbytes = n * (k / 2);
   for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       b < nbytes;
-       b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+       b < nbytes; b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t e0 = 2 * b;
     const int64_t row = e0 / k;
     const int col0 = static_cast<int>(e0 % k);
 
-    const float s0 =
-        Widen(scales[static_cast<int64_t>(row) * groups_per_row +
-                     (col0 / group)]);
-    const float s1 =
-        Widen(scales[static_cast<int64_t>(row) * groups_per_row +
-                     ((col0 + 1) / group)]);
+    const float s0 = Widen(
+        scales[static_cast<int64_t>(row) * groups_per_row + (col0 / group)]);
+    const float s1 = Widen(scales[static_cast<int64_t>(row) * groups_per_row +
+                                  ((col0 + 1) / group)]);
 
     // Round to nearest even, then clamp to the symmetric range. __float2int_rn
     // rounds ties to even, which is what keeps a uniform tensor quantizing
@@ -394,16 +389,16 @@ __global__ void QuantizeInt4Kernel(const H* __restrict__ w, int64_t n,
 
 // The inverse: one byte in, two fp16 out, each scaled by its own group.
 template <typename H>
-__global__ void DequantizeInt4Kernel(
-    const uint8_t* __restrict__ q, int64_t n, int64_t k, int group,
-    int groups_per_row, const H* __restrict__ scales, H* __restrict__ dst) {
+__global__ void DequantizeInt4Kernel(const uint8_t* __restrict__ q, int64_t n,
+                                     int64_t k, int group, int groups_per_row,
+                                     const H* __restrict__ scales,
+                                     H* __restrict__ dst) {
   const int64_t nbytes = n * (k / 2);
   for (int64_t b = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       b < nbytes;
-       b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+       b < nbytes; b += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const uint8_t byte = q[b];
-    int q0 = byte & 0xF;       // sign-extend the nibble:
-    if (q0 >= 8) q0 -= 16;     // 0x8..0xF map to -8..-1.
+    int q0 = byte & 0xF;    // sign-extend the nibble:
+    if (q0 >= 8) q0 -= 16;  // 0x8..0xF map to -8..-1.
     int q1 = byte >> 4;
     if (q1 >= 8) q1 -= 16;
 
@@ -411,12 +406,10 @@ __global__ void DequantizeInt4Kernel(
     const int64_t row = e0 / k;
     const int col0 = static_cast<int>(e0 % k);
 
-    const float s0 =
-        Widen(scales[static_cast<int64_t>(row) * groups_per_row +
-                     (col0 / group)]);
-    const float s1 =
-        Widen(scales[static_cast<int64_t>(row) * groups_per_row +
-                     ((col0 + 1) / group)]);
+    const float s0 = Widen(
+        scales[static_cast<int64_t>(row) * groups_per_row + (col0 / group)]);
+    const float s1 = Widen(scales[static_cast<int64_t>(row) * groups_per_row +
+                                  ((col0 + 1) / group)]);
 
     dst[e0] = Int4FromFloat<H>(q0 * s0);
     dst[e0 + 1] = Int4FromFloat<H>(q1 * s1);
@@ -445,8 +438,8 @@ Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
                                 dst.Dim(1), "], expected [", n, ", ", k, "]");
   }
   if (scales.Dim(0) != n) {
-    return InvalidArgumentError("QuantizeF16ToInt4: scales has ",
-                                scales.Dim(0), " rows, expected ", n);
+    return InvalidArgumentError("QuantizeF16ToInt4: scales has ", scales.Dim(0),
+                                " rows, expected ", n);
   }
   if (k % 2 != 0) {
     return InvalidArgumentError(
@@ -456,9 +449,9 @@ Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
 
   const int groups_per_row = static_cast<int>(scales.Dim(1));
   if (groups_per_row <= 0 || k % groups_per_row != 0) {
-    return InvalidArgumentError(
-        "QuantizeF16ToInt4: scales has ", groups_per_row,
-        " groups per row, which must divide k=", k);
+    return InvalidArgumentError("QuantizeF16ToInt4: scales has ",
+                                groups_per_row,
+                                " groups per row, which must divide k=", k);
   }
   const int group = static_cast<int>(k / groups_per_row);
 
@@ -467,15 +460,15 @@ Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
   // One block per group for the reduction. blockDim covers a group with
   // stride; group=128 lands one thread per element, larger groups stride. The
   // halving reduction inside the kernel only combines every lane when blockDim
-  // is a power of two, so round the group up to the next power of two (floor 32,
-  // ceiling 256 to fit the shared-memory tile); threads past the group load
+  // is a power of two, so round the group up to the next power of two (floor
+  // 32, ceiling 256 to fit the shared-memory tile); threads past the group load
   // nothing and contribute 0 to the max.
   int block = 32;
   while (block < group && block < 256) block <<= 1;
-  Int4GroupScaleKernel<__half><<<static_cast<int>(n) * groups_per_row, block, 0,
-                         stream>>>(static_cast<const __half*>(src.Data()), n, k,
-                                   group, groups_per_row,
-                                   static_cast<__half*>(scales.Data()));
+  Int4GroupScaleKernel<__half>
+      <<<static_cast<int>(n) * groups_per_row, block, 0, stream>>>(
+          static_cast<const __half*>(src.Data()), n, k, group, groups_per_row,
+          static_cast<__half*>(scales.Data()));
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
   QuantizeInt4Kernel<__half><<<GridFor(n * (k / 2)), kBlock, 0, stream>>>(
@@ -512,15 +505,14 @@ Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
                                 scales.Dim(0), " rows, expected ", n);
   }
   if (k % 2 != 0) {
-    return InvalidArgumentError(
-        "DequantizeInt4ToF16: k must be even, got ", k);
+    return InvalidArgumentError("DequantizeInt4ToF16: k must be even, got ", k);
   }
 
   const int groups_per_row = static_cast<int>(scales.Dim(1));
   if (groups_per_row <= 0 || k % groups_per_row != 0) {
-    return InvalidArgumentError(
-        "DequantizeInt4ToF16: scales has ", groups_per_row,
-        " groups per row, which must divide k=", k);
+    return InvalidArgumentError("DequantizeInt4ToF16: scales has ",
+                                groups_per_row,
+                                " groups per row, which must divide k=", k);
   }
   const int group = static_cast<int>(k / groups_per_row);
 
@@ -552,8 +544,9 @@ Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
   const int64_t n = src.Dim(0);
   const int64_t k = src.Dim(1);
   if (dst.Dim(0) != n || dst.Dim(1) != k) {
-    return InvalidArgumentError("QuantizeBf16ToInt4: dst is [", dst.Dim(0), ", ",
-                                dst.Dim(1), "], expected [", n, ", ", k, "]");
+    return InvalidArgumentError("QuantizeBf16ToInt4: dst is [", dst.Dim(0),
+                                ", ", dst.Dim(1), "], expected [", n, ", ", k,
+                                "]");
   }
   if (scales.Dim(0) != n) {
     return InvalidArgumentError("QuantizeBf16ToInt4: scales has ",
@@ -564,9 +557,9 @@ Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
   }
   const int groups_per_row = static_cast<int>(scales.Dim(1));
   if (groups_per_row <= 0 || k % groups_per_row != 0) {
-    return InvalidArgumentError(
-        "QuantizeBf16ToInt4: scales has ", groups_per_row,
-        " groups per row, which must divide k=", k);
+    return InvalidArgumentError("QuantizeBf16ToInt4: scales has ",
+                                groups_per_row,
+                                " groups per row, which must divide k=", k);
   }
   const int group = static_cast<int>(k / groups_per_row);
   if (n == 0 || k == 0) return OkStatus();
@@ -576,15 +569,13 @@ Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
   Int4GroupScaleKernel<__nv_bfloat16>
       <<<static_cast<int>(n) * groups_per_row, block, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(src.Data()), n, k, group,
-          groups_per_row,
-          static_cast<__nv_bfloat16*>(scales.Data()));
+          groups_per_row, static_cast<__nv_bfloat16*>(scales.Data()));
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
   QuantizeInt4Kernel<__nv_bfloat16>
       <<<GridFor(n * (k / 2)), kBlock, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(src.Data()), n, k, group,
-          groups_per_row,
-          static_cast<const __nv_bfloat16*>(scales.Data()),
+          groups_per_row, static_cast<const __nv_bfloat16*>(scales.Data()),
           static_cast<uint8_t*>(dst.Data()));
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -613,13 +604,14 @@ Status DequantizeInt4ToBf16(const TensorView& src, const TensorView& scales,
                                 scales.Dim(0), " rows, expected ", n);
   }
   if (k % 2 != 0) {
-    return InvalidArgumentError("DequantizeInt4ToBf16: k must be even, got ", k);
+    return InvalidArgumentError("DequantizeInt4ToBf16: k must be even, got ",
+                                k);
   }
   const int groups_per_row = static_cast<int>(scales.Dim(1));
   if (groups_per_row <= 0 || k % groups_per_row != 0) {
-    return InvalidArgumentError(
-        "DequantizeInt4ToBf16: scales has ", groups_per_row,
-        " groups per row, which must divide k=", k);
+    return InvalidArgumentError("DequantizeInt4ToBf16: scales has ",
+                                groups_per_row,
+                                " groups per row, which must divide k=", k);
   }
   const int group = static_cast<int>(k / groups_per_row);
   if (n == 0 || k == 0) return OkStatus();
@@ -633,4 +625,4 @@ Status DequantizeInt4ToBf16(const TensorView& src, const TensorView& scales,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

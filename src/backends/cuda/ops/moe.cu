@@ -1,13 +1,12 @@
-#include "inferx/ops/moe.h"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <type_traits>
 
 #include "inferx/backends/cuda/cuda_utils.h"
+#include "inferx/ops/moe.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -58,7 +57,8 @@ __global__ void RouteTopKKernel(const bf16* __restrict__ logits,
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
     if (threadIdx.x < stride) {
-      reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+      reduce[threadIdx.x] =
+          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
     }
     __syncthreads();
   }
@@ -78,7 +78,8 @@ __global__ void RouteTopKKernel(const bf16* __restrict__ logits,
   __syncthreads();
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+    if (threadIdx.x < stride)
+      reduce[threadIdx.x] += reduce[threadIdx.x + stride];
     __syncthreads();
   }
 
@@ -141,7 +142,8 @@ __global__ void CountPerExpertKernel(const int32_t* __restrict__ experts,
   __syncthreads();
 
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+    if (threadIdx.x < stride)
+      reduce[threadIdx.x] += reduce[threadIdx.x + stride];
     __syncthreads();
   }
 
@@ -256,7 +258,8 @@ __global__ void AddSharedExpertKernel(const bf16* __restrict__ shared,
                                       const bf16* __restrict__ gate_logits,
                                       bf16* __restrict__ out, int64_t width) {
   const int64_t token = blockIdx.x;
-  const float gate = 1.0f / (1.0f + __expf(-__bfloat162float(gate_logits[token])));
+  const float gate =
+      1.0f / (1.0f + __expf(-__bfloat162float(gate_logits[token])));
 
   for (int64_t c = threadIdx.x; c < width; c += blockDim.x) {
     const int64_t i = token * width + c;
@@ -350,8 +353,7 @@ __global__ void GroupedGemmBf16Kernel(const bf16* __restrict__ x,
       for (int r = 0; r < RowsPerChunk; ++r) {
         if (r < rows) {
           acc[r] +=
-              __bfloat162float(x[static_cast<int64_t>(row0 + r) * k + kk]) *
-              wv;
+              __bfloat162float(x[static_cast<int64_t>(row0 + r) * k + kk]) * wv;
         }
       }
     }
@@ -393,14 +395,15 @@ Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
 
   if (out_weights.Dim(0) != tokens || out_experts.Dim(0) != tokens ||
       out_experts.Dim(1) != k) {
-    return InvalidArgumentError(
-        "router outputs disagree: logits ", logits.GetShape().ToString(),
-        ", weights ", out_weights.GetShape().ToString(), ", experts ",
-        out_experts.GetShape().ToString());
+    return InvalidArgumentError("router outputs disagree: logits ",
+                                logits.GetShape().ToString(), ", weights ",
+                                out_weights.GetShape().ToString(), ", experts ",
+                                out_experts.GetShape().ToString());
   }
 
   if (k <= 0 || k > kMaxTopK) {
-    return InvalidArgumentError("top-k must be in [1, ", kMaxTopK, "], got ", k);
+    return InvalidArgumentError("top-k must be in [1, ", kMaxTopK, "], got ",
+                                k);
   }
 
   if (k > num_experts) {
@@ -429,13 +432,16 @@ Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
 }
 
 Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
-                        const TensorView& out_offsets, const TensorView& out_rows,
-                        const TensorView& out_dest, Stream stream) {
+                        const TensorView& out_offsets,
+                        const TensorView& out_rows, const TensorView& out_dest,
+                        Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(experts, DataType::kInt32, 2, "experts"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(out_offsets, DataType::kInt32, 1, "out_offsets"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(out_rows, DataType::kInt32, 1, "out_rows"));
-  INFERX_RETURN_IF_ERROR(CheckTensor(out_dest, DataType::kInt32, 1, "out_dest"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(out_rows, DataType::kInt32, 1, "out_rows"));
+  INFERX_RETURN_IF_ERROR(
+      CheckTensor(out_dest, DataType::kInt32, 1, "out_dest"));
 
   const int64_t tokens = experts.Dim(0);
   const int64_t k = experts.Dim(1);
@@ -481,8 +487,7 @@ Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
 
   ScatterByExpertKernel<<<grid, kBlock, 0, stream>>>(
       static_cast<const int32_t*>(experts.Data()), assignments,
-      static_cast<int>(k), offsets_ptr,
-      static_cast<int32_t*>(out_rows.Data()),
+      static_cast<int>(k), offsets_ptr, static_cast<int32_t*>(out_rows.Data()),
       static_cast<int32_t*>(out_dest.Data()));
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
@@ -503,16 +508,18 @@ Status MoeGatherRows(const TensorView& x, const TensorView& rows,
   }
 
   if (out.Dim(0) != rows.Dim(0)) {
-    return InvalidArgumentError("rows has ", rows.Dim(0), " entries but out "
-                                "has ", out.Dim(0), " rows");
+    return InvalidArgumentError("rows has ", rows.Dim(0),
+                                " entries but out "
+                                "has ",
+                                out.Dim(0), " rows");
   }
 
   if (rows.Dim(0) == 0) return OkStatus();
 
   GatherRowsKernel<<<static_cast<int>(rows.Dim(0)), kBlock, 0, stream>>>(
       static_cast<const bf16*>(x.Data()),
-      static_cast<const int32_t*>(rows.Data()),
-      static_cast<bf16*>(out.Data()), width);
+      static_cast<const int32_t*>(rows.Data()), static_cast<bf16*>(out.Data()),
+      width);
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -531,8 +538,10 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
   const int64_t k = weights.Dim(1);
 
   if (weights.Dim(0) != tokens) {
-    return InvalidArgumentError("weights has ", weights.Dim(0), " rows but "
-                                "out has ", tokens);
+    return InvalidArgumentError("weights has ", weights.Dim(0),
+                                " rows but "
+                                "out has ",
+                                tokens);
   }
 
   if (dest.Dim(0) != tokens * k) {
@@ -549,8 +558,8 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
   CombineRowsKernel<<<static_cast<int>(tokens), kBlock, 0, stream>>>(
       static_cast<const bf16*>(y.Data()),
       static_cast<const int32_t*>(dest.Data()),
-      static_cast<const float*>(weights.Data()),
-      static_cast<bf16*>(out.Data()), width, static_cast<int>(k));
+      static_cast<const float*>(weights.Data()), static_cast<bf16*>(out.Data()),
+      width, static_cast<int>(k));
 
   INFERX_CUDA_RETURN_IF_ERROR(cudaGetLastError());
   return OkStatus();
@@ -648,4 +657,4 @@ Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops

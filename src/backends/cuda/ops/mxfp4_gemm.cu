@@ -6,7 +6,7 @@
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/ops/mxfp4_gemm.h"
 
-namespace inferx::kernels {
+namespace inferx::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -216,9 +216,8 @@ __global__ void Mxfp4GroupedKernel(const bf16* __restrict__ x,
   for (int expert = expert_first; expert < expert_last; ++expert) {
     const int begin = offsets[expert];
     const int end = offsets[expert + 1];
-    const int row0 = RowsPerChunk == 1
-                         ? static_cast<int>(blockIdx.y)
-                         : begin + blockIdx.y * RowsPerChunk;
+    const int row0 = RowsPerChunk == 1 ? static_cast<int>(blockIdx.y)
+                                       : begin + blockIdx.y * RowsPerChunk;
     if (row0 >= end) continue;
     const int rows = min(RowsPerChunk, end - row0);
     const int64_t weight_row = static_cast<int64_t>(expert) * n + j_raw;
@@ -228,8 +227,7 @@ __global__ void Mxfp4GroupedKernel(const bf16* __restrict__ x,
     float acc[RowsPerChunk] = {};
     for (int base = 0; base + kVecStride <= k; base += kVecStride) {
       const int byte_off = base / 2 + lane * (kVecElems / 2);
-      const uint32_t packed =
-          *reinterpret_cast<const uint32_t*>(wr + byte_off);
+      const uint32_t packed = *reinterpret_cast<const uint32_t*>(wr + byte_off);
       const int k0 = base + lane * kVecElems;
       const float scale =
           __int_as_float(static_cast<uint32_t>(sr[k0 >> 5]) << 23);
@@ -260,8 +258,7 @@ __global__ void Mxfp4GroupedKernel(const bf16* __restrict__ x,
       for (int r = 0; r < RowsPerChunk; ++r) {
         if (r < rows)
           acc[r] +=
-              __bfloat162float(x[static_cast<int64_t>(row0 + r) * k + kk]) *
-              wv;
+              __bfloat162float(x[static_cast<int64_t>(row0 + r) * k + kk]) * wv;
       }
     }
 
@@ -370,16 +367,15 @@ Status Mxfp4GroupedGemm(const TensorView& x, const TensorView& offsets,
         "Mxfp4GroupedGemm: offsets must be 1-D int32 CUDA");
   if (!blocks.IsDefined() || !blocks.IsCuda() ||
       blocks.GetDataType() != DataType::kUInt8 ||
-      (blocks.Rank() != 3 && blocks.Rank() != 4) ||
-      !scales.IsDefined() || !scales.IsCuda() ||
-      scales.GetDataType() != DataType::kUInt8 || scales.Rank() != 3)
+      (blocks.Rank() != 3 && blocks.Rank() != 4) || !scales.IsDefined() ||
+      !scales.IsCuda() || scales.GetDataType() != DataType::kUInt8 ||
+      scales.Rank() != 3)
     return InvalidArgumentError(
         "Mxfp4GroupedGemm: blocks must be 3-D/4-D and scales 3-D u8 CUDA");
   const int64_t assignments = x.Dim(0), k = x.Dim(1);
   const int64_t experts = blocks.Dim(0), n = blocks.Dim(1);
-  const int64_t packed_k = blocks.Rank() == 3
-                               ? blocks.Dim(2)
-                               : blocks.Dim(2) * blocks.Dim(3);
+  const int64_t packed_k =
+      blocks.Rank() == 3 ? blocks.Dim(2) : blocks.Dim(2) * blocks.Dim(3);
   if (offsets.Dim(0) != experts + 1 || packed_k != k / 2 ||
       scales.Dim(0) != experts || scales.Dim(1) != n ||
       scales.Dim(2) != k / 32 || k % 32 != 0)
@@ -399,9 +395,8 @@ Status Mxfp4GroupedGemm(const TensorView& x, const TensorView& offsets,
       static_cast<unsigned>((n + kWarpsPerBlock - 1) / kWarpsPerBlock);
   const auto launch = [&](auto rows_tag) {
     constexpr int rows = decltype(rows_tag)::value;
-    const dim3 grid(
-        grid_x,
-        static_cast<unsigned>((assignments + rows - 1) / rows), 1);
+    const dim3 grid(grid_x,
+                    static_cast<unsigned>((assignments + rows - 1) / rows), 1);
     Mxfp4GroupedKernel<rows><<<grid, kWarpsPerBlock * 32, 0, stream>>>(
         static_cast<const bf16*>(x.Data()),
         static_cast<const int32_t*>(offsets.Data()),
@@ -424,4 +419,4 @@ Status Mxfp4GroupedGemm(const TensorView& x, const TensorView& offsets,
   return OkStatus();
 }
 
-}  // namespace inferx::kernels
+}  // namespace inferx::ops
