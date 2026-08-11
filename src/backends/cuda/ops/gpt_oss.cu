@@ -1,4 +1,4 @@
-#include "inferx/kernels/gpt_oss.h"
+#include "inferx/ops/gpt_oss.h"
 
 #include <cmath>
 

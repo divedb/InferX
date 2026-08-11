@@ -1,4 +1,4 @@
-#include "inferx/kernels/flashinfer_attention.h"
+#include "inferx/ops/flashinfer_attention.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

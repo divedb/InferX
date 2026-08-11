@@ -30,8 +30,8 @@
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
 #include "absl/types/span.h"
-#include "inferx/kernels/flashinfer_attention.h"
-#include "inferx/kernels/layers.h"
+#include "inferx/ops/flashinfer_attention.h"
+#include "inferx/ops/layers.h"
 
 namespace inferx::bench {
 namespace {
@@ -82,7 +82,7 @@ struct Arena {
   }
 };
 
-Status RunOne(kernels::FlashInferDecode* fi, int64_t batch, int64_t context,
+Status RunOne(ops::FlashInferDecode* fi, int64_t batch, int64_t context,
               int warmup, int iters, bool* ours_ran) {
   Arena arena;
 
@@ -138,7 +138,7 @@ Status RunOne(kernels::FlashInferDecode* fi, int64_t batch, int64_t context,
                          Shape({batch, blocks_per_seq}), DeviceId::Cuda(0)));
 
   std::vector<int32_t> indices, indptr;
-  INFERX_RETURN_IF_ERROR(kernels::BuildCsrBlockTable(
+  INFERX_RETURN_IF_ERROR(ops::BuildCsrBlockTable(
       dense, batch, blocks_per_seq, blocks_used, &indices, &indptr));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView indices_v, arena.Upload(indices));
@@ -167,7 +167,7 @@ Status RunOne(kernels::FlashInferDecode* fi, int64_t batch, int64_t context,
         const Timing t,
         TimeLaunch(
             [&] {
-              return kernels::PagedAttention(q, k_cache, v_cache, table_v,
+              return ops::PagedAttention(q, k_cache, v_cache, table_v,
                                              seq_v, pos_v, out, scale);
             },
             warmup, iters));
@@ -243,7 +243,7 @@ int Main(int argc, char** argv) {
               "best_ms", "noise_%", "GB/s", "speedup");
   std::printf("%s\n", std::string(72, '-').c_str());
 
-  auto fi = kernels::FlashInferDecode::Create();
+  auto fi = ops::FlashInferDecode::Create();
   if (!fi.ok()) {
     std::fprintf(stderr, "cannot create FlashInfer context: %s\n",
                  fi.status().ToString().c_str());

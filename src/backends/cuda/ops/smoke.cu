@@ -1,4 +1,4 @@
-#include "inferx/kernels/smoke.h"
+#include "inferx/ops/smoke.h"
 
 #include <type_traits>
 

@@ -15,7 +15,7 @@
 ///     off by one — silently, because both paths still produce plausible
 ///     numbers.
 
-#include "inferx/kernels/mla.h"
+#include "inferx/ops/mla.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -31,8 +31,8 @@
 #include "inferx/core/kv_cache.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/gpt_oss.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/gpt_oss.h"
 #include "inferx/model/config.h"
 #include "inferx/model/mla.h"
 
@@ -452,7 +452,7 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
   auto cache = pool->KeyCache(0);
   ASSERT_TRUE(cache.ok()) << cache.status();
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto layer = MlaAttentionLayer::Create(c, tokens, tokens, DeviceId::Cuda(0));
@@ -503,7 +503,7 @@ void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
   std::vector<DeviceBuffer> keep;
   const MlaWeights mw = UploadWeights(keep, c, w);
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto run = [&](bool one_at_a_time) {
@@ -673,7 +673,7 @@ TEST_F(MlaTest, RopeInPlaceRotatesOnlyTheTail) {
   const TensorView pos_v =
       Upload(keep, positions, DataType::kInt32, Shape({tokens}));
 
-  ASSERT_TRUE(kernels::MlaRopeInPlace(x_v, rope_dim, pos_v, 10000.0f).ok());
+  ASSERT_TRUE(ops::MlaRopeInPlace(x_v, rope_dim, pos_v, 10000.0f).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got = Download<bf16>(x_v, tokens * heads * head_dim);
@@ -738,9 +738,9 @@ TEST_F(MlaTest, RopeFromTableMatchesTheClosedFormAtFactorOne) {
   const TensorView freq_v =
       Upload(keep, inv_freq, DataType::kFloat, Shape({rope_dim / 2}));
 
-  ASSERT_TRUE(kernels::MlaRopeInPlace(a_v, rope_dim, pos_v, theta).ok());
+  ASSERT_TRUE(ops::MlaRopeInPlace(a_v, rope_dim, pos_v, theta).ok());
   ASSERT_TRUE(
-      kernels::MlaRopeFromTable(b_v, rope_dim, pos_v, freq_v, 1.0f).ok());
+      ops::MlaRopeFromTable(b_v, rope_dim, pos_v, freq_v, 1.0f).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto a = Download<bf16>(a_v, tokens * heads * head_dim);
@@ -766,7 +766,7 @@ TEST_F(MlaTest, YarnFrequenciesAreExactAtTheLadderEnds) {
   constexpr double theta = 10000.0, factor = 40.0;
 
   std::vector<float> got(rope_dim / 2);
-  const float attn = kernels::ComputeYarnInvFreq(
+  const float attn = ops::ComputeYarnInvFreq(
       rope_dim, theta, factor, /*beta_fast=*/32.0, /*beta_slow=*/1.0,
       /*original_max=*/4096, /*truncate=*/true, got.data());
 
@@ -789,10 +789,10 @@ TEST_F(MlaTest, YarnFrequenciesAreExactAtTheLadderEnds) {
 
   // The returned temperature is HF's default form, YarnMscale at coefficient
   // 1 — and DeepSeek's parameterized form must agree with it there.
-  EXPECT_NEAR(attn, kernels::YarnMscale(factor, 1.0), 1e-6f);
-  EXPECT_NEAR(kernels::YarnMscale(factor, 0.707), 1.260804f, 1e-5f);
-  EXPECT_FLOAT_EQ(kernels::YarnMscale(0.5, 0.707), 1.0f);   // factor <= 1
-  EXPECT_FLOAT_EQ(kernels::YarnMscale(factor, 0.0), 1.0f);  // coefficient 0
+  EXPECT_NEAR(attn, ops::YarnMscale(factor, 1.0), 1e-6f);
+  EXPECT_NEAR(ops::YarnMscale(factor, 0.707), 1.260804f, 1e-5f);
+  EXPECT_FLOAT_EQ(ops::YarnMscale(0.5, 0.707), 1.0f);   // factor <= 1
+  EXPECT_FLOAT_EQ(ops::YarnMscale(factor, 0.0), 1.0f);  // coefficient 0
 }
 
 TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
@@ -845,8 +845,8 @@ TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
   auto cache = pool->KeyCache(0);
   ASSERT_TRUE(cache.ok()) << cache.status();
 
-  ASSERT_TRUE(kernels::MlaAppendLatent(latent_v, rope_v, *cache, slots_v).ok());
-  ASSERT_TRUE(kernels::MlaGatherLatents(*cache, table_v, tokens, out_v).ok());
+  ASSERT_TRUE(ops::MlaAppendLatent(latent_v, rope_v, *cache, slots_v).ok());
+  ASSERT_TRUE(ops::MlaGatherLatents(*cache, table_v, tokens, out_v).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got = Download<bf16>(out_v, tokens * width);
@@ -925,7 +925,7 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   auto cache = pool->KeyCache(0);
   ASSERT_TRUE(cache.ok()) << cache.status();
   ASSERT_TRUE(
-      kernels::MlaAppendLatent(latents_v, rope_keys_v, *cache, slots_v).ok());
+      ops::MlaAppendLatent(latents_v, rope_keys_v, *cache, slots_v).ok());
 
   const TensorView q_nope_v = Upload(keep, ToBf16(q_nope), DataType::kBFloat16,
                                      Shape({1, heads, nope}));
@@ -944,12 +944,12 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   const TensorView absorbed_out =
       Empty(keep, DataType::kBFloat16, Shape({1, heads, vd}));
 
-  ASSERT_TRUE(kernels::MlaAbsorbQ(q_nope_v, kv_b_v, q_lat, vd).ok());
-  ASSERT_TRUE(kernels::MlaLatentAttention(q_lat, q_rope_v, *cache, table_v,
+  ASSERT_TRUE(ops::MlaAbsorbQ(q_nope_v, kv_b_v, q_lat, vd).ok());
+  ASSERT_TRUE(ops::MlaLatentAttention(q_lat, q_rope_v, *cache, table_v,
                                           context, attn_lat, context - 1, scale)
                   .ok());
   ASSERT_TRUE(
-      kernels::MlaUnabsorbOut(attn_lat, kv_b_v, absorbed_out, nope).ok());
+      ops::MlaUnabsorbOut(attn_lat, kv_b_v, absorbed_out, nope).ok());
 
   // --- Unabsorbed: host-reconstructed K/V through MlaAttention --------------
   const std::vector<float> kv =
@@ -979,7 +979,7 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   const TensorView unabsorbed_out =
       Empty(keep, DataType::kBFloat16, Shape({1, heads, vd}));
 
-  ASSERT_TRUE(kernels::MlaAttention(q_nope_v, q_rope_v, k_nope_v, rope_keys_v,
+  ASSERT_TRUE(ops::MlaAttention(q_nope_v, q_rope_v, k_nope_v, rope_keys_v,
                                     v_v, unabsorbed_out, context - 1, scale)
                   .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);

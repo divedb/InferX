@@ -13,7 +13,7 @@
 /// a token's contributions in the wrong place all produce output that is
 /// numerically plausible and wrong.
 
-#include "inferx/kernels/moe.h"
+#include "inferx/ops/moe.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -29,7 +29,7 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
+#include "inferx/ops/gemm.h"
 #include "inferx/model/moe_ffn.h"
 
 namespace inferx {
@@ -186,7 +186,7 @@ TEST_F(MoeTest, RouterMatchesSoftmaxTopK) {
   const TensorView w = Empty(keep, DataType::kFloat, Shape({tokens, k}));
   const TensorView e = Empty(keep, DataType::kInt32, Shape({tokens, k}));
 
-  ASSERT_TRUE(kernels::MoeRouteTopK(logits_v, w, e, /*renormalize=*/true).ok());
+  ASSERT_TRUE(ops::MoeRouteTopK(logits_v, w, e, /*renormalize=*/true).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const Routing want = ReferenceRoute(logits, tokens, num_experts, k, true);
@@ -226,7 +226,7 @@ TEST_F(MoeTest, RouterWithoutRenormalizationKeepsSoftmaxMass) {
   const TensorView e = Empty(keep, DataType::kInt32, Shape({tokens, k}));
 
   ASSERT_TRUE(
-      kernels::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
+      ops::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const Routing want = ReferenceRoute(logits, tokens, num_experts, k, false);
@@ -263,7 +263,7 @@ TEST_F(MoeTest, RouterBreaksTiesTowardsTheLowerIndex) {
   const TensorView w = Empty(keep, DataType::kFloat, Shape({tokens, k}));
   const TensorView e = Empty(keep, DataType::kInt32, Shape({tokens, k}));
 
-  ASSERT_TRUE(kernels::MoeRouteTopK(logits_v, w, e, true).ok());
+  ASSERT_TRUE(ops::MoeRouteTopK(logits_v, w, e, true).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got_e = Download<int32_t>(e, tokens * k);
@@ -299,7 +299,7 @@ TEST_F(MoeTest, DispatchGroupsStablyAndInvertsExactly) {
   const TensorView dest = Empty(keep, DataType::kInt32, Shape({assignments}));
 
   ASSERT_TRUE(
-      kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
+      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
           .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -397,10 +397,10 @@ TEST_F(MoeTest, GatherAndCombineRoundTripThroughThePermutation) {
       Empty(keep, DataType::kBFloat16, Shape({tokens, width}));
 
   ASSERT_TRUE(
-      kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
+      ops::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
           .ok());
-  ASSERT_TRUE(kernels::MoeGatherRows(x_v, rows, gathered).ok());
-  ASSERT_TRUE(kernels::MoeCombineRows(gathered, dest, weights_v, out).ok());
+  ASSERT_TRUE(ops::MoeGatherRows(x_v, rows, gathered).ok());
+  ASSERT_TRUE(ops::MoeCombineRows(gathered, dest, weights_v, out).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got = Download<bf16>(out, tokens * width);
@@ -530,7 +530,7 @@ TEST_F(MoeTest, LayerMatchesTheDenseReferenceMixture) {
   const TensorView out =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
@@ -623,7 +623,7 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
   w.down = Upload(keep, ToBf16(down), DataType::kBFloat16,
                   Shape({c.num_experts, c.hidden, c.moe_intermediate}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   // Routed only.
@@ -740,7 +740,7 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
   w.down = Upload(keep, ToBf16(down), DataType::kBFloat16,
                   Shape({c.num_experts, c.hidden, c.moe_intermediate}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   MoeFfn::Config routed_only = c;
@@ -830,7 +830,7 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
   w.down = Upload(keep, ToBf16(down), DataType::kBFloat16,
                   Shape({c.num_experts, c.hidden, c.moe_intermediate}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   const TensorView out_unit =
@@ -912,7 +912,7 @@ TEST_F(MoeTest, SharedGateMustMatchTheConvention) {
   w.shared_down = Upload(keep, ToBf16(sd), DataType::kBFloat16,
                          Shape({c.hidden, c.shared_intermediate}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   const TensorView out =
@@ -979,7 +979,7 @@ TEST_F(MoeTest, IdenticalInputProducesIdenticalOutput) {
                   DataType::kBFloat16,
                   Shape({c.num_experts, c.hidden, c.moe_intermediate}));
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));

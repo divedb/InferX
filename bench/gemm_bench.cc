@@ -29,8 +29,8 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/quantize.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/quantize.h"
 
 namespace inferx::bench {
 namespace {
@@ -75,7 +75,7 @@ Status FillDevice(const DeviceBuffer& buf, int64_t elems, float salt) {
 // One measured row. `fp8` selects the M1 prototype path over the baseline; the
 // two are deliberately run through the same allocation, fill, warm and timing
 // code so that a difference between them is a difference between the kernels.
-Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
+Status RunOne(ops::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
               int warmup, int iters, bool fp8, double* out_tflops) {
   const int64_t n = shape.n;
   const int64_t k = shape.k;
@@ -136,10 +136,10 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
     x_scale = reinterpret_cast<float*>(scale_buf.data());
     w_scale = x_scale + 1;
 
-    INFERX_RETURN_IF_ERROR(kernels::ComputeF8Scale(x, x_scale));
-    INFERX_RETURN_IF_ERROR(kernels::ComputeF8Scale(w, w_scale));
-    INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToF8E4M3(x, xq, x_scale));
-    INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToF8E4M3(w, wq, w_scale));
+    INFERX_RETURN_IF_ERROR(ops::ComputeF8Scale(x, x_scale));
+    INFERX_RETURN_IF_ERROR(ops::ComputeF8Scale(w, w_scale));
+    INFERX_RETURN_IF_ERROR(ops::QuantizeF16ToF8E4M3(x, xq, x_scale));
+    INFERX_RETURN_IF_ERROR(ops::QuantizeF16ToF8E4M3(w, wq, w_scale));
     INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
   }
 
@@ -189,7 +189,7 @@ Status RunOne(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
 // purpose: that double touch of the weights (read int4, write fp16, read fp16
 // again) is precisely the bandwidth a fused kernel removes, so timing it shows
 // the size of the prize rather than hiding it.
-Status RunW4A16(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
+Status RunW4A16(ops::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
                 int warmup, int iters, double* out_tflops) {
   const int64_t n = shape.n;
   const int64_t k = shape.k;
@@ -236,7 +236,7 @@ Status RunW4A16(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
                                           Shape({n, k}), DeviceId::Cuda(0)));
 
   // Quantize once, out of the timed region: weights are quantized at load.
-  INFERX_RETURN_IF_ERROR(kernels::QuantizeF16ToInt4(w, q, s));
+  INFERX_RETURN_IF_ERROR(ops::QuantizeF16ToInt4(w, q, s));
   INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
 
   // The fp16 plan for (m,n,k); the dequant has no plan cache.
@@ -246,7 +246,7 @@ Status RunW4A16(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
       Timing t,
       TimeLaunch(
           [&] {
-            INFERX_RETURN_IF_ERROR(kernels::DequantizeInt4ToF16(q, s, hat));
+            INFERX_RETURN_IF_ERROR(ops::DequantizeInt4ToF16(q, s, hat));
             return gemm.LinearF16(x, hat, y);
           },
           warmup, iters));
@@ -288,7 +288,7 @@ Status RunW4A16(kernels::CublasLtGemm& gemm, const GemmShape& shape, int64_t m,
 // 2.35x unsoaked, and it does not stabilize the shapes that were still moving.
 // Locking the clock is what fixes the ramp; the soak is left in only because it
 // is the right tool if a future card throttles differently, and it stays off.
-Status WarmUpDevice(kernels::CublasLtGemm& gemm, double seconds) {
+Status WarmUpDevice(ops::CublasLtGemm& gemm, double seconds) {
   constexpr int64_t m = 4096, n = 4096, k = 4096;
 
   INFERX_ASSIGN_OR_RETURN(
@@ -389,7 +389,7 @@ int Main(int argc, char** argv) {
               "m", "n", "k", "best_ms", "noise_%", "TFLOP/s", "GB/s", "bound");
   std::printf("%s\n", std::string(90, '-').c_str());
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   if (!gemm.ok()) {
     std::fprintf(stderr, "failed to create cuBLASLt context: %s\n",
                  gemm.status().ToString().c_str());

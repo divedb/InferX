@@ -23,7 +23,7 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/layers.h"
+#include "inferx/ops/layers.h"
 
 namespace inferx {
 namespace {
@@ -194,7 +194,7 @@ std::vector<int32_t> SampleManySeeds(const TensorView& logits,
   const TensorView out = Empty(keep, DataType::kInt32, Shape({n}));
 
   EXPECT_TRUE(
-      kernels::SampleTokens(logits, rows, temp, top_p, top_k, min_p, seeds, out)
+      ops::SampleTokens(logits, rows, temp, top_p, top_k, min_p, seeds, out)
           .ok());
   EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -247,7 +247,7 @@ TEST_F(SamplingTest, GreedyMatchesHostArgmax) {
       Upload(keep, seeds_h, DataType::kUInt64, Shape({2}));
   const TensorView out = Empty(keep, DataType::kInt32, Shape({2}));
 
-  ASSERT_TRUE(kernels::SampleTokens(logits_v, rows, temp, top_p, top_k, min_p,
+  ASSERT_TRUE(ops::SampleTokens(logits_v, rows, temp, top_p, top_k, min_p,
                                     seeds, out)
                   .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -482,7 +482,7 @@ TEST_F(SamplingTest, PenaltiesMatchTheHostFormulaAndMaskForcesNegInf) {
   const TensorView mask_ids =
       Upload(keep, mask_ids_h, DataType::kInt32, Shape({1, mask_cap}));
 
-  ASSERT_TRUE(kernels::ApplyPenalties(logits_v, rows, presence, frequency,
+  ASSERT_TRUE(ops::ApplyPenalties(logits_v, rows, presence, frequency,
                                       repetition, history_ids, history_counts,
                                       mask_ids)
                   .ok());
@@ -575,7 +575,7 @@ TEST_F(SamplingTest, LogprobsMatchTheHostAndSkippedRowsStayUntouched) {
   const TensorView top_lps =
       Upload(keep, lps_sentinel, DataType::kFloat, Shape({2, max_k}));
 
-  ASSERT_TRUE(kernels::ComputeLogprobs(logits_v, rows, chosen, k_wanted,
+  ASSERT_TRUE(ops::ComputeLogprobs(logits_v, rows, chosen, k_wanted,
                                        chosen_lp, top_ids, top_lps)
                   .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);

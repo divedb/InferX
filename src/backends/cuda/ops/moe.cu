@@ -1,4 +1,4 @@
-#include "inferx/kernels/moe.h"
+#include "inferx/ops/moe.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

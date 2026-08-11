@@ -131,7 +131,7 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS INFERX_CUDA_MIN_VERSION)
       "\n"
       "  This is a compile-check configuration only. It builds the host layer\n"
       "  against the CUDA runtime API; every target containing device code is\n"
-      "  SKIPPED, starting with csrc.\n"
+      "  SKIPPED, starting with src/backends/cuda/ops.\n"
       "\n"
       "  Install CUDA 13.x: ./scripts/install-cuda.sh\n")
   else()

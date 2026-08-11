@@ -7,17 +7,17 @@
 #include <type_traits>
 
 #include "inferx/comm/communicator.h"
-#include "inferx/kernels/flashinfer_attention.h"
-#include "inferx/kernels/flashinfer_prefill.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/gpt_oss.h"
-#include "inferx/kernels/layers.h"
-#include "inferx/kernels/mla.h"
-#include "inferx/kernels/moe.h"
-#include "inferx/kernels/mxfp4.h"
-#include "inferx/kernels/mxfp4_gemm.h"
-#include "inferx/kernels/quantize.h"
-#include "inferx/kernels/w4a16_gemm.h"
+#include "inferx/ops/flashinfer_attention.h"
+#include "inferx/ops/flashinfer_prefill.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/gpt_oss.h"
+#include "inferx/ops/layers.h"
+#include "inferx/ops/mla.h"
+#include "inferx/ops/moe.h"
+#include "inferx/ops/mxfp4.h"
+#include "inferx/ops/mxfp4_gemm.h"
+#include "inferx/ops/quantize.h"
+#include "inferx/ops/w4a16_gemm.h"
 
 namespace inferx {
 namespace {

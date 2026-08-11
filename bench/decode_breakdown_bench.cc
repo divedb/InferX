@@ -28,9 +28,9 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor_view.h"
-#include "inferx/kernels/flashinfer_attention.h"
-#include "inferx/kernels/gemm.h"
-#include "inferx/kernels/layers.h"
+#include "inferx/ops/flashinfer_attention.h"
+#include "inferx/ops/gemm.h"
+#include "inferx/ops/layers.h"
 
 namespace inferx::bench {
 namespace {
@@ -110,7 +110,7 @@ int Main(int argc, char** argv) {
   Arena a;
   std::vector<Row> rows;
 
-  auto gemm = kernels::CublasLtGemm::Create();
+  auto gemm = ops::CublasLtGemm::Create();
   if (!gemm.ok()) {
     std::fprintf(stderr, "%s\n", gemm.status().ToString().c_str());
     return 1;
@@ -189,7 +189,7 @@ int Main(int argc, char** argv) {
   auto ip = a.I32(indptr);
   auto lp = a.I32(last_page);
 
-  auto fi = kernels::FlashInferDecode::Create();
+  auto fi = ops::FlashInferDecode::Create();
   if (!fi.ok()) {
     std::fprintf(stderr, "%s\n", fi.status().ToString().c_str());
     return 1;
@@ -216,10 +216,10 @@ int Main(int argc, char** argv) {
     if (t.ok()) rows.push_back({name, t->min_ms, calls, 0.0});
   };
 
-  time_small("rms_norm", [&] { return kernels::RmsNorm(x, norm_w, x, 1e-6f); },
+  time_small("rms_norm", [&] { return ops::RmsNorm(x, norm_w, x, 1e-6f); },
              kLayers * 2 + 1);
   time_small("qkv split + bias", [&] {
-    return kernels::SplitQkvWithBias(qkv_out, bias_qkv, qv, kv, vv);
+    return ops::SplitQkvWithBias(qkv_out, bias_qkv, qv, kv, vv);
   }, kLayers);
   // Hoisted, deliberately. An earlier version allocated these inside the timed
   // lambda, so every iteration paid a cudaMalloc -- which is tens of
@@ -232,15 +232,15 @@ int Main(int argc, char** argv) {
   const TensorView slot1 = *a.I32({0});
 
   time_small("rope", [&] {
-    return kernels::RotaryEmbedding(q3, k3, pos1, 1e6f);
+    return ops::RotaryEmbedding(q3, k3, pos1, 1e6f);
   }, kLayers);
   time_small("silu_mul (fused)", [&] {
-    return kernels::SiluMulFused(gate_up_out, gate);
+    return ops::SiluMulFused(gate_up_out, gate);
   }, kLayers);
-  time_small("residual_add", [&] { return kernels::AddInPlace(x, x); },
+  time_small("residual_add", [&] { return ops::AddInPlace(x, x); },
              kLayers * 2);
   time_small("kv_append", [&] {
-    return kernels::AppendToKvCache(k3, v3, k_cache, v_cache, slot1);
+    return ops::AppendToKvCache(k3, v3, k_cache, v_cache, slot1);
   }, kLayers);
 
   // --- host-side per-step work ----------------------------------------------

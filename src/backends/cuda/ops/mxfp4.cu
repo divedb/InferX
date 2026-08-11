@@ -1,4 +1,4 @@
-#include "inferx/kernels/mxfp4.h"
+#include "inferx/ops/mxfp4.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

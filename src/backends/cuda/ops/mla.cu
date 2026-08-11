@@ -1,4 +1,4 @@
-#include "inferx/kernels/mla.h"
+#include "inferx/ops/mla.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

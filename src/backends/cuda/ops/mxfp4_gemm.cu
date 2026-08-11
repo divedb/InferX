@@ -4,7 +4,7 @@
 #include <type_traits>
 
 #include "inferx/backends/cuda/cuda_utils.h"
-#include "inferx/kernels/mxfp4_gemm.h"
+#include "inferx/ops/mxfp4_gemm.h"
 
 namespace inferx::kernels {
 namespace {

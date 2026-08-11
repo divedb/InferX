@@ -1,4 +1,4 @@
-# inferx_cuda_ops -- CUDA implementation of the backend-neutral ops API.
+# CUDA implementation of the backend-neutral InferX ops API.
 #
 # This is the first target in the tree compiled by nvcc. It is added only when
 # the toolkit meets INFERX_CUDA_MIN_VERSION (see cmake/InferXCuda.cmake): below

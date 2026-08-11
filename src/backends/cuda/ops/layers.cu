@@ -1,4 +1,4 @@
-#include "inferx/kernels/layers.h"
+#include "inferx/ops/layers.h"
 
 #include <curand_kernel.h>
 

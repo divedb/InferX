@@ -1,4 +1,4 @@
-#include "inferx/kernels/w4a16_gemm.h"
+#include "inferx/ops/w4a16_gemm.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

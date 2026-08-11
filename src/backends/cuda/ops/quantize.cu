@@ -1,4 +1,4 @@
-#include "inferx/kernels/quantize.h"
+#include "inferx/ops/quantize.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

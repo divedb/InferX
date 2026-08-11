@@ -31,10 +31,11 @@ add_subdirectory(src/comm)
 add_subdirectory(src/tokenizer)
 
 if(INFERX_CUDA_MEETS_FLOOR)
-  add_subdirectory(csrc)
+  add_subdirectory(src/backends/cuda/ops)
 endif()
 
-# After csrc: the model's forward pass links inferx::ops when device
+# After the selected ops backend: the model's forward pass links inferx::ops
+# when device
 # code is available, and is loader-only when it is not.
 add_subdirectory(src/model)
 add_subdirectory(src/scheduler)

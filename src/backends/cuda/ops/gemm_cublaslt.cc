@@ -8,7 +8,7 @@
 #include "absl/strings/str_cat.h"
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/shape.h"
-#include "inferx/kernels/gemm.h"
+#include "inferx/ops/gemm.h"
 
 namespace inferx::kernels {
 namespace {

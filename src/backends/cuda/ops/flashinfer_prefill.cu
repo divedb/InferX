@@ -14,7 +14,7 @@
 
 #include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
-#include "inferx/kernels/flashinfer_prefill.h"
+#include "inferx/ops/flashinfer_prefill.h"
 
 namespace inferx::kernels {
 namespace {
