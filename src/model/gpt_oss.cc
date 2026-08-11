@@ -11,6 +11,7 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/model/moe_ffn.h"
+#include "inferx/model/parallel/linear.h"
 #include "inferx/model/parallel/tp_dims.h"
 #include "inferx/model/parallel/tp_layout.h"
 #include "inferx/model/weight_loader.h"
@@ -192,6 +193,11 @@ struct GptOssModel::Impl {
   ops::CublasLtGemm gemm;
   std::unique_ptr<comm::Communicator> comm;
   std::unique_ptr<MoeFfn> moe;
+
+  int64_t LocalHeads() const { return tp_dims.local_heads; }
+  int64_t LocalKvHeads() const { return tp_dims.local_kv_heads; }
+  int64_t LocalQDim() const { return tp_dims.local_q_dim; }
+  int64_t LocalKvDim() const { return tp_dims.local_kv_dim; }
   // Paged serving owns a nonblocking stream so its device half can be captured
   // without involving the legacy default stream. Forward() remains the
   // synchronous reference path and deliberately does not use this stream.
@@ -275,7 +281,7 @@ Status GptOssModel::Impl::EnsureCapacity(int64_t tokens) {
 
   const size_t sz = DataTypeByteSize(kBf16, 1);
   const int64_t h = config.hidden_size;
-  const int64_t heads = config.num_attention_heads;
+  const int64_t heads = LocalHeads();
   const int64_t hd = config.head_dim;
 
   INFERX_RETURN_IF_ERROR(Grow(&ids, sizeof(int32_t) * tokens, device));
@@ -283,12 +289,11 @@ Status GptOssModel::Impl::EnsureCapacity(int64_t tokens) {
   INFERX_RETURN_IF_ERROR(Grow(&hidden, sz * tokens * h, device));
   INFERX_RETURN_IF_ERROR(Grow(&residual, sz * tokens * h, device));
   INFERX_RETURN_IF_ERROR(Grow(&normed, sz * tokens * h, device));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * config.q_dim(), device));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * config.kv_dim(), device));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * config.kv_dim(), device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * LocalQDim(), device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * LocalKvDim(), device));
+  INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * LocalKvDim(), device));
   INFERX_RETURN_IF_ERROR(
-      Grow(&qkv_fused, sz * tokens * (config.q_dim() + 2 * config.kv_dim()),
-           device));
+      Grow(&qkv_fused, sz * tokens * (LocalQDim() + 2 * LocalKvDim()), device));
   INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * heads * hd, device));
   INFERX_RETURN_IF_ERROR(Grow(&lse, sizeof(float) * tokens * heads, device));
   INFERX_RETURN_IF_ERROR(Grow(&proj, sz * tokens * h, device));
@@ -457,8 +462,8 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
   const ModelConfig& c = m.config;
   const int64_t tokens = batch.num_tokens();
   const int64_t h = c.hidden_size;
-  const int64_t heads = c.num_attention_heads;
-  const int64_t kv_heads = c.num_key_value_heads;
+  const int64_t heads = m.LocalHeads();
+  const int64_t kv_heads = m.LocalKvHeads();
   const int64_t hd = c.head_dim;
 
   const auto i32 = [&](const DeviceBuffer& buf,
@@ -504,16 +509,17 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   // Flat views for the projections (2-D) and the cache append (3-D per head).
   INFERX_ASSIGN_OR_RETURN(const TensorView q2,
-                          q.Reshape(Shape({tokens, c.q_dim()})));
+                          q.Reshape(Shape({tokens, m.LocalQDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView k2,
-                          k.Reshape(Shape({tokens, c.kv_dim()})));
+                          k.Reshape(Shape({tokens, m.LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView v2,
-                          v.Reshape(Shape({tokens, c.kv_dim()})));
+                          v.Reshape(Shape({tokens, m.LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView attn2,
                           attn.Reshape(Shape({tokens, heads * hd})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qkv_v,
-      m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
+      m.qkv_fused.View(kBf16,
+                       Shape({tokens, m.LocalQDim() + 2 * m.LocalKvDim()})));
 
   INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(m.embed, ids_v, x, stream));
 
@@ -577,8 +583,8 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
         attn, lse_v, w.sinks, /*lse_is_log2=*/false, stream));
     if (profiling) prof.tick(prof.attn_kernel);
 
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj, stream));
-    INFERX_RETURN_IF_ERROR(ops::AddBiasInPlace(proj, w.o_b, stream));
+    INFERX_RETURN_IF_ERROR(parallel::RowParallelLinear::ForwardBf16WithBias(
+        m.gemm, *m.comm, attn2, w.o_w, w.o_b, proj, stream));
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(proj, resid, stream));
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), proj.Data(), DataTypeByteSize(kBf16, tokens * h),
@@ -659,7 +665,7 @@ StatusOr<GptOssModel> GptOssModel::Load(
                           parallel::TpDims::For(config, tp_layout, tp_size));
   if (tp_size != 1) {
     return UnimplementedError(
-        "GptOssModel: tensor-parallel activation shapes are not wired yet");
+        "GptOssModel: tensor-parallel expert shards are not wired yet");
   }
 
   INFERX_ASSIGN_OR_RETURN(Checkpoint ckpt, Checkpoint::Open(dir));
@@ -856,8 +862,8 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
   const ModelConfig& c = m.config;
   const int64_t tokens = static_cast<int64_t>(token_ids.size());
   const int64_t h = c.hidden_size;
-  const int64_t heads = c.num_attention_heads;
-  const int64_t kv_heads = c.num_key_value_heads;
+  const int64_t heads = m.LocalHeads();
+  const int64_t kv_heads = m.LocalKvHeads();
   const int64_t hd = c.head_dim;
 
   for (const int32_t id : token_ids) {
@@ -908,16 +914,17 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
 
   // Flat views of q/k/v for the projections, which are 2-D.
   INFERX_ASSIGN_OR_RETURN(const TensorView q2,
-                          q.Reshape(Shape({tokens, c.q_dim()})));
+                          q.Reshape(Shape({tokens, m.LocalQDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView k2,
-                          k.Reshape(Shape({tokens, c.kv_dim()})));
+                          k.Reshape(Shape({tokens, m.LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView v2,
-                          v.Reshape(Shape({tokens, c.kv_dim()})));
+                          v.Reshape(Shape({tokens, m.LocalKvDim()})));
   INFERX_ASSIGN_OR_RETURN(const TensorView attn2,
                           attn.Reshape(Shape({tokens, heads * hd})));
   INFERX_ASSIGN_OR_RETURN(
       const TensorView qkv_v,
-      m.qkv_fused.View(kBf16, Shape({tokens, c.q_dim() + 2 * c.kv_dim()})));
+      m.qkv_fused.View(kBf16,
+                       Shape({tokens, m.LocalQDim() + 2 * m.LocalKvDim()})));
 
   INFERX_RETURN_IF_ERROR(ops::EmbeddingLookup(m.embed, ids_v, x));
 
@@ -977,8 +984,8 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
                                                     /*lse_is_log2=*/true));
     if (profiling) prof.tick(prof.attn_kernel);
 
-    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
-    INFERX_RETURN_IF_ERROR(ops::AddBiasInPlace(proj, w.o_b));
+    INFERX_RETURN_IF_ERROR(parallel::RowParallelLinear::ForwardBf16WithBias(
+        m.gemm, *m.comm, attn2, w.o_w, w.o_b, proj));
     dump_hidden(proj);  // attention output, after o_proj, before the residual
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(proj, resid));
     INFERX_RETURN_IF_ERROR(m.runtime->Copy(x.Data(), proj.Data(),
@@ -1055,11 +1062,11 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
 
 namespace {
 
-KvLayout GptOssKvLayout(const ModelConfig& config) {
+KvLayout GptOssKvLayout(int64_t local_kv_heads, int64_t head_dim) {
   KvLayout layout;
   layout.entries_per_token = 2;  // K and V
-  layout.kv_heads = config.num_key_value_heads;
-  layout.head_dim = config.head_dim;
+  layout.kv_heads = local_kv_heads;
+  layout.head_dim = head_dim;
   layout.dtype = DataType::kBFloat16;
   return layout;
 }
@@ -1067,12 +1074,14 @@ KvLayout GptOssKvLayout(const ModelConfig& config) {
 }  // namespace
 
 int64_t GptOssModel::KvBlockBytes(int64_t block_size) const {
-  return KvBlockPool::BlockBytes(impl_->config.num_hidden_layers, block_size,
-                                 GptOssKvLayout(impl_->config));
+  return KvBlockPool::BlockBytes(
+      impl_->config.num_hidden_layers, block_size,
+      GptOssKvLayout(impl_->LocalKvHeads(), impl_->config.head_dim));
 }
 
 Status GptOssModel::AttachKvCache(int64_t num_blocks, int64_t block_size) {
-  const KvLayout layout = GptOssKvLayout(impl_->config);
+  const KvLayout layout =
+      GptOssKvLayout(impl_->LocalKvHeads(), impl_->config.head_dim);
 
   INFERX_ASSIGN_OR_RETURN(
       KvBlockPool pool,

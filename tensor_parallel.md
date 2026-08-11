@@ -32,8 +32,9 @@ DeepSeek-V2 still reject TP greater than one. `GptOssTpLayout` now declares
 the attention and nested MXFP4 expert shards, including fused gate/up
 segmentation and 32-weight local alignment. The GPT-OSS loader now owns its
 communicator, derives these local dimensions, and loads attention shards
-through the shared layout-aware loader. It still rejects multi-rank execution
-until its activation shapes consume them.
+through the shared layout-aware loader. Attention scratch, paged KV layout,
+and output projection completion now consume the local dimensions in both
+forward paths. Multi-rank execution remains guarded until MoE shards land.
 
 Relationship to existing documents:
 
