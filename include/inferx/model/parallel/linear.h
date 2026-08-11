@@ -29,11 +29,24 @@ class RowParallelLinear {
                             const TensorView& local_weight,
                             const TensorView& output, Stream stream = {});
 
+  // Bias is replicated rather than sharded for row-parallel projections. It
+  // must therefore be added after the partial outputs have been summed, or
+  // tensor parallelism would add it once per rank.
+  static Status ForwardBf16WithBias(
+      ops::CublasLtGemm& gemm, comm::Communicator& communicator,
+      const TensorView& local_input, const TensorView& local_weight,
+      const TensorView& bias, const TensorView& output, Stream stream = {});
+
   // Completion seam for callers that select a quantized local GEMM. Keeping
   // the collective here preserves one communication boundary for every
   // storage format.
   static Status ReduceOutput(comm::Communicator& communicator,
                              const TensorView& output, Stream stream = {});
+
+  static Status ReduceOutputWithBias(comm::Communicator& communicator,
+                                     const TensorView& output,
+                                     const TensorView& bias,
+                                     Stream stream = {});
 };
 
 }  // namespace inferx::model::parallel

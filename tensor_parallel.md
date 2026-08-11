@@ -26,7 +26,8 @@ Qwen2's dense BF16 path composes both linear primitives. `MoeFfn` exposes a
 parallel forward that reduces routed and shared-expert partials once after
 combine. Replicated expert down biases are omitted from local GEMMs and their
 routed weighted mixture is applied once after reduction. The MLA primitive
-has not landed, while gpt-oss and
+has not landed. `RowParallelLinear` also owns the replicated dense-bias rule:
+reduce projection partials first, then add bias once. GPT-OSS and
 DeepSeek-V2 still reject TP greater than one. `GptOssTpLayout` now declares
 the attention and nested MXFP4 expert shards, including fused gate/up
 segmentation and 32-weight local alignment; it is not yet consumed by the
