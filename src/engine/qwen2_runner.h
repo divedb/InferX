@@ -12,7 +12,7 @@
 
 namespace inferx::engine {
 
-struct QwenRunnerConfig {
+struct Qwen2RunnerConfig {
   std::string model_dir;
   DeviceKind device_kind = DeviceKind::kCuda;
   std::vector<int> devices{0};
@@ -47,12 +47,12 @@ struct RankTelemetry {
 
 /// Model execution boundary used by the server. TP=1 calls the model directly;
 /// TP=2 dispatches the same operation to two persistent rank workers.
-class QwenRunner {
+class Qwen2Runner {
  public:
-  virtual ~QwenRunner() = default;
+  virtual ~Qwen2Runner() = default;
 
-  static StatusOr<std::unique_ptr<QwenRunner>> Create(
-      const QwenRunnerConfig& config);
+  static StatusOr<std::unique_ptr<Qwen2Runner>> Create(
+      const Qwen2RunnerConfig& config);
 
   virtual KvBlockPool* kv_pool() = 0;
   virtual Status ReserveActivations(int64_t max_tokens) = 0;

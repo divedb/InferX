@@ -21,7 +21,7 @@
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
 #include "kv_autosize.h"
-#include "qwen_runner.h"
+#include "qwen2_runner.h"
 
 namespace inferx::engine {
 namespace {
@@ -373,14 +373,14 @@ struct Engine::Impl {
   EngineConfig config;
 
   // Exactly one of these is populated, decided once in Engine::Create from the
-  // checkpoint's declared architecture. QwenRunner hides whether execution is
+  // checkpoint's declared architecture. Qwen2Runner hides whether execution is
   // direct TP=1 or dispatched to NCCL rank workers.
   //
   // The gpt-oss path is the Phase 3 slow serve: GptOssModel has only Forward(),
   // no paged KV, no continuous batching. It is batch-1, full recompute per
   // token, and exists so the engine can serve the checkpoint end to end before
   // Phase 4 makes it fast.
-  std::unique_ptr<QwenRunner> qwen2_model;
+  std::unique_ptr<Qwen2Runner> qwen2_model;
   std::unique_ptr<model::GptOssModel> gpt_oss_model;
   std::unique_ptr<model::DeepseekV2Model> deepseek_model;
 
@@ -1215,7 +1215,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
       }
     }
   } else {
-    QwenRunnerConfig runner_config;
+    Qwen2RunnerConfig runner_config;
     runner_config.model_dir = config.model_dir;
     runner_config.device_kind = config.device_kind;
     runner_config.devices = config.devices;
@@ -1231,8 +1231,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     runner_config.block_size = config.block_size;
     runner_config.max_seq_len = config.scheduler.max_seq_len;
     runner_config.max_sampling_rows = config.scheduler.max_running;
-    INFERX_ASSIGN_OR_RETURN(std::unique_ptr<QwenRunner> model,
-                            QwenRunner::Create(runner_config));
+    INFERX_ASSIGN_OR_RETURN(std::unique_ptr<Qwen2Runner> model,
+                            Qwen2Runner::Create(runner_config));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,

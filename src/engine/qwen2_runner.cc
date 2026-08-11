@@ -1,4 +1,4 @@
-#include "qwen_runner.h"
+#include "qwen2_runner.h"
 
 #include <atomic>
 #include <chrono>
@@ -64,7 +64,7 @@ class KvSizeRendezvous {
 
 /// `agreed` reports whether this rank posted to `rendezvous`, so failure
 /// paths know whether the peer still needs unblocking.
-Status ConfigureModel(model::Qwen2Model* model, const QwenRunnerConfig& config,
+Status ConfigureModel(model::Qwen2Model* model, const Qwen2RunnerConfig& config,
                       DeviceId device, KvSizeRendezvous* rendezvous,
                       bool* agreed) {
   Status prep = OkStatus();
@@ -104,10 +104,10 @@ Status ConfigureModel(model::Qwen2Model* model, const QwenRunnerConfig& config,
   return model->EnableDeviceSampling(config.max_sampling_rows);
 }
 
-class SingleQwenRunner final : public QwenRunner {
+class SingleQwen2Runner final : public Qwen2Runner {
  public:
-  SingleQwenRunner(model::Qwen2Model model, int device,
-                   std::shared_ptr<comm::CommMetrics> communication)
+  SingleQwen2Runner(model::Qwen2Model model, int device,
+                    std::shared_ptr<comm::CommMetrics> communication)
       : model_(std::move(model)),
         device_(device),
         communication_(std::move(communication)) {}
@@ -168,7 +168,7 @@ class RankWorker {
  public:
   using Job = std::function<Status(model::Qwen2Model&)>;
 
-  RankWorker(const QwenRunnerConfig& config, int rank,
+  RankWorker(const Qwen2RunnerConfig& config, int rank,
              const comm::NcclUniqueIdBytes& unique_id,
              std::shared_ptr<KvSizeRendezvous> rendezvous)
       : config_(config),
@@ -319,7 +319,7 @@ class RankWorker {
     model_.reset();
   }
 
-  QwenRunnerConfig config_;
+  Qwen2RunnerConfig config_;
   int rank_;
   comm::NcclUniqueIdBytes unique_id_;
   std::shared_ptr<KvSizeRendezvous> rendezvous_;
@@ -344,10 +344,10 @@ class RankWorker {
   bool stopping_ = false;
 };
 
-class NcclQwenRunner final : public QwenRunner {
+class NcclQwen2Runner final : public Qwen2Runner {
  public:
-  static StatusOr<std::unique_ptr<NcclQwenRunner>> Create(
-      const QwenRunnerConfig& config) {
+  static StatusOr<std::unique_ptr<NcclQwen2Runner>> Create(
+      const Qwen2RunnerConfig& config) {
     if (config.devices.size() != 2) {
       return InvalidArgumentError(
           "the first NCCL runtime requires exactly two devices, got ",
@@ -359,7 +359,7 @@ class NcclQwenRunner final : public QwenRunner {
     INFERX_ASSIGN_OR_RETURN(const comm::NcclUniqueIdBytes id,
                             comm::CreateNcclUniqueId());
 
-    auto runner = std::unique_ptr<NcclQwenRunner>(new NcclQwenRunner());
+    auto runner = std::unique_ptr<NcclQwen2Runner>(new NcclQwen2Runner());
     auto rendezvous = std::make_shared<KvSizeRendezvous>(2);
     for (int rank = 0; rank < 2; ++rank) {
       runner->workers_.push_back(
@@ -462,8 +462,8 @@ class NcclQwenRunner final : public QwenRunner {
 
 }  // namespace
 
-StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
-    const QwenRunnerConfig& config) {
+StatusOr<std::unique_ptr<Qwen2Runner>> Qwen2Runner::Create(
+    const Qwen2RunnerConfig& config) {
   if (config.devices.empty()) {
     return InvalidArgumentError("at least one CUDA device is required");
   }
@@ -474,8 +474,8 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
     if (config.device_kind != DeviceKind::kCuda) {
       return InvalidArgumentError("NCCL requires CUDA devices");
     }
-    INFERX_ASSIGN_OR_RETURN(auto runner, NcclQwenRunner::Create(config));
-    return std::unique_ptr<QwenRunner>(std::move(runner));
+    INFERX_ASSIGN_OR_RETURN(auto runner, NcclQwen2Runner::Create(config));
+    return std::unique_ptr<Qwen2Runner>(std::move(runner));
   }
   if (config.devices.size() != 1) {
     return InvalidArgumentError("multiple devices require the NCCL backend");
@@ -497,7 +497,7 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   bool agreed = false;
   INFERX_RETURN_IF_ERROR(
       ConfigureModel(&model, config, placement, nullptr, &agreed));
-  return std::unique_ptr<QwenRunner>(std::make_unique<SingleQwenRunner>(
+  return std::unique_ptr<Qwen2Runner>(std::make_unique<SingleQwen2Runner>(
       std::move(model), device, std::move(communication)));
 }
 
