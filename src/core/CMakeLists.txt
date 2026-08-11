@@ -5,6 +5,7 @@
 # __global__ kernels need nvcc, and there are none at M0.
 
 add_library(inferx_core
+  ../backends/cpu/device_runtime.cc
   allocator.cc
   arena.cc
   caching_allocator.cc
@@ -17,6 +18,12 @@ add_library(inferx_core
   tensor.cc
   tensor_view.cc
 )
+
+if(INFERX_CUDA_MEETS_FLOOR)
+  target_sources(inferx_core PRIVATE
+    ../backends/cuda/device_runtime.cc
+  )
+endif()
 add_library(inferx::core ALIAS inferx_core)
 
 target_include_directories(inferx_core PUBLIC
