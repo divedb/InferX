@@ -23,6 +23,7 @@
 #include "kv_autosize.h"
 #include "model_runner.h"
 #include "qwen2_runner.h"
+#include "sync_model_runner.h"
 
 namespace inferx::engine {
 namespace {
@@ -382,8 +383,7 @@ struct Engine::Impl {
   // token, and exists so the engine can serve the checkpoint end to end before
   // Phase 4 makes it fast.
   std::unique_ptr<ModelRunner> model_runner;
-  std::unique_ptr<model::GptOssModel> gpt_oss_model;
-  std::unique_ptr<model::DeepseekV2Model> deepseek_model;
+  std::unique_ptr<SyncModelRunner> sync_model_runner;
 
   // The declared architecture, kept because composition needs it after Create
   // (chat-template selection) and the populated pointer alone cannot
@@ -459,20 +459,7 @@ struct Engine::Impl {
   // The two synchronous models (Step to host logits, argmax here) against the
   // Qwen2 async runner. One predicate and two forwarding helpers rather than a
   // third serving loop: RunSyncModel is the only consumer.
-  bool is_sync_model() const {
-    return gpt_oss_model != nullptr || deepseek_model != nullptr;
-  }
-
-  Status StepSyncModel(const model::ForwardBatch& batch,
-                       std::vector<float>* logits) {
-    if (gpt_oss_model != nullptr) return gpt_oss_model->Step(batch, logits);
-    return deepseek_model->Step(batch, logits);
-  }
-
-  int64_t sync_model_vocab() const {
-    if (gpt_oss_model != nullptr) return gpt_oss_model->config().vocab_size;
-    return deepseek_model->config().vocab_size;
-  }
+  bool is_sync_model() const { return sync_model_runner != nullptr; }
 
   // Routes one sampled token to its request: detokenize, apply stop sequences,
   // emit whatever is now safe to send.
@@ -963,7 +950,7 @@ struct Engine::Impl {
       // the sampled tokens go to the scheduler. The Qwen2 path's StepAsync /
       // AwaitStep overlap does not apply -- both synchronous models
       // stream-synchronize inside Step.
-      const Status stepped = StepSyncModel(batch, &logits);
+      const Status stepped = sync_model_runner->Step(batch, &logits);
 
       if (!stepped.ok()) {
         FailAll(stepped);
@@ -975,7 +962,7 @@ struct Engine::Impl {
       // models already ship logits back, so the full vLLM-compatible
       // treatment (penalties, masks, temperature/top-p/top-k/min-p, seeded
       // draw, logprobs) costs a few vocabulary-length passes per row.
-      const int64_t vocab = sync_model_vocab();
+      const int64_t vocab = sync_model_runner->vocab_size();
       sampled.clear();
       sampled.reserve(batch.logits_indices.size());
       std::vector<scheduler::StepLogprob> step_logprobs(
@@ -1148,12 +1135,11 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler scheduler,
         Scheduler::Create(config.scheduler, deepseek.kv_pool()));
 
-    impl->deepseek_model =
-        std::make_unique<model::DeepseekV2Model>(std::move(deepseek));
+    impl->sync_model_runner = MakeSyncModelRunner(std::move(deepseek));
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = kv_blocks;
 
-    INFERX_RETURN_IF_ERROR(impl->deepseek_model->ReserveActivations(
+    INFERX_RETURN_IF_ERROR(impl->sync_model_runner->ReserveActivations(
         config.scheduler.max_batch_tokens));
   } else if (model_config.architecture == model::Architecture::kGptOss) {
     if (config.tensor_parallel_size != 1) {
@@ -1195,15 +1181,14 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler scheduler,
         Scheduler::Create(config.scheduler, gpt_oss.kv_pool()));
 
-    impl->gpt_oss_model =
-        std::make_unique<model::GptOssModel>(std::move(gpt_oss));
+    impl->sync_model_runner = MakeSyncModelRunner(std::move(gpt_oss));
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
     impl->stats.blocks_total = kv_blocks;
 
     // Size the activation scratch once, for the largest batch that will ever
     // run. The scratch only grows, so a later growth inside a step is fine --
     // but doing it up front avoids the first-step reallocation cost.
-    INFERX_RETURN_IF_ERROR(impl->gpt_oss_model->ReserveActivations(
+    INFERX_RETURN_IF_ERROR(impl->sync_model_runner->ReserveActivations(
         config.scheduler.max_batch_tokens));
 
     if (config.capture_graphs) {
@@ -1212,7 +1197,7 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
           config.block_size;
       for (int64_t seqs = config.scheduler.max_running; seqs >= 1; --seqs) {
         INFERX_RETURN_IF_ERROR(
-            impl->gpt_oss_model->CaptureDecodeGraph(seqs, max_blocks));
+            impl->sync_model_runner->CaptureDecodeGraph(seqs, max_blocks));
       }
     }
   } else {

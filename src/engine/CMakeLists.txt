@@ -3,7 +3,8 @@
 add_library(inferx_engine
   engine.cc
   kv_autosize.cc
-  qwen2_runner.cc)
+  qwen2_runner.cc
+  sync_model_runner.cc)
 add_library(inferx::engine ALIAS inferx_engine)
 
 target_include_directories(inferx_engine
