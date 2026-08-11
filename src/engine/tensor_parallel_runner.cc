@@ -1,4 +1,4 @@
-#include "qwen2_runner.h"
+#include "inferx/engine/tensor_parallel_runner.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,8 +15,7 @@
 
 #include "inferx/comm/nccl_communicator.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/model/qwen2.h"
-#include "kv_autosize.h"
+#include "inferx/engine/kv_autosize.h"
 
 namespace inferx::engine {
 namespace {
@@ -66,13 +65,10 @@ class KvSizeRendezvous {
 
 /// `agreed` reports whether this rank posted to `rendezvous`, so failure
 /// paths know whether the peer still needs unblocking.
-Status ConfigureModel(model::Qwen2Model* model, const Qwen2RunnerConfig& config,
-                      DeviceId device, KvSizeRendezvous* rendezvous,
-                      bool* agreed) {
-  Status prep = OkStatus();
-  if (config.fp8_weights) prep = model->QuantizeWeightsToF8();
-  if (prep.ok() && config.int4_weights) prep = model->QuantizeWeightsToInt4();
-  if (prep.ok() && config.fp8_kv_cache) prep = model->EnableFp8KvCache();
+Status ConfigureModel(RankModel* model,
+                      const TensorParallelRunnerConfig& config, DeviceId device,
+                      KvSizeRendezvous* rendezvous, bool* agreed) {
+  const Status prep = model->PrepareWeights();
 
   int64_t blocks = config.kv_blocks;
   if (blocks <= 0) {
@@ -103,50 +99,43 @@ Status ConfigureModel(model::Qwen2Model* model, const Qwen2RunnerConfig& config,
   }
   INFERX_RETURN_IF_ERROR(prep);
   INFERX_RETURN_IF_ERROR(model->AttachKvCache(blocks, config.block_size));
-  return model->EnableDeviceSampling(config.max_sampling_rows);
+  return model->EnableSampling(config.max_sampling_rows);
 }
 
-class SingleQwen2Runner final : public Qwen2Runner {
+class SingleModelRunner final : public TensorParallelRunner {
  public:
-  SingleQwen2Runner(model::Qwen2Model model, int device,
-                    std::shared_ptr<comm::CommMetrics> communication)
-      : model_(std::move(model)),
+  SingleModelRunner(std::unique_ptr<RankModel> model, int device,
+                    std::shared_ptr<comm::CommMetrics> communication,
+                    const TensorParallelRunnerConfig& config)
+      : TensorParallelRunner(config),
+        model_(std::move(model)),
         device_(device),
         communication_(std::move(communication)) {}
 
-  KvBlockPool* kv_pool() override { return model_.kv_pool(); }
+  KvBlockPool* kv_pool() override { return model_->kv_pool(); }
   Status ReserveActivations(int64_t n) override {
-    return model_.ReserveActivations(n);
+    return model_->ReserveActivations(n);
   }
   Status StepAsync(const model::ForwardBatch& batch) {
-    Status result = model_.StepAsync(batch);
+    Status result = model_->StepAsync(batch);
     if (!result.ok()) healthy_.store(false, std::memory_order_relaxed);
     return result;
   }
   Status AwaitStep(std::vector<int32_t>* sampled) {
-    Status result = model_.AwaitStep(sampled);
+    Status result = model_->AwaitStep(sampled);
     healthy_.store(result.ok(), std::memory_order_relaxed);
     if (result.ok()) {
-      last_step_device_ms_.store(model_.last_step_device_ms(),
+      last_step_device_ms_.store(model_->last_step_device_ms(),
                                  std::memory_order_relaxed);
       last_progress_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
     }
     return result;
   }
   Status CaptureDecodeGraph(int64_t n, int64_t blocks) override {
-    return model_.CaptureDecodeGraph(n, blocks);
+    return model_->CaptureDecodeGraph(n, blocks);
   }
   Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) {
-    std::vector<model::Qwen2Model::SampledLogprob> raw;
-    INFERX_RETURN_IF_ERROR(model_.ReadSampledLogprobs(&raw));
-    out->clear();
-    out->reserve(raw.size());
-    for (auto& item : raw) {
-      out->push_back({.present = item.present,
-                      .logprob = item.logprob,
-                      .top = std::move(item.top)});
-    }
-    return OkStatus();
+    return model_->ReadSampledLogprobs(out);
   }
   Status Step(const model::ForwardBatch& batch, std::vector<int32_t>* sampled,
               std::vector<SampledLogprob>* logprobs) override {
@@ -176,7 +165,7 @@ class SingleQwen2Runner final : public Qwen2Runner {
   }
 
  private:
-  model::Qwen2Model model_;
+  std::unique_ptr<RankModel> model_;
   int device_ = 0;
   std::shared_ptr<comm::CommMetrics> communication_;
   std::atomic<bool> healthy_{true};
@@ -186,15 +175,17 @@ class SingleQwen2Runner final : public Qwen2Runner {
 
 class RankWorker {
  public:
-  using Job = std::function<Status(model::Qwen2Model&)>;
+  using Job = std::function<Status(RankModel&)>;
 
-  RankWorker(const Qwen2RunnerConfig& config, int rank,
+  RankWorker(const TensorParallelRunnerConfig& config, int rank,
              const comm::NcclUniqueIdBytes& unique_id,
-             std::shared_ptr<KvSizeRendezvous> rendezvous)
+             std::shared_ptr<KvSizeRendezvous> rendezvous,
+             RankModelFactory factory)
       : config_(config),
         rank_(rank),
         unique_id_(unique_id),
         rendezvous_(std::move(rendezvous)),
+        factory_(std::move(factory)),
         communication_(std::make_shared<comm::CommMetrics>()) {
     thread_ = std::thread([this] { ThreadMain(); });
   }
@@ -231,7 +222,7 @@ class RankWorker {
   }
 
   Status AbortCommunication() {
-    return model_ == nullptr ? OkStatus() : model_->AbortCommunicator();
+    return model_ == nullptr ? OkStatus() : model_->AbortCommunication();
   }
 
   KvBlockPool* kv_pool() const { return pool_; }
@@ -287,12 +278,14 @@ class RankWorker {
         *communicator = comm::ObserveCommunicator(
             std::move(*communicator), communication_,
             {.timing_sample_every = config_.collective_timing_sample_every});
-        auto loaded = model::Qwen2Model::LoadFromDirectory(
-            config_.model_dir, std::move(*communicator));
+        ParallelContext context(placement, rank_,
+                                static_cast<int>(config_.devices.size()),
+                                std::move(*communicator));
+        auto loaded = factory_(std::move(context));
         if (!loaded.ok()) {
           status = loaded.status();
         } else {
-          model_ = std::make_unique<model::Qwen2Model>(std::move(*loaded));
+          model_ = std::move(*loaded);
           status = ConfigureModel(model_.get(), config_, placement,
                                   rendezvous_.get(), &agreed_with_peer_);
           if (status.ok()) pool_ = model_->kv_pool();
@@ -339,14 +332,15 @@ class RankWorker {
     model_.reset();
   }
 
-  Qwen2RunnerConfig config_;
+  TensorParallelRunnerConfig config_;
   int rank_;
   comm::NcclUniqueIdBytes unique_id_;
   std::shared_ptr<KvSizeRendezvous> rendezvous_;
+  RankModelFactory factory_;
   bool agreed_with_peer_ = false;
   std::thread thread_;
   std::promise<Status> initialized_;
-  std::unique_ptr<model::Qwen2Model> model_;
+  std::unique_ptr<RankModel> model_;
   KvBlockPool* pool_ = nullptr;
   float last_step_device_ms_ = 0.0f;
   std::shared_ptr<comm::CommMetrics> communication_;
@@ -364,10 +358,10 @@ class RankWorker {
   bool stopping_ = false;
 };
 
-class NcclQwen2Runner final : public Qwen2Runner {
+class NcclTensorParallelRunner final : public TensorParallelRunner {
  public:
-  static StatusOr<std::unique_ptr<NcclQwen2Runner>> Create(
-      const Qwen2RunnerConfig& config) {
+  static StatusOr<std::unique_ptr<NcclTensorParallelRunner>> Create(
+      const TensorParallelRunnerConfig& config, RankModelFactory factory) {
     if (config.devices.size() != 2) {
       return InvalidArgumentError(
           "the first NCCL runtime requires exactly two devices, got ",
@@ -379,11 +373,12 @@ class NcclQwen2Runner final : public Qwen2Runner {
     INFERX_ASSIGN_OR_RETURN(const comm::NcclUniqueIdBytes id,
                             comm::CreateNcclUniqueId());
 
-    auto runner = std::unique_ptr<NcclQwen2Runner>(new NcclQwen2Runner());
+    auto runner = std::unique_ptr<NcclTensorParallelRunner>(
+        new NcclTensorParallelRunner(config));
     auto rendezvous = std::make_shared<KvSizeRendezvous>(2);
     for (int rank = 0; rank < 2; ++rank) {
       runner->workers_.push_back(
-          std::make_unique<RankWorker>(config, rank, id, rendezvous));
+          std::make_unique<RankWorker>(config, rank, id, rendezvous, factory));
     }
     for (auto& worker : runner->workers_) {
       const Status initialized = worker->WaitInitialized();
@@ -395,20 +390,20 @@ class NcclQwen2Runner final : public Qwen2Runner {
   KvBlockPool* kv_pool() override { return workers_[0]->kv_pool(); }
 
   Status ReserveActivations(int64_t max_tokens) override {
-    return Dispatch([max_tokens](model::Qwen2Model& model) {
+    return Dispatch([max_tokens](RankModel& model) {
       return model.ReserveActivations(max_tokens);
     });
   }
 
   Status StepAsync(const model::ForwardBatch& batch) {
     return Dispatch(
-        [batch](model::Qwen2Model& model) { return model.StepAsync(batch); });
+        [batch](RankModel& model) { return model.StepAsync(batch); });
   }
 
   Status AwaitStep(std::vector<int32_t>* sampled) {
     std::vector<std::vector<int32_t>> outputs(workers_.size());
     INFERX_RETURN_IF_ERROR(
-        DispatchIndexed([&outputs](size_t rank, model::Qwen2Model& model) {
+        DispatchIndexed([&outputs](size_t rank, RankModel& model) {
           return model.AwaitStep(&outputs[rank]);
         }));
     *sampled = std::move(outputs[0]);
@@ -417,7 +412,7 @@ class NcclQwen2Runner final : public Qwen2Runner {
 
   Status CaptureDecodeGraph(int64_t num_seqs,
                             int64_t max_blocks_per_seq) override {
-    return Dispatch([=](model::Qwen2Model& model) {
+    return Dispatch([=](RankModel& model) {
       return model.CaptureDecodeGraph(num_seqs, max_blocks_per_seq);
     });
   }
@@ -425,19 +420,9 @@ class NcclQwen2Runner final : public Qwen2Runner {
   Status ReadSampledLogprobs(std::vector<SampledLogprob>* out) {
     // Rank 0 only: every rank samples the same tokens from the same
     // all-reduced logits, so one readback answers for the pair.
-    std::vector<model::Qwen2Model::SampledLogprob> raw;
-    INFERX_RETURN_IF_ERROR(
-        workers_[0]->Submit([&raw](model::Qwen2Model& model) {
-          return model.ReadSampledLogprobs(&raw);
-        }));
+    INFERX_RETURN_IF_ERROR(workers_[0]->Submit(
+        [out](RankModel& model) { return model.ReadSampledLogprobs(out); }));
     INFERX_RETURN_IF_ERROR(workers_[0]->Wait());
-    out->clear();
-    out->reserve(raw.size());
-    for (auto& item : raw) {
-      out->push_back({.present = item.present,
-                      .logprob = item.logprob,
-                      .top = std::move(item.top)});
-    }
     return OkStatus();
   }
   Status Step(const model::ForwardBatch& batch, std::vector<int32_t>* sampled,
@@ -463,10 +448,13 @@ class NcclQwen2Runner final : public Qwen2Runner {
   }
 
  private:
+  explicit NcclTensorParallelRunner(const TensorParallelRunnerConfig& config)
+      : TensorParallelRunner(config) {}
+
   template <typename Fn>
   Status Dispatch(Fn fn) {
     return DispatchIndexed(
-        [fn = std::move(fn)](size_t, model::Qwen2Model& model) mutable {
+        [fn = std::move(fn)](size_t, RankModel& model) mutable {
           return fn(model);
         });
   }
@@ -474,10 +462,8 @@ class NcclQwen2Runner final : public Qwen2Runner {
   template <typename Fn>
   Status DispatchIndexed(Fn fn) {
     for (size_t rank = 0; rank < workers_.size(); ++rank) {
-      INFERX_RETURN_IF_ERROR(
-          workers_[rank]->Submit([fn, rank](model::Qwen2Model& model) mutable {
-            return fn(rank, model);
-          }));
+      INFERX_RETURN_IF_ERROR(workers_[rank]->Submit(
+          [fn, rank](RankModel& model) mutable { return fn(rank, model); }));
     }
     Status first = OkStatus();
     for (auto& worker : workers_) {
@@ -501,20 +487,19 @@ class NcclQwen2Runner final : public Qwen2Runner {
 
 }  // namespace
 
-StatusOr<std::unique_ptr<Qwen2Runner>> Qwen2Runner::Create(
-    const Qwen2RunnerConfig& config) {
+StatusOr<std::unique_ptr<TensorParallelRunner>> TensorParallelRunner::Create(
+    const TensorParallelRunnerConfig& config, RankModelFactory factory) {
   if (config.devices.empty()) {
     return InvalidArgumentError("at least one CUDA device is required");
   }
-  if (config.fp8_weights && config.int4_weights) {
-    return InvalidArgumentError("FP8 and int4 weights are mutually exclusive");
-  }
+  if (!factory) return InvalidArgumentError("rank model factory is empty");
   if (config.use_nccl) {
     if (config.device_kind != DeviceKind::kCuda) {
       return InvalidArgumentError("NCCL requires CUDA devices");
     }
-    INFERX_ASSIGN_OR_RETURN(auto runner, NcclQwen2Runner::Create(config));
-    return std::unique_ptr<Qwen2Runner>(std::move(runner));
+    INFERX_ASSIGN_OR_RETURN(auto runner, NcclTensorParallelRunner::Create(
+                                             config, std::move(factory)));
+    return std::unique_ptr<TensorParallelRunner>(std::move(runner));
   }
   if (config.devices.size() != 1) {
     return InvalidArgumentError("multiple devices require the NCCL backend");
@@ -530,14 +515,15 @@ StatusOr<std::unique_ptr<Qwen2Runner>> Qwen2Runner::Create(
   std::unique_ptr<comm::Communicator> observed = comm::ObserveCommunicator(
       std::move(communicator), communication,
       {.timing_sample_every = config.collective_timing_sample_every});
-  INFERX_ASSIGN_OR_RETURN(model::Qwen2Model model,
-                          model::Qwen2Model::LoadFromDirectory(
-                              config.model_dir, std::move(observed)));
+  ParallelContext context(placement, 0, 1, std::move(observed));
+  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<RankModel> model,
+                          factory(std::move(context)));
   bool agreed = false;
   INFERX_RETURN_IF_ERROR(
-      ConfigureModel(&model, config, placement, nullptr, &agreed));
-  return std::unique_ptr<Qwen2Runner>(std::make_unique<SingleQwen2Runner>(
-      std::move(model), device, std::move(communication)));
+      ConfigureModel(model.get(), config, placement, nullptr, &agreed));
+  return std::unique_ptr<TensorParallelRunner>(
+      std::make_unique<SingleModelRunner>(std::move(model), device,
+                                          std::move(communication), config));
 }
 
 }  // namespace inferx::engine

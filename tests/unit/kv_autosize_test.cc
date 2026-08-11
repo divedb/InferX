@@ -1,4 +1,4 @@
-#include "engine/kv_autosize.h"
+#include "inferx/engine/kv_autosize.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"

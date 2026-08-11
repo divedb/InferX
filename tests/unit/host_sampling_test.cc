@@ -4,7 +4,7 @@
 
 #include <gtest/gtest.h>
 
-#include "engine/host_sampling.h"
+#include "inferx/engine/host_sampling.h"
 
 namespace inferx::engine {
 namespace {

@@ -5,8 +5,8 @@ add_library(inferx_engine
   host_sampling.cc
   kv_autosize.cc
   model_runner_factory.cc
-  qwen2_runner.cc
-  sync_model_runner.cc)
+  sync_model_runner.cc
+  tensor_parallel_runner.cc)
 add_library(inferx::engine ALIAS inferx_engine)
 
 target_include_directories(inferx_engine

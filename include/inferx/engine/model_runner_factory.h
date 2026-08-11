@@ -5,8 +5,8 @@
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/model/config.h"
-#include "host_sampling.h"
-#include "model_runner.h"
+#include "inferx/engine/host_sampling.h"
+#include "inferx/engine/model_runner.h"
 
 namespace inferx::engine {
 

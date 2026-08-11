@@ -85,6 +85,7 @@ inferx_add_test(model_runner_validation_test
                 unit/model_runner_validation_test.cc)
 target_include_directories(model_runner_validation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src)
+inferx_add_test(parallel_context_test unit/parallel_context_test.cc)
 inferx_add_test(log_test               unit/log_test.cc)
 inferx_add_test(crash_test             unit/support/crash_test.cc)
 

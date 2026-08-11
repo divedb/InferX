@@ -1,4 +1,4 @@
-#include "host_sampling.h"
+#include "inferx/engine/host_sampling.h"
 
 #include <algorithm>
 #include <cmath>

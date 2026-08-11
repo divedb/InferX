@@ -1,4 +1,4 @@
-#include "sync_model_runner.h"
+#include "inferx/engine/sync_model_runner.h"
 
 #include <type_traits>
 #include <utility>

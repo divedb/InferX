@@ -5,7 +5,7 @@
 #include <functional>
 
 #include "inferx/model/forward_batch.h"
-#include "model_runner.h"
+#include "inferx/engine/model_runner.h"
 
 namespace inferx::engine {
 

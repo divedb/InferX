@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "engine/model_runner_validation.h"
+#include "inferx/engine/model_runner_validation.h"
 
 namespace inferx::engine {
 namespace {

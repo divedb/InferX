@@ -2,9 +2,31 @@
 
 ## Status
 
-Design. No implementation has started. This document analyzes InferX's CUDA
-coupling and defines the architecture for making the engine backend-agnostic,
-targeting CUDA (reference), ROCm, and NPU platforms such as Ascend (CANN).
+Implementation in progress. The CUDA reference backend has been separated
+behind the ops and device-runtime boundaries, and model/engine orchestration is
+vendor-neutral. CPU provides the runtime contract and host-only CI, but not yet
+a complete inference ops backend. ROCm and Ascend backends have not started.
+
+Implemented as of August 2026:
+
+- Opaque `Stream`, `DeviceEvent`, and `GraphExec` handles plus a
+  `DeviceRuntime` contract with CPU and CUDA implementations.
+- Canonical compute headers under `include/inferx/ops` and CUDA
+  implementations under `src/backends/cuda/ops`; CUDA utilities and NCCL are
+  likewise backend-owned.
+- Explicit `INFERX_BACKEND=CPU|CUDA|ROCM|ASCEND|AUTO` selection, scoped device
+  targets, and public-header hygiene/backend-selection tests.
+- Vendor-neutral model and engine sources. A repository scan currently finds
+  no CUDA API, CUDA include, or `INFERX_CUDA` token in `src/model`,
+  `src/engine`, `include/inferx/model`, or `include/inferx/engine`.
+- A common `ModelRunner` serving contract for Qwen2/Llama/Qwen2-MoE, gpt-oss,
+  and DeepSeek-V2; one continuous-batching loop; explicit architecture
+  builders; capability-driven graph setup; and independently tested host
+  sampling and runner feature validation.
+
+CPU inference ops are deferred; the CPU runtime remains useful for host-only
+contract tests. Remaining active work is the CUDA hardware parity gate followed
+by the first non-CUDA accelerator backend selected for bring-up.
 
 Relationship to existing documents:
 
@@ -18,6 +40,10 @@ Relationship to existing documents:
   concept for the rest of the system.
 
 ## 1. Current architecture and CUDA dependency analysis
+
+This section records the pre-refactor baseline used to derive the design.
+Paths and counts here are intentionally historical; the live implementation
+state and current paths are summarized under **Status** above.
 
 ### 1.1 The dependency map
 
@@ -519,29 +545,31 @@ runtime interface), because the TP layer primitives
 already requires happens *once*, against the final surfaces. The TP work's
 Qwen2 refactor and this design's Phase 3 are the same editing pass.
 
-1. **Handles and runtime (mechanical, CUDA-only build unchanged)**
+1. **Handles and runtime — complete**
    Introduce `Stream`/`Event`, `DeviceRuntime` + CUDA and CPU
    implementations; reroute `DeviceBuffer`/`AllocatorFor`/`WeightLoader`
    internals; swap `cudaStream_t`→`Stream` in the 13 affected headers.
    Risk: low. Touches many signatures, changes no logic.
-2. **Build restructure**
+2. **Build restructure — complete**
    `csrc/`→`backends/cuda/`, `kernels/`→`ops/` headers, `INFERX_BACKEND`
    switch, per-backend cmake files, remove global cudart linkage, add the
    header-hygiene ratchet. Risk: low; pure mechanics, big diff.
-3. **Model/engine sweep (the substantive pass, shared with TP adoption)**
+3. **Model/engine sweep — structurally complete; hardware parity gate pending**
    Rewrite qwen2/gpt_oss/deepseek_v2/mla/moe_ffn/qwen_runner/kv_autosize per
    the §5 table; delete their vendor includes; neutral naming sweep.
    Gate: bit-identical outputs and step-time parity on CUDA at TP=1 and
    TP=2 (HostSim + NCCL), graphs on and off.
-4. **CPU backend completion**
+4. **CPU backend completion — deferred; runtime contract complete**
    Promote host-only build to a running configuration for the covered ops;
    op-conformance tier lands here. Value: hardware-free CI for everything
    above the kernels.
-5. **ROCm bring-up** (first proof the boundary holds for a second GPU)
+5. **ROCm bring-up — not started**
+   First proof the boundary holds for a second GPU.
    Runtime, HIP kernel port + wavefront audit, hipBLASLt Gemm, RCCL,
    reference-attention fallback, then CK/aiter attention. Gate: model-tier
    validation on MI-series hardware.
-6. **Ascend bring-up** (proof for non-GPU)
+6. **Ascend bring-up — not started**
+   Proof for a non-GPU backend.
    aclrt runtime, aclnn/ATB ops for the dense path first (Qwen2), HCCL,
    `graph_capture=false` serving; MoE/MLA and quantized paths follow
    capability by capability.

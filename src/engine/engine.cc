@@ -14,9 +14,9 @@
 #include "inferx/model/forward_batch.h"
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
-#include "host_sampling.h"
-#include "model_runner.h"
-#include "model_runner_factory.h"
+#include "inferx/engine/host_sampling.h"
+#include "inferx/engine/model_runner.h"
+#include "inferx/engine/model_runner_factory.h"
 
 namespace inferx::engine {
 namespace {

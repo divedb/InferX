@@ -2,8 +2,22 @@
 
 ## Status
 
-Design. No implementation has started. This document defines the model-facing
-tensor-parallel (TP) API before any code changes.
+Implementation in progress. The engine-facing mechanism is now generalized:
+
+- `ParallelContext` carries rank, world size, placement, and the TP
+  communicator into rank-model construction.
+- `RankModel` type-erases the per-rank execution surface.
+- `TensorParallelRunner` owns model-neutral rank workers, NCCL bootstrap,
+  KV-size rendezvous, watchdog/abort handling, telemetry, and rank-zero result
+  collection.
+- Architecture builders inject a `RankModelFactory`; Qwen2 is an adapter in
+  the architecture factory rather than a runner type. There is no
+  `qwen2_runner.cc` or `Qwen2Runner` API.
+
+The declared strategy half remains: `TpLayout`, `TpDims`, shard-aware loader
+verbs, and parallel linear/MoE/MLA primitives have not landed. Consequently,
+Qwen2 still contains its existing imperative sharding and direct collective
+calls, while gpt-oss and DeepSeek-V2 still reject TP greater than one.
 
 Relationship to existing documents:
 
@@ -649,11 +663,11 @@ Unchanged from `nccl.md`, restated as obligations on the new layers:
 
 ## 8. Adoption sequence (design-level, not a work plan)
 
-1. **Extract without behavior change**: introduce `ParallelContext`, `TpDims`,
+1. **Extract without behavior change — partial**: introduce `ParallelContext`, `TpDims`,
    `ColumnParallelLinear`/`RowParallelLinear`, shard-aware loader verbs, and
    Qwen2's `TpLayout`; rewrite Qwen2's load/forward onto them. Gate: HostSim
    TP differential vs. current Qwen2 is exact; TP=1 perf unchanged.
-2. **Generalize the runner**: `Model` interface + `ModelRunner`; engine
+2. **Generalize the runner — complete**: rank-model interface + tensor-parallel runner; engine
    dispatch becomes factory selection. Gate: Qwen2 serving behavior unchanged
    at TP=1 and TP=2.
 3. **DeepSeek-V2 TP**: device-literal removal (5 in `deepseek_v2.cc`, 4 in
