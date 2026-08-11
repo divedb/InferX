@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/kernels/flashinfer_prefill.h"
 

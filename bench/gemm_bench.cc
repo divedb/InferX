@@ -24,7 +24,7 @@
 #include <cuda_runtime.h>
 
 #include "bench/cuda_timer.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/status.h"
@@ -354,7 +354,7 @@ int Main(int argc, char** argv) {
     }
   }
 
-  if (!CudaAvailable()) {
+  if (!cuda::Available()) {
     std::fprintf(stderr, "no CUDA device available\n");
     return 1;
   }

@@ -19,7 +19,7 @@
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
@@ -204,7 +204,7 @@ std::vector<int32_t> SampleManySeeds(const TensorView& logits,
 class SamplingTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+    if (!cuda::Available()) GTEST_SKIP() << "no CUDA device available";
   }
 };
 

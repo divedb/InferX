@@ -25,7 +25,7 @@
 #include <numeric>
 #include <vector>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
@@ -107,7 +107,7 @@ std::vector<T> Download(const TensorView& v, int64_t count) {
 class MoeTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
+    if (!cuda::Available()) GTEST_SKIP() << "no CUDA device available";
   }
 };
 

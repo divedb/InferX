@@ -3,7 +3,7 @@
 
 #include <type_traits>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/kernels/mxfp4_gemm.h"
 
 namespace inferx::kernels {

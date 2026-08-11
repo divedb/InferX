@@ -6,7 +6,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/shape.h"
 #include "inferx/kernels/gemm.h"
 
@@ -32,7 +32,7 @@ const char* CublasStatusName(cublasStatus_t s) {
   }
 }
 
-// Mirrors CudaErrorToStatus: the status code carries what the caller can do
+// Mirrors cuda::ErrorToStatus: the status code carries what the caller can do
 // about it, and the message carries where it happened.
 Status CublasErrorToStatus(cublasStatus_t s, const char* expr, const char* file,
                            int line) {

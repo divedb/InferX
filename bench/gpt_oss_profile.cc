@@ -7,7 +7,7 @@
 #include <iostream>
 #include <vector>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/model/gpt_oss.h"
 
 int main(int argc, char** argv) {
@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: " << argv[0] << " <gpt-oss-checkpoint-dir>\n";
     return 2;
   }
-  if (!inferx::CudaAvailable()) {
+  if (!inferx::cuda::Available()) {
     std::cerr << "no CUDA device\n";
     return 1;
   }

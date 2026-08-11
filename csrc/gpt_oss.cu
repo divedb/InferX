@@ -5,7 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 
 namespace inferx::kernels {
 namespace {

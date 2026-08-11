@@ -1,12 +1,12 @@
 #include <cuda_runtime_api.h>
 
 #include "../../core/device_runtime_internal.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 
 namespace inferx {
 namespace {
 
-#define CUDA_STATUS(expr) CudaErrorToStatus((expr), #expr, __FILE__, __LINE__)
+#define CUDA_STATUS(expr) cuda::ErrorToStatus((expr), #expr, __FILE__, __LINE__)
 cudaStream_t Native(Stream stream) {
   return static_cast<cudaStream_t>(stream.handle);
 }
@@ -17,7 +17,7 @@ cudaEvent_t Native(DeviceEvent event) {
 class CudaRuntime final : public DeviceRuntime {
  public:
   DeviceKind kind() const override { return DeviceKind::kCuda; }
-  int DeviceCount() const override { return CudaDeviceCount(); }
+  int DeviceCount() const override { return cuda::DeviceCount(); }
   Status SetDevice(DeviceId device) override {
     if (!device.IsCuda())
       return InvalidArgumentError("CUDA runtime cannot select ",

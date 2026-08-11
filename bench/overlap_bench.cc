@@ -42,7 +42,7 @@
 #include <string>
 #include <vector>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/model/qwen2.h"
 #include "inferx/scheduler/scheduler.h"
 
@@ -390,7 +390,7 @@ int Main(int argc, char** argv) {
     return 2;
   }
 
-  if (!CudaAvailable()) {
+  if (!cuda::Available()) {
     std::fprintf(stderr, "no CUDA device available\n");
     return 1;
   }

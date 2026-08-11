@@ -243,7 +243,8 @@ compiler handles it. This keeps nvcc out of most of the build and is why the
 device memory layer is testable without a device compiler.
 
 **Device support is compile-time and run-time.** `kCudaEnabled` says the binary
-has device support; `CudaAvailable()` says a GPU is actually usable right now.
+has device support; `cuda::Available()` says a GPU is actually usable right
+now.
 GPU-dependent tests gate on the latter with `GTEST_SKIP()`.
 
 **Sizes are in bits.** `DTypeBits()`, not a byte size, because int4 is a real
@@ -313,7 +314,7 @@ that needs them so an early checkout stays fast.
 **`nvcc` fails inside `libstdc++` headers** — a pre-12.4 toolkit with GCC 13.
 Either install CUDA 13.x or pass `-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12`.
 
-**`nvidia-smi` works but `CudaDeviceCount()` returns 0** — the CUDA runtime
+**`nvidia-smi` works but `cuda::DeviceCount()` returns 0** — the CUDA runtime
 cannot find a driver. On WSL2, confirm `/usr/lib/wsl/lib` is on the loader path
 and that no Linux NVIDIA driver package is installed.
 

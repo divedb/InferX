@@ -5,8 +5,14 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest
 
 include(GoogleTest)
 
+add_test(NAME public_header_hygiene
+  COMMAND ${CMAKE_COMMAND}
+    -DINFERX_PUBLIC_INCLUDE_DIR=${PROJECT_SOURCE_DIR}/include
+    -P ${PROJECT_SOURCE_DIR}/cmake/CheckPublicHeaderHygiene.cmake)
+set_tests_properties(public_header_hygiene PROPERTIES LABELS unit)
+
 # Every test here must run to completion on a machine with no GPU. Tests that
-# need a device gate themselves on inferx::CudaAvailable() and skip.
+# need a device gate themselves on inferx::cuda::Available() and skip.
 function(inferx_add_test name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE

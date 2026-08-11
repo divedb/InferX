@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {

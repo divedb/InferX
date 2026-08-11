@@ -9,7 +9,6 @@ add_library(inferx_core
   allocator.cc
   arena.cc
   caching_allocator.cc
-  cuda_utils.cc
   kv_cache.cc
   device_buffer.cc
   device_runtime.cc
@@ -21,6 +20,7 @@ add_library(inferx_core
 
 if(INFERX_CUDA_MEETS_FLOOR)
   target_sources(inferx_core PRIVATE
+    ../backends/cuda/cuda_utils.cc
     ../backends/cuda/device_runtime.cc
   )
 endif()

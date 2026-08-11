@@ -22,7 +22,7 @@
 #include <gtest/gtest.h>
 
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/shape.h"
 #include "inferx/model/safetensors.h"
 #include "inferx/model/weight_loader.h"
@@ -300,7 +300,7 @@ TEST_F(WeightLoaderTest, RejectsMismatchedInputs) {
 }
 
 TEST_F(WeightLoaderTest, CudaMatchesTheHostGathers) {
-  if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device";
+  if (!cuda::Available()) GTEST_SKIP() << "no CUDA device";
 
   auto loader =
       WeightLoader::Create(&*checkpoint_, SmallOptions(DeviceId::Cuda(0)));

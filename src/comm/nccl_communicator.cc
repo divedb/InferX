@@ -8,7 +8,7 @@
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #endif
 
 namespace inferx::comm {

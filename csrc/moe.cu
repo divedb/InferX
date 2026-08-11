@@ -5,7 +5,7 @@
 
 #include <type_traits>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 
 namespace inferx::kernels {
 namespace {

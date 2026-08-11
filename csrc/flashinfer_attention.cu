@@ -16,7 +16,7 @@
 #include <flashinfer/pos_enc.cuh>
 #include <flashinfer/utils.cuh>
 
-#include "inferx/core/cuda_utils.h"
+#include "inferx/backends/cuda/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 
 namespace inferx::kernels {
