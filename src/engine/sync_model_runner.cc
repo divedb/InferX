@@ -1,5 +1,6 @@
 #include "sync_model_runner.h"
 
+#include <type_traits>
 #include <utility>
 
 #include "inferx/model/deepseek_v2.h"
@@ -37,6 +38,10 @@ class SyncModelAdapter final : public ModelRunner {
                             int64_t max_blocks_per_seq) override {
     return model_.CaptureDecodeGraph(num_seqs, max_blocks_per_seq);
   }
+  bool SupportsGraphCapture() const override {
+    return !std::is_same_v<Model, model::DeepseekV2Model>;
+  }
+  bool RequiresGraphWarmup() const override { return false; }
   float last_step_device_ms() const override { return 0.0f; }
   std::vector<RankTelemetry> telemetry() const override { return {}; }
 

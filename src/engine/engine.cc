@@ -922,14 +922,6 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
           "--quantization / --kv-cache-dtype are not supported for the "
           "DeepSeek-V2 architecture");
     }
-    // --enforce-eager's default is accepted and *skipped* rather than
-    // attempted: the unabsorbed MLA path sizes its scratch by context length,
-    // so CaptureDecodeGraph is Unimplemented by design (§18.7 D4), and
-    // failing startup over a documented limitation would be wrong.
-    if (config.capture_graphs) {
-      LOG(INFO) << "DeepSeek-V2 serves without CUDA graphs by design; "
-                   "graph capture is skipped";
-    }
     INFERX_ASSIGN_OR_RETURN(
         model::DeepseekV2Model deepseek,
         model::DeepseekV2Model::Load(config.model_dir, primary_device));
@@ -958,10 +950,6 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     impl->model_runner =
         MakeSyncModelRunner(std::move(deepseek), HostSampleRow);
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = kv_blocks;
-
-    INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
-        config.scheduler.max_batch_tokens));
   } else if (model_config.architecture == model::Architecture::kGptOss) {
     if (config.tensor_parallel_size != 1) {
       return UnimplementedError(
@@ -1004,23 +992,6 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
 
     impl->model_runner = MakeSyncModelRunner(std::move(gpt_oss), HostSampleRow);
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = kv_blocks;
-
-    // Size the activation scratch once, for the largest batch that will ever
-    // run. The scratch only grows, so a later growth inside a step is fine --
-    // but doing it up front avoids the first-step reallocation cost.
-    INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
-        config.scheduler.max_batch_tokens));
-
-    if (config.capture_graphs) {
-      const int64_t max_blocks =
-          (config.scheduler.max_seq_len + config.block_size - 1) /
-          config.block_size;
-      for (int64_t seqs = config.scheduler.max_running; seqs >= 1; --seqs) {
-        INFERX_RETURN_IF_ERROR(
-            impl->model_runner->CaptureDecodeGraph(seqs, max_blocks));
-      }
-    }
   } else {
     Qwen2RunnerConfig runner_config;
     runner_config.model_dir = config.model_dir;
@@ -1045,46 +1016,27 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         Scheduler::Create(config.scheduler, model->kv_pool()));
 
     impl->model_runner = std::move(model);
-    impl->metrics.ConfigureRanks(impl->model_runner->telemetry());
     impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-    impl->stats.blocks_total = impl->model_runner->kv_pool()->num_blocks();
+  }
 
-    // One graph per batch size. The block-table width is fixed for the whole
-    // scheduler, so the only shape that varies between decode steps is the
-    // number of sequences -- which makes the set of graphs small and knowable
-    // up front rather than something to capture lazily and hope converges.
-    if (config.capture_graphs) {
-      // Order matters, and both of these are correctness requirements rather
-      // than optimizations. First size the activation buffers for the largest
-      // batch that will ever run, because they only grow and a later growth
-      // would strand every captured pointer. Then run one real request through,
-      // so that everything allocated on first use has been allocated.
-      INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
-          config.scheduler.max_batch_tokens));
+  impl->metrics.ConfigureRanks(impl->model_runner->telemetry());
+  impl->stats.blocks_total = impl->model_runner->kv_pool()->num_blocks();
+  INFERX_RETURN_IF_ERROR(impl->model_runner->ReserveActivations(
+      config.scheduler.max_batch_tokens));
 
-      INFERX_RETURN_IF_ERROR(impl->Warmup());
-
+  if (config.capture_graphs) {
+    if (!impl->model_runner->SupportsGraphCapture()) {
+      LOG(INFO) << "selected model serves without graph capture; skipped";
+    } else {
+      if (impl->model_runner->RequiresGraphWarmup()) {
+        INFERX_RETURN_IF_ERROR(impl->Warmup());
+      }
       const int64_t max_blocks =
           (config.scheduler.max_seq_len + config.block_size - 1) /
           config.block_size;
-
-      // Largest shape first, and this order is load-bearing. Capture records
-      // device addresses, and preparing a *bigger* batch grows buffers that are
-      // sized on demand -- FlashInfer's workspace among them. Capturing 1, 2,
-      // 3, 4 in that order therefore strands graphs 1..3 the moment graph 4's
-      // preparation reallocates underneath them, leaving only the last one
-      // valid.
-      //
-      // Measured, because it does not announce itself: ascending capture left
-      // "The capital of France is" continuing " Paris" and then repeating a
-      // single token forever, while the same build with only one shape
-      // captured produced " Paris. The capital of Germany is Berlin."
-      // Descending, every shape is captured after the buffers have already
-      // reached their maximum.
+      // Largest first: capture records addresses after buffers reach their
+      // maximum size. Unsupported shapes retain the eager fallback.
       for (int64_t seqs = config.scheduler.max_running; seqs >= 1; --seqs) {
-        // Best-effort: a shape that will not capture still runs un-graphed, and
-        // refusing to start the server over it would trade a working slow path
-        // for no path at all.
         (void)impl->model_runner->CaptureDecodeGraph(seqs, max_blocks);
       }
     }

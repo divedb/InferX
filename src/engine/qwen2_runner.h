@@ -39,6 +39,9 @@ class Qwen2Runner : public ModelRunner {
 
   static StatusOr<std::unique_ptr<Qwen2Runner>> Create(
       const Qwen2RunnerConfig& config);
+
+  bool SupportsGraphCapture() const override { return true; }
+  bool RequiresGraphWarmup() const override { return true; }
 };
 
 }  // namespace inferx::engine

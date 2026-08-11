@@ -43,6 +43,8 @@ class ModelRunner {
                       std::vector<SampledLogprob>* logprobs) = 0;
   virtual Status CaptureDecodeGraph(int64_t num_seqs,
                                     int64_t max_blocks_per_seq) = 0;
+  virtual bool SupportsGraphCapture() const = 0;
+  virtual bool RequiresGraphWarmup() const = 0;
   virtual float last_step_device_ms() const = 0;
   virtual std::vector<RankTelemetry> telemetry() const = 0;
 };
