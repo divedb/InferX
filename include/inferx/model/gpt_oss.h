@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 
+#include "inferx/comm/communicator.h"
 #include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
 #include "inferx/model/config.h"
@@ -46,6 +47,13 @@ class GptOssModel {
   /// 3.6 GB) go to the device once. The expert weights are left in the
   /// checkpoint's mapping and read per layer per call.
   static StatusOr<GptOssModel> Load(std::string_view dir, DeviceId device);
+
+  /// \brief Loads one tensor-parallel rank from a checkpoint directory.
+  ///
+  /// The communicator supplies device placement as well as rank topology and
+  /// is retained by the model for row-parallel completion collectives.
+  static StatusOr<GptOssModel> Load(
+      std::string_view dir, std::unique_ptr<comm::Communicator> communicator);
 
   ~GptOssModel();
   GptOssModel(const GptOssModel&) = delete;

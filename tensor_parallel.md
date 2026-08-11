@@ -30,8 +30,9 @@ has not landed. `RowParallelLinear` also owns the replicated dense-bias rule:
 reduce projection partials first, then add bias once. GPT-OSS and
 DeepSeek-V2 still reject TP greater than one. `GptOssTpLayout` now declares
 the attention and nested MXFP4 expert shards, including fused gate/up
-segmentation and 32-weight local alignment; it is not yet consumed by the
-GPT-OSS loader.
+segmentation and 32-weight local alignment. The GPT-OSS loader now owns its
+communicator and derives these local dimensions, but still rejects multi-rank
+execution until its activation shapes consume them.
 
 Relationship to existing documents:
 

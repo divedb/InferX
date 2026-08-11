@@ -11,6 +11,8 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/model/moe_ffn.h"
+#include "inferx/model/parallel/tp_dims.h"
+#include "inferx/model/parallel/tp_layout.h"
 #include "inferx/model/weight_loader.h"
 #include "inferx/ops/gemm.h"
 #include "inferx/ops/gpt_oss.h"
@@ -160,8 +162,12 @@ struct LayerWeights {
 }  // namespace
 
 struct GptOssModel::Impl {
-  Impl(ModelConfig c, Checkpoint ck, ops::CublasLtGemm g)
-      : config(std::move(c)), ckpt(std::move(ck)), gemm(std::move(g)) {}
+  Impl(ModelConfig c, Checkpoint ck, ops::CublasLtGemm g,
+       std::unique_ptr<comm::Communicator> communicator)
+      : config(std::move(c)),
+        ckpt(std::move(ck)),
+        gemm(std::move(g)),
+        comm(std::move(communicator)) {}
   ~Impl() {
     for (DecodeGraph& graph : graphs) {
       if (runtime != nullptr) (void)runtime->DestroyGraph(graph.exec);
@@ -172,6 +178,7 @@ struct GptOssModel::Impl {
   }
 
   ModelConfig config;
+  parallel::TpDims tp_dims;
   DeviceId device;
   Checkpoint ckpt;
 
@@ -183,6 +190,7 @@ struct GptOssModel::Impl {
   TensorView lm_head;
 
   ops::CublasLtGemm gemm;
+  std::unique_ptr<comm::Communicator> comm;
   std::unique_ptr<MoeFfn> moe;
   // Paged serving owns a nonblocking stream so its device half can be captured
   // without involving the legacy default stream. Forward() remains the
@@ -623,6 +631,22 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 }
 
 StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir, DeviceId device) {
+  return Load(dir, std::make_unique<comm::SingleRankComm>(device));
+}
+
+StatusOr<GptOssModel> GptOssModel::Load(
+    std::string_view dir, std::unique_ptr<comm::Communicator> communicator) {
+  if (communicator == nullptr) {
+    return InvalidArgumentError("GptOssModel: communicator is null");
+  }
+  const int tp_size = communicator->size();
+  const int tp_rank = communicator->rank();
+  const DeviceId device = communicator->device();
+  if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size) {
+    return InvalidArgumentError(
+        "GptOssModel: invalid TP topology rank=", tp_rank, " size=", tp_size);
+  }
+
   INFERX_ASSIGN_OR_RETURN(ModelConfig config, ModelConfig::FromDirectory(dir));
 
   if (config.architecture != Architecture::kGptOss) {
@@ -630,10 +654,20 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir, DeviceId device) {
                                 ArchitectureName(config.architecture));
   }
 
+  const parallel::TpLayout tp_layout = parallel::GptOssTpLayout(config);
+  INFERX_ASSIGN_OR_RETURN(const parallel::TpDims tp_dims,
+                          parallel::TpDims::For(config, tp_layout, tp_size));
+  if (tp_size != 1) {
+    return UnimplementedError(
+        "GptOssModel: tensor-parallel activation shapes are not wired yet");
+  }
+
   INFERX_ASSIGN_OR_RETURN(Checkpoint ckpt, Checkpoint::Open(dir));
   INFERX_ASSIGN_OR_RETURN(ops::CublasLtGemm gemm, ops::CublasLtGemm::Create());
 
-  auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm));
+  auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm),
+                                     std::move(communicator));
+  impl->tp_dims = tp_dims;
   impl->device = device;
   INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
   INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream(device));
