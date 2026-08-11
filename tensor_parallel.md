@@ -34,7 +34,9 @@ segmentation and 32-weight local alignment. The GPT-OSS loader now owns its
 communicator, derives these local dimensions, and loads attention shards
 through the shared layout-aware loader. Attention scratch, paged KV layout,
 and output projection completion now consume the local dimensions in both
-forward paths. Multi-rank execution remains guarded until MoE shards land.
+forward paths. Nested MXFP4 expert tensors are streamed as local shards;
+interleaved gate/up pairs are sharded contiguously before local de-interleave,
+and both MoE paths use the shared parallel completion boundary.
 
 Relationship to existing documents:
 

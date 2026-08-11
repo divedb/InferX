@@ -89,16 +89,28 @@ Status Grow(Scratch* s, size_t bytes, DeviceId device) {
 // `[gate | up]`. The gather stays on the host because it is 368 KB per layer,
 // against 423 MB of weights moving beside it; the loader stages the permuted
 // copy before returning, so the scratch vector may die with this scope.
-StatusOr<TensorView> UploadDeinterleaved(WeightLoader* loader,
-                                         const Tensor& host) {
+StatusOr<TensorView> UploadDeinterleavedShard(WeightLoader* loader,
+                                              const Tensor& host, int tp_rank,
+                                              int tp_size) {
   if (host.rank() != 2 || host.dim(1) % 2 != 0) {
     return InvalidArgumentError("gate_up bias must be [experts, even], got ",
                                 host.shape().ToString());
   }
 
   const int64_t experts = host.dim(0);
-  const int64_t width = host.dim(1);
+  if (tp_size <= 0 || tp_rank < 0 || tp_rank >= tp_size ||
+      host.dim(1) % tp_size != 0) {
+    return InvalidArgumentError(
+        "invalid gate/up bias TP topology rank=", tp_rank, " size=", tp_size);
+  }
+  const int64_t global_width = host.dim(1);
+  const int64_t width = global_width / tp_size;
+  if (width % 2 != 0) {
+    return InvalidArgumentError("local gate/up bias width must be even, got ",
+                                width);
+  }
   const int64_t half = width / 2;
+  const int64_t rank_offset = tp_rank * width;
 
   const auto* src = static_cast<const uint16_t*>(host.data());
   std::vector<uint16_t> permuted(static_cast<size_t>(experts * width));
@@ -106,15 +118,16 @@ StatusOr<TensorView> UploadDeinterleaved(WeightLoader* loader,
   for (int64_t e = 0; e < experts; ++e) {
     for (int64_t j = 0; j < half; ++j) {
       permuted[static_cast<size_t>(e * width + j)] =
-          src[static_cast<size_t>(e * width + 2 * j)];
+          src[static_cast<size_t>(e * global_width + rank_offset + 2 * j)];
       permuted[static_cast<size_t>(e * width + half + j)] =
-          src[static_cast<size_t>(e * width + 2 * j + 1)];
+          src[static_cast<size_t>(e * global_width + rank_offset + 2 * j + 1)];
     }
   }
 
-  INFERX_ASSIGN_OR_RETURN(const Tensor staged,
-                          Tensor::FromBlob(permuted.data(), host.dtype(),
-                                           host.shape(), DeviceId::Cpu()));
+  INFERX_ASSIGN_OR_RETURN(
+      const Tensor staged,
+      Tensor::FromBlob(permuted.data(), host.dtype(), Shape({experts, width}),
+                       DeviceId::Cpu()));
   return loader->Upload(staged);
 }
 
@@ -146,12 +159,6 @@ struct LayerWeights {
   // the dequantize kernel reading device-resident MXFP4 into the reusable
   // bf16 scratch.
   //
-  // The host Tensors below are kept only because Checkpoint already maps them
-  // and the device upload reads from them once; after Load they are not
-  // touched again.
-  Tensor gate_up_blocks, gate_up_scales, gate_up_bias;
-  Tensor down_blocks, down_scales, down_bias;
-
   // Device-resident views over the same data, set at Load.
   // DequantizeLayerExperts reads these instead of uploading, and Forward reads
   // the biases from here instead of re-uploading per layer.
@@ -198,6 +205,9 @@ struct GptOssModel::Impl {
   int64_t LocalKvHeads() const { return tp_dims.local_kv_heads; }
   int64_t LocalQDim() const { return tp_dims.local_q_dim; }
   int64_t LocalKvDim() const { return tp_dims.local_kv_dim; }
+  int64_t LocalMoeIntermediate() const {
+    return tp_dims.local_moe_intermediate;
+  }
   // Paged serving owns a nonblocking stream so its device half can be captured
   // without involving the legacy default stream. Forward() remains the
   // synchronous reference path and deliberately does not use this stream.
@@ -315,7 +325,7 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
                                                  TensorView* gate_up,
                                                  TensorView* down) {
   const int64_t experts = config.num_experts;
-  const int64_t inter = config.moe_intermediate_size;
+  const int64_t inter = LocalMoeIntermediate();
   const int64_t h = config.hidden_size;
 
   // Reads the resident device-resident MXFP4 (uploaded once at Load) and
@@ -614,7 +624,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     mw.down_bias = w.down_bias_dev;
 
     INFERX_RETURN_IF_ERROR(
-        m.moe->Forward(normed, mw, moe_out, &m.gemm, stream));
+        m.moe->ForwardParallel(normed, mw, moe_out, &m.gemm, *m.comm, stream));
     if (profiling) prof.tick(prof.moe_forward);
 
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(moe_out, resid, stream));
@@ -663,11 +673,6 @@ StatusOr<GptOssModel> GptOssModel::Load(
   const parallel::TpLayout tp_layout = parallel::GptOssTpLayout(config);
   INFERX_ASSIGN_OR_RETURN(const parallel::TpDims tp_dims,
                           parallel::TpDims::For(config, tp_layout, tp_size));
-  if (tp_size != 1) {
-    return UnimplementedError(
-        "GptOssModel: tensor-parallel expert shards are not wired yet");
-  }
-
   INFERX_ASSIGN_OR_RETURN(Checkpoint ckpt, Checkpoint::Open(dir));
   INFERX_ASSIGN_OR_RETURN(ops::CublasLtGemm gemm, ops::CublasLtGemm::Create());
 
@@ -683,8 +688,6 @@ StatusOr<GptOssModel> GptOssModel::Load(
   const int64_t hd = config.head_dim;
   const int64_t experts = config.num_experts;
   const int64_t inter = config.moe_intermediate_size;
-
-  auto get = [&](const std::string& name) { return impl->ckpt.Get(name); };
 
   // The shared movement layer, borrowing the checkpoint Impl owns. Unchecked
   // (shape-free) loads on purpose: this loader validates its shapes
@@ -765,36 +768,44 @@ StatusOr<GptOssModel> GptOssModel::Load(
     INFERX_RETURN_IF_ERROR(up("mlp.router.weight", &w.router_w));
     INFERX_RETURN_IF_ERROR(up("mlp.router.bias", &w.router_b));
 
-    // The expert weights are read from the checkpoint once and uploaded to the
-    // device here, permanently. The host `get` borrows the checkpoint's mapping
-    // (so the read costs no memory until the page is touched); the `Upload`
-    // then copies it into `weight_buffers`, which owns it for the model's life.
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_blocks,
-                            get(p + "mlp.experts.gate_up_proj_blocks"));
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_scales,
-                            get(p + "mlp.experts.gate_up_proj_scales"));
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_bias,
-                            get(p + "mlp.experts.gate_up_proj_bias"));
-    INFERX_ASSIGN_OR_RETURN(w.down_blocks,
-                            get(p + "mlp.experts.down_proj_blocks"));
-    INFERX_ASSIGN_OR_RETURN(w.down_scales,
-                            get(p + "mlp.experts.down_proj_scales"));
-    INFERX_ASSIGN_OR_RETURN(w.down_bias, get(p + "mlp.experts.down_proj_bias"));
-
-    // Device-resident copies. The ~10 GB this uploads across all 24 layers is
-    // paid ONCE at load rather than per-layer-per-call, which the profile
-    // showed was 98.6% of Forward. gate_up_bias is de-interleaved on the way
-    // up so the device layout matches `DequantizeMxfp4GateUpToBf16`'s split
-    // output; the rest copy verbatim.
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_blocks_dev,
-                            loader.Upload(w.gate_up_blocks));
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_scales_dev,
-                            loader.Upload(w.gate_up_scales));
-    INFERX_ASSIGN_OR_RETURN(w.gate_up_bias_dev,
-                            UploadDeinterleaved(&loader, w.gate_up_bias));
-    INFERX_ASSIGN_OR_RETURN(w.down_blocks_dev, loader.Upload(w.down_blocks));
-    INFERX_ASSIGN_OR_RETURN(w.down_scales_dev, loader.Upload(w.down_scales));
-    INFERX_ASSIGN_OR_RETURN(w.down_bias_dev, loader.Upload(w.down_bias));
+    // Stream only this rank's nested MXFP4 shards. Gate/up rows are adjacent
+    // pairs in the checkpoint, so their shard is contiguous; only the small
+    // bf16 bias needs a local host permutation into [gate | up] order.
+    const auto load_expert = [&](std::string_view suffix, const Shape& shape,
+                                 TensorView* out) -> Status {
+      const std::string name = absl::StrCat(p, suffix);
+      INFERX_ASSIGN_OR_RETURN(
+          *out,
+          loader.Load(name, shape, tp_layout.SpecFor(name), tp_rank, tp_size));
+      return OkStatus();
+    };
+    INFERX_RETURN_IF_ERROR(
+        load_expert("mlp.experts.gate_up_proj_blocks",
+                    Shape({experts, 2 * inter, h / kMxfp4ValuesPerBlock,
+                           kMxfp4BytesPerBlock}),
+                    &w.gate_up_blocks_dev));
+    INFERX_RETURN_IF_ERROR(
+        load_expert("mlp.experts.gate_up_proj_scales",
+                    Shape({experts, 2 * inter, h / kMxfp4ValuesPerBlock}),
+                    &w.gate_up_scales_dev));
+    {
+      INFERX_ASSIGN_OR_RETURN(
+          const Tensor gate_up_bias,
+          impl->ckpt.GetChecked(p + "mlp.experts.gate_up_proj_bias",
+                                Shape({experts, 2 * inter})));
+      INFERX_ASSIGN_OR_RETURN(
+          w.gate_up_bias_dev,
+          UploadDeinterleavedShard(&loader, gate_up_bias, tp_rank, tp_size));
+    }
+    INFERX_RETURN_IF_ERROR(load_expert(
+        "mlp.experts.down_proj_blocks",
+        Shape({experts, h, inter / kMxfp4ValuesPerBlock, kMxfp4BytesPerBlock}),
+        &w.down_blocks_dev));
+    INFERX_RETURN_IF_ERROR(load_expert(
+        "mlp.experts.down_proj_scales",
+        Shape({experts, h, inter / kMxfp4ValuesPerBlock}), &w.down_scales_dev));
+    INFERX_RETURN_IF_ERROR(load_expert("mlp.experts.down_proj_bias",
+                                       Shape({experts, h}), &w.down_bias_dev));
   }
 
   // Drain the upload pipeline and take ownership of the buffers. Views handed
@@ -831,7 +842,7 @@ StatusOr<GptOssModel> GptOssModel::Load(
   moe_config.hidden = h;
   moe_config.num_experts = experts;
   moe_config.top_k = config.num_experts_per_tok;
-  moe_config.moe_intermediate = inter;
+  moe_config.moe_intermediate = impl->LocalMoeIntermediate();
   moe_config.norm_topk_prob = true;  // equals gpt-oss's top-k-then-softmax
   moe_config.activation = MoeFfn::Activation::kGptOssClamped;
   moe_config.swiglu_limit = static_cast<float>(config.swiglu_limit);
@@ -1015,7 +1026,8 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     mw.gate_up_bias = w.gate_up_bias_dev;
     mw.down_bias = w.down_bias_dev;
 
-    INFERX_RETURN_IF_ERROR(m.moe->Forward(normed, mw, moe_out, &m.gemm));
+    INFERX_RETURN_IF_ERROR(
+        m.moe->ForwardParallel(normed, mw, moe_out, &m.gemm, *m.comm));
     if (profiling) prof.tick(prof.moe_forward);
 
     INFERX_RETURN_IF_ERROR(ops::AddInPlace(moe_out, resid));

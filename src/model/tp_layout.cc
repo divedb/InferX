@@ -113,7 +113,10 @@ TpLayout Qwen2TpLayout(const ModelConfig& config) {
 TpLayout GptOssTpLayout(const ModelConfig& config) {
   const ShardSpec attention_rows{Partition::kRows, config.head_dim};
   const ShardSpec attention_cols{Partition::kCols, config.head_dim};
-  const ShardSpec expert_gate_up{Partition::kRows, 1, 1, 2};
+  // GPT-OSS stores gate/up rows as adjacent pairs (gate0, up0, gate1, up1),
+  // so each rank takes one contiguous range aligned to a complete pair. The
+  // local range is de-interleaved after loading.
+  const ShardSpec expert_gate_up{Partition::kRows, 2, 1, 1};
   // MXFP4 stores two weights per byte and one scale per 32 weights. Requiring
   // 16 packed bytes per local down shard keeps both representations aligned.
   const ShardSpec expert_down_blocks{Partition::kCols, 16, 2};

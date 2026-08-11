@@ -94,7 +94,7 @@ TEST(TpLayoutTest, DescribesGptOssAttentionAndPackedExperts) {
   EXPECT_EQ(layout.SpecFor("model.layers.2.self_attn.o_proj.bias"),
             (ShardSpec{Partition::kReplicated, 1}));
   EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.gate_up_proj_blocks"),
-            (ShardSpec{Partition::kRows, 1, 1, 2}));
+            (ShardSpec{Partition::kRows, 2, 1, 1}));
   EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.down_proj_blocks"),
             (ShardSpec{Partition::kCols, 16, 2}));
   EXPECT_EQ(layout.SpecFor("model.layers.2.mlp.experts.down_proj_bias"),
