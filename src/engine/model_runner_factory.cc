@@ -8,22 +8,21 @@
 #include "kv_autosize.h"
 #include "qwen2_runner.h"
 #include "sync_model_runner.h"
+#include "model_runner_validation.h"
 
 namespace inferx::engine {
 
 StatusOr<std::unique_ptr<ModelRunner>> BuildModelRunner(
     const EngineConfig& config, model::Architecture architecture,
     DeviceId primary_device, HostSampler host_sampler) {
+  INFERX_RETURN_IF_ERROR(ValidateModelRunnerFeatures(
+      architecture,
+      {.tensor_parallel_size = config.tensor_parallel_size,
+       .fp8_weights = config.fp8_weights,
+       .int4_weights = config.int4_weights,
+       .fp8_kv_cache = config.fp8_kv_cache}));
+
   if (architecture == model::Architecture::kDeepSeekV2) {
-    if (config.tensor_parallel_size != 1) {
-      return UnimplementedError(
-          "tensor parallel serving is currently implemented for Qwen2 only");
-    }
-    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
-      return InvalidArgumentError(
-          "--quantization / --kv-cache-dtype are not supported for the "
-          "DeepSeek-V2 architecture");
-    }
     INFERX_ASSIGN_OR_RETURN(
         model::DeepseekV2Model model,
         model::DeepseekV2Model::Load(config.model_dir, primary_device));
@@ -44,15 +43,6 @@ StatusOr<std::unique_ptr<ModelRunner>> BuildModelRunner(
   }
 
   if (architecture == model::Architecture::kGptOss) {
-    if (config.tensor_parallel_size != 1) {
-      return UnimplementedError(
-          "tensor parallel serving is currently implemented for Qwen2 only");
-    }
-    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
-      return InvalidArgumentError(
-          "--quantization / --kv-cache-dtype are not supported for the "
-          "gpt-oss architecture");
-    }
     INFERX_ASSIGN_OR_RETURN(
         model::GptOssModel model,
         model::GptOssModel::Load(config.model_dir, primary_device));
