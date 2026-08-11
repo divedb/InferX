@@ -2,6 +2,14 @@
 
 namespace inferx::model::parallel {
 
+Status ColumnParallelLinear::ForwardBf16(ops::CublasLtGemm& gemm,
+                                         const TensorView& input,
+                                         const TensorView& local_weight,
+                                         const TensorView& local_output,
+                                         Stream stream) {
+  return gemm.LinearBF16(input, local_weight, local_output, stream);
+}
+
 Status RowParallelLinear::ForwardBf16(ops::CublasLtGemm& gemm,
                                       comm::Communicator& communicator,
                                       const TensorView& local_input,

@@ -21,8 +21,10 @@ discarded ranks. Qwen2 weight loading now consumes that layout and no longer
 contains an imperative axis-selection lambda. `RowParallelLinear` now owns the
 local-BF16-GEMM plus reduction path and the reduction completion seam used by
 quantized GEMMs; it is the only model-layer caller of `AllReduceSum`.
-Column-parallel, MoE, and MLA primitives have not landed, while gpt-oss and
-DeepSeek-V2 still reject TP greater than one.
+`ColumnParallelLinear` owns the communication-free local BF16 projection, and
+Qwen2's dense BF16 path composes both linear primitives. MoE and MLA
+primitives have not landed, while gpt-oss and DeepSeek-V2 still reject TP
+greater than one.
 
 Relationship to existing documents:
 

@@ -515,7 +515,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.qkv_w, qkv_v));
+    INFERX_RETURN_IF_ERROR(parallel::ColumnParallelLinear::ForwardBf16(
+        gemm, norm, layer.qkv_w, qkv_v));
     INFERX_RETURN_IF_ERROR(
         ops::SplitQkvWithBias(qkv_v, layer.qkv_b, qv, kv_, vv));
 
@@ -538,7 +539,8 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(ops::RmsNorm(
         x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps)));
 
-    INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, layer.gate_up_w, gate_up_v));
+    INFERX_RETURN_IF_ERROR(parallel::ColumnParallelLinear::ForwardBf16(
+        gemm, norm, layer.gate_up_w, gate_up_v));
     INFERX_RETURN_IF_ERROR(ops::SiluMulFused(gate_up_v, gate_v));
     INFERX_RETURN_IF_ERROR(parallel::RowParallelLinear::ForwardBf16(
         gemm, *comm, gate_v, layer.down_w, x));

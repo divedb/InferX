@@ -8,6 +8,16 @@
 
 namespace inferx::model::parallel {
 
+// A linear whose output-feature dimension is partitioned across TP ranks.
+// Its output stays rank-local, so completing the primitive requires no
+// collective.
+class ColumnParallelLinear {
+ public:
+  static Status ForwardBf16(ops::CublasLtGemm& gemm, const TensorView& input,
+                            const TensorView& local_weight,
+                            const TensorView& local_output, Stream stream = {});
+};
+
 // A linear whose input-feature dimension is partitioned across TP ranks.
 // The local GEMM produces one partial full-width output; completing the
 // primitive sums those partials on every rank.
