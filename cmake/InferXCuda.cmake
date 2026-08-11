@@ -163,8 +163,6 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS "12.4"
     "  Real fix:   install CUDA 13.x\n")
 endif()
 
-target_compile_definitions(inferx_flags INTERFACE INFERX_WITH_CUDA=1)
-
 target_compile_options(inferx_flags INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:
     --expt-relaxed-constexpr

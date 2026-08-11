@@ -73,5 +73,14 @@ TEST(DeviceRuntimeTest, MissingBackendFailsClearly) {
 }
 #endif
 
+TEST(DeviceRuntimeTest, RejectsNonSelectedAcceleratorKinds) {
+  for (DeviceId device : {DeviceId::Rocm(0), DeviceId::Ascend(0)}) {
+    auto runtime = RuntimeFor(device);
+    EXPECT_FALSE(runtime.ok());
+    EXPECT_NE(runtime.status().message().find(device.ToString()),
+              std::string::npos);
+  }
+}
+
 }  // namespace
 }  // namespace inferx

@@ -18,8 +18,8 @@ add_library(inferx_cuda_ops
   w4a16_gemm.cu
 )
 add_library(inferx::ops ALIAS inferx_cuda_ops)
-# Transitional compatibility name. New consumers depend on inferx::ops.
-add_library(inferx::kernels ALIAS inferx_cuda_ops)
+
+target_compile_definitions(inferx_cuda_ops PUBLIC INFERX_WITH_CUDA=1)
 
 if(INFERX_HAVE_FLASHINFER)
   target_sources(inferx_cuda_ops PRIVATE

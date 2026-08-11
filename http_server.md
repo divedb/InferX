@@ -1466,7 +1466,7 @@ Upstream Boost and Folly targets must remain private behind the two existing
 InferX aliases. CUDA libraries must appear only below `inferx::engine_adapters`
 or the final composition target. Add a configure-time or link-time test that a
 host-only build can compile protocol, lifecycle, admission, streaming, and
-transport unit tests without `inferx::model` or `inferx::kernels`.
+transport unit tests without `inferx::model` or `inferx::ops`.
 
 ### 17.3 Phase 0: establish tests and capture current wire behavior
 
@@ -2215,7 +2215,7 @@ below touches files near them.
   `config_test.cc`, `scheduler_test.cc`, `prefix_cache_test.cc`,
   `safetensors_test.cc`, and the old `tests/CMakeLists.txt` harness
   (`inferx_add_kernel_test`, `kernel` labels, GPU self-skip). Target names
-  survived the rename (`inferx::kernels` is unchanged), so link lines
+  survived the rename (`inferx::ops` is unchanged), so link lines
   resolve.
 - Reconfigure the stale `build/` tree (it predates the rename).
 

@@ -199,7 +199,7 @@ line of device code.
 ```
 include/inferx/     Public headers, mirroring src/
 src/core/           DType, Tensor, Status, arenas, allocators
-csrc/               .cu — device code. Needs CUDA >= 13.0 to build at all
+src/backends/cuda/ops/  CUDA device ops. Needs CUDA >= 13.0 to build at all
 cmake/              Options, CUDA config, dependency wiring
 scripts/            Setup and bootstrap
 third_party/        Submodules, pinned

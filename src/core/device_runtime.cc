@@ -6,10 +6,7 @@ namespace inferx {
 
 StatusOr<DeviceRuntime*> RuntimeFor(DeviceId device) {
   if (device.IsCpu()) return internal::CpuDeviceRuntime();
-#ifdef INFERX_WITH_CUDA
-  if (device.IsCuda()) return internal::CudaDeviceRuntime();
-#endif
-  return FailedPreconditionError("no runtime is built for ", device.ToString());
+  return internal::AcceleratorDeviceRuntime(device);
 }
 
 }  // namespace inferx

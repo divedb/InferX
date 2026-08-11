@@ -22,7 +22,9 @@ if(INFERX_ENABLE_NCCL AND INFERX_ENABLE_CUDA AND INFERX_CUDA_MEETS_FLOOR)
     target_sources(inferx_comm PRIVATE
       ../backends/cuda/nccl_communicator.cc
     )
-    target_compile_definitions(inferx_comm PRIVATE INFERX_WITH_NCCL=1)
+    target_compile_definitions(inferx_comm PRIVATE
+      INFERX_WITH_CUDA=1
+      INFERX_WITH_NCCL=1)
     target_include_directories(inferx_comm PRIVATE ${INFERX_NCCL_INCLUDE_DIR})
     target_link_libraries(inferx_comm PRIVATE
       CUDA::cudart

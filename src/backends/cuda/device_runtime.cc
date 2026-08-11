@@ -160,5 +160,11 @@ DeviceRuntime* CudaDeviceRuntime() {
   return runtime;
 }
 
+StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(DeviceId device) {
+  if (device.IsCuda()) return CudaDeviceRuntime();
+  return FailedPreconditionError("CUDA backend cannot provide a runtime for ",
+                                 device.ToString());
+}
+
 }  // namespace internal
 }  // namespace inferx

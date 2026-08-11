@@ -419,7 +419,7 @@ sharded on the feature axis and stays local.
 struct ColumnParallelLinear {
   TensorView weight;                 // [local_out, in]
   std::optional<TensorView> bias;    // [local_out]
-  Status Forward(kernels::CublasLtGemm& gemm, const TensorView& x,
+  Status Forward(ops::CublasLtGemm& gemm, const TensorView& x,
                  const TensorView& y_local, cudaStream_t stream) const;
 };
 ```
@@ -438,7 +438,7 @@ struct RowParallelLinear {
   TensorView weight;                 // [out, local_in]
   std::optional<TensorView> bias;    // [out]; added after the reduction so
                                      // it is applied exactly once
-  Status Forward(kernels::CublasLtGemm& gemm, comm::Communicator& comm,
+  Status Forward(ops::CublasLtGemm& gemm, comm::Communicator& comm,
                  const TensorView& x_local, const TensorView& y,
                  cudaStream_t stream) const;
 };

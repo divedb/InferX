@@ -5,9 +5,6 @@
 namespace inferx::internal {
 
 DeviceRuntime* CpuDeviceRuntime();
-
-#ifdef INFERX_WITH_CUDA
-DeviceRuntime* CudaDeviceRuntime();
-#endif
+StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(DeviceId device);
 
 }  // namespace inferx::internal
