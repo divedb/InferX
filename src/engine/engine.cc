@@ -15,15 +15,11 @@
 
 #include "inferx/api/openai.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/model/deepseek_v2.h"
 #include "inferx/model/forward_batch.h"
-#include "inferx/model/gpt_oss.h"
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
-#include "kv_autosize.h"
 #include "model_runner.h"
-#include "qwen2_runner.h"
-#include "sync_model_runner.h"
+#include "model_runner_factory.h"
 
 namespace inferx::engine {
 namespace {
@@ -374,14 +370,8 @@ std::string RenderRankMetrics(const std::vector<RankTelemetry>& ranks) {
 struct Engine::Impl {
   EngineConfig config;
 
-  // Exactly one of these is populated, decided once in Engine::Create from the
-  // checkpoint's declared architecture. Qwen2Runner hides whether execution is
-  // direct TP=1 or dispatched to NCCL rank workers.
-  //
-  // The gpt-oss path is the Phase 3 slow serve: GptOssModel has only Forward(),
-  // no paged KV, no continuous batching. It is batch-1, full recompute per
-  // token, and exists so the engine can serve the checkpoint end to end before
-  // Phase 4 makes it fast.
+  // Architecture-specific execution is selected once by the runner factory;
+  // the serving loop depends only on this common contract.
   std::unique_ptr<ModelRunner> model_runner;
 
   // The declared architecture, kept because composition needs it after Create
@@ -389,9 +379,8 @@ struct Engine::Impl {
   // distinguish the two synchronous models.
   model::Architecture architecture = model::Architecture::kQwen2;
 
-  // Null in the gpt-oss path, which does not continuous-batch. Held by pointer
-  // rather than by value for the same reason the models are: the Qwen2 path
-  // keeps its direct access pattern, the gpt-oss path pays nothing for it.
+  // All architectures share the continuous-batching scheduler and paged KV
+  // contract exposed by ModelRunner.
   std::unique_ptr<Scheduler> scheduler;
 
   std::unique_ptr<tokenizer::Tokenizer> tokenizer;
@@ -910,114 +899,14 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
           ? std::filesystem::path(config.model_dir).filename().string()
           : config.served_model_name;
 
-  if (model_config.architecture == model::Architecture::kDeepSeekV2) {
-    if (config.tensor_parallel_size != 1) {
-      return UnimplementedError(
-          "tensor parallel serving is currently implemented for Qwen2 only");
-    }
-    // A quantization request that would be silently ignored is a startup
-    // error: the caller asked for behavior this arm cannot deliver.
-    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
-      return InvalidArgumentError(
-          "--quantization / --kv-cache-dtype are not supported for the "
-          "DeepSeek-V2 architecture");
-    }
-    INFERX_ASSIGN_OR_RETURN(
-        model::DeepseekV2Model deepseek,
-        model::DeepseekV2Model::Load(config.model_dir, primary_device));
-
-    // The latent cache: 576 elements/token/layer for V2-Lite against a GQA
-    // model's thousands, so the same block count buys ~14x the cached context.
-    INFERX_ASSIGN_OR_RETURN(
-        const int64_t kv_blocks,
-        AutosizeKvBlocksOnDevice(
-            KvSizingSpec{
-                .explicit_blocks = config.kv_blocks,
-                .explicit_bytes = config.kv_cache_memory_bytes,
-                .gpu_memory_utilization = config.gpu_memory_utilization,
-                .block_bytes = deepseek.KvBlockBytes(config.block_size),
-                .min_blocks =
-                    (config.scheduler.max_seq_len + config.block_size - 1) /
-                    config.block_size},
-            primary_device));
-    INFERX_RETURN_IF_ERROR(
-        deepseek.AttachKvCache(kv_blocks, config.block_size));
-
-    INFERX_ASSIGN_OR_RETURN(
-        Scheduler scheduler,
-        Scheduler::Create(config.scheduler, deepseek.kv_pool()));
-
-    impl->model_runner =
-        MakeSyncModelRunner(std::move(deepseek), HostSampleRow);
-    impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-  } else if (model_config.architecture == model::Architecture::kGptOss) {
-    if (config.tensor_parallel_size != 1) {
-      return UnimplementedError(
-          "tensor parallel serving is currently implemented for Qwen2 only");
-    }
-    // A quantization request that would be silently ignored is a startup
-    // error; gpt-oss weights are MXFP4 from the checkpoint and the Qwen2-path
-    // quantization methods do not exist on this class.
-    if (config.fp8_weights || config.int4_weights || config.fp8_kv_cache) {
-      return InvalidArgumentError(
-          "--quantization / --kv-cache-dtype are not supported for the "
-          "gpt-oss architecture");
-    }
-
-    INFERX_ASSIGN_OR_RETURN(
-        model::GptOssModel gpt_oss,
-        model::GptOssModel::Load(config.model_dir, primary_device));
-
-    // Attach a paged KV cache so the scheduler can batch multiple sequences.
-    // gpt-oss has 24 layers × 8 kv_heads × 64 head_dim × 2 (bf16) = 2048
-    // bytes/token/layer; the pool sizing is the same VRAM/latency trade as
-    // Qwen2, auto-sized unless pinned.
-    INFERX_ASSIGN_OR_RETURN(
-        const int64_t kv_blocks,
-        AutosizeKvBlocksOnDevice(
-            KvSizingSpec{
-                .explicit_blocks = config.kv_blocks,
-                .explicit_bytes = config.kv_cache_memory_bytes,
-                .gpu_memory_utilization = config.gpu_memory_utilization,
-                .block_bytes = gpt_oss.KvBlockBytes(config.block_size),
-                .min_blocks =
-                    (config.scheduler.max_seq_len + config.block_size - 1) /
-                    config.block_size},
-            primary_device));
-    INFERX_RETURN_IF_ERROR(gpt_oss.AttachKvCache(kv_blocks, config.block_size));
-
-    INFERX_ASSIGN_OR_RETURN(
-        Scheduler scheduler,
-        Scheduler::Create(config.scheduler, gpt_oss.kv_pool()));
-
-    impl->model_runner = MakeSyncModelRunner(std::move(gpt_oss), HostSampleRow);
-    impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-  } else {
-    Qwen2RunnerConfig runner_config;
-    runner_config.model_dir = config.model_dir;
-    runner_config.device_kind = config.device_kind;
-    runner_config.devices = config.devices;
-    runner_config.use_nccl = config.comm_backend == "nccl";
-    runner_config.collective_timing_sample_every =
-        config.collective_timing_sample_every;
-    runner_config.fp8_weights = config.fp8_weights;
-    runner_config.int4_weights = config.int4_weights;
-    runner_config.fp8_kv_cache = config.fp8_kv_cache;
-    runner_config.kv_blocks = config.kv_blocks;
-    runner_config.kv_cache_memory_bytes = config.kv_cache_memory_bytes;
-    runner_config.gpu_memory_utilization = config.gpu_memory_utilization;
-    runner_config.block_size = config.block_size;
-    runner_config.max_seq_len = config.scheduler.max_seq_len;
-    runner_config.max_sampling_rows = config.scheduler.max_running;
-    INFERX_ASSIGN_OR_RETURN(auto model, Qwen2Runner::Create(runner_config));
-
-    INFERX_ASSIGN_OR_RETURN(
-        Scheduler scheduler,
-        Scheduler::Create(config.scheduler, model->kv_pool()));
-
-    impl->model_runner = std::move(model);
-    impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
-  }
+  INFERX_ASSIGN_OR_RETURN(
+      impl->model_runner,
+      BuildModelRunner(config, model_config.architecture, primary_device,
+                       HostSampleRow));
+  INFERX_ASSIGN_OR_RETURN(
+      Scheduler scheduler,
+      Scheduler::Create(config.scheduler, impl->model_runner->kv_pool()));
+  impl->scheduler = std::make_unique<Scheduler>(std::move(scheduler));
 
   impl->metrics.ConfigureRanks(impl->model_runner->telemetry());
   impl->stats.blocks_total = impl->model_runner->kv_pool()->num_blocks();
