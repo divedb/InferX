@@ -2,6 +2,7 @@
 
 add_library(inferx_engine
   engine.cc
+  host_sampling.cc
   kv_autosize.cc
   model_runner_factory.cc
   qwen2_runner.cc

@@ -1,11 +1,8 @@
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <functional>
 #include <memory>
-#include <vector>
 
+#include "host_sampling.h"
 #include "model_runner.h"
 
 namespace inferx::model {
@@ -14,10 +11,6 @@ class GptOssModel;
 }  // namespace inferx::model
 
 namespace inferx::engine {
-
-using HostSampler = std::function<int32_t(
-    float* row, int64_t vocab, const model::ForwardBatch& batch, size_t index,
-    SampledLogprob* logprob)>;
 
 std::unique_ptr<ModelRunner> MakeSyncModelRunner(model::GptOssModel model,
                                                  HostSampler sampler);

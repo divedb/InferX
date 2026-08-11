@@ -7,6 +7,7 @@
 #include "inferx/model/gpt_oss.h"
 #include "kv_autosize.h"
 #include "qwen2_runner.h"
+#include "sync_model_runner.h"
 
 namespace inferx::engine {
 

@@ -99,6 +99,11 @@ if(INFERX_HAS_DEVICE_OPS)
   target_link_libraries(kv_autosize_test PRIVATE inferx::engine)
   target_include_directories(kv_autosize_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
+
+  inferx_add_test(host_sampling_test   unit/host_sampling_test.cc)
+  target_link_libraries(host_sampling_test PRIVATE inferx::engine)
+  target_include_directories(host_sampling_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
 endif()
 
 if(INFERX_HAS_DEVICE_OPS)
