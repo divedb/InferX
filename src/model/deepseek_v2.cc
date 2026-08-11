@@ -8,11 +8,9 @@
 #include <utility>
 #include <vector>
 
-#include <cuda_runtime.h>
-
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/core/tensor.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/layers.h"
@@ -109,7 +107,9 @@ struct DeepseekV2Model::Impl {
   Impl(ModelConfig c, kernels::CublasLtGemm g)
       : config(std::move(c)), gemm(std::move(g)) {}
   ~Impl() {
-    if (stream != nullptr) cudaStreamDestroy(stream);
+    if (runtime != nullptr && stream.handle != nullptr) {
+      (void)runtime->DestroyStream(stream);
+    }
   }
 
   ModelConfig config;
@@ -124,7 +124,8 @@ struct DeepseekV2Model::Impl {
   kernels::CublasLtGemm gemm;
   std::unique_ptr<MlaAttentionLayer> mla;
   std::unique_ptr<MoeFfn> moe;
-  cudaStream_t stream = nullptr;
+  DeviceRuntime* runtime = nullptr;
+  Stream stream;
 
   std::unique_ptr<KvBlockPool> pool;
 
@@ -179,10 +180,9 @@ Status DeepseekV2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   const int64_t table_elems = batch.num_seqs * batch.max_blocks_per_seq;
   if (table_elems > block_table_capacity) {
     INFERX_ASSIGN_OR_RETURN(
-        block_table_buf,
-        DeviceBuffer::Allocate(
-            static_cast<size_t>(table_elems) * sizeof(int32_t),
-            DeviceId::Cuda(0)));
+        block_table_buf, DeviceBuffer::Allocate(
+                             static_cast<size_t>(table_elems) * sizeof(int32_t),
+                             DeviceId::Cuda(0)));
     block_table_capacity = table_elems;
   }
 
@@ -192,19 +192,19 @@ Status DeepseekV2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
         slots_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
   }
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(ids.buf.data(),
-                                              batch.token_ids.data(), tok_bytes,
-                                              cudaMemcpyHostToDevice, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpyAsync(positions.buf.data(), batch.positions.data(), tok_bytes,
-                      cudaMemcpyHostToDevice, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(slots_buf.data(),
-                                              batch.slots.data(), tok_bytes,
-                                              cudaMemcpyHostToDevice, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      block_table_buf.data(), batch.block_table.data(),
-      static_cast<size_t>(table_elems) * sizeof(int32_t),
-      cudaMemcpyHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(ids.buf.data(),
+                                            batch.token_ids.data(), tok_bytes,
+                                            CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(positions.buf.data(),
+                                            batch.positions.data(), tok_bytes,
+                                            CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(slots_buf.data(),
+                                            batch.slots.data(), tok_bytes,
+                                            CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(
+      runtime->CopyAsync(block_table_buf.data(), batch.block_table.data(),
+                         static_cast<size_t>(table_elems) * sizeof(int32_t),
+                         CopyKind::kHostToDevice, stream));
 
   // Decompose the flat batch into per-sequence runs. The MLA loop needs each
   // sequence's token range and its context length after the append; the
@@ -221,15 +221,15 @@ Status DeepseekV2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
         if (r.seq == seq) {
           return InvalidArgumentError(
               "DeepseekV2Model: batch tokens are not grouped by sequence "
-              "(sequence ", seq, " reappears at token ", t, ")");
+              "(sequence ",
+              seq, " reappears at token ", t, ")");
         }
       }
       ranges.push_back({t, 1, 0, seq});
     }
   }
   for (SeqRange& r : ranges) {
-    r.context =
-        batch.positions[static_cast<size_t>(r.start + r.count - 1)] + 1;
+    r.context = batch.positions[static_cast<size_t>(r.start + r.count - 1)] + 1;
   }
 
   return OkStatus();
@@ -278,8 +278,8 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
     const LayerWeights& w = m.layers[static_cast<size_t>(layer)];
 
     // --- MLA attention ------------------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        resid.Data(), x.Data(), row_bytes, cudaMemcpyDeviceToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+        resid.Data(), x.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
     INFERX_RETURN_IF_ERROR(
         kernels::RmsNorm(x, w.input_norm, normed, eps, stream));
 
@@ -300,21 +300,22 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
       INFERX_ASSIGN_OR_RETURN(const TensorView row_2d,
                               table_v.Slice(r.seq, r.seq + 1));
-      INFERX_ASSIGN_OR_RETURN(const TensorView row,
-                              row_2d.Reshape(Shape({batch.max_blocks_per_seq})));
+      INFERX_ASSIGN_OR_RETURN(
+          const TensorView row,
+          row_2d.Reshape(Shape({batch.max_blocks_per_seq})));
 
-      INFERX_RETURN_IF_ERROR(m.mla->Forward(x_s, pos_s, slots_s, row,
-                                            r.context, cache, w.mla, out_s,
-                                            &m.gemm, stream));
+      INFERX_RETURN_IF_ERROR(m.mla->Forward(x_s, pos_s, slots_s, row, r.context,
+                                            cache, w.mla, out_s, &m.gemm,
+                                            stream));
     }
 
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(attn, resid, stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        x.Data(), attn.Data(), row_bytes, cudaMemcpyDeviceToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+        x.Data(), attn.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
 
     // --- FFN: dense below first_k_dense_replace, routed after --------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        resid.Data(), x.Data(), row_bytes, cudaMemcpyDeviceToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+        resid.Data(), x.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
     INFERX_RETURN_IF_ERROR(
         kernels::RmsNorm(x, w.post_norm, normed, eps, stream));
 
@@ -332,28 +333,25 @@ Status DeepseekV2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
       INFERX_ASSIGN_OR_RETURN(
           const TensorView gu,
           m.dense_gate_up.View(kBf16, Shape({tokens, 2 * inter})));
-      INFERX_ASSIGN_OR_RETURN(
-          const TensorView act,
-          m.dense_act.View(kBf16, Shape({tokens, inter})));
+      INFERX_ASSIGN_OR_RETURN(const TensorView act,
+                              m.dense_act.View(kBf16, Shape({tokens, inter})));
 
       INFERX_RETURN_IF_ERROR(
           m.gemm.LinearBF16(normed, w.dense_gate_up, gu, stream));
       INFERX_RETURN_IF_ERROR(kernels::SiluMulFused(gu, act, stream));
-      INFERX_RETURN_IF_ERROR(
-          m.gemm.LinearBF16(act, w.dense_down, ffn, stream));
+      INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(act, w.dense_down, ffn, stream));
     }
 
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(ffn, resid, stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        x.Data(), ffn.Data(), row_bytes, cudaMemcpyDeviceToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+        x.Data(), ffn.Data(), row_bytes, CopyKind::kDeviceToDevice, stream));
   }
 
   INFERX_RETURN_IF_ERROR(
       kernels::RmsNorm(x, m.final_norm, normed, eps, stream));
 
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView logits_v,
-      m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView logits_v,
+                          m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
   INFERX_RETURN_IF_ERROR(
       m.gemm.LinearBF16(normed, m.lm_head, logits_v, stream));
 
@@ -377,8 +375,9 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                           kernels::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(gemm));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(impl->stream,
+                          impl->runtime->CreateStream(DeviceId::Cuda(0)));
 
   const int64_t h = config.hidden_size;
   const int64_t heads = config.num_attention_heads;
@@ -438,7 +437,8 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
               << static_cast<double>(loader.stats().bytes - layer_before) / 1e6
               << " MB in "
               << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     now - layer_start).count()
+                     now - layer_start)
+                     .count()
               << " ms, " << static_cast<double>(loader.stats().bytes) / 1e9
               << " GB total";
     };
@@ -472,17 +472,15 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       INFERX_RETURN_IF_ERROR(up("self_attn.q_a_layernorm.weight",
                                 Shape({config.q_lora_rank}), &w.mla.q_a_norm));
       INFERX_ASSIGN_OR_RETURN(
-          w.mla.q_b,
-          loader.LoadRowPermuted(
-              p + "self_attn.q_b_proj.weight",
-              Shape({heads * qk, config.q_lora_rank}),
-              DeinterleaveMap(heads * qk, q_rope_starts, rope)));
+          w.mla.q_b, loader.LoadRowPermuted(
+                         p + "self_attn.q_b_proj.weight",
+                         Shape({heads * qk, config.q_lora_rank}),
+                         DeinterleaveMap(heads * qk, q_rope_starts, rope)));
     } else {
       INFERX_ASSIGN_OR_RETURN(
-          w.mla.q_b,
-          loader.LoadRowPermuted(
-              p + "self_attn.q_proj.weight", Shape({heads * qk, h}),
-              DeinterleaveMap(heads * qk, q_rope_starts, rope)));
+          w.mla.q_b, loader.LoadRowPermuted(
+                         p + "self_attn.q_proj.weight", Shape({heads * qk, h}),
+                         DeinterleaveMap(heads * qk, q_rope_starts, rope)));
     }
     INFERX_ASSIGN_OR_RETURN(
         w.mla.kv_a,
@@ -491,10 +489,9 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
                                DeinterleaveMap(latent + rope, {latent}, rope)));
     INFERX_RETURN_IF_ERROR(up("self_attn.kv_a_layernorm.weight",
                               Shape({latent}), &w.mla.kv_a_norm));
-    INFERX_RETURN_IF_ERROR(up("self_attn.kv_b_proj.weight",
-                              Shape({heads * (config.qk_nope_head_dim + vd),
-                                     latent}),
-                              &w.mla.kv_b));
+    INFERX_RETURN_IF_ERROR(up(
+        "self_attn.kv_b_proj.weight",
+        Shape({heads * (config.qk_nope_head_dim + vd), latent}), &w.mla.kv_b));
     INFERX_RETURN_IF_ERROR(
         up("self_attn.o_proj.weight", Shape({h, heads * vd}), &w.mla.o));
 
@@ -502,10 +499,9 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       const int64_t inter = config.intermediate_size;
       const std::vector<std::string> gate_up = {p + "mlp.gate_proj.weight",
                                                 p + "mlp.up_proj.weight"};
-      INFERX_ASSIGN_OR_RETURN(
-          w.dense_gate_up,
-          loader.LoadStacked(gate_up, Shape({inter, h}),
-                             Shape({2 * inter, h})));
+      INFERX_ASSIGN_OR_RETURN(w.dense_gate_up,
+                              loader.LoadStacked(gate_up, Shape({inter, h}),
+                                                 Shape({2 * inter, h})));
       INFERX_RETURN_IF_ERROR(
           up("mlp.down_proj.weight", Shape({h, inter}), &w.dense_down));
       log_layer("dense");
@@ -536,12 +532,12 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       std::vector<std::string> names;
       names.reserve(static_cast<size_t>(experts));
       for (int64_t e = 0; e < experts; ++e) {
-        names.push_back(absl::StrCat(p, "mlp.experts.", e, ".down_proj.weight"));
+        names.push_back(
+            absl::StrCat(p, "mlp.experts.", e, ".down_proj.weight"));
       }
       INFERX_ASSIGN_OR_RETURN(
-          w.experts_down,
-          loader.LoadStacked(names, Shape({h, moe_inter}),
-                             Shape({experts, h, moe_inter})));
+          w.experts_down, loader.LoadStacked(names, Shape({h, moe_inter}),
+                                             Shape({experts, h, moe_inter})));
     }
 
     // The shared experts, stored as one fused MLP of width
@@ -569,14 +565,16 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
   LOG(INFO) << "deepseek-v2: loaded " << static_cast<double>(ls.bytes) / 1e9
             << " GB in "
             << std::chrono::duration_cast<std::chrono::duration<double>>(
-                   std::chrono::steady_clock::now() - load_start).count()
+                   std::chrono::steady_clock::now() - load_start)
+                   .count()
             << " s (stage " << ls.stage_seconds << " s, h2d wait "
             << ls.h2d_wait_seconds << " s)";
 
   INFERX_ASSIGN_OR_RETURN(impl->weight_buffers, loader.Release());
 
-  INFERX_ASSIGN_OR_RETURN(MlaAttentionLayer mla,
-                          MlaAttentionLayer::Create(config, 1, 1));
+  INFERX_ASSIGN_OR_RETURN(
+      MlaAttentionLayer mla,
+      MlaAttentionLayer::Create(config, 1, 1, DeviceId::Cuda(0)));
   impl->mla = std::make_unique<MlaAttentionLayer>(std::move(mla));
 
   MoeFfn::Config moe_config;
@@ -591,7 +589,8 @@ StatusOr<DeepseekV2Model> DeepseekV2Model::Load(std::string_view dir) {
       static_cast<float>(config.routed_scaling_factor);
   moe_config.activation = MoeFfn::Activation::kSiluMul;
 
-  INFERX_ASSIGN_OR_RETURN(MoeFfn moe, MoeFfn::Create(moe_config, 1));
+  INFERX_ASSIGN_OR_RETURN(MoeFfn moe,
+                          MoeFfn::Create(moe_config, 1, DeviceId::Cuda(0)));
   impl->moe = std::make_unique<MoeFfn>(std::move(moe));
 
   return DeepseekV2Model(std::move(impl));
@@ -659,20 +658,19 @@ Status DeepseekV2Model::Step(const ForwardBatch& batch,
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(batch));
   INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(batch));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
   const int64_t vocab = impl_->config.vocab_size;
   out_logits->clear();
-  out_logits->reserve(batch.logits_indices.size() *
-                      static_cast<size_t>(vocab));
+  out_logits->reserve(batch.logits_indices.size() * static_cast<size_t>(vocab));
 
   std::vector<uint16_t> raw(static_cast<size_t>(vocab));
   for (const int32_t index : batch.logits_indices) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_RETURN_IF_ERROR(impl_->runtime->Copy(
         raw.data(),
         static_cast<const std::byte*>(impl_->logits.buf.data()) +
             static_cast<size_t>(index) * static_cast<size_t>(vocab) * 2,
-        raw.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        raw.size() * sizeof(uint16_t), CopyKind::kDeviceToHost));
 
     const size_t base = out_logits->size();
     out_logits->resize(base + raw.size());

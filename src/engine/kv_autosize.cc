@@ -1,11 +1,9 @@
 #include "kv_autosize.h"
 
-#include <cuda_runtime_api.h>
-
 #include <algorithm>
 
 #include "absl/log/log.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/core/device_runtime.h"
 
 namespace inferx::engine {
 
@@ -30,10 +28,10 @@ StatusOr<int64_t> ResolveKvBlocks(const KvSizingSpec& spec, int64_t free_bytes,
   }
 
   const int64_t used_bytes = total_bytes - free_bytes;
-  const int64_t budget = static_cast<int64_t>(
-                             spec.gpu_memory_utilization *
-                             static_cast<double>(total_bytes)) -
-                         used_bytes - spec.headroom_bytes;
+  const int64_t budget =
+      static_cast<int64_t>(spec.gpu_memory_utilization *
+                           static_cast<double>(total_bytes)) -
+      used_bytes - spec.headroom_bytes;
   const int64_t blocks = budget > 0 ? budget / spec.block_bytes : 0;
   if (blocks < spec.min_blocks) {
     return InvalidArgumentError(
@@ -48,14 +46,15 @@ StatusOr<int64_t> ResolveKvBlocks(const KvSizingSpec& spec, int64_t free_bytes,
   return blocks;
 }
 
-StatusOr<int64_t> AutosizeKvBlocksOnCurrentDevice(const KvSizingSpec& spec) {
+StatusOr<int64_t> AutosizeKvBlocksOnDevice(const KvSizingSpec& spec,
+                                           DeviceId device) {
   if (spec.explicit_blocks > 0) return spec.explicit_blocks;
 
-  size_t free_bytes = 0;
-  size_t total_bytes = 0;
-  INFERX_RETURN_IF_ERROR(CudaErrorToStatus(
-      cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo", __FILE__,
-      __LINE__));
+  INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
+  INFERX_ASSIGN_OR_RETURN(const DeviceMemoryInfo memory,
+                          runtime->GetMemoryInfo(device));
+  const size_t free_bytes = memory.free_bytes;
+  const size_t total_bytes = memory.total_bytes;
 
   INFERX_ASSIGN_OR_RETURN(
       const int64_t blocks,

@@ -599,7 +599,7 @@ int BlockFor(int64_t width) {
 }  // namespace
 
 Status RmsNorm(const TensorView& x, const TensorView& weight,
-               const TensorView& out, float eps, cudaStream_t stream) {
+               const TensorView& out, float eps, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 2, "x"));
   INFERX_RETURN_IF_ERROR(CheckTensor(weight, DataType::kBFloat16, 1, "weight"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
@@ -629,7 +629,7 @@ Status RmsNorm(const TensorView& x, const TensorView& weight,
 
 Status RotaryEmbedding(const TensorView& q, const TensorView& k,
                        const TensorView& positions, float theta,
-                       cudaStream_t stream) {
+                       Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(positions, DataType::kInt32, 1,
@@ -674,7 +674,7 @@ Status RotaryEmbedding(const TensorView& q, const TensorView& k,
 }
 
 Status SiluMul(const TensorView& gate, const TensorView& up,
-               const TensorView& out, cudaStream_t stream) {
+               const TensorView& out, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(gate, DataType::kBFloat16, 2, "gate"));
   INFERX_RETURN_IF_ERROR(CheckTensor(up, DataType::kBFloat16, 2, "up"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
@@ -699,7 +699,7 @@ Status SiluMul(const TensorView& gate, const TensorView& up,
 }
 
 Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
-                 const TensorView& out, float scale, cudaStream_t stream) {
+                 const TensorView& out, float scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
@@ -757,7 +757,7 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
 
 Status AppendToKvCache(const TensorView& k, const TensorView& v,
                        const TensorView& k_cache, const TensorView& v_cache,
-                       const TensorView& slots, cudaStream_t stream) {
+                       const TensorView& slots, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
@@ -803,7 +803,7 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
 Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
                        const TensorView& k_cache, const TensorView& v_cache,
                        const TensorView& slots, float k_scale, float v_scale,
-                       cudaStream_t stream) {
+                       Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
   INFERX_RETURN_IF_ERROR(
@@ -857,7 +857,7 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& v_cache, const TensorView& block_table,
                       const TensorView& seq_of_token, const TensorView& q_pos,
                       const TensorView& out, float scale, int64_t max_context,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
                                      "k_cache"));
@@ -940,7 +940,7 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
                              const TensorView& q_pos, const TensorView& out,
                              const TensorView& lse, float scale,
                              int64_t window, int64_t max_context,
-                             cudaStream_t stream) {
+                             Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k_cache, DataType::kBFloat16, 4,
                                       "k_cache"));
@@ -1441,7 +1441,7 @@ __global__ void ComputeLogprobsKernel(
 }
 
 Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
-                    const TensorView& out, cudaStream_t stream) {
+                    const TensorView& out, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
   INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kInt32, 1, "out"));
@@ -1470,7 +1470,7 @@ Status SampleTokens(const TensorView& logits, const TensorView& rows,
                     const TensorView& temperature, const TensorView& top_p,
                     const TensorView& top_k, const TensorView& min_p,
                     const TensorView& seeds, const TensorView& out,
-                    cudaStream_t stream) {
+                    Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
   INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
   INFERX_RETURN_IF_ERROR(
@@ -1528,7 +1528,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
                       const TensorView& repetition,
                       const TensorView& history_ids,
                       const TensorView& history_counts,
-                      const TensorView& mask_ids, cudaStream_t stream) {
+                      const TensorView& mask_ids, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
   INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
   INFERX_RETURN_IF_ERROR(
@@ -1585,7 +1585,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
 Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
                        const TensorView& chosen, const TensorView& k_wanted,
                        const TensorView& chosen_lp, const TensorView& top_ids,
-                       const TensorView& top_lps, cudaStream_t stream) {
+                       const TensorView& top_lps, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(logits, DataType::kBFloat16, 2, "logits"));
   INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
   INFERX_RETURN_IF_ERROR(CheckTensor(chosen, DataType::kInt32, 1, "chosen"));
@@ -1622,7 +1622,7 @@ Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
 }
 
 Status ScatterTokens(const TensorView& src, const TensorView& dst,
-                     const TensorView& slots, cudaStream_t stream) {
+                     const TensorView& slots, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(src, DataType::kInt32, 1, "src"));
   INFERX_RETURN_IF_ERROR(CheckTensor(dst, DataType::kInt32, 1, "dst"));
   INFERX_RETURN_IF_ERROR(CheckTensor(slots, DataType::kInt32, 1, "slots"));
@@ -1649,7 +1649,7 @@ Status ScatterTokens(const TensorView& src, const TensorView& dst,
 }
 
 Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
-                       const TensorView& out, cudaStream_t stream) {
+                       const TensorView& out, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(table, DataType::kBFloat16, 2, "table"));
   INFERX_RETURN_IF_ERROR(CheckTensor(ids, DataType::kInt32, 1, "ids"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
@@ -1678,7 +1678,7 @@ Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
 
 Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
                         const TensorView& q, const TensorView& k,
-                        const TensorView& v, cudaStream_t stream) {
+                        const TensorView& v, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(fused, DataType::kBFloat16, 2, "fused"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 2, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 2, "k"));
@@ -1727,7 +1727,7 @@ Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
 }
 
 Status SiluMulFused(const TensorView& fused, const TensorView& out,
-                    cudaStream_t stream) {
+                    Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(fused, DataType::kBFloat16, 2, "fused"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
 
@@ -1755,7 +1755,7 @@ Status SiluMulFused(const TensorView& fused, const TensorView& out,
 }
 
 Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
   INFERX_RETURN_IF_ERROR(CheckTensor(bias, DataType::kBFloat16, 1, "bias"));
 
@@ -1783,7 +1783,7 @@ Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
 }
 
 Status AddInPlace(const TensorView& out, const TensorView& residual,
-                  cudaStream_t stream) {
+                  Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
   INFERX_RETURN_IF_ERROR(CheckTensor(residual, DataType::kBFloat16, 2,
                                      "residual"));

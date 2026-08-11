@@ -375,7 +375,7 @@ __global__ void GroupedGemmBf16Kernel(const bf16* __restrict__ x,
 
 Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
                     const TensorView& out_experts, bool renormalize,
-                    float scale, cudaStream_t stream) {
+                    float scale, Stream stream) {
   if (!(scale > 0.0f) || !isfinite(scale)) {
     return InvalidArgumentError("gate scale must be positive and finite, got ",
                                 scale);
@@ -430,7 +430,7 @@ Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
 
 Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
                         const TensorView& out_offsets, const TensorView& out_rows,
-                        const TensorView& out_dest, cudaStream_t stream) {
+                        const TensorView& out_dest, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(experts, DataType::kInt32, 2, "experts"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(out_offsets, DataType::kInt32, 1, "out_offsets"));
@@ -490,7 +490,7 @@ Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
 }
 
 Status MoeGatherRows(const TensorView& x, const TensorView& rows,
-                     const TensorView& out, cudaStream_t stream) {
+                     const TensorView& out, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 2, "x"));
   INFERX_RETURN_IF_ERROR(CheckTensor(rows, DataType::kInt32, 1, "rows"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
@@ -520,7 +520,7 @@ Status MoeGatherRows(const TensorView& x, const TensorView& rows,
 
 Status MoeCombineRows(const TensorView& y, const TensorView& dest,
                       const TensorView& weights, const TensorView& out,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(y, DataType::kBFloat16, 2, "y"));
   INFERX_RETURN_IF_ERROR(CheckTensor(dest, DataType::kInt32, 1, "dest"));
   INFERX_RETURN_IF_ERROR(CheckTensor(weights, DataType::kFloat, 2, "weights"));
@@ -558,7 +558,7 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
 
 Status MoeAddSharedExpert(const TensorView& shared,
                           const TensorView& gate_logits, const TensorView& out,
-                          cudaStream_t stream) {
+                          Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(shared, DataType::kBFloat16, 2, "shared"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(gate_logits, DataType::kBFloat16, 2, "gate_logits"));
@@ -590,7 +590,7 @@ Status MoeAddSharedExpert(const TensorView& shared,
 
 Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
                           const TensorView& w, const TensorView& bias,
-                          const TensorView& y, cudaStream_t stream) {
+                          const TensorView& y, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 2, "x"));
   INFERX_RETURN_IF_ERROR(CheckTensor(offsets, DataType::kInt32, 1, "offsets"));
   INFERX_RETURN_IF_ERROR(CheckTensor(w, DataType::kBFloat16, 3, "w"));

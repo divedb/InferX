@@ -3,10 +3,9 @@
 #include <cstdint>
 #include <memory>
 
-#include <cuda_runtime_api.h>
-
 #include "absl/types/span.h"
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -66,7 +65,7 @@ class FlashInferPrefill {
               int64_t head_dim, int64_t page_size,
               absl::Span<const int32_t> qo_indptr_host,
               absl::Span<const int32_t> kv_indptr_host, int64_t total_rows,
-              cudaStream_t stream = nullptr);
+              Stream stream = {});
 
   /// \brief Launches the plan from the last `Plan` call.
   ///
@@ -80,7 +79,7 @@ class FlashInferPrefill {
              const TensorView& v_cache, const TensorView& qo_indptr,
              const TensorView& kv_indices, const TensorView& kv_indptr,
              const TensorView& last_page_len, const TensorView& out,
-             float scale, cudaStream_t stream = nullptr);
+             float scale, Stream stream = {});
 
   /// \brief `Plan` followed by `Run`, for callers with no graph to worry about.
   Status Prefill(const TensorView& q, const TensorView& k_cache,
@@ -89,23 +88,24 @@ class FlashInferPrefill {
                  const TensorView& kv_indices, const TensorView& kv_indptr,
                  absl::Span<const int32_t> kv_indptr_host,
                  const TensorView& last_page_len, const TensorView& out,
-                 float scale, cudaStream_t stream = nullptr);
+                 float scale, Stream stream = {});
 
   /// \brief Same as `Prefill` against an **FP8 e4m3** paged KV cache.
   ///
   /// The prefill writes the prompt's K/V and attends over them, so for a cache
   /// that decode will read as fp8, prefill must speak fp8 too -- otherwise the
-  /// prompt's K/V land in bf16 and decode reads them as fp8 (garbage). `v_scale`
-  /// applies to `out` after the kernel, as in `FlashInferDecode::DecodeFp8`.
-  /// `k_scale` is folded into the query (`q*k_scale`, into a scratch buffer) and
-  /// `sm_scale` stays at `scale` -- not folded into `sm_scale` like decode: fa2
-  /// prefill suppresses masked/padding K positions inside
-  /// `exp2(logit*sm_scale_log2)`, and the `scale*k_scale` product (~1e-4) is too
-  /// small to zero them, so they leak into the softmax denominator and attenuate
-  /// the output. Folding into Q is algebraically identical and keeps `sm_scale`
-  /// at 1/sqrt(head_dim). Decode needs no such care -- it excludes invalid slots
-  /// structurally, with no soft mask to defeat. One-shot (no Plan/Run split)
-  /// because prefill is not graph-captured -- prompt shapes vary.
+  /// prompt's K/V land in bf16 and decode reads them as fp8 (garbage).
+  /// `v_scale` applies to `out` after the kernel, as in
+  /// `FlashInferDecode::DecodeFp8`. `k_scale` is folded into the query
+  /// (`q*k_scale`, into a scratch buffer) and `sm_scale` stays at `scale` --
+  /// not folded into `sm_scale` like decode: fa2 prefill suppresses
+  /// masked/padding K positions inside `exp2(logit*sm_scale_log2)`, and the
+  /// `scale*k_scale` product (~1e-4) is too small to zero them, so they leak
+  /// into the softmax denominator and attenuate the output. Folding into Q is
+  /// algebraically identical and keeps `sm_scale` at 1/sqrt(head_dim). Decode
+  /// needs no such care -- it excludes invalid slots structurally, with no soft
+  /// mask to defeat. One-shot (no Plan/Run split) because prefill is not
+  /// graph-captured -- prompt shapes vary.
   Status PrefillFp8(const TensorView& q, const TensorView& k_cache,
                     const TensorView& v_cache, const TensorView& qo_indptr,
                     absl::Span<const int32_t> qo_indptr_host,
@@ -113,7 +113,7 @@ class FlashInferPrefill {
                     absl::Span<const int32_t> kv_indptr_host,
                     const TensorView& last_page_len, const TensorView& out,
                     float scale, float k_scale, float v_scale,
-                    cudaStream_t stream = nullptr);
+                    Stream stream = {});
 
  private:
   struct Impl;

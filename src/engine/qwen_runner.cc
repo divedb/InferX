@@ -1,7 +1,5 @@
 #include "qwen_runner.h"
 
-#include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,7 +13,7 @@
 #include <vector>
 
 #include "inferx/comm/nccl_communicator.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/core/device_runtime.h"
 #include "kv_autosize.h"
 
 namespace inferx::engine {
@@ -67,7 +65,8 @@ class KvSizeRendezvous {
 /// `agreed` reports whether this rank posted to `rendezvous`, so failure
 /// paths know whether the peer still needs unblocking.
 Status ConfigureModel(model::Qwen2Model* model, const QwenRunnerConfig& config,
-                      KvSizeRendezvous* rendezvous, bool* agreed) {
+                      DeviceId device, KvSizeRendezvous* rendezvous,
+                      bool* agreed) {
   Status prep = OkStatus();
   if (config.fp8_weights) prep = model->QuantizeWeightsToF8();
   if (prep.ok() && config.int4_weights) prep = model->QuantizeWeightsToInt4();
@@ -83,7 +82,7 @@ Status ConfigureModel(model::Qwen2Model* model, const QwenRunnerConfig& config,
       spec.block_bytes = model->KvBlockBytes(config.block_size);
       spec.min_blocks =
           (config.max_seq_len + config.block_size - 1) / config.block_size;
-      sized = AutosizeKvBlocksOnCurrentDevice(spec);
+      sized = AutosizeKvBlocksOnDevice(spec, device);
     }
     if (rendezvous != nullptr) {
       const int64_t agreed_blocks = rendezvous->Agree(sized.ok() ? *sized : -1);
@@ -250,8 +249,11 @@ class RankWorker {
  private:
   void ThreadMain() {
     const int device = config_.devices[static_cast<size_t>(rank_)];
-    Status status = CudaErrorToStatus(cudaSetDevice(device), "cudaSetDevice",
-                                      __FILE__, __LINE__);
+    auto runtime = RuntimeFor(DeviceId::Cuda(static_cast<int8_t>(device)));
+    Status status =
+        runtime.ok()
+            ? (*runtime)->SetDevice(DeviceId::Cuda(static_cast<int8_t>(device)))
+            : runtime.status();
     if (status.ok()) {
       comm::NcclCommConfig comm_config;
       comm_config.rank = rank_;
@@ -271,8 +273,9 @@ class RankWorker {
           status = loaded.status();
         } else {
           model_ = std::make_unique<model::Qwen2Model>(std::move(*loaded));
-          status = ConfigureModel(model_.get(), config_, rendezvous_.get(),
-                                  &agreed_with_peer_);
+          status = ConfigureModel(model_.get(), config_,
+                                  DeviceId::Cuda(static_cast<int8_t>(device)),
+                                  rendezvous_.get(), &agreed_with_peer_);
           if (status.ok()) pool_ = model_->kv_pool();
         }
       }
@@ -404,10 +407,9 @@ class NcclQwenRunner final : public QwenRunner {
       std::vector<model::Qwen2Model::SampledLogprob>* out) override {
     // Rank 0 only: every rank samples the same tokens from the same
     // all-reduced logits, so one readback answers for the pair.
-    INFERX_RETURN_IF_ERROR(workers_[0]->Submit(
-        [out](model::Qwen2Model& model) {
-          return model.ReadSampledLogprobs(out);
-        }));
+    INFERX_RETURN_IF_ERROR(workers_[0]->Submit([out](model::Qwen2Model& model) {
+      return model.ReadSampledLogprobs(out);
+    }));
     return workers_[0]->Wait();
   }
 
@@ -478,7 +480,11 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
   }
 
   const int device = config.devices.front();
-  INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(device));
+  INFERX_ASSIGN_OR_RETURN(
+      DeviceRuntime * runtime,
+      RuntimeFor(DeviceId::Cuda(static_cast<int8_t>(device))));
+  INFERX_RETURN_IF_ERROR(
+      runtime->SetDevice(DeviceId::Cuda(static_cast<int8_t>(device))));
   auto communicator = std::make_unique<comm::SingleRankComm>(
       DeviceId::Cuda(static_cast<int8_t>(device)));
   auto communication = std::make_shared<comm::CommMetrics>();
@@ -489,7 +495,9 @@ StatusOr<std::unique_ptr<QwenRunner>> QwenRunner::Create(
                           model::Qwen2Model::LoadFromDirectory(
                               config.model_dir, std::move(observed)));
   bool agreed = false;
-  INFERX_RETURN_IF_ERROR(ConfigureModel(&model, config, nullptr, &agreed));
+  INFERX_RETURN_IF_ERROR(ConfigureModel(
+      &model, config, DeviceId::Cuda(static_cast<int8_t>(device)), nullptr,
+      &agreed));
   return std::unique_ptr<QwenRunner>(std::make_unique<SingleQwenRunner>(
       std::move(model), device, std::move(communication)));
 }

@@ -13,22 +13,23 @@
 /// a token's contributions in the wrong place all produce output that is
 /// numerically plausible and wrong.
 
+#include "inferx/kernels/moe.h"
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <gtest/gtest.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
 #include <vector>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <gtest/gtest.h>
-
 #include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
-#include "inferx/kernels/moe.h"
 #include "inferx/model/moe_ffn.h"
 
 namespace inferx {
@@ -72,8 +73,8 @@ TensorView Upload(std::vector<DeviceBuffer>& keep, const std::vector<T>& host,
 
   keep.push_back(*std::move(buf));
 
-  auto v = TensorView::Create(keep.back().data(), dtype, shape,
-                              DeviceId::Cuda(0));
+  auto v =
+      TensorView::Create(keep.back().data(), dtype, shape, DeviceId::Cuda(0));
   EXPECT_TRUE(v.ok()) << v.status();
   return *v;
 }
@@ -88,8 +89,8 @@ TensorView Empty(std::vector<DeviceBuffer>& keep, DataType dtype,
 
   keep.push_back(*std::move(buf));
 
-  auto v = TensorView::Create(keep.back().data(), dtype, shape,
-                              DeviceId::Cuda(0));
+  auto v =
+      TensorView::Create(keep.back().data(), dtype, shape, DeviceId::Cuda(0));
   EXPECT_TRUE(v.ok()) << v.status();
   return *v;
 }
@@ -114,8 +115,8 @@ class MoeTest : public ::testing::Test {
 
 // Softmax then top-k, computed on the host the way the definition reads.
 struct Routing {
-  std::vector<float> weights;   // [tokens, k]
-  std::vector<int32_t> experts; // [tokens, k]
+  std::vector<float> weights;    // [tokens, k]
+  std::vector<int32_t> experts;  // [tokens, k]
 };
 
 Routing ReferenceRoute(const std::vector<float>& logits, int64_t tokens,
@@ -128,7 +129,8 @@ Routing ReferenceRoute(const std::vector<float>& logits, int64_t tokens,
     std::vector<float> row(static_cast<size_t>(num_experts));
     float max_v = -INFINITY;
     for (int64_t e = 0; e < num_experts; ++e) {
-      row[static_cast<size_t>(e)] = logits[static_cast<size_t>(t * num_experts + e)];
+      row[static_cast<size_t>(e)] =
+          logits[static_cast<size_t>(t * num_experts + e)];
       max_v = std::max(max_v, row[static_cast<size_t>(e)]);
     }
 
@@ -172,7 +174,8 @@ TEST_F(MoeTest, RouterMatchesSoftmaxTopK) {
   std::vector<float> logits(static_cast<size_t>(tokens * num_experts));
   for (int64_t t = 0; t < tokens; ++t) {
     for (int64_t e = 0; e < num_experts; ++e) {
-      logits[static_cast<size_t>(t * num_experts + e)] = 3.0f * Fill(t, e, 0.2f);
+      logits[static_cast<size_t>(t * num_experts + e)] =
+          3.0f * Fill(t, e, 0.2f);
     }
   }
   logits = RoundTrip(logits);
@@ -222,7 +225,8 @@ TEST_F(MoeTest, RouterWithoutRenormalizationKeepsSoftmaxMass) {
   const TensorView w = Empty(keep, DataType::kFloat, Shape({tokens, k}));
   const TensorView e = Empty(keep, DataType::kInt32, Shape({tokens, k}));
 
-  ASSERT_TRUE(kernels::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
+  ASSERT_TRUE(
+      kernels::MoeRouteTopK(logits_v, w, e, /*renormalize=*/false).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const Routing want = ReferenceRoute(logits, tokens, num_experts, k, false);
@@ -250,8 +254,8 @@ TEST_F(MoeTest, RouterBreaksTiesTowardsTheLowerIndex) {
   constexpr int64_t tokens = 4, num_experts = 32;
   constexpr int k = 2;
 
-  const std::vector<float> logits(
-      static_cast<size_t>(tokens * num_experts), 0.25f);
+  const std::vector<float> logits(static_cast<size_t>(tokens * num_experts),
+                                  0.25f);
 
   std::vector<DeviceBuffer> keep;
   const TensorView logits_v = Upload(keep, ToBf16(logits), DataType::kBFloat16,
@@ -294,9 +298,9 @@ TEST_F(MoeTest, DispatchGroupsStablyAndInvertsExactly) {
   const TensorView rows = Empty(keep, DataType::kInt32, Shape({assignments}));
   const TensorView dest = Empty(keep, DataType::kInt32, Shape({assignments}));
 
-  ASSERT_TRUE(kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows,
-                                        dest)
-                  .ok());
+  ASSERT_TRUE(
+      kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
+          .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got_offsets = Download<int32_t>(offsets, num_experts + 1);
@@ -323,8 +327,7 @@ TEST_F(MoeTest, DispatchGroupsStablyAndInvertsExactly) {
     EXPECT_GE(slot, got_offsets[static_cast<size_t>(expert)]);
     EXPECT_LT(slot, got_offsets[static_cast<size_t>(expert) + 1]);
 
-    EXPECT_EQ(got_rows[static_cast<size_t>(slot)],
-              static_cast<int32_t>(a / k))
+    EXPECT_EQ(got_rows[static_cast<size_t>(slot)], static_cast<int32_t>(a / k))
         << "dest and rows disagree about assignment " << a;
   }
 
@@ -363,7 +366,8 @@ TEST_F(MoeTest, GatherAndCombineRoundTripThroughThePermutation) {
 
   std::vector<int32_t> experts(static_cast<size_t>(assignments));
   for (int64_t a = 0; a < assignments; ++a) {
-    experts[static_cast<size_t>(a)] = static_cast<int32_t>((a * 5 + 1) % num_experts);
+    experts[static_cast<size_t>(a)] =
+        static_cast<int32_t>((a * 5 + 1) % num_experts);
   }
 
   // Weights that sum to 1 per token, so a correct gather-then-combine with no
@@ -392,8 +396,9 @@ TEST_F(MoeTest, GatherAndCombineRoundTripThroughThePermutation) {
   const TensorView out =
       Empty(keep, DataType::kBFloat16, Shape({tokens, width}));
 
-  ASSERT_TRUE(kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows,
-                                        dest).ok());
+  ASSERT_TRUE(
+      kernels::MoeBuildDispatch(experts_v, num_experts, offsets, rows, dest)
+          .ok());
   ASSERT_TRUE(kernels::MoeGatherRows(x_v, rows, gathered).ok());
   ASSERT_TRUE(kernels::MoeCombineRows(gathered, dest, weights_v, out).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -463,7 +468,8 @@ std::vector<float> ReferenceMoe(const std::vector<float>& x,
       for (int64_t i = 0; i < h; ++i) {
         float acc = 0.0f;
         for (int64_t j = 0; j < inter; ++j) {
-          acc += act[static_cast<size_t>(j)] * dw[static_cast<size_t>(i * inter + j)];
+          acc += act[static_cast<size_t>(j)] *
+                 dw[static_cast<size_t>(i * inter + j)];
         }
         out[static_cast<size_t>(t * h + i)] += w * acc;
       }
@@ -512,8 +518,8 @@ TEST_F(MoeTest, LayerMatchesTheDenseReferenceMixture) {
 
   std::vector<DeviceBuffer> keep;
   MoeWeights w;
-  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
-                                Shape({tokens, c.hidden}));
+  const TensorView x_v =
+      Upload(keep, ToBf16(x), DataType::kBFloat16, Shape({tokens, c.hidden}));
   w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
                     Shape({c.num_experts, c.hidden}));
   w.gate_up = Upload(keep, ToBf16(gate_up), DataType::kBFloat16,
@@ -527,14 +533,14 @@ TEST_F(MoeTest, LayerMatchesTheDenseReferenceMixture) {
   auto gemm = kernels::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
-  auto ffn = MoeFfn::Create(c, tokens);
+  auto ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(ffn.ok()) << ffn.status();
 
   ASSERT_TRUE(ffn->Forward(x_v, w, out, &*gemm).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-  const std::vector<float> want = ReferenceMoe(x, router, gate_up, down, c,
-                                               tokens);
+  const std::vector<float> want =
+      ReferenceMoe(x, router, gate_up, down, c, tokens);
   const auto got = Download<bf16>(out, tokens * c.hidden);
 
   double worst = 0.0;
@@ -545,16 +551,16 @@ TEST_F(MoeTest, LayerMatchesTheDenseReferenceMixture) {
   ASSERT_GT(scale, 0.0) << "degenerate reference";
 
   for (size_t i = 0; i < want.size(); ++i) {
-    worst = std::max<double>(
-        worst, std::abs(__bfloat162float(got[i]) - want[i]));
+    worst =
+        std::max<double>(worst, std::abs(__bfloat162float(got[i]) - want[i]));
   }
 
   // bf16 keeps 8 mantissa bits, and the value has been through two GEMMs of
   // depth 64 and 32 plus a mixture. Relative to the largest output, 2% bounds
   // that comfortably while still being orders of magnitude tighter than a
   // misrouted token would be.
-  EXPECT_LT(worst / scale, 0.02) << "worst absolute error " << worst
-                                 << " against scale " << scale;
+  EXPECT_LT(worst / scale, 0.02)
+      << "worst absolute error " << worst << " against scale " << scale;
 
   // Every assignment landed somewhere: the counts have to sum to tokens · k.
   auto counts = ffn->LastExpertCounts();
@@ -583,31 +589,31 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
   auto rand_vec = [](size_t n, float salt) {
     std::vector<float> v(n);
     for (size_t i = 0; i < n; ++i) {
-      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
-                         static_cast<int64_t>(i % 13), salt);
+      v[i] = 0.4f *
+             Fill(static_cast<int64_t>(i), static_cast<int64_t>(i % 13), salt);
     }
     return RoundTrip(v);
   };
 
-  const std::vector<float> x = rand_vec(
-      static_cast<size_t>(tokens * c.hidden), 0.1f);
-  const std::vector<float> router = rand_vec(
-      static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
+  const std::vector<float> x =
+      rand_vec(static_cast<size_t>(tokens * c.hidden), 0.1f);
+  const std::vector<float> router =
+      rand_vec(static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
   const std::vector<float> gate_up = rand_vec(
       static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
       1.4f);
   const std::vector<float> down = rand_vec(
       static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate), 2.7f);
-  const std::vector<float> sgu = rand_vec(
-      static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 3.1f);
-  const std::vector<float> sdown = rand_vec(
-      static_cast<size_t>(c.hidden * c.shared_intermediate), 3.9f);
-  const std::vector<float> sgate = rand_vec(
-      static_cast<size_t>(c.hidden), 4.3f);
+  const std::vector<float> sgu =
+      rand_vec(static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 3.1f);
+  const std::vector<float> sdown =
+      rand_vec(static_cast<size_t>(c.hidden * c.shared_intermediate), 3.9f);
+  const std::vector<float> sgate =
+      rand_vec(static_cast<size_t>(c.hidden), 4.3f);
 
   std::vector<DeviceBuffer> keep;
-  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
-                                Shape({tokens, c.hidden}));
+  const TensorView x_v =
+      Upload(keep, ToBf16(x), DataType::kBFloat16, Shape({tokens, c.hidden}));
 
   MoeWeights w;
   w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
@@ -626,7 +632,7 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
 
   const TensorView out_routed =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto routed_ffn = MoeFfn::Create(routed_only, tokens);
+  auto routed_ffn = MoeFfn::Create(routed_only, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(routed_ffn.ok()) << routed_ffn.status();
   ASSERT_TRUE(routed_ffn->Forward(x_v, w, out_routed, &*gemm).ok());
 
@@ -635,12 +641,12 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
                             Shape({2 * c.shared_intermediate, c.hidden}));
   w.shared_down = Upload(keep, ToBf16(sdown), DataType::kBFloat16,
                          Shape({c.hidden, c.shared_intermediate}));
-  w.shared_gate = Upload(keep, ToBf16(sgate), DataType::kBFloat16,
-                         Shape({1, c.hidden}));
+  w.shared_gate =
+      Upload(keep, ToBf16(sgate), DataType::kBFloat16, Shape({1, c.hidden}));
 
   const TensorView out_both =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto both_ffn = MoeFfn::Create(c, tokens);
+  auto both_ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(both_ffn.ok()) << both_ffn.status();
   ASSERT_TRUE(both_ffn->Forward(x_v, w, out_both, &*gemm).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -652,11 +658,11 @@ TEST_F(MoeTest, SharedExpertIsAddedToTheRoutedMixture) {
     double row_delta = 0.0;
     for (int64_t i = 0; i < c.hidden; ++i) {
       const size_t idx = static_cast<size_t>(t * c.hidden + i);
-      row_delta += std::abs(__bfloat162float(both[idx]) -
-                            __bfloat162float(routed[idx]));
+      row_delta +=
+          std::abs(__bfloat162float(both[idx]) - __bfloat162float(routed[idx]));
     }
-    EXPECT_GT(row_delta, 1e-3) << "token " << t
-                               << " was untouched by the shared expert";
+    EXPECT_GT(row_delta, 1e-3)
+        << "token " << t << " was untouched by the shared expert";
   }
 }
 
@@ -677,25 +683,25 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
   auto rand_vec = [](size_t n, float salt) {
     std::vector<float> v(n);
     for (size_t i = 0; i < n; ++i) {
-      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
-                         static_cast<int64_t>(i % 13), salt);
+      v[i] = 0.4f *
+             Fill(static_cast<int64_t>(i), static_cast<int64_t>(i % 13), salt);
     }
     return RoundTrip(v);
   };
 
-  const std::vector<float> x = rand_vec(
-      static_cast<size_t>(tokens * c.hidden), 0.1f);
-  const std::vector<float> router = rand_vec(
-      static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
+  const std::vector<float> x =
+      rand_vec(static_cast<size_t>(tokens * c.hidden), 0.1f);
+  const std::vector<float> router =
+      rand_vec(static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
   const std::vector<float> gate_up = rand_vec(
       static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
       1.4f);
   const std::vector<float> down = rand_vec(
       static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate), 2.7f);
-  const std::vector<float> sgu = rand_vec(
-      static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 3.1f);
-  const std::vector<float> sdown = rand_vec(
-      static_cast<size_t>(c.hidden * c.shared_intermediate), 3.9f);
+  const std::vector<float> sgu =
+      rand_vec(static_cast<size_t>(2 * c.shared_intermediate * c.hidden), 3.1f);
+  const std::vector<float> sdown =
+      rand_vec(static_cast<size_t>(c.hidden * c.shared_intermediate), 3.9f);
 
   // The shared MLP by hand: silu(gate) * up through the down projection.
   const int64_t si = c.shared_intermediate;
@@ -723,8 +729,8 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
   }
 
   std::vector<DeviceBuffer> keep;
-  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
-                                Shape({tokens, c.hidden}));
+  const TensorView x_v =
+      Upload(keep, ToBf16(x), DataType::kBFloat16, Shape({tokens, c.hidden}));
 
   MoeWeights w;
   w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
@@ -742,7 +748,7 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
 
   const TensorView out_routed =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto routed_ffn = MoeFfn::Create(routed_only, tokens);
+  auto routed_ffn = MoeFfn::Create(routed_only, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(routed_ffn.ok()) << routed_ffn.status();
   ASSERT_TRUE(routed_ffn->Forward(x_v, w, out_routed, &*gemm).ok());
 
@@ -754,7 +760,7 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
 
   const TensorView out_both =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto both_ffn = MoeFfn::Create(c, tokens);
+  auto both_ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(both_ffn.ok()) << both_ffn.status();
   ASSERT_TRUE(both_ffn->Forward(x_v, w, out_both, &*gemm).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -763,7 +769,8 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
   const auto both = Download<bf16>(out_both, tokens * c.hidden);
 
   double scale = 0.0;
-  for (const float v : want_shared) scale = std::max<double>(scale, std::abs(v));
+  for (const float v : want_shared)
+    scale = std::max<double>(scale, std::abs(v));
   ASSERT_GT(scale, 0.0) << "degenerate shared reference";
 
   double worst = 0.0;
@@ -775,8 +782,8 @@ TEST_F(MoeTest, UngatedSharedExpertAddsExactlyTheSharedMlp) {
 
   // The delta went through one bf16 subtraction on top of the usual two-GEMM
   // error, so the layer test's 2% gets a little headroom.
-  EXPECT_LT(worst / scale, 0.03) << "worst delta error " << worst
-                                 << " against scale " << scale;
+  EXPECT_LT(worst / scale, 0.03)
+      << "worst delta error " << worst << " against scale " << scale;
 }
 
 TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
@@ -795,16 +802,16 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
   auto rand_vec = [](size_t n, float salt) {
     std::vector<float> v(n);
     for (size_t i = 0; i < n; ++i) {
-      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
-                         static_cast<int64_t>(i % 13), salt);
+      v[i] = 0.4f *
+             Fill(static_cast<int64_t>(i), static_cast<int64_t>(i % 13), salt);
     }
     return RoundTrip(v);
   };
 
-  const std::vector<float> x = rand_vec(
-      static_cast<size_t>(tokens * c.hidden), 0.1f);
-  const std::vector<float> router = rand_vec(
-      static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
+  const std::vector<float> x =
+      rand_vec(static_cast<size_t>(tokens * c.hidden), 0.1f);
+  const std::vector<float> router =
+      rand_vec(static_cast<size_t>(c.num_experts * c.hidden), 0.6f);
   const std::vector<float> gate_up = rand_vec(
       static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate * c.hidden),
       1.4f);
@@ -812,8 +819,8 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
       static_cast<size_t>(c.num_experts * c.hidden * c.moe_intermediate), 2.7f);
 
   std::vector<DeviceBuffer> keep;
-  const TensorView x_v = Upload(keep, ToBf16(x), DataType::kBFloat16,
-                                Shape({tokens, c.hidden}));
+  const TensorView x_v =
+      Upload(keep, ToBf16(x), DataType::kBFloat16, Shape({tokens, c.hidden}));
 
   MoeWeights w;
   w.router = Upload(keep, ToBf16(router), DataType::kBFloat16,
@@ -828,7 +835,7 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
 
   const TensorView out_unit =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto unit_ffn = MoeFfn::Create(c, tokens);
+  auto unit_ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(unit_ffn.ok()) << unit_ffn.status();
   ASSERT_TRUE(unit_ffn->Forward(x_v, w, out_unit, &*gemm).ok());
 
@@ -837,7 +844,7 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
 
   const TensorView out_scaled =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
-  auto scaled_ffn = MoeFfn::Create(scaled, tokens);
+  auto scaled_ffn = MoeFfn::Create(scaled, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(scaled_ffn.ok()) << scaled_ffn.status();
   ASSERT_TRUE(scaled_ffn->Forward(x_v, w, out_scaled, &*gemm).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -847,20 +854,20 @@ TEST_F(MoeTest, RoutedScalingFactorScalesTheRoutedMixture) {
 
   double scale = 0.0;
   for (size_t i = 0; i < unit.size(); ++i) {
-    scale = std::max<double>(
-        scale, std::abs(kFactor * __bfloat162float(unit[i])));
+    scale =
+        std::max<double>(scale, std::abs(kFactor * __bfloat162float(unit[i])));
   }
   ASSERT_GT(scale, 0.0) << "degenerate mixture";
 
   double worst = 0.0;
   for (size_t i = 0; i < unit.size(); ++i) {
-    worst = std::max<double>(
-        worst, std::abs(__bfloat162float(got[i]) -
-                        kFactor * __bfloat162float(unit[i])));
+    worst =
+        std::max<double>(worst, std::abs(__bfloat162float(got[i]) -
+                                         kFactor * __bfloat162float(unit[i])));
   }
 
-  EXPECT_LT(worst / scale, 0.02) << "worst error " << worst << " against scale "
-                                 << scale;
+  EXPECT_LT(worst / scale, 0.02)
+      << "worst error " << worst << " against scale " << scale;
 }
 
 TEST_F(MoeTest, SharedGateMustMatchTheConvention) {
@@ -877,8 +884,7 @@ TEST_F(MoeTest, SharedGateMustMatchTheConvention) {
   constexpr int64_t tokens = 4;
 
   std::vector<DeviceBuffer> keep;
-  const std::vector<float> zeros(
-      static_cast<size_t>(tokens * c.hidden), 0.0f);
+  const std::vector<float> zeros(static_cast<size_t>(tokens * c.hidden), 0.0f);
   const TensorView x_v = Upload(keep, ToBf16(zeros), DataType::kBFloat16,
                                 Shape({tokens, c.hidden}));
 
@@ -913,17 +919,17 @@ TEST_F(MoeTest, SharedGateMustMatchTheConvention) {
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden}));
 
   // Gated (the default) without a gate weight: rejected.
-  auto gated = MoeFfn::Create(c, tokens);
+  auto gated = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(gated.ok()) << gated.status();
   EXPECT_FALSE(gated->Forward(x_v, w, out, &*gemm).ok());
 
   // Ungated with a gate weight: also rejected.
   const std::vector<float> gate_w(static_cast<size_t>(c.hidden), 0.01f);
-  w.shared_gate = Upload(keep, ToBf16(gate_w), DataType::kBFloat16,
-                         Shape({1, c.hidden}));
+  w.shared_gate =
+      Upload(keep, ToBf16(gate_w), DataType::kBFloat16, Shape({1, c.hidden}));
   MoeFfn::Config ungated = c;
   ungated.shared_gated = false;
-  auto ungated_ffn = MoeFfn::Create(ungated, tokens);
+  auto ungated_ffn = MoeFfn::Create(ungated, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(ungated_ffn.ok()) << ungated_ffn.status();
   EXPECT_FALSE(ungated_ffn->Forward(x_v, w, out, &*gemm).ok());
 }
@@ -943,37 +949,40 @@ TEST_F(MoeTest, IdenticalInputProducesIdenticalOutput) {
   auto rand_vec = [](size_t n, float salt) {
     std::vector<float> v(n);
     for (size_t i = 0; i < n; ++i) {
-      v[i] = 0.4f * Fill(static_cast<int64_t>(i),
-                         static_cast<int64_t>(i % 13), salt);
+      v[i] = 0.4f *
+             Fill(static_cast<int64_t>(i), static_cast<int64_t>(i % 13), salt);
     }
     return RoundTrip(v);
   };
 
   std::vector<DeviceBuffer> keep;
-  const TensorView x_v =
-      Upload(keep, ToBf16(rand_vec(static_cast<size_t>(tokens * c.hidden), 0.2f)),
-             DataType::kBFloat16, Shape({tokens, c.hidden}));
+  const TensorView x_v = Upload(
+      keep, ToBf16(rand_vec(static_cast<size_t>(tokens * c.hidden), 0.2f)),
+      DataType::kBFloat16, Shape({tokens, c.hidden}));
 
   MoeWeights w;
   w.router = Upload(
-      keep, ToBf16(rand_vec(static_cast<size_t>(c.num_experts * c.hidden), 0.8f)),
+      keep,
+      ToBf16(rand_vec(static_cast<size_t>(c.num_experts * c.hidden), 0.8f)),
       DataType::kBFloat16, Shape({c.num_experts, c.hidden}));
-  w.gate_up = Upload(
-      keep,
-      ToBf16(rand_vec(static_cast<size_t>(c.num_experts * 2 * c.moe_intermediate *
-                                          c.hidden), 1.9f)),
-      DataType::kBFloat16,
-      Shape({c.num_experts, 2 * c.moe_intermediate, c.hidden}));
-  w.down = Upload(
-      keep,
-      ToBf16(rand_vec(static_cast<size_t>(c.num_experts * c.hidden *
-                                          c.moe_intermediate), 2.5f)),
-      DataType::kBFloat16, Shape({c.num_experts, c.hidden, c.moe_intermediate}));
+  w.gate_up =
+      Upload(keep,
+             ToBf16(rand_vec(static_cast<size_t>(c.num_experts * 2 *
+                                                 c.moe_intermediate * c.hidden),
+                             1.9f)),
+             DataType::kBFloat16,
+             Shape({c.num_experts, 2 * c.moe_intermediate, c.hidden}));
+  w.down = Upload(keep,
+                  ToBf16(rand_vec(static_cast<size_t>(c.num_experts * c.hidden *
+                                                      c.moe_intermediate),
+                                  2.5f)),
+                  DataType::kBFloat16,
+                  Shape({c.num_experts, c.hidden, c.moe_intermediate}));
 
   auto gemm = kernels::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
-  auto ffn = MoeFfn::Create(c, tokens);
+  auto ffn = MoeFfn::Create(c, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(ffn.ok()) << ffn.status();
 
   const TensorView out =
@@ -981,10 +990,10 @@ TEST_F(MoeTest, IdenticalInputProducesIdenticalOutput) {
 
   std::vector<bf16> first;
   for (int run = 0; run < 4; ++run) {
-    ASSERT_EQ(cudaMemset(out.Data(), 0,
-                         DataTypeByteSize(DataType::kBFloat16,
-                                          tokens * c.hidden)),
-              cudaSuccess);
+    ASSERT_EQ(
+        cudaMemset(out.Data(), 0,
+                   DataTypeByteSize(DataType::kBFloat16, tokens * c.hidden)),
+        cudaSuccess);
     ASSERT_TRUE(ffn->Forward(x_v, w, out, &*gemm).ok());
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 

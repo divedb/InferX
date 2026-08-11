@@ -160,7 +160,7 @@ Status FlashInferDecode::Plan(int64_t batch, int64_t q_heads,
                               int64_t kv_heads, int64_t head_dim,
                               int64_t page_size,
                               absl::Span<const int32_t> kv_indptr_host,
-                              bool graph_safe, cudaStream_t stream) {
+                              bool graph_safe, Stream stream) {
   if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || page_size <= 0) {
     return InvalidArgumentError("degenerate plan shape: batch=", batch,
                                 " q_heads=", q_heads, " kv_heads=", kv_heads,
@@ -229,7 +229,7 @@ Status FlashInferDecode::Run(const TensorView& q, const TensorView& k_cache,
                              const TensorView& kv_indptr,
                              const TensorView& last_page_len,
                              const TensorView& out, float scale,
-                             cudaStream_t stream) {
+                             Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
   INFERX_RETURN_IF_ERROR(CheckBf16(v_cache, 4, "v_cache"));
@@ -356,7 +356,7 @@ Status FlashInferDecode::Decode(const TensorView& q, const TensorView& k_cache,
                                 absl::Span<const int32_t> kv_indptr_host,
                                 const TensorView& last_page_len,
                                 const TensorView& out, float scale,
-                                cudaStream_t stream) {
+                                Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
 
@@ -377,7 +377,7 @@ Status FlashInferDecode::PlanFp8(int64_t batch, int64_t q_heads,
                                  int64_t kv_heads, int64_t head_dim,
                                  int64_t page_size,
                                  absl::Span<const int32_t> kv_indptr_host,
-                                 bool graph_safe, cudaStream_t stream) {
+                                 bool graph_safe, Stream stream) {
   if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || page_size <= 0) {
     return InvalidArgumentError("degenerate plan shape: batch=", batch,
                                 " q_heads=", q_heads, " kv_heads=", kv_heads,
@@ -445,7 +445,7 @@ Status FlashInferDecode::RunFp8(const TensorView& q, const TensorView& k_cache,
                                 const TensorView& last_page_len,
                                 const TensorView& out, float scale,
                                 float k_scale, float v_scale,
-                                cudaStream_t stream) {
+                                Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckFp8(k_cache, 4, "k_cache"));
   INFERX_RETURN_IF_ERROR(CheckFp8(v_cache, 4, "v_cache"));
@@ -578,7 +578,7 @@ Status FlashInferDecode::DecodeFp8(
     const TensorView& kv_indices, const TensorView& kv_indptr,
     absl::Span<const int32_t> kv_indptr_host, const TensorView& last_page_len,
     const TensorView& out, float scale, float k_scale, float v_scale,
-    cudaStream_t stream) {
+    Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckFp8(k_cache, 4, "k_cache"));
 

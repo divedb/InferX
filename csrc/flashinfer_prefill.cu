@@ -156,7 +156,7 @@ Status FlashInferPrefill::Plan(int64_t batch, int64_t q_heads, int64_t kv_heads,
                                int64_t head_dim, int64_t page_size,
                                absl::Span<const int32_t> qo_indptr_host,
                                absl::Span<const int32_t> kv_indptr_host,
-                               int64_t total_rows, cudaStream_t stream) {
+                               int64_t total_rows, Stream stream) {
   if (batch <= 0) {
     return InvalidArgumentError("batch must be positive, got ", batch);
   }
@@ -222,7 +222,7 @@ Status FlashInferPrefill::Run(
     const TensorView& q, const TensorView& k_cache, const TensorView& v_cache,
     const TensorView& qo_indptr, const TensorView& kv_indices,
     const TensorView& kv_indptr, const TensorView& last_page_len,
-    const TensorView& out, float scale, cudaStream_t stream) {
+    const TensorView& out, float scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckBf16(q, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckBf16(k_cache, 4, "k_cache"));
   INFERX_RETURN_IF_ERROR(CheckBf16(v_cache, 4, "v_cache"));
@@ -358,7 +358,7 @@ Status FlashInferPrefill::Prefill(
     const TensorView& qo_indptr, absl::Span<const int32_t> qo_indptr_host,
     const TensorView& kv_indices, const TensorView& kv_indptr,
     absl::Span<const int32_t> kv_indptr_host, const TensorView& last_page_len,
-    const TensorView& out, float scale, cudaStream_t stream) {
+    const TensorView& out, float scale, Stream stream) {
   if (qo_indptr_host.empty()) {
     return InvalidArgumentError("qo_indptr is empty");
   }
@@ -378,7 +378,7 @@ Status FlashInferPrefill::PrefillFp8(
     const TensorView& kv_indices, const TensorView& kv_indptr,
     absl::Span<const int32_t> kv_indptr_host, const TensorView& last_page_len,
     const TensorView& out, float scale, float k_scale, float v_scale,
-    cudaStream_t stream) {
+    Stream stream) {
   if (qo_indptr_host.empty()) {
     return InvalidArgumentError("qo_indptr is empty");
   }

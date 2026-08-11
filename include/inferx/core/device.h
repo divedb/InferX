@@ -29,6 +29,8 @@ inline constexpr size_t kPageAlignment = 4096;
 enum class DeviceKind : uint8_t {
   kCpu = 0,
   kCuda = 1,
+  kRocm = 2,
+  kAscend = 3,
 };
 
 /// \brief Identifies one device as a (kind, ordinal) pair.
@@ -63,11 +65,21 @@ struct DeviceId {
     return DeviceId(DeviceKind::kCuda, ordinal);
   }
 
+  static constexpr DeviceId Rocm(int8_t ordinal) {
+    return DeviceId(DeviceKind::kRocm, ordinal);
+  }
+
+  static constexpr DeviceId Ascend(int8_t ordinal) {
+    return DeviceId(DeviceKind::kAscend, ordinal);
+  }
+
   /// \brief True if this device is the host (CPU).
   constexpr bool IsCpu() const { return kind == DeviceKind::kCpu; }
 
   /// \brief True if this device is a CUDA GPU.
   constexpr bool IsCuda() const { return kind == DeviceKind::kCuda; }
+
+  constexpr bool IsAccelerator() const { return !IsCpu(); }
 
   friend constexpr bool operator==(const DeviceId& a, const DeviceId& b) {
     return a.kind == b.kind && a.index == b.index;
@@ -85,7 +97,23 @@ struct DeviceId {
   ///
   /// \return A string representing the device ID.
   std::string ToString() const {
-    return IsCpu() ? "cpu" : absl::StrCat("cuda:", static_cast<int>(index));
+    if (IsCpu()) return "cpu";
+    const char* name = "unknown";
+    switch (kind) {
+      case DeviceKind::kCpu:
+        name = "cpu";
+        break;
+      case DeviceKind::kCuda:
+        name = "cuda";
+        break;
+      case DeviceKind::kRocm:
+        name = "rocm";
+        break;
+      case DeviceKind::kAscend:
+        name = "ascend";
+        break;
+    }
+    return absl::StrCat(name, ":", static_cast<int>(index));
   }
 
   template <typename H>

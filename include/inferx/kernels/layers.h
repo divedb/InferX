@@ -1,8 +1,7 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -31,8 +30,7 @@ namespace inferx::kernels {
 /// \param out    `[tokens, hidden]` bf16. May alias `x`.
 /// \param eps    Added inside the sqrt, from the config.
 Status RmsNorm(const TensorView& x, const TensorView& weight,
-               const TensorView& out, float eps,
-               cudaStream_t stream = nullptr);
+               const TensorView& out, float eps, Stream stream = {});
 
 /// \brief Applies rotary position embeddings to Q and K, in place.
 ///
@@ -40,8 +38,9 @@ Status RmsNorm(const TensorView& x, const TensorView& weight,
 /// the original RoFormer code. For a head of width `d` and position `p`, with
 /// `inv_freq[j] = theta^(-2j/d)` for `j < d/2`:
 ///
-///     out[j]       = x[j]       * cos(p·inv_freq[j]) - x[j + d/2] * sin(p·inv_freq[j])
-///     out[j + d/2] = x[j + d/2] * cos(p·inv_freq[j]) + x[j]       * sin(p·inv_freq[j])
+///     out[j]       = x[j]       * cos(p·inv_freq[j]) - x[j + d/2] *
+///     sin(p·inv_freq[j]) out[j + d/2] = x[j + d/2] * cos(p·inv_freq[j]) + x[j]
+///     * sin(p·inv_freq[j])
 ///
 /// Getting the two conventions confused produces a model that generates fluent
 /// text with no long-range coherence, which is why the formula is written out
@@ -56,7 +55,7 @@ Status RmsNorm(const TensorView& x, const TensorView& weight,
 /// \param theta     `rope_theta` from the config (1e6 for Qwen2.5).
 Status RotaryEmbedding(const TensorView& q, const TensorView& k,
                        const TensorView& positions, float theta,
-                       cudaStream_t stream = nullptr);
+                       Stream stream = {});
 
 /// \brief `out = silu(gate) * up`, elementwise, where `silu(x) = x·sigmoid(x)`.
 ///
@@ -69,7 +68,7 @@ Status RotaryEmbedding(const TensorView& q, const TensorView& k,
 /// \param up   `[tokens, intermediate]` bf16.
 /// \param out  `[tokens, intermediate]` bf16. May alias either input.
 Status SiluMul(const TensorView& gate, const TensorView& up,
-               const TensorView& out, cudaStream_t stream = nullptr);
+               const TensorView& out, Stream stream = {});
 
 /// \brief Naive causal self-attention with GQA. Batch 1, no KV cache.
 ///
@@ -89,8 +88,7 @@ Status SiluMul(const TensorView& gate, const TensorView& up,
 /// \param scale Usually `1/sqrt(head_dim)`; passed in so a model that scales
 ///              differently does not need a new kernel.
 Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
-                 const TensorView& out, float scale,
-                 cudaStream_t stream = nullptr);
+                 const TensorView& out, float scale, Stream stream = {});
 
 /// \brief Scatters new K/V into their paged cache slots.
 ///
@@ -108,7 +106,7 @@ Status Attention(const TensorView& q, const TensorView& k, const TensorView& v,
 /// \param slots     `[tokens]` int32, destination slot per token.
 Status AppendToKvCache(const TensorView& k, const TensorView& v,
                        const TensorView& k_cache, const TensorView& v_cache,
-                       const TensorView& slots, cudaStream_t stream = nullptr);
+                       const TensorView& slots, Stream stream = {});
 
 /// \brief Scatters new bf16 K/V into an **fp8 e4m3** paged cache, quantizing
 /// in flight against fixed per-layer scales.
@@ -132,7 +130,7 @@ Status AppendToKvCache(const TensorView& k, const TensorView& v,
 Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
                        const TensorView& k_cache, const TensorView& v_cache,
                        const TensorView& slots, float k_scale, float v_scale,
-                       cudaStream_t stream = nullptr);
+                       Stream stream = {});
 
 /// \brief Causal attention over a paged KV cache.
 ///
@@ -162,21 +160,21 @@ Status AppendBf16AsFp8(const TensorView& k, const TensorView& v,
 ///                    over, which sets the shared-memory tile. Zero means
 ///                    "assume the block table's full width", which is what this
 ///                    used to do unconditionally -- and that was a bug worth
-///                    naming: the table is `max_blocks_per_seq` wide because the
-///                    *scheduler* was configured that way, so a ten-token prompt
-///                    asked for enough shared memory to hold `max_seq_len` keys
-///                    and failed to launch. A server configured for 16k context
-///                    could not prefill anything at all.
+///                    naming: the table is `max_blocks_per_seq` wide because
+///                    the *scheduler* was configured that way, so a ten-token
+///                    prompt asked for enough shared memory to hold
+///                    `max_seq_len` keys and failed to launch. A server
+///                    configured for 16k context could not prefill anything at
+///                    all.
 ///
-///                    Callers inside a captured CUDA graph must pass the largest
-///                    value they will ever replay with, since the tile size is
-///                    baked at capture.
+///                    Callers inside a captured CUDA graph must pass the
+///                    largest value they will ever replay with, since the tile
+///                    size is baked at capture.
 Status PagedAttention(const TensorView& q, const TensorView& k_cache,
                       const TensorView& v_cache, const TensorView& block_table,
                       const TensorView& seq_of_token, const TensorView& q_pos,
                       const TensorView& out, float scale,
-                      int64_t max_context = 0,
-                      cudaStream_t stream = nullptr);
+                      int64_t max_context = 0, Stream stream = {});
 
 /// \brief Paged attention that also writes the per-(token, head) log-sum-exp
 ///        and honours a sliding window.
@@ -188,13 +186,14 @@ Status PagedAttention(const TensorView& q, const TensorView& k_cache,
 ///     makes an attention sink a post-pass rescale (\see kernels/gpt_oss.h,
 ///     `ApplyAttentionSinks`) rather than a change inside the kernel. The plain
 ///     `PagedAttention` computes it internally and discards it; this entry
-///     writes it. The convention is **natural log** (`max + ln sum`), so callers
-///     that pair it with `ApplyAttentionSinks` must pass `lse_is_log2=false`.
+///     writes it. The convention is **natural log** (`max + ln sum`), so
+///     callers that pair it with `ApplyAttentionSinks` must pass
+///     `lse_is_log2=false`.
 ///   * **`window`.** When non-zero, a query at position `p` attends to keys
 ///     `max(0, p - window + 1) .. p` rather than `0 .. p`. gpt-oss alternates
 ///     full and sliding (128) layers; a wrong layer mask is a model with the
-///     wrong receptive field and no error message. `max_context` should be sized
-///     from `window` on a sliding layer so the shared-memory tile is not.
+///     wrong receptive field and no error message. `max_context` should be
+///     sized from `window` on a sliding layer so the shared-memory tile is not.
 ///
 /// `lse` may be an empty `TensorView` when the caller does not need it, in
 /// which case nothing is written; that keeps a graph capture or a path that
@@ -204,9 +203,8 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
                              const TensorView& block_table,
                              const TensorView& seq_of_token,
                              const TensorView& q_pos, const TensorView& out,
-                             const TensorView& lse, float scale,
-                             int64_t window, int64_t max_context = 0,
-                             cudaStream_t stream = nullptr);
+                             const TensorView& lse, float scale, int64_t window,
+                             int64_t max_context = 0, Stream stream = {});
 
 /// \brief Greedy sampling: the argmax of each logits row, on the device.
 ///
@@ -224,7 +222,7 @@ Status PagedAttentionWithLse(const TensorView& q, const TensorView& k_cache,
 ///               but one row of it.
 /// \param out    `[n]` int32, receiving one token id per requested row.
 Status ArgmaxSample(const TensorView& logits, const TensorView& rows,
-                    const TensorView& out, cudaStream_t stream = nullptr);
+                    const TensorView& out, Stream stream = {});
 
 /// \brief Temperature and nucleus (top-p) sampling, on the device.
 ///
@@ -262,7 +260,7 @@ Status SampleTokens(const TensorView& logits, const TensorView& rows,
                     const TensorView& temperature, const TensorView& top_p,
                     const TensorView& top_k, const TensorView& min_p,
                     const TensorView& seeds, const TensorView& out,
-                    cudaStream_t stream = nullptr);
+                    Stream stream = {});
 
 /// \brief Applies repetition/presence/frequency penalties and stop-token
 /// masks to logits rows in place, before sampling.
@@ -288,8 +286,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
                       const TensorView& repetition,
                       const TensorView& history_ids,
                       const TensorView& history_counts,
-                      const TensorView& mask_ids,
-                      cudaStream_t stream = nullptr);
+                      const TensorView& mask_ids, Stream stream = {});
 
 /// \brief Log-probabilities of the sampled tokens, after the fact.
 ///
@@ -309,8 +306,7 @@ Status ApplyPenalties(const TensorView& logits, const TensorView& rows,
 Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
                        const TensorView& chosen, const TensorView& k_wanted,
                        const TensorView& chosen_lp, const TensorView& top_ids,
-                       const TensorView& top_lps,
-                       cudaStream_t stream = nullptr);
+                       const TensorView& top_lps, Stream stream = {});
 
 /// \brief Copies `src[i]` into `dst[slot[i]]`, on the device.
 ///
@@ -323,7 +319,7 @@ Status ComputeLogprobs(const TensorView& logits, const TensorView& rows,
 /// \param dst   `[m]` int32, the next step's token buffer.
 /// \param slots `[n]` int32, destination index in `dst` for each entry.
 Status ScatterTokens(const TensorView& src, const TensorView& dst,
-                     const TensorView& slots, cudaStream_t stream = nullptr);
+                     const TensorView& slots, Stream stream = {});
 
 /// \brief `out[t,:] = table[ids[t],:]`, an embedding lookup.
 ///
@@ -331,7 +327,7 @@ Status ScatterTokens(const TensorView& src, const TensorView& dst,
 /// \param ids   `[tokens]` int32. Out-of-range ids are an error, not a wrap.
 /// \param out   `[tokens, hidden]` bf16.
 Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
-                       const TensorView& out, cudaStream_t stream = nullptr);
+                       const TensorView& out, Stream stream = {});
 
 /// \brief Splits a fused QKV projection into contiguous Q, K and V, adding the
 ///        bias on the way through.
@@ -350,7 +346,7 @@ Status EmbeddingLookup(const TensorView& table, const TensorView& ids,
 /// \param k, v  `[tokens, kv_dim]` bf16.
 Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
                         const TensorView& q, const TensorView& k,
-                        const TensorView& v, cudaStream_t stream = nullptr);
+                        const TensorView& v, Stream stream = {});
 
 /// \brief `out = silu(fused[..., :n]) * fused[..., n:]` for a fused gate/up.
 ///
@@ -361,7 +357,7 @@ Status SplitQkvWithBias(const TensorView& fused, const TensorView& bias,
 /// \param fused `[tokens, 2·intermediate]` bf16.
 /// \param out   `[tokens, intermediate]` bf16.
 Status SiluMulFused(const TensorView& fused, const TensorView& out,
-                    cudaStream_t stream = nullptr);
+                    Stream stream = {});
 
 /// \brief `out[t, i] += bias[i]`, broadcasting the bias across tokens.
 ///
@@ -373,13 +369,13 @@ Status SiluMulFused(const TensorView& fused, const TensorView& out,
 /// \param out  `[tokens, width]` bf16, updated in place.
 /// \param bias `[width]` bf16.
 Status AddBiasInPlace(const TensorView& out, const TensorView& bias,
-                      cudaStream_t stream = nullptr);
+                      Stream stream = {});
 
 /// \brief `out += residual`, elementwise, in bf16 with fp32 accumulation.
 ///
 /// \param out      `[tokens, hidden]` bf16, updated in place.
 /// \param residual `[tokens, hidden]` bf16.
 Status AddInPlace(const TensorView& out, const TensorView& residual,
-                  cudaStream_t stream = nullptr);
+                  Stream stream = {});
 
 }  // namespace inferx::kernels

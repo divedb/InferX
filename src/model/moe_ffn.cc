@@ -1,13 +1,11 @@
 #include "inferx/model/moe_ffn.h"
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cstring>
 #include <utility>
 
-#include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/kernels/gpt_oss.h"
 #include "inferx/kernels/layers.h"
 #include "inferx/kernels/moe.h"
@@ -26,15 +24,14 @@ struct Scratch {
   DeviceBuffer buf;
 
   StatusOr<TensorView> View(DataType dtype, const Shape& shape) const {
-    return TensorView::Create(buf.data(), dtype, shape, DeviceId::Cuda(0));
+    return TensorView::Create(buf.data(), dtype, shape, buf.device());
   }
 };
 
-Status Grow(Scratch* s, size_t bytes) {
+Status Grow(Scratch* s, size_t bytes, DeviceId device) {
   if (s->buf.size() >= bytes) return OkStatus();
 
-  INFERX_ASSIGN_OR_RETURN(s->buf,
-                          DeviceBuffer::Allocate(bytes, DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(s->buf, DeviceBuffer::Allocate(bytes, device));
   return OkStatus();
 }
 
@@ -42,6 +39,8 @@ Status Grow(Scratch* s, size_t bytes) {
 
 struct MoeFfn::Impl {
   MoeFfn::Config config;
+  DeviceId device;
+  DeviceRuntime* runtime = nullptr;
 
   int64_t capacity_tokens = 0;
 
@@ -78,32 +77,37 @@ Status MoeFfn::Impl::EnsureCapacity(int64_t tokens) {
   const size_t bf16_size = DataTypeByteSize(kBf16, 1);
 
   INFERX_RETURN_IF_ERROR(
-      Grow(&router_logits, bf16_size * tokens * config.num_experts));
-  INFERX_RETURN_IF_ERROR(Grow(&weights, sizeof(float) * assignments));
-  INFERX_RETURN_IF_ERROR(Grow(&experts, sizeof(int32_t) * assignments));
+      Grow(&router_logits, bf16_size * tokens * config.num_experts, device));
+  INFERX_RETURN_IF_ERROR(Grow(&weights, sizeof(float) * assignments, device));
+  INFERX_RETURN_IF_ERROR(Grow(&experts, sizeof(int32_t) * assignments, device));
   INFERX_RETURN_IF_ERROR(
-      Grow(&offsets, sizeof(int32_t) * (config.num_experts + 1)));
-  INFERX_RETURN_IF_ERROR(Grow(&rows, sizeof(int32_t) * assignments));
-  INFERX_RETURN_IF_ERROR(Grow(&dest, sizeof(int32_t) * assignments));
+      Grow(&offsets, sizeof(int32_t) * (config.num_experts + 1), device));
+  INFERX_RETURN_IF_ERROR(Grow(&rows, sizeof(int32_t) * assignments, device));
+  INFERX_RETURN_IF_ERROR(Grow(&dest, sizeof(int32_t) * assignments, device));
 
-  INFERX_RETURN_IF_ERROR(Grow(&gathered, bf16_size * assignments * h));
-  INFERX_RETURN_IF_ERROR(Grow(&gate_up, bf16_size * assignments * 2 * inter));
-  INFERX_RETURN_IF_ERROR(Grow(&activated, bf16_size * assignments * inter));
-  INFERX_RETURN_IF_ERROR(Grow(&expert_out, bf16_size * assignments * h));
+  INFERX_RETURN_IF_ERROR(Grow(&gathered, bf16_size * assignments * h, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&gate_up, bf16_size * assignments * 2 * inter, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&activated, bf16_size * assignments * inter, device));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&expert_out, bf16_size * assignments * h, device));
 
   if (config.shared_intermediate > 0) {
     const int64_t si = config.shared_intermediate;
-    INFERX_RETURN_IF_ERROR(Grow(&shared_gate_up, bf16_size * tokens * 2 * si));
-    INFERX_RETURN_IF_ERROR(Grow(&shared_act, bf16_size * tokens * si));
-    INFERX_RETURN_IF_ERROR(Grow(&shared_out, bf16_size * tokens * h));
-    INFERX_RETURN_IF_ERROR(Grow(&shared_gate, bf16_size * tokens));
+    INFERX_RETURN_IF_ERROR(
+        Grow(&shared_gate_up, bf16_size * tokens * 2 * si, device));
+    INFERX_RETURN_IF_ERROR(Grow(&shared_act, bf16_size * tokens * si, device));
+    INFERX_RETURN_IF_ERROR(Grow(&shared_out, bf16_size * tokens * h, device));
+    INFERX_RETURN_IF_ERROR(Grow(&shared_gate, bf16_size * tokens, device));
   }
 
   capacity_tokens = tokens;
   return OkStatus();
 }
 
-StatusOr<MoeFfn> MoeFfn::Create(const Config& config, int64_t max_tokens) {
+StatusOr<MoeFfn> MoeFfn::Create(const Config& config, int64_t max_tokens,
+                                DeviceId device) {
   if (config.hidden <= 0 || config.moe_intermediate <= 0) {
     return InvalidArgumentError(
         "MoeFfn: hidden and moe_intermediate must be "
@@ -124,6 +128,8 @@ StatusOr<MoeFfn> MoeFfn::Create(const Config& config, int64_t max_tokens) {
 
   auto impl = std::make_unique<Impl>();
   impl->config = config;
+  impl->device = device;
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
 
   INFERX_RETURN_IF_ERROR(impl->EnsureCapacity(max_tokens));
 
@@ -137,7 +143,7 @@ MoeFfn& MoeFfn::operator=(MoeFfn&&) noexcept = default;
 
 Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
                        const TensorView& out, kernels::CublasLtGemm* gemm,
-                       cudaStream_t stream) {
+                       Stream stream) {
   if (gemm == nullptr) return InvalidArgumentError("MoeFfn: gemm is null");
 
   if (!x.IsDefined() || x.Rank() != 2 || x.GetDataType() != kBf16) {
@@ -190,10 +196,9 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
         kernels::AddBiasInPlace(logits_v, weights.router_bias, stream));
   }
 
-  INFERX_RETURN_IF_ERROR(kernels::MoeRouteTopK(logits_v, weights_v, experts_v,
-                                               c.norm_topk_prob,
-                                               c.routed_scaling_factor,
-                                               stream));
+  INFERX_RETURN_IF_ERROR(
+      kernels::MoeRouteTopK(logits_v, weights_v, experts_v, c.norm_topk_prob,
+                            c.routed_scaling_factor, stream));
 
   // --- 2. Group by expert ---------------------------------------------------
 
@@ -256,9 +261,9 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
     // cuBLASLt loop whose offsets readback was one D2H sync per layer per
     // step -- and the reason the bf16 FFN could not be graph-captured.
     // Bias is fused into each projection, as on the MXFP4 path.
-    INFERX_RETURN_IF_ERROR(kernels::MoeGroupedGemmBf16(
-        gathered_v, offsets_v, weights.gate_up, weights.gate_up_bias,
-        gate_up_all, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::MoeGroupedGemmBf16(gathered_v, offsets_v, weights.gate_up,
+                                    weights.gate_up_bias, gate_up_all, stream));
     switch (c.activation) {
       case Activation::kSiluMul:
         INFERX_RETURN_IF_ERROR(
@@ -270,9 +275,9 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
                                                      c.swiglu_alpha, stream));
         break;
     }
-    INFERX_RETURN_IF_ERROR(kernels::MoeGroupedGemmBf16(
-        activated_all, offsets_v, weights.down, weights.down_bias,
-        expert_out_all, stream));
+    INFERX_RETURN_IF_ERROR(
+        kernels::MoeGroupedGemmBf16(activated_all, offsets_v, weights.down,
+                                    weights.down_bias, expert_out_all, stream));
   }
 
   // --- 4. Combine, then the shared expert -----------------------------------
@@ -281,7 +286,8 @@ Status MoeFfn::Forward(const TensorView& x, const MoeWeights& weights,
       kernels::MoeCombineRows(expert_out_all, dest_v, weights_v, out, stream));
 
   if (c.shared_intermediate > 0) {
-    if (!weights.shared_gate_up.IsDefined() || !weights.shared_down.IsDefined()) {
+    if (!weights.shared_gate_up.IsDefined() ||
+        !weights.shared_down.IsDefined()) {
       return InvalidArgumentError("MoeFfn: shared_intermediate is ",
                                   c.shared_intermediate,
                                   " but the shared expert's weights are unset");
@@ -342,9 +348,9 @@ StatusOr<std::vector<int32_t>> MoeFfn::LastExpertCounts() const {
     return FailedPreconditionError("MoeFfn: no Forward has run yet");
   }
 
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(offsets.data(), impl_->offsets.buf.data(),
-                 sizeof(int32_t) * offsets.size(), cudaMemcpyDeviceToHost));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->Copy(
+      offsets.data(), impl_->offsets.buf.data(),
+      sizeof(int32_t) * offsets.size(), CopyKind::kDeviceToHost));
 
   std::vector<int32_t> counts(static_cast<size_t>(num_experts));
   for (int64_t e = 0; e < num_experts; ++e) {

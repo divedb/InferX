@@ -10,11 +10,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(INFERX_WITH_CUDA)
-#include <cuda_runtime_api.h>
-
-#include "inferx/core/cuda_utils.h"
-#endif
+#include "inferx/core/device_runtime.h"
 
 namespace inferx::comm {
 namespace {
@@ -27,34 +23,44 @@ class ObservedCommunicator final : public Communicator {
       : inner_(std::move(inner)),
         metrics_(std::move(metrics)),
         config_(config) {
-#if defined(INFERX_WITH_CUDA)
-    if (config_.timing_sample_every == 0 || !inner_->device().IsCuda()) return;
+    if (config_.timing_sample_every == 0 || !inner_->device().IsAccelerator())
+      return;
     if (config_.timing_ring_size == 0) config_.timing_ring_size = 1;
-    if (cudaSetDevice(static_cast<int>(inner_->device().index)) !=
-        cudaSuccess) {
+    auto selected = RuntimeFor(inner_->device());
+    if (!selected.ok()) {
+      metrics_->RecordTimingDrop();
+      config_.timing_sample_every = 0;
+      return;
+    }
+    runtime_ = *selected;
+    if (!runtime_->SetDevice(inner_->device()).ok()) {
       metrics_->RecordTimingDrop();
       config_.timing_sample_every = 0;
       return;
     }
     slots_.resize(config_.timing_ring_size);
     for (Slot& slot : slots_) {
-      if (cudaEventCreate(&slot.start) != cudaSuccess ||
-          cudaEventCreate(&slot.end) != cudaSuccess) {
+      auto start = runtime_->CreateEvent(true);
+      auto end = runtime_->CreateEvent(true);
+      if (!start.ok() || !end.ok()) {
+        if (start.ok()) (void)runtime_->DestroyEvent(*start);
+        if (end.ok()) (void)runtime_->DestroyEvent(*end);
         metrics_->RecordTimingDrop();
         config_.timing_sample_every = 0;
         break;
       }
+      slot.start = *start;
+      slot.end = *end;
     }
-#endif
   }
 
   ~ObservedCommunicator() override {
-#if defined(INFERX_WITH_CUDA)
+    if (runtime_ == nullptr) return;
     for (Slot& slot : slots_) {
-      if (slot.start != nullptr) (void)cudaEventDestroy(slot.start);
-      if (slot.end != nullptr) (void)cudaEventDestroy(slot.end);
+      if (slot.start.handle != nullptr)
+        (void)runtime_->DestroyEvent(slot.start);
+      if (slot.end.handle != nullptr) (void)runtime_->DestroyEvent(slot.end);
     }
-#endif
   }
 
   int rank() const override { return inner_->rank(); }
@@ -65,16 +71,12 @@ class ObservedCommunicator final : public Communicator {
     return inner_->capabilities();
   }
 
-  Status AllReduceSum(const TensorView& tensor, void* stream) override {
+  Status AllReduceSum(const TensorView& tensor, Stream stream) override {
     const uint64_t bytes = tensor.IsDefined() ? tensor.NBytes() : 0;
-#if defined(INFERX_WITH_CUDA)
     PollSamples();
     Slot* sample = BeginSample(stream);
-#endif
     Status result = inner_->AllReduceSum(tensor, stream);
-#if defined(INFERX_WITH_CUDA)
     EndSample(sample, stream, result.ok());
-#endif
     metrics_->RecordAllReduce(bytes, result.ok());
     return result;
   }
@@ -85,10 +87,9 @@ class ObservedCommunicator final : public Communicator {
   }
 
  private:
-#if defined(INFERX_WITH_CUDA)
   struct Slot {
-    cudaEvent_t start = nullptr;
-    cudaEvent_t end = nullptr;
+    DeviceEvent start;
+    DeviceEvent end;
     bool active = false;
     bool record = true;
   };
@@ -96,14 +97,14 @@ class ObservedCommunicator final : public Communicator {
   void PollSamples() noexcept {
     for (Slot& slot : slots_) {
       if (!slot.active) continue;
-      const cudaError_t ready = cudaEventQuery(slot.end);
-      if (ready == cudaErrorNotReady) continue;
-      if (ready == cudaSuccess) {
+      StatusOr<bool> ready = runtime_->QueryEvent(slot.end);
+      if (ready.ok() && !*ready) continue;
+      if (ready.ok()) {
         if (slot.record) {
-          float milliseconds = 0.0f;
-          if (cudaEventElapsedTime(&milliseconds, slot.start, slot.end) ==
-              cudaSuccess) {
-            metrics_->RecordLatency(milliseconds / 1000.0);
+          StatusOr<float> milliseconds =
+              runtime_->ElapsedMs(slot.start, slot.end);
+          if (milliseconds.ok()) {
+            metrics_->RecordLatency(*milliseconds / 1000.0);
           } else {
             metrics_->RecordTimingDrop();
           }
@@ -115,24 +116,23 @@ class ObservedCommunicator final : public Communicator {
     }
   }
 
-  Slot* BeginSample(void* stream) noexcept {
+  Slot* BeginSample(Stream stream) noexcept {
     if (config_.timing_sample_every == 0 || slots_.empty()) return nullptr;
     if (++collective_sequence_ % config_.timing_sample_every != 0) {
       return nullptr;
     }
-    auto cuda_stream = static_cast<cudaStream_t>(stream);
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(cuda_stream, &capture) != cudaSuccess) {
+    StatusOr<bool> capture = runtime_->IsCapturing(stream);
+    if (!capture.ok()) {
       metrics_->RecordTimingDrop();
       return nullptr;
     }
-    if (capture != cudaStreamCaptureStatusNone) {
+    if (*capture) {
       metrics_->RecordGraphSkip();
       return nullptr;
     }
     for (Slot& slot : slots_) {
       if (slot.active) continue;
-      if (cudaEventRecord(slot.start, cuda_stream) != cudaSuccess) {
+      if (!runtime_->RecordEvent(slot.start, stream).ok()) {
         metrics_->RecordTimingDrop();
         return nullptr;
       }
@@ -142,10 +142,9 @@ class ObservedCommunicator final : public Communicator {
     return nullptr;
   }
 
-  void EndSample(Slot* slot, void* stream, bool success) noexcept {
+  void EndSample(Slot* slot, Stream stream, bool success) noexcept {
     if (slot == nullptr) return;
-    if (cudaEventRecord(slot->end, static_cast<cudaStream_t>(stream)) !=
-        cudaSuccess) {
+    if (!runtime_->RecordEvent(slot->end, stream).ok()) {
       metrics_->RecordTimingDrop();
       return;
     }
@@ -153,25 +152,22 @@ class ObservedCommunicator final : public Communicator {
     slot->record = success;
     if (!success) metrics_->RecordTimingDrop();
   }
-#endif
-
   std::unique_ptr<Communicator> inner_;
   std::shared_ptr<CommMetrics> metrics_;
   CommObservationConfig config_;
-#if defined(INFERX_WITH_CUDA)
+  DeviceRuntime* runtime_ = nullptr;
   std::vector<Slot> slots_;
   uint64_t collective_sequence_ = 0;
-#endif
 };
 
-Status ValidateTensor(const TensorView& tensor, bool allow_cuda) {
+Status ValidateTensor(const TensorView& tensor, bool allow_accelerator) {
   if (!tensor.IsDefined())
     return InvalidArgumentError("AllReduceSum: tensor is undefined");
-  if (!tensor.IsCpu() && !tensor.IsCuda())
+  if (!tensor.IsCpu() && !tensor.Device().IsAccelerator())
     return InvalidArgumentError("AllReduceSum: unsupported device");
-  if (tensor.IsCuda() && !allow_cuda)
+  if (tensor.Device().IsAccelerator() && !allow_accelerator)
     return UnimplementedError(
-        "HostSimComm CUDA tensors require a CUDA-enabled build");
+        "HostSimComm accelerator tensors require a matching device runtime");
   switch (tensor.GetDataType()) {
     case DataType::kFloat:
     case DataType::kDouble:
@@ -220,19 +216,21 @@ void SumBf16(const std::vector<std::vector<std::byte>>& inputs, int64_t count,
 }
 
 struct HostSimState {
-  explicit HostSimState(int world_size)
+  HostSimState(int world_size, DeviceId selected_device,
+               DeviceRuntime* selected_runtime)
       : size(world_size),
+        device(selected_device),
+        runtime(selected_runtime),
         inputs(static_cast<size_t>(world_size)),
         outputs(static_cast<size_t>(world_size)) {}
 
-  Status AllReduce(int rank, const TensorView& tensor, void* stream) {
-#if defined(INFERX_WITH_CUDA)
-    constexpr bool kAllowCuda = true;
-#else
-    constexpr bool kAllowCuda = false;
-    (void)stream;
-#endif
-    INFERX_RETURN_IF_ERROR(ValidateTensor(tensor, kAllowCuda));
+  Status AllReduce(int rank, const TensorView& tensor, Stream stream) {
+    INFERX_RETURN_IF_ERROR(ValidateTensor(tensor, runtime != nullptr));
+    if (tensor.Device() != device) {
+      return InvalidArgumentError("HostSimComm rank ", rank, " uses ",
+                                  device.ToString(), " but tensor is on ",
+                                  tensor.Device().ToString());
+    }
 
     std::unique_lock lock(mu);
     if (arrived == 0) {
@@ -253,20 +251,13 @@ struct HostSimState {
         std::memcpy(inputs[static_cast<size_t>(rank)].data(), tensor.Data(),
                     tensor.NBytes());
       } else {
-#if defined(INFERX_WITH_CUDA)
-        auto cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaError_t error = cudaStreamSynchronize(cuda_stream);
-        if (error == cudaSuccess) {
-          error = cudaMemcpy(inputs[static_cast<size_t>(rank)].data(),
-                             tensor.Data(), tensor.NBytes(),
-                             cudaMemcpyDeviceToHost);
+        Status staged = runtime->SynchronizeStream(stream);
+        if (staged.ok()) {
+          staged = runtime->Copy(inputs[static_cast<size_t>(rank)].data(),
+                                 tensor.Data(), tensor.NBytes(),
+                                 CopyKind::kDeviceToHost);
         }
-        if (error != cudaSuccess) {
-          collective_status =
-              InternalError("HostSimComm CUDA staging failed on rank ", rank,
-                            ": ", cudaGetErrorString(error));
-        }
-#endif
+        if (!staged.ok()) collective_status = staged;
       }
     }
     outputs[static_cast<size_t>(rank)] = tensor;
@@ -320,22 +311,20 @@ struct HostSimState {
         if (output.IsCpu()) {
           std::memcpy(output.Data(), result.data(), bytes);
         } else {
-#if defined(INFERX_WITH_CUDA)
-          const cudaError_t error = cudaMemcpy(output.Data(), result.data(),
-                                               bytes, cudaMemcpyHostToDevice);
-          if (error != cudaSuccess) {
-            collective_status =
-                InternalError("HostSimComm CUDA broadcast failed: ",
-                              cudaGetErrorString(error));
+          Status copied = runtime->Copy(output.Data(), result.data(), bytes,
+                                        CopyKind::kHostToDevice);
+          if (!copied.ok()) {
+            collective_status = copied;
             return;
           }
-#endif
         }
       }
     }
   }
 
   const int size;
+  const DeviceId device;
+  DeviceRuntime* const runtime;
   std::mutex mu;
   std::condition_variable cv;
   int arrived = 0;
@@ -356,16 +345,10 @@ class HostSimComm final : public Communicator {
 
   int rank() const override { return rank_; }
   int size() const override { return state_->size; }
-  DeviceId device() const override {
-#if defined(INFERX_WITH_CUDA)
-    return DeviceId::Cuda(0);
-#else
-    return DeviceId::Cpu();
-#endif
-  }
+  DeviceId device() const override { return state_->device; }
   CommBackend backend() const override { return CommBackend::kHostSim; }
   CommCapabilities capabilities() const override { return {}; }
-  Status AllReduceSum(const TensorView& tensor, void* stream) override {
+  Status AllReduceSum(const TensorView& tensor, Stream stream) override {
     return state_->AllReduce(rank_, tensor, stream);
   }
   Status Abort() override { return OkStatus(); }
@@ -452,16 +435,27 @@ std::unique_ptr<Communicator> ObserveCommunicator(
                                                 std::move(metrics), config);
 }
 
-Status SingleRankComm::AllReduceSum(const TensorView& tensor, void*) {
-  return ValidateTensor(tensor, /*allow_cuda=*/true);
+Status SingleRankComm::AllReduceSum(const TensorView& tensor, Stream) {
+  INFERX_RETURN_IF_ERROR(ValidateTensor(tensor, /*allow_accelerator=*/true));
+  if (tensor.Device() != device_) {
+    return InvalidArgumentError("SingleRankComm uses ", device_.ToString(),
+                                " but tensor is on ",
+                                tensor.Device().ToString());
+  }
+  return OkStatus();
 }
 
 StatusOr<std::vector<std::unique_ptr<Communicator>>> CreateHostSimCommunicators(
-    int size) {
+    int size, DeviceId device) {
   if (size <= 0)
     return InvalidArgumentError("communicator size must be positive, got ",
                                 size);
-  auto state = std::make_shared<HostSimState>(size);
+  DeviceRuntime* runtime = nullptr;
+  if (device.IsAccelerator()) {
+    INFERX_ASSIGN_OR_RETURN(runtime, RuntimeFor(device));
+    INFERX_RETURN_IF_ERROR(runtime->SetDevice(device));
+  }
+  auto state = std::make_shared<HostSimState>(size, device, runtime);
   std::vector<std::unique_ptr<Communicator>> communicators;
   communicators.reserve(static_cast<size_t>(size));
   for (int rank = 0; rank < size; ++rank)

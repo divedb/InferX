@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 /// The kernels multi-head latent attention needs that grouped-query attention
@@ -34,7 +35,8 @@
 /// stated rather than assumed.
 namespace inferx::kernels {
 
-/// \brief Applies RoPE in place to the trailing `rope_dim` columns of each head.
+/// \brief Applies RoPE in place to the trailing `rope_dim` columns of each
+/// head.
 ///
 /// MLA splits every Q head into a position-free part and a rotated part laid
 /// out contiguously as `[nope | rope]`, so the rotated part is a strided
@@ -57,7 +59,7 @@ namespace inferx::kernels {
 /// \param theta     `rope_theta` from the config.
 Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
                       const TensorView& positions, float theta,
-                      cudaStream_t stream = nullptr);
+                      Stream stream = {});
 
 /// \brief `MlaRopeInPlace` with the frequencies from a precomputed table.
 ///
@@ -82,7 +84,7 @@ Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
 ///                    attention softmax scale instead.
 Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
                         const TensorView& positions, const TensorView& inv_freq,
-                        float attn_factor, cudaStream_t stream = nullptr);
+                        float attn_factor, Stream stream = {});
 
 /// \brief Splits `[rows, heads, a + b]` into `[rows, heads, a]` and
 ///        `[rows, heads, b]`.
@@ -97,7 +99,7 @@ Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
 /// \param head `[rows, heads, a]` bf16 — the leading part.
 /// \param tail `[rows, heads, b]` bf16 — the trailing part.
 Status SplitTrailing(const TensorView& src, const TensorView& head,
-                     const TensorView& tail, cudaStream_t stream = nullptr);
+                     const TensorView& tail, Stream stream = {});
 
 /// \brief Writes each token's latent and shared RoPE key into the paged cache.
 ///
@@ -113,7 +115,7 @@ Status SplitTrailing(const TensorView& src, const TensorView& head,
 ///                     `block · block_size + offset` each token writes to.
 Status MlaAppendLatent(const TensorView& latent, const TensorView& rope_key,
                        const TensorView& cache, const TensorView& slot_mapping,
-                       cudaStream_t stream = nullptr);
+                       Stream stream = {});
 
 /// \brief Reads a sequence's cached latents back into a contiguous buffer.
 ///
@@ -129,7 +131,7 @@ Status MlaAppendLatent(const TensorView& latent, const TensorView& rope_key,
 /// \param out          `[context_len, kv_lora_rank + qk_rope_head_dim]` bf16.
 Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
                         int64_t context_len, const TensorView& out,
-                        cudaStream_t stream = nullptr);
+                        Stream stream = {});
 
 /// \brief Causal attention over reconstructed K/V, with the decoupled RoPE key.
 ///
@@ -150,10 +152,10 @@ Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
 /// \param q_nope     `[q_tokens, heads, qk_nope_head_dim]` bf16.
 /// \param q_rope     `[q_tokens, heads, qk_rope_head_dim]` bf16, rotated.
 /// \param k_nope     `[context, heads, qk_nope_head_dim]` bf16.
-/// \param k_rope     `[context, qk_rope_head_dim]` bf16, rotated. One per token.
-/// \param v          `[context, heads, v_head_dim]` bf16.
-/// \param out        `[q_tokens, heads, v_head_dim]` bf16.
-/// \param query_base Absolute position of the first query token, so causality
+/// \param k_rope     `[context, qk_rope_head_dim]` bf16, rotated. One per
+/// token. \param v          `[context, heads, v_head_dim]` bf16. \param out
+/// `[q_tokens, heads, v_head_dim]` bf16. \param query_base Absolute position of
+/// the first query token, so causality
 ///                   is `key_pos <= query_base + i`. A decode step passes
 ///                   `context - 1`; a prefill from empty passes 0.
 /// \param scale      `1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`, passed
@@ -162,8 +164,7 @@ Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
 Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
                     const TensorView& k_nope, const TensorView& k_rope,
                     const TensorView& v, const TensorView& out,
-                    int64_t query_base, float scale,
-                    cudaStream_t stream = nullptr);
+                    int64_t query_base, float scale, Stream stream = {});
 
 // --- The absorbed form (§14, M9's "obvious next move") ----------------------
 //
@@ -191,7 +192,7 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
 /// \param v_head_dim The v width, needed only to stride between heads.
 Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
                   const TensorView& q_lat, int64_t v_head_dim,
-                  cudaStream_t stream = nullptr);
+                  Stream stream = {});
 
 /// \brief Causal attention of absorbed queries directly against the paged
 ///        latent cache.
@@ -215,7 +216,7 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
                           const TensorView& cache,
                           const TensorView& block_table, int64_t context_len,
                           const TensorView& out_lat, int64_t query_base,
-                          float scale, cudaStream_t stream = nullptr);
+                          float scale, Stream stream = {});
 
 /// \brief `out[t,h] = W_UV[h] · attn_lat[t,h]`.
 ///
@@ -226,6 +227,6 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
 /// \param qk_nope_head_dim The nope width, needed only to stride heads.
 Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
                       const TensorView& out, int64_t qk_nope_head_dim,
-                      cudaStream_t stream = nullptr);
+                      Stream stream = {});
 
 }  // namespace inferx::kernels

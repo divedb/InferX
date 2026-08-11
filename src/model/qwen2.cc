@@ -7,13 +7,11 @@
 #include <utility>
 #include <vector>
 
-#include <cuda_runtime.h>
-
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
 #include "inferx/comm/communicator.h"
 #include "inferx/comm/tensor_parallel.h"
 #include "inferx/core/device_buffer.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
@@ -84,6 +82,7 @@ struct Scratch {
 struct Qwen2Model::Impl {
   ModelConfig config;
   std::unique_ptr<comm::Communicator> comm;
+  DeviceRuntime* runtime = nullptr;
 
   std::vector<DeviceBuffer> weight_buffers;
   std::vector<LayerWeights> layers;
@@ -130,12 +129,12 @@ struct Qwen2Model::Impl {
 
   // Everything device-side runs on this stream rather than the default one,
   // because a graph cannot be captured from the legacy default stream.
-  cudaStream_t stream = nullptr;
+  Stream stream;
 
   // Page-locked staging for the per-step index arrays, and for the logits on
   // the way back.
   //
-  // A cudaMemcpy from ordinary pageable memory is synchronous *and* stages
+  // A device copy from ordinary pageable memory is synchronous and stages
   // through a driver-owned bounce buffer, so the eight tiny index uploads a
   // step needs cost 0.149 ms of host time between them -- far more than the
   // bytes justify. From pinned memory the same copies are asynchronous enqueues
@@ -147,8 +146,8 @@ struct Qwen2Model::Impl {
 
   // Events bracketing the device portion of a step, so the split between work
   // and the host wrapper around it can be measured rather than inferred.
-  cudaEvent_t step_begin = nullptr;
-  cudaEvent_t step_end = nullptr;
+  DeviceEvent step_begin;
+  DeviceEvent step_end;
   float last_device_ms = 0.0f;
 
   /// Grows the index staging buffer. Contents are not preserved; every step
@@ -156,12 +155,11 @@ struct Qwen2Model::Impl {
   Status EnsurePinned(size_t bytes) {
     if (bytes <= pinned_bytes) return OkStatus();
 
-    if (pinned != nullptr) cudaFreeHost(pinned);
+    if (pinned != nullptr) INFERX_RETURN_IF_ERROR(runtime->FreePinnedHost(pinned));
     pinned = nullptr;
     pinned_bytes = 0;
 
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaHostAlloc(&pinned, bytes, cudaHostAllocDefault));
+    INFERX_ASSIGN_OR_RETURN(pinned, runtime->AllocatePinnedHost(bytes));
     pinned_bytes = bytes;
 
     return OkStatus();
@@ -227,7 +225,7 @@ struct Qwen2Model::Impl {
   /// Host copy of the last step's per-row logprob request, so the readback
   /// knows which pinned entries are live.
   std::vector<int32_t> last_logprob_ks;
-  cudaEvent_t sampled_ready = nullptr;
+  DeviceEvent sampled_ready;
   int64_t sampled_count = 0;
 
   bool weights_f8 = false;
@@ -258,24 +256,25 @@ struct Qwen2Model::Impl {
     int64_t tokens = 0;
     int64_t num_seqs = 0;
     int64_t max_blocks = 0;
-    cudaGraphExec_t exec = nullptr;
+    GraphExec exec;
   };
   std::vector<DecodeGraph> graphs;
 
   ~Impl() {
     for (DecodeGraph& g : graphs) {
-      if (g.exec != nullptr) cudaGraphExecDestroy(g.exec);
+      if (g.exec.handle != nullptr) (void)runtime->DestroyGraph(g.exec);
     }
-    if (sampled_ready != nullptr) cudaEventDestroy(sampled_ready);
-    if (pinned_sampled != nullptr) cudaFreeHost(pinned_sampled);
-    if (pinned_lp_chosen != nullptr) cudaFreeHost(pinned_lp_chosen);
-    if (pinned_lp_top_ids != nullptr) cudaFreeHost(pinned_lp_top_ids);
-    if (pinned_lp_top_lps != nullptr) cudaFreeHost(pinned_lp_top_lps);
-    if (step_begin != nullptr) cudaEventDestroy(step_begin);
-    if (step_end != nullptr) cudaEventDestroy(step_end);
-    if (pinned != nullptr) cudaFreeHost(pinned);
-    if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
-    if (stream != nullptr) cudaStreamDestroy(stream);
+    if (sampled_ready.handle != nullptr)
+      (void)runtime->DestroyEvent(sampled_ready);
+    if (pinned_sampled != nullptr) (void)runtime->FreePinnedHost(pinned_sampled);
+    if (pinned_lp_chosen != nullptr) (void)runtime->FreePinnedHost(pinned_lp_chosen);
+    if (pinned_lp_top_ids != nullptr) (void)runtime->FreePinnedHost(pinned_lp_top_ids);
+    if (pinned_lp_top_lps != nullptr) (void)runtime->FreePinnedHost(pinned_lp_top_lps);
+    if (step_begin.handle != nullptr) (void)runtime->DestroyEvent(step_begin);
+    if (step_end.handle != nullptr) (void)runtime->DestroyEvent(step_end);
+    if (pinned != nullptr) (void)runtime->FreePinnedHost(pinned);
+    if (pinned_logits != nullptr) (void)runtime->FreePinnedHost(pinned_logits);
+    if (stream.handle != nullptr) (void)runtime->DestroyStream(stream);
   }
 
   /// One projection, in whichever precision the model is configured for.
@@ -341,13 +340,13 @@ struct Qwen2Model::Impl {
   Status LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                           int64_t max_blocks_per_seq);
 
-  cudaGraphExec_t FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
+  GraphExec FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
     for (DecodeGraph& g : graphs) {
       if (g.tokens == tokens && g.num_seqs == seqs && g.max_blocks == blocks) {
         return g.exec;
       }
     }
-    return nullptr;
+    return {};
   }
 };
 
@@ -407,12 +406,13 @@ Status Qwen2Model::Impl::EnsureCapacity(int64_t tokens) {
                               static_cast<size_t>(vocab) * 2;
 
   if (logits_bytes > pinned_logits_bytes) {
-    if (pinned_logits != nullptr) cudaFreeHost(pinned_logits);
+    if (pinned_logits != nullptr)
+      INFERX_RETURN_IF_ERROR(runtime->FreePinnedHost(pinned_logits));
     pinned_logits = nullptr;
     pinned_logits_bytes = 0;
 
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaHostAlloc(&pinned_logits, logits_bytes, cudaHostAllocDefault));
+    INFERX_ASSIGN_OR_RETURN(pinned_logits,
+                            runtime->AllocatePinnedHost(logits_bytes));
     pinned_logits_bytes = logits_bytes;
   }
 
@@ -438,12 +438,12 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
   for (int64_t i = 0; i < tokens; ++i) pos[static_cast<size_t>(i)] =
       static_cast<int32_t>(i);
 
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(positions.data(), pos.data(),
-                 pos.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaMemcpy(token_ids.data(), ids.data(), ids.size() * sizeof(int32_t),
-                 cudaMemcpyHostToDevice));
+  INFERX_RETURN_IF_ERROR(runtime->Copy(positions.data(), pos.data(),
+                                       pos.size() * sizeof(int32_t),
+                                       CopyKind::kHostToDevice));
+  INFERX_RETURN_IF_ERROR(runtime->Copy(token_ids.data(), ids.data(),
+                                       ids.size() * sizeof(int32_t),
+                                       CopyKind::kHostToDevice));
 
   INFERX_ASSIGN_OR_RETURN(
       const TensorView ids_v,
@@ -508,9 +508,9 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
   for (const LayerWeights& layer : layers) {
     // --- attention block -------------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(resid.Data(), x.Data(),
-                                           static_cast<size_t>(x.NBytes()),
-                                           cudaMemcpyDeviceToDevice));
+    INFERX_RETURN_IF_ERROR(runtime->Copy(resid.Data(), x.Data(),
+                                         static_cast<size_t>(x.NBytes()),
+                                         CopyKind::kDeviceToDevice));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, layer.input_norm, norm,
                                             static_cast<float>(
@@ -532,9 +532,9 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid));
 
     // --- feed-forward block ----------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(resid.Data(), x.Data(),
-                                           static_cast<size_t>(x.NBytes()),
-                                           cudaMemcpyDeviceToDevice));
+    INFERX_RETURN_IF_ERROR(runtime->Copy(resid.Data(), x.Data(),
+                                         static_cast<size_t>(x.NBytes()),
+                                         CopyKind::kDeviceToDevice));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, layer.post_norm, norm,
                                             static_cast<float>(
@@ -557,7 +557,7 @@ Status Qwen2Model::Impl::RunForward(const std::vector<int32_t>& ids,
 
   INFERX_RETURN_IF_ERROR(gemm.LinearBF16(norm, lm_head, logits_v));
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(Stream{}));
 
   return OkStatus();
 }
@@ -627,9 +627,9 @@ Status Qwen2Model::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
 
     std::memcpy(static_cast<std::byte*>(pinned) + staged, src.data(), bytes);
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         buf.data(), static_cast<std::byte*>(pinned) + staged, bytes,
-        cudaMemcpyHostToDevice, stream));
+        CopyKind::kHostToDevice, stream));
 
     staged += bytes;
     return OkStatus();
@@ -911,9 +911,9 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
        layer_index < static_cast<int64_t>(layers.size()); ++layer_index) {
     LayerWeights& layer = layers[static_cast<size_t>(layer_index)];
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
         x, layer.input_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
@@ -958,13 +958,13 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
             k3, k_fp8_tmp, k_scale_dev, stream));
         INFERX_RETURN_IF_ERROR(kernels::QuantizeToF8E4M3Dynamic(
             v3, k_fp8_tmp, v_scale_dev, stream));
-        INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
-        INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(&layer.k_scale, k_scale_dev,
-                                               sizeof(float),
-                                               cudaMemcpyDeviceToHost));
-        INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(&layer.v_scale, v_scale_dev,
-                                               sizeof(float),
-                                               cudaMemcpyDeviceToHost));
+        INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
+        INFERX_RETURN_IF_ERROR(runtime->Copy(&layer.k_scale, k_scale_dev,
+                                             sizeof(float),
+                                             CopyKind::kDeviceToHost));
+        INFERX_RETURN_IF_ERROR(runtime->Copy(&layer.v_scale, v_scale_dev,
+                                             sizeof(float),
+                                             CopyKind::kDeviceToHost));
       }
       INFERX_RETURN_IF_ERROR(kernels::AppendBf16AsFp8(
           k3, v3, k_cache, v_cache, slots_v, layer.k_scale, layer.v_scale,
@@ -1032,12 +1032,12 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     INFERX_RETURN_IF_ERROR(Linear(av, layer.o_w, layer.o_w8, layer.o_s,
                                   layer.o_w4, layer.o_s4, x, 1));
     INFERX_RETURN_IF_ERROR(
-        comm->AllReduceSum(x, static_cast<void*>(stream)));
+        comm->AllReduceSum(x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), static_cast<size_t>(x.NBytes()),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
         x, layer.post_norm, norm, static_cast<float>(config.rms_norm_eps), stream));
@@ -1053,7 +1053,7 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
                                   layer.down_s, layer.down_w4, layer.down_s4,
                                   x, 3));
     INFERX_RETURN_IF_ERROR(
-        comm->AllReduceSum(x, static_cast<void*>(stream)));
+        comm->AllReduceSum(x, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(x, resid, stream));
   }
 
@@ -1197,18 +1197,18 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
 
       const size_t lp_cap =
           static_cast<size_t>(ForwardBatch::kMaxTopLogprobs);
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
           pinned_lp_chosen, lp_chosen.data(),
           static_cast<size_t>(sampled_count) * sizeof(float),
-          cudaMemcpyDeviceToHost, stream));
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          CopyKind::kDeviceToHost, stream));
+      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
           pinned_lp_top_ids, lp_top_ids.data(),
           static_cast<size_t>(sampled_count) * lp_cap * sizeof(int32_t),
-          cudaMemcpyDeviceToHost, stream));
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+          CopyKind::kDeviceToHost, stream));
+      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
           pinned_lp_top_lps, lp_top_lps.data(),
           static_cast<size_t>(sampled_count) * lp_cap * sizeof(float),
-          cudaMemcpyDeviceToHost, stream));
+          CopyKind::kDeviceToHost, stream));
     }
 
     INFERX_ASSIGN_OR_RETURN(
@@ -1225,14 +1225,14 @@ Status Qwen2Model::Impl::LaunchDecodeBody(int64_t tokens, int64_t num_seqs,
     // The copy out is stream-ordered work and belongs in the graph. The event
     // that tells the host it has landed does NOT: an event recorded inside a
     // captured region becomes a graph-internal dependency node, and replaying
-    // the graph never signals the host-visible event. cudaEventSynchronize then
+    // the graph never signals the host-visible event. Waiting on it then
     // returns immediately on something that was never set, and generation
     // reports thousands of tokens a second while reading a stale buffer. The
     // record lives in StepAsync, after the launch.
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         pinned_sampled, sampled_ids.data(),
         static_cast<size_t>(sampled_count) * sizeof(int32_t),
-        cudaMemcpyDeviceToHost, stream));
+        CopyKind::kDeviceToHost, stream));
   }
 
   return OkStatus();
@@ -1244,28 +1244,28 @@ Status Qwen2Model::Impl::RunPagedForward(const ForwardBatch& batch) {
 
   const int64_t tokens = batch.num_tokens();
 
-  cudaGraphExec_t graph =
+  GraphExec graph =
       FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaEventRecord(step_begin, stream));
+  INFERX_RETURN_IF_ERROR(runtime->RecordEvent(step_begin, stream));
 
-  if (graph != nullptr) {
+  if (graph.handle != nullptr) {
     // The replay reads exactly the buffers PrepareBatchInputs just wrote. That
     // is the whole contract: a graph fixes the *structure* of the step -- which
     // kernels, what dimensions, which pointers -- while every value it reads
     // still comes from memory that was updated a moment ago. Sequence lengths,
     // block tables and token ids all change freely between replays; only the
     // shape may not.
-    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, stream));
+    INFERX_RETURN_IF_ERROR(runtime->LaunchGraph(graph, stream));
   } else {
     INFERX_RETURN_IF_ERROR(LaunchDecodeBody(tokens, batch.num_seqs,
                                             batch.max_blocks_per_seq));
   }
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaEventRecord(step_end, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaEventElapsedTime(&last_device_ms, step_begin, step_end));
+  INFERX_RETURN_IF_ERROR(runtime->RecordEvent(step_end, stream));
+  INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
+  INFERX_ASSIGN_OR_RETURN(last_device_ms,
+                          runtime->ElapsedMs(step_begin, step_end));
 
   return OkStatus();
 }
@@ -1305,11 +1305,12 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
         ". Converting on upload is straightforward but is not done here, so "
         "that what runs is what the file contains.");
   }
-  if (!device.IsCuda()) {
-    return InvalidArgumentError("Qwen2Model requires a CUDA communicator "
-                                "device, got ", device.ToString());
+  if (!device.IsAccelerator()) {
+    return InvalidArgumentError("Qwen2Model requires an accelerator "
+                                "communicator device, got ", device.ToString());
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(static_cast<int>(device.index)));
+  INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
+  INFERX_RETURN_IF_ERROR(runtime->SetDevice(device));
 
   INFERX_ASSIGN_OR_RETURN(kernels::CublasLtGemm gemm,
                           kernels::CublasLtGemm::Create());
@@ -1317,16 +1318,16 @@ StatusOr<Qwen2Model> Qwen2Model::Load(
   auto impl =
       std::make_unique<Impl>(std::move(gemm), std::move(communicator));
   impl->config = config;
+  impl->runtime = runtime;
 
   // A dedicated stream, non-blocking. Two reasons, and the first is not
   // optional: the legacy default stream cannot be captured at all, and
-  // attempting it returns cudaErrorStreamCaptureUnsupported. Non-blocking so it
+  // attempting it is unsupported. Non-blocking so it
   // does not implicitly synchronize against the default stream, which would
   // reintroduce exactly the serialization graphs are here to remove.
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl->step_begin));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl->step_end));
+  INFERX_ASSIGN_OR_RETURN(impl->stream, runtime->CreateStream(device));
+  INFERX_ASSIGN_OR_RETURN(impl->step_begin, runtime->CreateEvent(true));
+  INFERX_ASSIGN_OR_RETURN(impl->step_end, runtime->CreateEvent(true));
 
   const int64_t h = config.hidden_size;
   const int64_t inter = config.intermediate_size;
@@ -1525,14 +1526,15 @@ Status ValidateIds(const std::vector<int32_t>& ids, int64_t vocab) {
 /// of host time per step. Pinned, it is a stream-ordered transfer like any
 /// other.
 Status DownloadLogitsPinned(const DeviceBuffer& buf, int64_t offset_elems,
-                            int64_t count, void* pinned, cudaStream_t stream,
+                            int64_t count, void* pinned, DeviceRuntime* runtime,
+                            Stream stream,
                             std::vector<float>* out) {
   const auto* bits = static_cast<const uint16_t*>(pinned);
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
       pinned, static_cast<const std::byte*>(buf.data()) + offset_elems * 2,
-      static_cast<size_t>(count) * 2, cudaMemcpyDeviceToHost, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+      static_cast<size_t>(count) * 2, CopyKind::kDeviceToHost, stream));
+  INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
 
   out->resize(static_cast<size_t>(count));
 
@@ -1560,7 +1562,8 @@ Status Qwen2Model::Forward(const std::vector<int32_t>& token_ids,
 
   return DownloadLogitsPinned(impl_->logits.buf, 0,
                               tokens * impl_->config.vocab_size,
-                              impl_->pinned_logits, impl_->stream, out_logits);
+                              impl_->pinned_logits, impl_->runtime,
+                              impl_->stream, out_logits);
 }
 
 namespace {
@@ -1639,7 +1642,7 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   // prefill lengths vary per request and would need a graph each.
   const int64_t tokens = num_seqs;
 
-  if (impl_->FindGraph(tokens, num_seqs, max_blocks_per_seq) != nullptr) {
+  if (impl_->FindGraph(tokens, num_seqs, max_blocks_per_seq).handle != nullptr) {
     return OkStatus();
   }
 
@@ -1712,28 +1715,21 @@ Status Qwen2Model::CaptureDecodeGraph(int64_t num_seqs,
   // it happened during capture it would be baked into the graph.
   INFERX_RETURN_IF_ERROR(
       impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
-
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
-      impl_->stream, cudaStreamCaptureModeThreadLocal));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->BeginCapture(impl_->stream));
 
   const Status body =
       impl_->LaunchDecodeBody(tokens, num_seqs, max_blocks_per_seq);
 
-  cudaGraph_t graph = nullptr;
-  const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
-
   // Capture must be ended even if the body failed, or the stream stays in
   // capture mode and every later launch on it fails with an opaque error.
+  StatusOr<GraphExec> captured =
+      impl_->runtime->EndCaptureAndInstantiate(impl_->stream);
+  if (!body.ok() && captured.ok()) {
+    (void)impl_->runtime->DestroyGraph(*captured);
+  }
   INFERX_RETURN_IF_ERROR(body);
-  INFERX_CUDA_RETURN_IF_ERROR(ended);
-
-  cudaGraphExec_t exec = nullptr;
-  const cudaError_t instantiated =
-      cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
-
-  cudaGraphDestroy(graph);  // the executable owns what it needs
-  INFERX_CUDA_RETURN_IF_ERROR(instantiated);
+  INFERX_ASSIGN_OR_RETURN(GraphExec exec, std::move(captured));
 
   impl_->graphs.push_back({tokens, num_seqs, max_blocks_per_seq, exec});
 
@@ -1817,7 +1813,7 @@ Status Qwen2Model::QuantizeWeightsToF8() {
     INFERX_RETURN_IF_ERROR(quantize(w.down_w, &w.down_w8, &w.down_s, index++));
   }
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
   impl_->f8_buffers.push_back(std::move(scales));
 
@@ -1910,7 +1906,7 @@ Status Qwen2Model::QuantizeWeightsToInt4() {
         quantize(w.gate_up_w, &w.gate_up_w4, &w.gate_up_s4));
     INFERX_RETURN_IF_ERROR(quantize(w.down_w, &w.down_w4, &w.down_s4));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
   for (const LayerWeights& w : impl_->layers) {
     for (const int index : {w.qkv_buf, w.o_buf, w.gate_up_buf, w.down_buf}) {
@@ -2045,32 +2041,38 @@ Status Qwen2Model::EnableDeviceSampling(int64_t max_rows) {
       DeviceBuffer::Allocate(rows * kMaxLp * sizeof(float),
                              impl_->comm->device()));
 
-  if (impl_->pinned_sampled != nullptr) cudaFreeHost(impl_->pinned_sampled);
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaHostAlloc(&impl_->pinned_sampled,
-                    static_cast<size_t>(max_rows) * sizeof(int32_t),
-                    cudaHostAllocDefault));
+  if (impl_->pinned_sampled != nullptr)
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->FreePinnedHost(impl_->pinned_sampled));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->pinned_sampled,
+      impl_->runtime->AllocatePinnedHost(
+          static_cast<size_t>(max_rows) * sizeof(int32_t)));
   if (impl_->pinned_lp_chosen != nullptr) {
-    cudaFreeHost(impl_->pinned_lp_chosen);
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->FreePinnedHost(impl_->pinned_lp_chosen));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_chosen,
-                                            rows * sizeof(float),
-                                            cudaHostAllocDefault));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->pinned_lp_chosen,
+      impl_->runtime->AllocatePinnedHost(rows * sizeof(float)));
   if (impl_->pinned_lp_top_ids != nullptr) {
-    cudaFreeHost(impl_->pinned_lp_top_ids);
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->FreePinnedHost(impl_->pinned_lp_top_ids));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_top_ids,
-                                            rows * kMaxLp * sizeof(int32_t),
-                                            cudaHostAllocDefault));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->pinned_lp_top_ids,
+      impl_->runtime->AllocatePinnedHost(rows * kMaxLp * sizeof(int32_t)));
   if (impl_->pinned_lp_top_lps != nullptr) {
-    cudaFreeHost(impl_->pinned_lp_top_lps);
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->FreePinnedHost(impl_->pinned_lp_top_lps));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(&impl_->pinned_lp_top_lps,
-                                            rows * kMaxLp * sizeof(float),
-                                            cudaHostAllocDefault));
+  INFERX_ASSIGN_OR_RETURN(
+      impl_->pinned_lp_top_lps,
+      impl_->runtime->AllocatePinnedHost(rows * kMaxLp * sizeof(float)));
 
-  if (impl_->sampled_ready == nullptr) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaEventCreate(&impl_->sampled_ready));
+  if (impl_->sampled_ready.handle == nullptr) {
+    INFERX_ASSIGN_OR_RETURN(impl_->sampled_ready,
+                            impl_->runtime->CreateEvent(false));
   }
 
   impl_->sample_on_device = true;
@@ -2149,13 +2151,15 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
       slots[i] = batch.seq_of_token[static_cast<size_t>(rows[i])];
     }
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_rows.data(), rows.data(), rows.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice, impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_slots.data(), slots.data(),
-        slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
+    const auto upload = [&](const DeviceBuffer& dst, const void* src,
+                            size_t bytes) {
+      return impl_->runtime->CopyAsync(dst.data(), src, bytes,
+                                       CopyKind::kHostToDevice, impl_->stream);
+    };
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_rows, rows.data(), rows.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_slots, slots.data(), slots.size() * sizeof(int32_t)));
 
     // Per-row sampling parameters. Absent means greedy with everything off,
     // so a caller that never heard of sampling keeps the behaviour it had.
@@ -2202,61 +2206,41 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
       mask_ids = batch.mask_token_ids;
     }
 
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_temp.data(), temps.data(), temps.size() * sizeof(float),
-        cudaMemcpyHostToDevice, impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_top_p.data(), tops.data(), tops.size() * sizeof(float),
-        cudaMemcpyHostToDevice, impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_top_k.data(), top_ks.data(),
-        top_ks.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_min_p.data(), min_ps.data(),
-        min_ps.size() * sizeof(float), cudaMemcpyHostToDevice, impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_presence.data(), presences.data(),
-        presences.size() * sizeof(float), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_frequency.data(), frequencies.data(),
-        frequencies.size() * sizeof(float), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_repetition.data(), repetitions.data(),
-        repetitions.size() * sizeof(float), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_hist_ids.data(), hist_ids.data(),
-        hist_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_hist_counts.data(), hist_counts.data(),
-        hist_counts.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_mask_ids.data(), mask_ids.data(),
-        mask_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_logprobs_k.data(), logprob_ks.data(),
-        logprob_ks.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
-        impl_->stream));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_temp, temps.data(), temps.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_top_p, tops.data(), tops.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_top_k, top_ks.data(), top_ks.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_min_p, min_ps.data(), min_ps.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_presence, presences.data(),
+                                  presences.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_frequency, frequencies.data(),
+                                  frequencies.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_repetition, repetitions.data(),
+                                  repetitions.size() * sizeof(float)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_hist_ids, hist_ids.data(),
+                                  hist_ids.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_hist_counts, hist_counts.data(),
+                                  hist_counts.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_mask_ids, mask_ids.data(),
+                                  mask_ids.size() * sizeof(int32_t)));
+    INFERX_RETURN_IF_ERROR(upload(impl_->sample_logprobs_k, logprob_ks.data(),
+                                  logprob_ks.size() * sizeof(int32_t)));
     impl_->last_logprob_ks = std::move(logprob_ks);
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        impl_->sample_seeds.data(), seeds.data(),
-        seeds.size() * sizeof(uint64_t), cudaMemcpyHostToDevice,
-        impl_->stream));
+    INFERX_RETURN_IF_ERROR(upload(
+        impl_->sample_seeds, seeds.data(), seeds.size() * sizeof(uint64_t)));
   }
 
   const int64_t tokens = batch.num_tokens();
 
-  cudaGraphExec_t graph =
+  GraphExec graph =
       impl_->FindGraph(tokens, batch.num_seqs, batch.max_blocks_per_seq);
 
-  if (graph != nullptr) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, impl_->stream));
+  if (graph.handle != nullptr) {
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->LaunchGraph(graph, impl_->stream));
   } else {
     INFERX_RETURN_IF_ERROR(impl_->LaunchDecodeBody(
         tokens, batch.num_seqs, batch.max_blocks_per_seq));
@@ -2264,8 +2248,8 @@ Status Qwen2Model::StepAsync(const ForwardBatch& batch) {
 
   // Recorded here rather than inside the body, so it is a real host-visible
   // event rather than a node buried in the graph. \see LaunchDecodeBody.
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaEventRecord(impl_->sampled_ready, impl_->stream));
+  INFERX_RETURN_IF_ERROR(
+      impl_->runtime->RecordEvent(impl_->sampled_ready, impl_->stream));
 
   // No synchronize. That absence is the entire feature.
   return OkStatus();
@@ -2277,7 +2261,8 @@ Status Qwen2Model::AwaitStep(std::vector<int32_t>* out_tokens) {
     return OkStatus();
   }
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaEventSynchronize(impl_->sampled_ready));
+  INFERX_RETURN_IF_ERROR(
+      impl_->runtime->SynchronizeEvent(impl_->sampled_ready));
 
   const auto* ids = static_cast<const int32_t*>(impl_->pinned_sampled);
   out_tokens->assign(ids, ids + impl_->sampled_count);
@@ -2317,7 +2302,7 @@ Status Qwen2Model::Step(const ForwardBatch& batch,
     std::vector<float> row;
     INFERX_RETURN_IF_ERROR(DownloadLogitsPinned(
         impl_->logits.buf, index * vocab, vocab, impl_->pinned_logits,
-        impl_->stream, &row));
+        impl_->runtime, impl_->stream, &row));
     out_logits->insert(out_logits->end(), row.begin(), row.end());
   }
 
@@ -2335,7 +2320,8 @@ Status Qwen2Model::ForwardLastLogits(const std::vector<int32_t>& token_ids,
   const int64_t vocab = impl_->config.vocab_size;
 
   return DownloadLogitsPinned(impl_->logits.buf, (tokens - 1) * vocab, vocab,
-                              impl_->pinned_logits, impl_->stream, out_logits);
+                              impl_->pinned_logits, impl_->runtime,
+                              impl_->stream, out_logits);
 }
 
 }  // namespace inferx::model

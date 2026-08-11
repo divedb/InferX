@@ -283,7 +283,7 @@ __global__ void Mxfp4GroupedKernel(const bf16* __restrict__ x,
 
 Status Mxfp4Gemm(const TensorView& x, const TensorView& blocks,
                  const TensorView& scales, const TensorView& y,
-                 bool deinterleave, cudaStream_t stream) {
+                 bool deinterleave, Stream stream) {
   if (!x.IsDefined() || !x.IsCuda() || x.GetDataType() != DataType::kBFloat16 ||
       x.Rank() != 2) {
     return InvalidArgumentError("Mxfp4Gemm: x must be a 2-D bf16 CUDA tensor");
@@ -360,7 +360,7 @@ Status Mxfp4Gemm(const TensorView& x, const TensorView& blocks,
 Status Mxfp4GroupedGemm(const TensorView& x, const TensorView& offsets,
                         const TensorView& blocks, const TensorView& scales,
                         const TensorView& bias, const TensorView& y,
-                        bool deinterleave, cudaStream_t stream) {
+                        bool deinterleave, Stream stream) {
   if (!x.IsDefined() || !x.IsCuda() || x.GetDataType() != DataType::kBFloat16 ||
       x.Rank() != 2)
     return InvalidArgumentError("Mxfp4GroupedGemm: x must be 2-D bf16 CUDA");

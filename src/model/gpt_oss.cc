@@ -7,11 +7,9 @@
 #include <string>
 #include <utility>
 
-#include <cuda_runtime.h>
-
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/gpt_oss.h"
 #include "inferx/kernels/layers.h"
@@ -29,18 +27,23 @@ namespace {
 /// whichever later operation happens to block first, which produced plausible
 /// but false phase attribution after the expert upload was removed.
 struct ForwardProfile {
+  ForwardProfile(DeviceRuntime* device_runtime, Stream execution_stream = {})
+      : runtime(device_runtime), stream(execution_stream) {}
+  DeviceRuntime* runtime;
+  Stream stream;
   using Clock = std::chrono::steady_clock;
   Clock::time_point last = Clock::now();
-  double dequant = 0;        // DequantizeLayerExperts (now: dequantize kernel only)
-  double moe_forward = 0;    // MoeFfn::Forward
-  double attn_proj = 0;      // QKV+o GEMMs, RoPE, norms, d2d copies around attention
-  double attn_kernel = 0;    // the attention kernel + sink rescale only
+  double dequant = 0;  // DequantizeLayerExperts (now: dequantize kernel only)
+  double moe_forward = 0;  // MoeFfn::Forward
+  double attn_proj =
+      0;  // QKV+o GEMMs, RoPE, norms, d2d copies around attention
+  double attn_kernel = 0;  // the attention kernel + sink rescale only
   int64_t layers = 0;
 
   void tick(double& bucket) {
     // Profiling mode only. A synchronization here would be disastrous in the
     // serving path, but is required for phase timings to describe device work.
-    (void)cudaDeviceSynchronize();
+    (void)runtime->SynchronizeStream(stream);
     const auto now = Clock::now();
     bucket += std::chrono::duration<double, std::milli>(now - last).count();
     last = now;
@@ -107,10 +110,9 @@ StatusOr<TensorView> UploadDeinterleaved(WeightLoader* loader,
     }
   }
 
-  INFERX_ASSIGN_OR_RETURN(
-      const Tensor staged,
-      Tensor::FromBlob(permuted.data(), host.dtype(), host.shape(),
-                       DeviceId::Cpu()));
+  INFERX_ASSIGN_OR_RETURN(const Tensor staged,
+                          Tensor::FromBlob(permuted.data(), host.dtype(),
+                                           host.shape(), DeviceId::Cpu()));
   return loader->Upload(staged);
 }
 
@@ -148,9 +150,9 @@ struct LayerWeights {
   Tensor gate_up_blocks, gate_up_scales, gate_up_bias;
   Tensor down_blocks, down_scales, down_bias;
 
-  // Device-resident views over the same data, set at Load. DequantizeLayerExperts
-  // reads these instead of uploading, and Forward reads the biases from here
-  // instead of re-uploading per layer.
+  // Device-resident views over the same data, set at Load.
+  // DequantizeLayerExperts reads these instead of uploading, and Forward reads
+  // the biases from here instead of re-uploading per layer.
   TensorView gate_up_blocks_dev, gate_up_scales_dev;
   TensorView down_blocks_dev, down_scales_dev;
   TensorView gate_up_bias_dev, down_bias_dev;
@@ -163,9 +165,11 @@ struct GptOssModel::Impl {
       : config(std::move(c)), ckpt(std::move(ck)), gemm(std::move(g)) {}
   ~Impl() {
     for (DecodeGraph& graph : graphs) {
-      if (graph.exec != nullptr) cudaGraphExecDestroy(graph.exec);
+      if (runtime != nullptr) (void)runtime->DestroyGraph(graph.exec);
     }
-    if (stream != nullptr) cudaStreamDestroy(stream);
+    if (runtime != nullptr && stream.handle != nullptr) {
+      (void)runtime->DestroyStream(stream);
+    }
   }
 
   ModelConfig config;
@@ -183,24 +187,25 @@ struct GptOssModel::Impl {
   // Paged serving owns a nonblocking stream so its device half can be captured
   // without involving the legacy default stream. Forward() remains the
   // synchronous reference path and deliberately does not use this stream.
-  cudaStream_t stream = nullptr;
+  DeviceRuntime* runtime = nullptr;
+  Stream stream;
 
   struct DecodeGraph {
     int64_t tokens = 0;
     int64_t seqs = 0;
     int64_t blocks = 0;
-    cudaGraphExec_t exec = nullptr;
+    GraphExec exec;
   };
   std::vector<DecodeGraph> graphs;
 
-  cudaGraphExec_t FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
+  GraphExec FindGraph(int64_t tokens, int64_t seqs, int64_t blocks) {
     for (const DecodeGraph& graph : graphs) {
       if (graph.tokens == tokens && graph.seqs == seqs &&
           graph.blocks == blocks) {
         return graph.exec;
       }
     }
-    return nullptr;
+    return {};
   }
 
   // YaRN's frequency table, computed once on the host.
@@ -234,7 +239,7 @@ struct GptOssModel::Impl {
   std::unique_ptr<KvBlockPool> pool;
 
   // Per-step index buffers, device-resident. Grown with the token / sequence
-  // count, rewritten every step. Uploaded with plain cudaMemcpy rather than
+  // count, rewritten every step. Uploaded with a synchronous copy rather than
   // pinned staging because the MoE upload dominates the step and the index
   // traffic is noise beside it.
   DeviceBuffer slots_buf, seq_of_token_buf, block_table_buf;
@@ -247,8 +252,8 @@ struct GptOssModel::Impl {
   int64_t batch_max_context = 0;
 
   Status EnsureCapacity(int64_t tokens);
-  Status DequantizeLayerExperts(const LayerWeights& layer,
-                                TensorView* gate_up, TensorView* down);
+  Status DequantizeLayerExperts(const LayerWeights& layer, TensorView* gate_up,
+                                TensorView* down);
 
   // Step's two halves, split for the same reason Qwen2 splits them: the first
   // is host-side index staging (never inside a captured region, when graphs
@@ -273,8 +278,8 @@ Status GptOssModel::Impl::EnsureCapacity(int64_t tokens) {
   INFERX_RETURN_IF_ERROR(Grow(&qkv_q, sz * tokens * config.q_dim()));
   INFERX_RETURN_IF_ERROR(Grow(&qkv_k, sz * tokens * config.kv_dim()));
   INFERX_RETURN_IF_ERROR(Grow(&qkv_v, sz * tokens * config.kv_dim()));
-  INFERX_RETURN_IF_ERROR(Grow(&qkv_fused,
-                               sz * tokens * (config.q_dim() + 2 * config.kv_dim())));
+  INFERX_RETURN_IF_ERROR(
+      Grow(&qkv_fused, sz * tokens * (config.q_dim() + 2 * config.kv_dim())));
   INFERX_RETURN_IF_ERROR(Grow(&attn_out, sz * tokens * heads * hd));
   INFERX_RETURN_IF_ERROR(Grow(&lse, sizeof(float) * tokens * heads));
   INFERX_RETURN_IF_ERROR(Grow(&proj, sz * tokens * h));
@@ -301,9 +306,8 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
   // Reads the resident device-resident MXFP4 (uploaded once at Load) and
   // dequantizes into the reusable bf16 scratch. No host->device copy -- that
   // copy was 98.6% of Forward under the profiler, and it is gone now.
-  auto decode = [&](const TensorView& blocks_dev,
-                    const TensorView& scales_dev, int64_t rows,
-                    bool deinterleave, Scratch* dest_scratch,
+  auto decode = [&](const TensorView& blocks_dev, const TensorView& scales_dev,
+                    int64_t rows, bool deinterleave, Scratch* dest_scratch,
                     TensorView* out) -> Status {
     // The resident views carry the checkpoint's rank-4/3 shape
     // ([E, rows, num_blocks, 16] / [E, rows, num_blocks]); the kernel wants the
@@ -311,13 +315,13 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
     // a copy -- the bytes are identical, only the indexing changes.
     INFERX_ASSIGN_OR_RETURN(
         const TensorView blocks_v,
-        blocks_dev.Reshape(Shape({experts * rows,
-                                  blocks_dev.Dim(blocks_dev.Rank() - 2),
-                                  kMxfp4BytesPerBlock})));
+        blocks_dev.Reshape(
+            Shape({experts * rows, blocks_dev.Dim(blocks_dev.Rank() - 2),
+                   kMxfp4BytesPerBlock})));
     INFERX_ASSIGN_OR_RETURN(
         const TensorView scales_v,
-        scales_dev.Reshape(Shape(
-            {experts * rows, scales_dev.Dim(scales_dev.Rank() - 1)})));
+        scales_dev.Reshape(
+            Shape({experts * rows, scales_dev.Dim(scales_dev.Rank() - 1)})));
 
     const int64_t num_blocks = blocks_dev.Dim(blocks_dev.Rank() - 2);
     const int64_t width = num_blocks * kMxfp4ValuesPerBlock;
@@ -358,13 +362,12 @@ Status GptOssModel::Impl::DequantizeLayerExperts(const LayerWeights& layer,
     return OkStatus();
   };
 
-  INFERX_RETURN_IF_ERROR(decode(layer.gate_up_blocks_dev,
-                                layer.gate_up_scales_dev, 2 * inter,
-                                /*deinterleave=*/true, &expert_gate_up,
-                                gate_up));
+  INFERX_RETURN_IF_ERROR(
+      decode(layer.gate_up_blocks_dev, layer.gate_up_scales_dev, 2 * inter,
+             /*deinterleave=*/true, &expert_gate_up, gate_up));
 
-  INFERX_RETURN_IF_ERROR(decode(layer.down_blocks_dev, layer.down_scales_dev,
-                                h, /*deinterleave=*/false, &expert_down, down));
+  INFERX_RETURN_IF_ERROR(decode(layer.down_blocks_dev, layer.down_scales_dev, h,
+                                /*deinterleave=*/false, &expert_down, down));
 
   return OkStatus();
 }
@@ -383,44 +386,44 @@ Status GptOssModel::Impl::PrepareBatchInputs(const ForwardBatch& batch) {
   const int64_t table_elems = batch.num_seqs * batch.max_blocks_per_seq;
   if (table_elems > block_table_capacity) {
     INFERX_ASSIGN_OR_RETURN(
-        block_table_buf,
-        DeviceBuffer::Allocate(static_cast<size_t>(table_elems) * sizeof(int32_t),
-                               DeviceId::Cuda(0)));
+        block_table_buf, DeviceBuffer::Allocate(
+                             static_cast<size_t>(table_elems) * sizeof(int32_t),
+                             DeviceId::Cuda(0)));
     block_table_capacity = table_elems;
   }
 
   const size_t tok_bytes = static_cast<size_t>(tokens) * sizeof(int32_t);
 
   if (slots_buf.size() < tok_bytes) {
-    INFERX_ASSIGN_OR_RETURN(slots_buf,
-                            DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
-    INFERX_ASSIGN_OR_RETURN(seq_of_token_buf,
-                            DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        slots_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
+    INFERX_ASSIGN_OR_RETURN(
+        seq_of_token_buf, DeviceBuffer::Allocate(tok_bytes, DeviceId::Cuda(0)));
   }
 
-  // Plain cudaMemcpy rather than the Qwen2 path's pinned staging. A gpt-oss
+  // Pageable copies rather than the Qwen2 path's pinned staging. A gpt-oss
   // step moves ~10 GB of expert weights over PCIe per layer, so the few KB of
   // index traffic -- and the few hundred microseconds of host time a pageable
   // copy costs -- is noise. Keeping it simple here is worth not reproducing the
   // pinned-buffer plumbing until the MoE upload itself is gone (Phase 4).
   if (!batch.tokens_from_device) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-        ids.buf.data(), batch.token_ids.data(), tok_bytes,
-        cudaMemcpyHostToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(ids.buf.data(),
+                                              batch.token_ids.data(), tok_bytes,
+                                              CopyKind::kHostToDevice, stream));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      positions.buf.data(), batch.positions.data(), tok_bytes,
-      cudaMemcpyHostToDevice, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      slots_buf.data(), batch.slots.data(), tok_bytes, cudaMemcpyHostToDevice,
-      stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      seq_of_token_buf.data(), batch.seq_of_token.data(), tok_bytes,
-      cudaMemcpyHostToDevice, stream));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-      block_table_buf.data(), batch.block_table.data(),
-      static_cast<size_t>(table_elems) * sizeof(int32_t),
-      cudaMemcpyHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(positions.buf.data(),
+                                            batch.positions.data(), tok_bytes,
+                                            CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(runtime->CopyAsync(slots_buf.data(),
+                                            batch.slots.data(), tok_bytes,
+                                            CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(
+      runtime->CopyAsync(seq_of_token_buf.data(), batch.seq_of_token.data(),
+                         tok_bytes, CopyKind::kHostToDevice, stream));
+  INFERX_RETURN_IF_ERROR(
+      runtime->CopyAsync(block_table_buf.data(), batch.block_table.data(),
+                         static_cast<size_t>(table_elems) * sizeof(int32_t),
+                         CopyKind::kHostToDevice, stream));
 
   // Longest key sequence any query attends over. For full-attention layers this
   // sizes the reference kernel's shared-memory tile; for sliding layers it is
@@ -474,24 +477,22 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
                           m.residual.View(kBf16, Shape({tokens, h})));
   INFERX_ASSIGN_OR_RETURN(const TensorView normed,
                           m.normed.View(kBf16, Shape({tokens, h})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView q, m.qkv_q.View(kBf16, Shape({tokens, heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView k, m.qkv_k.View(kBf16, Shape({tokens, kv_heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView v, m.qkv_v.View(kBf16, Shape({tokens, kv_heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView attn, m.attn_out.View(kBf16, Shape({tokens, heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView lse_v,
-      m.lse.View(DataType::kFloat, Shape({tokens, heads})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView q,
+                          m.qkv_q.View(kBf16, Shape({tokens, heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView k,
+                          m.qkv_k.View(kBf16, Shape({tokens, kv_heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView v,
+                          m.qkv_v.View(kBf16, Shape({tokens, kv_heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView attn,
+                          m.attn_out.View(kBf16, Shape({tokens, heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView lse_v,
+                          m.lse.View(DataType::kFloat, Shape({tokens, heads})));
   INFERX_ASSIGN_OR_RETURN(const TensorView proj,
                           m.proj.View(kBf16, Shape({tokens, h})));
   INFERX_ASSIGN_OR_RETURN(const TensorView moe_out,
                           m.moe_out.View(kBf16, Shape({tokens, h})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView inv_freq,
-      m.inv_freq.View(DataType::kFloat, Shape({hd / 2})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView inv_freq,
+                          m.inv_freq.View(DataType::kFloat, Shape({hd / 2})));
 
   // Flat views for the projections (2-D) and the cache append (3-D per head).
   INFERX_ASSIGN_OR_RETURN(const TensorView q2,
@@ -515,7 +516,7 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
   // here rather than once at construction because Forward and RunPagedForward
   // are different call sites and a caller may profile one without the other.
   const char* prof_env = std::getenv("INFERX_GPTOSS_PROFILE");
-  ForwardProfile prof;
+  ForwardProfile prof(runtime, stream);
   const bool profiling = prof_env != nullptr;
 
   for (int64_t layer = 0; layer < c.num_hidden_layers; ++layer) {
@@ -523,17 +524,15 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
 
     // --- attention ---------------------------------------------------------
     if (profiling) prof.last = ForwardProfile::Clock::now();
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.input_norm, normed,
-                                            static_cast<float>(c.rms_norm_eps),
-                                            stream));
+    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+        x, w.input_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
     // One fused QKV GEMM instead of three, then split + bias in one pass.
-    INFERX_RETURN_IF_ERROR(
-        m.gemm.LinearBF16(normed, w.qkv_w, qkv_v, stream));
+    INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v, stream));
     INFERX_RETURN_IF_ERROR(
         kernels::SplitQkvWithBias(qkv_v, w.qkv_b, q2, k2, v2, stream));
 
@@ -544,22 +543,20 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     // Cache write *after* RoPE: a cached key is stored at the position it was
     // rotated for, so it never needs re-rotating when read back.
     INFERX_ASSIGN_OR_RETURN(const TensorView k_cache, m.pool->KeyCache(layer));
-    INFERX_ASSIGN_OR_RETURN(const TensorView v_cache, m.pool->ValueCache(layer));
+    INFERX_ASSIGN_OR_RETURN(const TensorView v_cache,
+                            m.pool->ValueCache(layer));
 
     INFERX_RETURN_IF_ERROR(
         kernels::AppendToKvCache(k, v, k_cache, v_cache, slots_v, stream));
 
     // Per-layer window: gpt-oss alternates full and sliding (128). The tile is
     // sized from `window` on a sliding layer, which is also the smem win.
-    const int64_t window =
-        c.IsSlidingLayer(layer) ? c.sliding_window : 0;
+    const int64_t window = c.IsSlidingLayer(layer) ? c.sliding_window : 0;
     // Use the table's fixed capacity for full attention. The kernel still
     // stops at each query's device-resident position, while a fixed launch
     // shape lets one captured decode graph replay as the sequence grows.
-    const int64_t max_ctx = window > 0
-                                ? window
-                                : batch.max_blocks_per_seq *
-                                      m.pool->block_size();
+    const int64_t max_ctx =
+        window > 0 ? window : batch.max_blocks_per_seq * m.pool->block_size();
 
     INFERX_RETURN_IF_ERROR(kernels::PagedAttentionWithLse(
         q, k_cache, v_cache, table_v, seq_v, pos_v, attn, lse_v, scale, window,
@@ -575,15 +572,15 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b, stream));
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid, stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), proj.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
     if (profiling) prof.tick(prof.attn_proj);
 
     // --- MoE ---------------------------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
 
     INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
         x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
@@ -607,23 +604,20 @@ Status GptOssModel::Impl::RunPagedForward(const ForwardBatch& batch) {
     if (profiling) prof.tick(prof.moe_forward);
 
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid, stream));
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
         x.Data(), moe_out.Data(), DataTypeByteSize(kBf16, tokens * h),
-        cudaMemcpyDeviceToDevice, stream));
+        CopyKind::kDeviceToDevice, stream));
     if (profiling) ++prof.layers;
   }
 
   if (profiling) prof.report(tokens);
 
-  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, m.final_norm, normed,
-                                          static_cast<float>(c.rms_norm_eps),
-                                          stream));
+  INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+      x, m.final_norm, normed, static_cast<float>(c.rms_norm_eps), stream));
 
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView logits,
-      m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
-  INFERX_RETURN_IF_ERROR(
-      m.gemm.LinearBF16(normed, m.lm_head, logits, stream));
+  INFERX_ASSIGN_OR_RETURN(const TensorView logits,
+                          m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
+  INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, m.lm_head, logits, stream));
 
   return OkStatus();
 }
@@ -641,8 +635,9 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
                           kernels::CublasLtGemm::Create());
 
   auto impl = std::make_unique<Impl>(config, std::move(ckpt), std::move(gemm));
-  INFERX_CUDA_RETURN_IF_ERROR(
-      cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(DeviceId::Cuda(0)));
+  INFERX_ASSIGN_OR_RETURN(impl->stream,
+                          impl->runtime->CreateStream(DeviceId::Cuda(0)));
 
   const int64_t h = config.hidden_size;
   const int64_t heads = config.num_attention_heads;
@@ -691,10 +686,9 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
       std::vector<Tensor> qkv_b_parts;
       for (const std::string_view name :
            {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"}) {
-        INFERX_ASSIGN_OR_RETURN(
-            Tensor wt, get(absl::StrCat(p, name, ".weight")));
-        INFERX_ASSIGN_OR_RETURN(
-            Tensor bs, get(absl::StrCat(p, name, ".bias")));
+        INFERX_ASSIGN_OR_RETURN(Tensor wt,
+                                get(absl::StrCat(p, name, ".weight")));
+        INFERX_ASSIGN_OR_RETURN(Tensor bs, get(absl::StrCat(p, name, ".bias")));
         qkv_w_parts.push_back(std::move(wt));
         qkv_b_parts.push_back(std::move(bs));
       }
@@ -728,8 +722,7 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
                             get(p + "mlp.experts.down_proj_blocks"));
     INFERX_ASSIGN_OR_RETURN(w.down_scales,
                             get(p + "mlp.experts.down_proj_scales"));
-    INFERX_ASSIGN_OR_RETURN(w.down_bias,
-                            get(p + "mlp.experts.down_proj_bias"));
+    INFERX_ASSIGN_OR_RETURN(w.down_bias, get(p + "mlp.experts.down_proj_bias"));
 
     // Device-resident copies. The ~10 GB this uploads across all 24 layers is
     // paid ONCE at load rather than per-layer-per-call, which the profile
@@ -773,10 +766,9 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
 
   INFERX_RETURN_IF_ERROR(
       Grow(&impl->inv_freq, sizeof(float) * inv_freq.size()));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(impl->inv_freq.buf.data(),
-                                         inv_freq.data(),
-                                         sizeof(float) * inv_freq.size(),
-                                         cudaMemcpyHostToDevice));
+  INFERX_RETURN_IF_ERROR(impl->runtime->Copy(
+      impl->inv_freq.buf.data(), inv_freq.data(),
+      sizeof(float) * inv_freq.size(), CopyKind::kHostToDevice));
 
   MoeFfn::Config moe_config;
   moe_config.hidden = h;
@@ -788,7 +780,8 @@ StatusOr<GptOssModel> GptOssModel::Load(std::string_view dir) {
   moe_config.swiglu_limit = static_cast<float>(config.swiglu_limit);
   moe_config.swiglu_alpha = static_cast<float>(config.swiglu_alpha);
 
-  INFERX_ASSIGN_OR_RETURN(MoeFfn moe, MoeFfn::Create(moe_config, 1));
+  INFERX_ASSIGN_OR_RETURN(MoeFfn moe,
+                          MoeFfn::Create(moe_config, 1, DeviceId::Cuda(0)));
   impl->moe = std::make_unique<MoeFfn>(std::move(moe));
 
   (void)heads;
@@ -829,12 +822,12 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
   std::vector<int32_t> pos(static_cast<size_t>(tokens));
   for (int64_t t = 0; t < tokens; ++t) pos[static_cast<size_t>(t)] = t;
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(m.ids.buf.data(), token_ids.data(),
+  INFERX_RETURN_IF_ERROR(m.runtime->Copy(m.ids.buf.data(), token_ids.data(),
                                          sizeof(int32_t) * tokens,
-                                         cudaMemcpyHostToDevice));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(m.positions.buf.data(), pos.data(),
+                                         CopyKind::kHostToDevice));
+  INFERX_RETURN_IF_ERROR(m.runtime->Copy(m.positions.buf.data(), pos.data(),
                                          sizeof(int32_t) * tokens,
-                                         cudaMemcpyHostToDevice));
+                                         CopyKind::kHostToDevice));
 
   INFERX_ASSIGN_OR_RETURN(const TensorView ids_v,
                           m.ids.View(DataType::kInt32, Shape({tokens})));
@@ -846,24 +839,22 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
                           m.residual.View(kBf16, Shape({tokens, h})));
   INFERX_ASSIGN_OR_RETURN(const TensorView normed,
                           m.normed.View(kBf16, Shape({tokens, h})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView q, m.qkv_q.View(kBf16, Shape({tokens, heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView k, m.qkv_k.View(kBf16, Shape({tokens, kv_heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView v, m.qkv_v.View(kBf16, Shape({tokens, kv_heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView attn, m.attn_out.View(kBf16, Shape({tokens, heads, hd})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView lse_v,
-      m.lse.View(DataType::kFloat, Shape({tokens, heads})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView q,
+                          m.qkv_q.View(kBf16, Shape({tokens, heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView k,
+                          m.qkv_k.View(kBf16, Shape({tokens, kv_heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView v,
+                          m.qkv_v.View(kBf16, Shape({tokens, kv_heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView attn,
+                          m.attn_out.View(kBf16, Shape({tokens, heads, hd})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView lse_v,
+                          m.lse.View(DataType::kFloat, Shape({tokens, heads})));
   INFERX_ASSIGN_OR_RETURN(const TensorView proj,
                           m.proj.View(kBf16, Shape({tokens, h})));
   INFERX_ASSIGN_OR_RETURN(const TensorView moe_out,
                           m.moe_out.View(kBf16, Shape({tokens, h})));
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView inv_freq,
-      m.inv_freq.View(DataType::kFloat, Shape({hd / 2})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView inv_freq,
+                          m.inv_freq.View(DataType::kFloat, Shape({hd / 2})));
 
   // Flat views of q/k/v for the projections, which are 2-D.
   INFERX_ASSIGN_OR_RETURN(const TensorView q2,
@@ -885,17 +876,18 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
   // disagreement to a layer is the difference between reading four kernels and
   // reading forty.
   const char* dump_path = std::getenv("INFERX_GPTOSS_DUMP");
-  std::FILE* dump = dump_path != nullptr ? std::fopen(dump_path, "wb") : nullptr;
+  std::FILE* dump =
+      dump_path != nullptr ? std::fopen(dump_path, "wb") : nullptr;
 
   const char* prof_env = std::getenv("INFERX_GPTOSS_PROFILE");
-  ForwardProfile prof;
+  ForwardProfile prof(m.runtime);
   const bool profiling = prof_env != nullptr;
 
   auto dump_hidden = [&](const TensorView& t) {
     if (dump == nullptr) return;
     std::vector<uint16_t> host(static_cast<size_t>(tokens * h));
-    (void)cudaMemcpy(host.data(), t.Data(), host.size() * sizeof(uint16_t),
-                     cudaMemcpyDeviceToHost);
+    (void)m.runtime->Copy(host.data(), t.Data(), host.size() * sizeof(uint16_t),
+                          CopyKind::kDeviceToHost);
     std::fwrite(host.data(), sizeof(uint16_t), host.size(), dump);
   };
 
@@ -908,12 +900,12 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
 
     // --- attention ---------------------------------------------------------
     if (profiling) prof.last = ForwardProfile::Clock::now();
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-                   cudaMemcpyDeviceToDevice));
+    INFERX_RETURN_IF_ERROR(m.runtime->Copy(resid.Data(), x.Data(),
+                                           DataTypeByteSize(kBf16, tokens * h),
+                                           CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.input_norm, normed,
-                                            static_cast<float>(c.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+        x, w.input_norm, normed, static_cast<float>(c.rms_norm_eps)));
 
     // One fused QKV GEMM instead of three, then split + bias in one pass.
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, w.qkv_w, qkv_v));
@@ -932,27 +924,26 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     // The sink, folded in afterwards using the lse the kernel just wrote.
     // \see kernels/gpt_oss.h for why this is a rescale rather than a change
     // inside the softmax.
-    INFERX_RETURN_IF_ERROR(
-        kernels::ApplyAttentionSinks(attn, lse_v, w.sinks, /*lse_is_log2=*/true));
+    INFERX_RETURN_IF_ERROR(kernels::ApplyAttentionSinks(attn, lse_v, w.sinks,
+                                                        /*lse_is_log2=*/true));
     if (profiling) prof.tick(prof.attn_kernel);
 
     INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(attn2, w.o_w, proj));
     INFERX_RETURN_IF_ERROR(kernels::AddBiasInPlace(proj, w.o_b));
-    dump_hidden(proj);   // attention output, after o_proj, before the residual
+    dump_hidden(proj);  // attention output, after o_proj, before the residual
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(proj, resid));
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(x.Data(), proj.Data(),
-                   DataTypeByteSize(kBf16, tokens * h),
-                   cudaMemcpyDeviceToDevice));
+    INFERX_RETURN_IF_ERROR(m.runtime->Copy(x.Data(), proj.Data(),
+                                           DataTypeByteSize(kBf16, tokens * h),
+                                           CopyKind::kDeviceToDevice));
     if (profiling) prof.tick(prof.attn_proj);
 
     // --- MoE ---------------------------------------------------------------
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(resid.Data(), x.Data(), DataTypeByteSize(kBf16, tokens * h),
-                   cudaMemcpyDeviceToDevice));
+    INFERX_RETURN_IF_ERROR(m.runtime->Copy(resid.Data(), x.Data(),
+                                           DataTypeByteSize(kBf16, tokens * h),
+                                           CopyKind::kDeviceToDevice));
 
-    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, w.post_norm, normed,
-                                            static_cast<float>(c.rms_norm_eps)));
+    INFERX_RETURN_IF_ERROR(kernels::RmsNorm(
+        x, w.post_norm, normed, static_cast<float>(c.rms_norm_eps)));
 
     MoeWeights mw;
     mw.router = w.router_w;
@@ -968,16 +959,16 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
     mw.gate_up_bias = w.gate_up_bias_dev;
     mw.down_bias = w.down_bias_dev;
 
-    INFERX_RETURN_IF_ERROR(
-        m.moe->Forward(normed, mw, moe_out, &m.gemm));
+    INFERX_RETURN_IF_ERROR(m.moe->Forward(normed, mw, moe_out, &m.gemm));
     if (profiling) prof.tick(prof.moe_forward);
 
     INFERX_RETURN_IF_ERROR(kernels::AddInPlace(moe_out, resid));
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaMemcpy(x.Data(), moe_out.Data(),
-                   DataTypeByteSize(kBf16, tokens * h),
-                   cudaMemcpyDeviceToDevice));
-    if (profiling) { ++prof.layers; }
+    INFERX_RETURN_IF_ERROR(m.runtime->Copy(x.Data(), moe_out.Data(),
+                                           DataTypeByteSize(kBf16, tokens * h),
+                                           CopyKind::kDeviceToDevice));
+    if (profiling) {
+      ++prof.layers;
+    }
 
     dump_hidden(x);
   }
@@ -989,19 +980,18 @@ Status GptOssModel::Forward(const std::vector<int32_t>& token_ids,
   INFERX_RETURN_IF_ERROR(kernels::RmsNorm(x, m.final_norm, normed,
                                           static_cast<float>(c.rms_norm_eps)));
 
-  INFERX_ASSIGN_OR_RETURN(
-      const TensorView logits,
-      m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
+  INFERX_ASSIGN_OR_RETURN(const TensorView logits,
+                          m.logits.View(kBf16, Shape({tokens, c.vocab_size})));
   INFERX_RETURN_IF_ERROR(m.gemm.LinearBF16(normed, m.lm_head, logits));
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaDeviceSynchronize());
+  INFERX_RETURN_IF_ERROR(m.runtime->SynchronizeStream(Stream{}));
 
   // Down to the host as bf16, widened here: a fp32 logits buffer for a 201088
   // vocabulary is 804 KB per position on a card with ~2 GB spare.
   std::vector<uint16_t> raw(static_cast<size_t>(tokens * c.vocab_size));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(raw.data(), logits.Data(),
+  INFERX_RETURN_IF_ERROR(m.runtime->Copy(raw.data(), logits.Data(),
                                          raw.size() * sizeof(uint16_t),
-                                         cudaMemcpyDeviceToHost));
+                                         CopyKind::kDeviceToHost));
 
   out_logits->resize(raw.size());
   for (size_t i = 0; i < raw.size(); ++i) {
@@ -1035,10 +1025,9 @@ int64_t GptOssModel::KvBlockBytes(int64_t block_size) const {
 Status GptOssModel::AttachKvCache(int64_t num_blocks, int64_t block_size) {
   const KvLayout layout = GptOssKvLayout(impl_->config);
 
-  INFERX_ASSIGN_OR_RETURN(
-      KvBlockPool pool,
-      KvBlockPool::Create(impl_->config.num_hidden_layers, num_blocks,
-                          block_size, layout));
+  INFERX_ASSIGN_OR_RETURN(KvBlockPool pool,
+                          KvBlockPool::Create(impl_->config.num_hidden_layers,
+                                              num_blocks, block_size, layout));
 
   impl_->pool = std::make_unique<KvBlockPool>(std::move(pool));
   return OkStatus();
@@ -1048,7 +1037,8 @@ KvBlockPool* GptOssModel::kv_pool() { return impl_->pool.get(); }
 
 Status GptOssModel::ReserveActivations(int64_t max_tokens) {
   if (max_tokens <= 0) {
-    return InvalidArgumentError("max_tokens must be positive, got ", max_tokens);
+    return InvalidArgumentError("max_tokens must be positive, got ",
+                                max_tokens);
   }
   return impl_->EnsureCapacity(max_tokens);
 }
@@ -1060,11 +1050,12 @@ Status GptOssModel::CaptureDecodeGraph(int64_t num_seqs,
         "CaptureDecodeGraph requires a KV cache; call AttachKvCache first");
   }
   if (num_seqs <= 0 || max_blocks_per_seq <= 0) {
-    return InvalidArgumentError("graph shape must be positive, got num_seqs=",
-                                num_seqs, " max_blocks_per_seq=",
-                                max_blocks_per_seq);
+    return InvalidArgumentError(
+        "graph shape must be positive, got num_seqs=", num_seqs,
+        " max_blocks_per_seq=", max_blocks_per_seq);
   }
-  if (impl_->FindGraph(num_seqs, num_seqs, max_blocks_per_seq) != nullptr) {
+  if (impl_->FindGraph(num_seqs, num_seqs, max_blocks_per_seq).handle !=
+      nullptr) {
     return OkStatus();
   }
 
@@ -1085,8 +1076,8 @@ Status GptOssModel::CaptureDecodeGraph(int64_t num_seqs,
   ForwardBatch probe;
   probe.num_seqs = num_seqs;
   probe.max_blocks_per_seq = max_blocks_per_seq;
-  probe.block_table.assign(
-      static_cast<size_t>(num_seqs * max_blocks_per_seq), scratch_block);
+  probe.block_table.assign(static_cast<size_t>(num_seqs * max_blocks_per_seq),
+                           scratch_block);
   for (int64_t seq = 0; seq < num_seqs; ++seq) {
     probe.token_ids.push_back(0);
     probe.positions.push_back(static_cast<int32_t>(last_position));
@@ -1097,24 +1088,18 @@ Status GptOssModel::CaptureDecodeGraph(int64_t num_seqs,
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(probe));
   INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(probe));
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamBeginCapture(
-      impl_->stream, cudaStreamCaptureModeThreadLocal));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->BeginCapture(impl_->stream));
   const Status body = impl_->RunPagedForward(probe);
-  cudaGraph_t graph = nullptr;
-  const cudaError_t ended = cudaStreamEndCapture(impl_->stream, &graph);
-  INFERX_RETURN_IF_ERROR(body);
-  INFERX_CUDA_RETURN_IF_ERROR(ended);
+  auto captured = impl_->runtime->EndCaptureAndInstantiate(impl_->stream);
+  if (!body.ok()) {
+    if (captured.ok()) (void)impl_->runtime->DestroyGraph(*captured);
+    return body;
+  }
+  INFERX_ASSIGN_OR_RETURN(GraphExec exec, std::move(captured));
 
-  cudaGraphExec_t exec = nullptr;
-  const cudaError_t instantiated =
-      cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
-  cudaGraphDestroy(graph);
-  INFERX_CUDA_RETURN_IF_ERROR(instantiated);
-
-  impl_->graphs.push_back(
-      {num_seqs, num_seqs, max_blocks_per_seq, exec});
+  impl_->graphs.push_back({num_seqs, num_seqs, max_blocks_per_seq, exec});
   return OkStatus();
 }
 
@@ -1134,33 +1119,32 @@ Status GptOssModel::Step(const ForwardBatch& batch,
   INFERX_RETURN_IF_ERROR(batch.Validate(impl_->config.vocab_size, total_slots));
 
   INFERX_RETURN_IF_ERROR(impl_->PrepareBatchInputs(batch));
-  cudaGraphExec_t graph = nullptr;
+  GraphExec graph;
   if (batch.decode_only) {
     graph = impl_->FindGraph(batch.num_tokens(), batch.num_seqs,
                              batch.max_blocks_per_seq);
   }
-  if (graph != nullptr) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaGraphLaunch(graph, impl_->stream));
+  if (graph.handle != nullptr) {
+    INFERX_RETURN_IF_ERROR(impl_->runtime->LaunchGraph(graph, impl_->stream));
   } else {
     INFERX_RETURN_IF_ERROR(impl_->RunPagedForward(batch));
   }
-  INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+  INFERX_RETURN_IF_ERROR(impl_->runtime->SynchronizeStream(impl_->stream));
 
   // Download only the rows a caller asked for. At a 201088-wide vocabulary that
   // is 804 KB per row, which is the same reason Qwen2's Step downloads logits
   // indices rather than the whole batch.
   const int64_t vocab = impl_->config.vocab_size;
   out_logits->clear();
-  out_logits->reserve(batch.logits_indices.size() *
-                      static_cast<size_t>(vocab));
+  out_logits->reserve(batch.logits_indices.size() * static_cast<size_t>(vocab));
 
   std::vector<uint16_t> raw(static_cast<size_t>(vocab));
   for (const int32_t index : batch.logits_indices) {
-    INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpy(
+    INFERX_RETURN_IF_ERROR(impl_->runtime->Copy(
         raw.data(),
         static_cast<const std::byte*>(impl_->logits.buf.data()) +
             static_cast<size_t>(index) * static_cast<size_t>(vocab) * 2,
-        raw.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        raw.size() * sizeof(uint16_t), CopyKind::kDeviceToHost));
 
     const size_t base = out_logits->size();
     out_logits->resize(base + raw.size());

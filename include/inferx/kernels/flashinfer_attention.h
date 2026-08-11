@@ -4,10 +4,9 @@
 #include <memory>
 #include <vector>
 
-#include <cuda_runtime_api.h>
-
 #include "absl/types/span.h"
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -72,8 +71,8 @@ class FlashInferDecode {
   /// \param kv_indptr_host The same `batch + 1` values **on the host**.
   ///
   ///   Both are required, and passing the host copy rather than reading it back
-  ///   is the whole reason this parameter exists. FlashInfer's planner needs the
-  ///   indptr host-side to estimate how to split the work, and an earlier
+  ///   is the whole reason this parameter exists. FlashInfer's planner needs
+  ///   the indptr host-side to estimate how to split the work, and an earlier
   ///   version of this wrapper obtained it with a device-to-host copy followed
   ///   by `cudaStreamSynchronize` -- a full device synchronization inside the
   ///   decode loop, which §5.2 forbids outright and which would have made M6's
@@ -94,7 +93,7 @@ class FlashInferDecode {
                 const TensorView& kv_indptr,
                 absl::Span<const int32_t> kv_indptr_host,
                 const TensorView& last_page_len, const TensorView& out,
-                float scale, cudaStream_t stream = nullptr);
+                float scale, Stream stream = {});
 
   /// \brief One decode step against an **FP8 e4m3** paged KV cache.
   ///
@@ -121,7 +120,7 @@ class FlashInferDecode {
                    absl::Span<const int32_t> kv_indptr_host,
                    const TensorView& last_page_len, const TensorView& out,
                    float scale, float k_scale, float v_scale,
-                   cudaStream_t stream = nullptr);
+                   Stream stream = {});
 
   /// \name Graph-capturable FP8 KV decode
   ///
@@ -134,13 +133,13 @@ class FlashInferDecode {
   Status PlanFp8(int64_t batch, int64_t q_heads, int64_t kv_heads,
                  int64_t head_dim, int64_t page_size,
                  absl::Span<const int32_t> kv_indptr_host, bool graph_safe,
-                 cudaStream_t stream = nullptr);
+                 Stream stream = {});
 
   Status RunFp8(const TensorView& q, const TensorView& k_cache,
                 const TensorView& v_cache, const TensorView& kv_indices,
                 const TensorView& kv_indptr, const TensorView& last_page_len,
                 const TensorView& out, float scale, float k_scale,
-                float v_scale, cudaStream_t stream = nullptr);
+                float v_scale, Stream stream = {});
   ///@}
 
   /// \brief Plans a step without launching it. Host-side; **not capturable**.
@@ -166,7 +165,7 @@ class FlashInferDecode {
   Status Plan(int64_t batch, int64_t q_heads, int64_t kv_heads,
               int64_t head_dim, int64_t page_size,
               absl::Span<const int32_t> kv_indptr_host, bool graph_safe,
-              cudaStream_t stream = nullptr);
+              Stream stream = {});
 
   /// \brief Launches the plan from the last `Plan` call. Capturable.
   ///
@@ -180,8 +179,7 @@ class FlashInferDecode {
   Status Run(const TensorView& q, const TensorView& k_cache,
              const TensorView& v_cache, const TensorView& kv_indices,
              const TensorView& kv_indptr, const TensorView& last_page_len,
-             const TensorView& out, float scale,
-             cudaStream_t stream = nullptr);
+             const TensorView& out, float scale, Stream stream = {});
 
  private:
   struct Impl;

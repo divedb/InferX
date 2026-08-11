@@ -1,12 +1,11 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include <cstddef>
 #include <memory>
 
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -64,7 +63,7 @@ class CublasLtGemm {
   /// \return       OK, InvalidArgument for shapes/dtypes this cannot serve, or
   ///               the cuBLAS error.
   Status LinearF16(const TensorView& x, const TensorView& w,
-                   const TensorView& y, cudaStream_t stream = nullptr);
+                   const TensorView& y, Stream stream = {});
 
   /// \brief `y = x · wᵀ` in bf16 with FP32 accumulation.
   ///
@@ -78,7 +77,7 @@ class CublasLtGemm {
   /// \param y      Output, `[m, n]` bf16, row-major.
   /// \param stream Stream to launch on. Does **not** synchronize.
   Status LinearBF16(const TensorView& x, const TensorView& w,
-                    const TensorView& y, cudaStream_t stream = nullptr);
+                    const TensorView& y, Stream stream = {});
 
   /// \brief Computes `y = (x·x_scale) · (w·w_scale)ᵀ` in FP8 e4m3.
   ///
@@ -105,7 +104,7 @@ class CublasLtGemm {
   ///                    shape, or the cuBLAS error.
   Status LinearF8E4M3(const TensorView& x, const TensorView& w,
                       const TensorView& y, const float* x_scale_dev,
-                      const float* w_scale_dev, cudaStream_t stream = nullptr);
+                      const float* w_scale_dev, Stream stream = {});
 
   /// \brief Builds and caches the plan for one shape without running it.
   ///

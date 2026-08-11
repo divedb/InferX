@@ -1,8 +1,7 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -34,7 +33,7 @@ inline constexpr float kFloat8E4M3Max = 448.0f;
 /// \param stream    Stream to launch on. Does not synchronize.
 /// \return          OK, InvalidArgument, or the CUDA error.
 Status ComputeF8Scale(const TensorView& src, float* scale_dev,
-                      cudaStream_t stream = nullptr);
+                      Stream stream = {});
 
 /// \brief Quantizes an f16 tensor to e4m3, dividing by `*scale_dev`.
 ///
@@ -48,8 +47,7 @@ Status ComputeF8Scale(const TensorView& src, float* scale_dev,
 /// \param stream    Stream to launch on. Does not synchronize.
 /// \return          OK, InvalidArgument, or the CUDA error.
 Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
-                           const float* scale_dev,
-                           cudaStream_t stream = nullptr);
+                           const float* scale_dev, Stream stream = {});
 
 /// \brief Computes a scale and quantizes in a single launch.
 ///
@@ -70,8 +68,7 @@ Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
 /// \param dst       f8e4m3 tensor of the same shape.
 /// \param scale_dev Device pointer to one float, receiving the dequant scale.
 Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
-                               float* scale_dev,
-                               cudaStream_t stream = nullptr);
+                               float* scale_dev, Stream stream = {});
 
 // ---------------------------------------------------------------------------
 // W4A16: per-group symmetric int4 weights.
@@ -124,8 +121,7 @@ inline constexpr float kInt4SymmetricMax = 7.0f;
 /// \return        OK, InvalidArgument for shapes this cannot serve, or the
 ///                CUDA error.
 Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
-                         const TensorView& scales,
-                         cudaStream_t stream = nullptr);
+                         const TensorView& scales, Stream stream = {});
 
 /// \brief Dequantizes per-group int4 weights back to f16.
 ///
@@ -141,20 +137,17 @@ Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
 /// \param stream  Stream to launch on. Does not synchronize.
 /// \return        OK, InvalidArgument, or the CUDA error.
 Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
-                           const TensorView& dst,
-                           cudaStream_t stream = nullptr);
+                           const TensorView& dst, Stream stream = {});
 
 /// \brief `QuantizeF16ToInt4` for bf16 weights -- the model's native dtype.
 ///
 /// W4A16 serving dequantizes bf16 weights to bf16 and runs the stock bf16 GEMM,
 /// so the quantize needs to read bf16 too (no bf16<->f16 cast at every linear).
 Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
-                          const TensorView& scales,
-                          cudaStream_t stream = nullptr);
+                          const TensorView& scales, Stream stream = {});
 
 /// \brief `DequantizeInt4ToF16` for bf16 output.
 Status DequantizeInt4ToBf16(const TensorView& src, const TensorView& scales,
-                            const TensorView& dst,
-                            cudaStream_t stream = nullptr);
+                            const TensorView& dst, Stream stream = {});
 
 }  // namespace inferx::kernels

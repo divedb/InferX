@@ -9,12 +9,8 @@
 #include <thread>
 #include <utility>
 
-#ifdef INFERX_WITH_CUDA
-#include <cuda_runtime.h>
-#endif
-
 #include "inferx/core/arena.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/core/dtype.h"
 #include "inferx/core/tensor.h"
 
@@ -155,15 +151,12 @@ struct WeightLoader::Impl {
   struct Slot {
     std::byte* pinned = nullptr;
     bool in_flight = false;
-#ifdef INFERX_WITH_CUDA
-    cudaEvent_t event = nullptr;
-#endif
+    DeviceEvent event;
   };
   std::vector<Slot> slots;
   size_t next_slot = 0;
-#ifdef INFERX_WITH_CUDA
-  cudaStream_t stream = nullptr;
-#endif
+  DeviceRuntime* runtime = nullptr;
+  Stream copy_stream;
 
   std::vector<DeviceBuffer> chunks;
   BumpArena arena;
@@ -176,24 +169,22 @@ struct WeightLoader::Impl {
   std::vector<Extent> extents;
 
   StatusOr<std::byte*> AllocateOut(size_t bytes);
-  Status Stream(absl::Span<const Extent> extents_in, std::byte* dst,
-                size_t total);
+  Status TransferExtents(absl::Span<const Extent> extents_in, std::byte* dst,
+                         size_t total);
   StatusOr<TensorView> FinishLoad(absl::Span<const Extent> extents_in,
                                   size_t total, DataType dtype,
                                   const Shape& shape);
 
   ~Impl() {
-#ifdef INFERX_WITH_CUDA
-    if (stream != nullptr) {
+    if (runtime != nullptr && copy_stream.handle != nullptr) {
       // In-flight copies read the pinned slots; drain before freeing them.
-      cudaStreamSynchronize(stream);
-      cudaStreamDestroy(stream);
+      (void)runtime->SynchronizeStream(copy_stream);
+      (void)runtime->DestroyStream(copy_stream);
     }
     for (Slot& slot : slots) {
-      if (slot.event != nullptr) cudaEventDestroy(slot.event);
-      if (slot.pinned != nullptr) cudaFreeHost(slot.pinned);
+      if (slot.event.handle != nullptr) (void)runtime->DestroyEvent(slot.event);
+      if (slot.pinned != nullptr) (void)runtime->FreePinnedHost(slot.pinned);
     }
-#endif
   }
 };
 
@@ -224,10 +215,10 @@ StatusOr<std::byte*> WeightLoader::Impl::AllocateOut(size_t bytes) {
 // Streams `extents_in` (`total` bytes) to `dst` through the pinned ring: pack
 // a slot with the worker pool, hand it to the copy engine, move on. In CPU
 // mode the "slot" is the destination itself and the copy is one pass.
-Status WeightLoader::Impl::Stream(absl::Span<const Extent> extents_in,
-                                  std::byte* dst, size_t total) {
-  const bool cuda = opts.device.IsCuda();
-  const size_t slot_bytes = cuda ? opts.staging_slot_bytes : total;
+Status WeightLoader::Impl::TransferExtents(absl::Span<const Extent> extents_in,
+                                           std::byte* dst, size_t total) {
+  const bool accelerator = opts.device.IsAccelerator();
+  const size_t slot_bytes = accelerator ? opts.staging_slot_bytes : total;
 
   size_t ei = 0;    // current extent
   size_t eoff = 0;  // bytes of it already consumed
@@ -237,20 +228,18 @@ Status WeightLoader::Impl::Stream(absl::Span<const Extent> extents_in,
     const size_t fill = std::min(slot_bytes, total - out_off);
 
     std::byte* base = dst + out_off;
-#ifdef INFERX_WITH_CUDA
     Slot* slot = nullptr;
-    if (cuda) {
+    if (accelerator) {
       slot = &slots[next_slot];
       next_slot = (next_slot + 1) % slots.size();
       if (slot->in_flight) {
         const auto wait_start = Clock::now();
-        INFERX_CUDA_RETURN_IF_ERROR(cudaEventSynchronize(slot->event));
+        INFERX_RETURN_IF_ERROR(runtime->SynchronizeEvent(slot->event));
         stats.h2d_wait_seconds += SecondsSince(wait_start);
         slot->in_flight = false;
       }
       base = slot->pinned;
     }
-#endif
 
     // Split the extents covering this slot at the slot boundary and the
     // stripe size, then partition the pieces among the threads by bytes.
@@ -275,8 +264,8 @@ Status WeightLoader::Impl::Stream(absl::Span<const Extent> extents_in,
     const size_t per_job =
         (fill + static_cast<size_t>(jobs) - 1) / static_cast<size_t>(jobs);
     size_t acc = 0;
-    for (size_t s = 0, j = 1;
-         s < segments.size() && j + 1 < job_bounds.size(); ++s) {
+    for (size_t s = 0, j = 1; s < segments.size() && j + 1 < job_bounds.size();
+         ++s) {
       acc += segments[s].len;
       if (acc >= per_job * j) job_bounds[j++] = s + 1;
     }
@@ -291,14 +280,12 @@ Status WeightLoader::Impl::Stream(absl::Span<const Extent> extents_in,
     });
     stats.stage_seconds += SecondsSince(stage_start);
 
-#ifdef INFERX_WITH_CUDA
-    if (cuda) {
-      INFERX_CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-          dst + out_off, base, fill, cudaMemcpyHostToDevice, stream));
-      INFERX_CUDA_RETURN_IF_ERROR(cudaEventRecord(slot->event, stream));
+    if (accelerator) {
+      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+          dst + out_off, base, fill, CopyKind::kHostToDevice, copy_stream));
+      INFERX_RETURN_IF_ERROR(runtime->RecordEvent(slot->event, copy_stream));
       slot->in_flight = true;
     }
-#endif
 
     out_off += fill;
   }
@@ -309,8 +296,8 @@ Status WeightLoader::Impl::Stream(absl::Span<const Extent> extents_in,
 StatusOr<TensorView> WeightLoader::Impl::FinishLoad(
     absl::Span<const Extent> extents_in, size_t total, DataType dtype,
     const Shape& shape) {
-  INFERX_ASSIGN_OR_RETURN(std::byte* dst, AllocateOut(total));
-  INFERX_RETURN_IF_ERROR(Stream(extents_in, dst, total));
+  INFERX_ASSIGN_OR_RETURN(std::byte * dst, AllocateOut(total));
+  INFERX_RETURN_IF_ERROR(TransferExtents(extents_in, dst, total));
   ++stats.tensors;
   stats.bytes += total;
   return TensorView::Create(dst, dtype, shape, opts.device);
@@ -335,22 +322,22 @@ StatusOr<WeightLoader> WeightLoader::Create(const Checkpoint* checkpoint,
   impl->threads = ResolveThreads(options.threads);
   impl->pool = std::make_unique<CopyPool>(impl->threads - 1);
 
-  if (impl->opts.device.IsCuda()) {
-#ifdef INFERX_WITH_CUDA
-    INFERX_CUDA_RETURN_IF_ERROR(
-        cudaStreamCreateWithFlags(&impl->stream, cudaStreamNonBlocking));
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(impl->opts.device));
+  if (impl->opts.device.IsAccelerator()) {
+    if (!impl->runtime->capabilities().pinned_host_memory) {
+      return UnimplementedError("WeightLoader: ", impl->opts.device.ToString(),
+                                " runtime has no pinned host memory");
+    }
+    INFERX_ASSIGN_OR_RETURN(impl->copy_stream,
+                            impl->runtime->CreateStream(impl->opts.device));
     impl->slots.resize(static_cast<size_t>(impl->opts.staging_slots));
     for (Impl::Slot& slot : impl->slots) {
-      void* pinned = nullptr;
-      INFERX_CUDA_RETURN_IF_ERROR(cudaHostAlloc(
-          &pinned, impl->opts.staging_slot_bytes, cudaHostAllocDefault));
+      INFERX_ASSIGN_OR_RETURN(void* pinned, impl->runtime->AllocatePinnedHost(
+                                                impl->opts.staging_slot_bytes));
       slot.pinned = static_cast<std::byte*>(pinned);
-      INFERX_CUDA_RETURN_IF_ERROR(
-          cudaEventCreateWithFlags(&slot.event, cudaEventDisableTiming));
+      INFERX_ASSIGN_OR_RETURN(slot.event,
+                              impl->runtime->CreateEvent(/*timing=*/false));
     }
-#else
-    return UnimplementedError("WeightLoader: built without CUDA");
-#endif
   }
 
   return WeightLoader(std::move(impl));
@@ -396,8 +383,8 @@ StatusOr<TensorView> WeightLoader::Upload(const Tensor& host) {
   }
   const size_t total = static_cast<size_t>(host.nbytes());
   const Extent extent{static_cast<const std::byte*>(host.data()), total};
-  return impl_->FinishLoad(absl::MakeConstSpan(&extent, 1), total,
-                           host.dtype(), host.shape());
+  return impl_->FinishLoad(absl::MakeConstSpan(&extent, 1), total, host.dtype(),
+                           host.shape());
 }
 
 StatusOr<TensorView> WeightLoader::UploadStacked(absl::Span<const Tensor> parts,
@@ -439,8 +426,8 @@ StatusOr<TensorView> WeightLoader::LoadRowPermuted(
     std::string_view name, const Shape& expected,
     absl::Span<const int64_t> row_map) {
   if (expected.Rank() != 2) {
-    return InvalidArgumentError("LoadRowPermuted: ", name,
-                                " must be 2-D, got ", expected.ToString());
+    return InvalidArgumentError("LoadRowPermuted: ", name, " must be 2-D, got ",
+                                expected.ToString());
   }
   INFERX_ASSIGN_OR_RETURN(const Tensor t,
                           impl_->ckpt->GetChecked(name, expected));
@@ -471,14 +458,13 @@ StatusOr<TensorView> WeightLoader::LoadRowPermuted(
 }
 
 Status WeightLoader::Finish() {
-#ifdef INFERX_WITH_CUDA
-  if (impl_->stream != nullptr) {
+  if (impl_->copy_stream.handle != nullptr) {
     const auto wait_start = Clock::now();
-    INFERX_CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(impl_->stream));
+    INFERX_RETURN_IF_ERROR(
+        impl_->runtime->SynchronizeStream(impl_->copy_stream));
     impl_->stats.h2d_wait_seconds += SecondsSince(wait_start);
     for (Impl::Slot& slot : impl_->slots) slot.in_flight = false;
   }
-#endif
   return OkStatus();
 }
 

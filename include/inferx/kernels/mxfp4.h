@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 /// MXFP4 — the OCP microscaling 4-bit format gpt-oss-20b stores its expert
@@ -46,10 +47,10 @@ namespace inferx::kernels {
 /// \param scales `[rows, G]` uint8.
 /// \param out    `[rows, G · 32]` bf16.
 Status DequantizeMxfp4ToBf16(const TensorView& blocks, const TensorView& scales,
-                             const TensorView& out,
-                             cudaStream_t stream = nullptr);
+                             const TensorView& out, Stream stream = {});
 
-/// \brief Dequantizes and de-interleaves a gpt-oss `gate_up` weight in one pass.
+/// \brief Dequantizes and de-interleaves a gpt-oss `gate_up` weight in one
+/// pass.
 ///
 /// gpt-oss stores gate and up **interleaved** along the `2·intermediate` axis —
 /// its MLP reads `gate_up[..., ::2]` and `gate_up[..., 1::2]` — where every
@@ -67,7 +68,6 @@ Status DequantizeMxfp4ToBf16(const TensorView& blocks, const TensorView& scales,
 /// \param out    `[2·intermediate, G · 32]` bf16, `[gate | up]`.
 Status DequantizeMxfp4GateUpToBf16(const TensorView& blocks,
                                    const TensorView& scales,
-                                   const TensorView& out,
-                                   cudaStream_t stream = nullptr);
+                                   const TensorView& out, Stream stream = {});
 
 }  // namespace inferx::kernels

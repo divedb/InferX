@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 /// The three things gpt-oss does differently from every other model in this
@@ -24,9 +25,9 @@ namespace inferx::kernels {
 ///
 /// Done that way it would need a change inside the attention kernel, and
 /// FlashInfer's **decode** kernel has no hook for it — `prefill.cuh` calls
-/// `variant.update_m_d`, `decode.cuh` maintains its softmax state directly. That
-/// looked like the plan's worst risk (X1): patch a pinned submodule we do not
-/// own, or fall back to our own slower kernel.
+/// `variant.update_m_d`, `decode.cuh` maintains its softmax state directly.
+/// That looked like the plan's worst risk (X1): patch a pinned submodule we do
+/// not own, or fall back to our own slower kernel.
 ///
 /// It is neither, because the sink factors out exactly. With `D = Σ_j e^{s_j}`
 /// over the real keys, the sinked output is
@@ -42,18 +43,19 @@ namespace inferx::kernels {
 /// 2e-16 across sinks from −5 to +20.
 ///
 /// \param out    `[tokens, heads, head_dim]` bf16, rescaled in place.
-/// \param lse    `[tokens, heads]` fp32, as written by FlashInfer's `lse` output.
-/// \param sinks  `[heads]` bf16, the learned per-head logits.
-/// \param lse_is_log2 FlashInfer's `state_t::get_lse()` returns `m + log2(d)` —
+/// \param lse    `[tokens, heads]` fp32, as written by FlashInfer's `lse`
+/// output. \param sinks  `[heads]` bf16, the learned per-head logits. \param
+/// lse_is_log2 FlashInfer's `state_t::get_lse()` returns `m + log2(d)` —
 ///                    base **two**, because the kernels fold `log2(e)` into the
 ///                    softmax scale so they can use `exp2`. Pass true for that
 ///                    convention and the kernel converts; pass false if the lse
-///                    is a natural log. Getting this wrong is a plausible-looking
-///                    error of a factor of `ln 2` inside a sigmoid, which is why
-///                    it is an explicit argument rather than a constant.
+///                    is a natural log. Getting this wrong is a
+///                    plausible-looking error of a factor of `ln 2` inside a
+///                    sigmoid, which is why it is an explicit argument rather
+///                    than a constant.
 Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
                            const TensorView& sinks, bool lse_is_log2 = true,
-                           cudaStream_t stream = nullptr);
+                           Stream stream = {});
 
 /// \brief Causal GQA attention that also reports its log-sum-exp.
 ///
@@ -83,7 +85,7 @@ Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
 Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
                           const TensorView& v, const TensorView& out,
                           const TensorView& lse, int64_t window, float scale,
-                          cudaStream_t stream = nullptr);
+                          Stream stream = {});
 
 /// \brief gpt-oss's gated activation: clamped, alpha-scaled, and offset.
 ///
@@ -110,7 +112,7 @@ Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
 /// \param limit   `swiglu_limit` from the config (7.0).
 /// \param alpha   1.702.
 Status GptOssSwiGlu(const TensorView& gate_up, const TensorView& out,
-                    float limit, float alpha, cudaStream_t stream = nullptr);
+                    float limit, float alpha, Stream stream = {});
 
 /// \brief Rotary embedding from a precomputed inverse-frequency table.
 ///
@@ -136,13 +138,14 @@ Status GptOssSwiGlu(const TensorView& gate_up, const TensorView& out,
 Status RotaryEmbeddingFromTable(const TensorView& q, const TensorView& k,
                                 const TensorView& positions,
                                 const TensorView& inv_freq, float attn_factor,
-                                cudaStream_t stream = nullptr);
+                                Stream stream = {});
 
 /// \brief Fills `inv_freq` with YaRN's blended frequencies, on the host.
 ///
 /// Separate from the kernel because it runs once per model, is fiddly, and is
 /// far easier to check against the reference on the host than on the device.
-/// The blend follows `transformers.modeling_rope_utils._compute_yarn_parameters`.
+/// The blend follows
+/// `transformers.modeling_rope_utils._compute_yarn_parameters`.
 ///
 /// \param head_dim      Rotary width.
 /// \param base          `rope_theta`.

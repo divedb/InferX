@@ -149,7 +149,7 @@ __global__ void QuantizeDynamicKernel(const Src* __restrict__ src,
 }  // namespace
 
 Status ComputeF8Scale(const TensorView& src, float* scale_dev,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kFloat16, "src"));
 
   if (scale_dev == nullptr) {
@@ -176,7 +176,7 @@ Status ComputeF8Scale(const TensorView& src, float* scale_dev,
 }
 
 Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
-                           const float* scale_dev, cudaStream_t stream) {
+                           const float* scale_dev, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kFloat16, "src"));
   INFERX_RETURN_IF_ERROR(
       CheckDeviceTensor(dst, DataType::kFloat8E4M3FN, "dst"));
@@ -203,7 +203,7 @@ Status QuantizeF16ToF8E4M3(const TensorView& src, const TensorView& dst,
 }
 
 Status QuantizeToF8E4M3Dynamic(const TensorView& src, const TensorView& dst,
-                               float* scale_dev, cudaStream_t stream) {
+                               float* scale_dev, Stream stream) {
   if (!src.IsDefined() || !src.IsCuda()) {
     return InvalidArgumentError("src must be a defined CUDA tensor");
   }
@@ -426,7 +426,7 @@ __global__ void DequantizeInt4Kernel(
 }  // namespace
 
 Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
-                         const TensorView& scales, cudaStream_t stream) {
+                         const TensorView& scales, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kFloat16, "src"));
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(dst, DataType::kInt4, "dst"));
   INFERX_RETURN_IF_ERROR(
@@ -488,7 +488,7 @@ Status QuantizeF16ToInt4(const TensorView& src, const TensorView& dst,
 }
 
 Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
-                           const TensorView& dst, cudaStream_t stream) {
+                           const TensorView& dst, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kInt4, "src"));
   INFERX_RETURN_IF_ERROR(
       CheckDeviceTensor(scales, DataType::kFloat16, "scales"));
@@ -536,7 +536,7 @@ Status DequantizeInt4ToF16(const TensorView& src, const TensorView& scales,
 }
 
 Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
-                          const TensorView& scales, cudaStream_t stream) {
+                          const TensorView& scales, Stream stream) {
   // The bf16 mirror of QuantizeF16ToInt4, so W4A16 stays in the model's native
   // dtype instead of casting bf16 <-> f16 around every linear. The block-size
   // rounding note in QuantizeF16ToInt4 applies here too.
@@ -591,7 +591,7 @@ Status QuantizeBf16ToInt4(const TensorView& src, const TensorView& dst,
 }
 
 Status DequantizeInt4ToBf16(const TensorView& src, const TensorView& scales,
-                            const TensorView& dst, cudaStream_t stream) {
+                            const TensorView& dst, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckDeviceTensor(src, DataType::kInt4, "src"));
   INFERX_RETURN_IF_ERROR(
       CheckDeviceTensor(scales, DataType::kBFloat16, "scales"));

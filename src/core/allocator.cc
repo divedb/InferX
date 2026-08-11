@@ -7,7 +7,7 @@
 #include <mutex>
 
 #include "absl/strings/str_cat.h"
-#include "inferx/core/cuda_utils.h"
+#include "inferx/core/device_runtime.h"
 
 namespace inferx {
 namespace {
@@ -52,44 +52,22 @@ class HostAllocatorImpl final : public Allocator {
   std::string_view Name() const override { return "host"; }
 };
 
-#ifdef INFERX_WITH_CUDA
-class CudaAllocatorImpl final : public Allocator {
+class DeviceAllocatorImpl final : public Allocator {
  public:
-  explicit CudaAllocatorImpl(int8_t ordinal) : ordinal_(ordinal) {}
+  explicit DeviceAllocatorImpl(DeviceId device) : device_(device) {}
 
   StatusOr<void*> Allocate(size_t bytes, size_t alignment) override {
     if (bytes == 0) return static_cast<void*>(nullptr);
 
     INFERX_RETURN_IF_ERROR(CheckAlignment(alignment));
 
-    int prev = 0;
-    INFERX_CUDA_RETURN_IF_ERROR(cudaGetDevice(&prev));
-    const bool switch_device = prev != ordinal_;
-
-    if (switch_device) {
-      INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(ordinal_));
-    }
-
-    // Unpadded. cudaMalloc suballocates from large VA reservations and applies
-    // its own size granularity, so rounding here would only inflate the
-    // request.
-    void* p = nullptr;
-    const cudaError_t err = cudaMalloc(&p, bytes);
-
-    if (switch_device) {
-      // Restore before surfacing any error, so a failed allocation does not
-      // also leave the calling thread pointed at the wrong device.
-      INFERX_CUDA_RETURN_IF_ERROR(cudaSetDevice(prev));
-    }
-
-    if (err != cudaSuccess) {
-      return CudaErrorToStatus(err, "cudaMalloc", __FILE__, __LINE__);
-    }
+    INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device_));
+    INFERX_ASSIGN_OR_RETURN(void* p, runtime->Allocate(device_, bytes));
 
     const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
 
     if (addr % alignment != 0) {
-      cudaFree(p);
+      (void)runtime->Free(device_, p);
 
       return InternalError("cudaMalloc returned 0x", absl::Hex(addr),
                            " which is not aligned to ", alignment, " bytes");
@@ -101,27 +79,23 @@ class CudaAllocatorImpl final : public Allocator {
   Status Deallocate(void* ptr) override {
     if (ptr == nullptr) return OkStatus();
 
-    const cudaError_t err = cudaFree(ptr);
-
-    if (err != cudaSuccess) {
-      return CudaErrorToStatus(err, "cudaFree", __FILE__, __LINE__);
-    }
-
-    return OkStatus();
+    INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device_));
+    return runtime->Free(device_, ptr);
   }
 
-  DeviceId Device() const override { return DeviceId::Cuda(ordinal_); }
-  std::string_view Name() const override { return "cuda"; }
+  DeviceId Device() const override { return device_; }
+  std::string_view Name() const override { return "accelerator"; }
 
  private:
-  int8_t ordinal_;
+  DeviceId device_;
 };
 
 constexpr int kMaxDevices = 16;
 
-StatusOr<Allocator*> CudaAllocatorFor(int8_t ordinal) {
+StatusOr<Allocator*> DeviceAllocatorFor(DeviceId device) {
+  const int8_t ordinal = device.index;
   if (ordinal < 0 || ordinal >= kMaxDevices) {
-    return InvalidArgumentError("CUDA ordinal ", static_cast<int>(ordinal),
+    return InvalidArgumentError("device ordinal ", static_cast<int>(ordinal),
                                 " is outside [0, ", kMaxDevices, ")");
   }
   // One allocator per ordinal, created on first use and intentionally leaked
@@ -131,11 +105,10 @@ StatusOr<Allocator*> CudaAllocatorFor(int8_t ordinal) {
 
   std::lock_guard<std::mutex> lock(mu);
   if (table[ordinal] == nullptr) {
-    table[ordinal] = new CudaAllocatorImpl(ordinal);
+    table[ordinal] = new DeviceAllocatorImpl(device);
   }
   return table[ordinal];
 }
-#endif  // INFERX_WITH_CUDA
 
 }  // namespace
 
@@ -146,13 +119,8 @@ StatusOr<Allocator*> AllocatorFor(DeviceId device) {
     return kInstance;
   }
 
-#ifdef INFERX_WITH_CUDA
-  return CudaAllocatorFor(device.index);
-#else
-  return FailedPreconditionError(
-      "cannot allocate on ", device.ToString(),
-      ": built without CUDA support (INFERX_ENABLE_CUDA=OFF)");
-#endif
+  INFERX_RETURN_IF_ERROR(RuntimeFor(device).status());
+  return DeviceAllocatorFor(device);
 }
 
 }  // namespace inferx

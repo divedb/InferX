@@ -6,6 +6,7 @@
 
 #include "inferx/core/kv_cache.h"
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/model/config.h"
@@ -94,9 +95,11 @@ class MlaAttentionLayer {
   ///                     reconstruction buffers are O(context · heads), which
   ///                     is the unabsorbed form's memory cost and another
   ///                     reason absorption is worth doing.
+  /// \param device       Accelerator placement for scratch and constants.
   static StatusOr<MlaAttentionLayer> Create(const ModelConfig& config,
                                             int64_t max_tokens,
-                                            int64_t max_context);
+                                            int64_t max_context,
+                                            DeviceId device);
 
   /// \brief The attention softmax scale in use, YaRN correction included.
   ///
@@ -131,7 +134,7 @@ class MlaAttentionLayer {
                  const TensorView& slot_mapping, const TensorView& block_table,
                  int64_t context_len, const TensorView& cache,
                  const MlaWeights& weights, const TensorView& out,
-                 kernels::CublasLtGemm* gemm, cudaStream_t stream = nullptr);
+                 kernels::CublasLtGemm* gemm, Stream stream = {});
 
  private:
   struct Impl;

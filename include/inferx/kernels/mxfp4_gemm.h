@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -38,7 +39,7 @@ namespace inferx::kernels {
 ///                      up]` split order, which the activation expects.
 Status Mxfp4Gemm(const TensorView& x, const TensorView& blocks,
                  const TensorView& scales, const TensorView& y,
-                 bool deinterleave = false, cudaStream_t stream = nullptr);
+                 bool deinterleave = false, Stream stream = {});
 
 /// \brief Ragged, GPU-dispatched variant used by MoE experts.
 ///
@@ -51,7 +52,6 @@ Status Mxfp4Gemm(const TensorView& x, const TensorView& blocks,
 Status Mxfp4GroupedGemm(const TensorView& x, const TensorView& offsets,
                         const TensorView& blocks, const TensorView& scales,
                         const TensorView& bias, const TensorView& y,
-                        bool deinterleave = false,
-                        cudaStream_t stream = nullptr);
+                        bool deinterleave = false, Stream stream = {});
 
 }  // namespace inferx::kernels

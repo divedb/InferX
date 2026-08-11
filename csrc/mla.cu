@@ -426,7 +426,7 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
 
 Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
                       const TensorView& positions, float theta,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 3, "x"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(positions, DataType::kInt32, 1, "positions"));
@@ -460,7 +460,7 @@ Status MlaRopeInPlace(const TensorView& x, int64_t rope_dim,
 
 Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
                         const TensorView& positions, const TensorView& inv_freq,
-                        float attn_factor, cudaStream_t stream) {
+                        float attn_factor, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(x, DataType::kBFloat16, 3, "x"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(positions, DataType::kInt32, 1, "positions"));
@@ -505,7 +505,7 @@ Status MlaRopeFromTable(const TensorView& x, int64_t rope_dim,
 }
 
 Status SplitTrailing(const TensorView& src, const TensorView& head,
-                     const TensorView& tail, cudaStream_t stream) {
+                     const TensorView& tail, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(src, DataType::kBFloat16, 3, "src"));
   INFERX_RETURN_IF_ERROR(CheckTensor(head, DataType::kBFloat16, 3, "head"));
   INFERX_RETURN_IF_ERROR(CheckTensor(tail, DataType::kBFloat16, 3, "tail"));
@@ -542,7 +542,7 @@ Status SplitTrailing(const TensorView& src, const TensorView& head,
 
 Status MlaAppendLatent(const TensorView& latent, const TensorView& rope_key,
                        const TensorView& cache, const TensorView& slot_mapping,
-                       cudaStream_t stream) {
+                       Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(latent, DataType::kBFloat16, 2, "latent"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(rope_key, DataType::kBFloat16, 2, "rope_key"));
@@ -582,7 +582,7 @@ Status MlaAppendLatent(const TensorView& latent, const TensorView& rope_key,
 
 Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
                         int64_t context_len, const TensorView& out,
-                        cudaStream_t stream) {
+                        Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(cache, DataType::kBFloat16, 4, "cache"));
   INFERX_RETURN_IF_ERROR(
       CheckTensor(block_table, DataType::kInt32, 1, "block_table"));
@@ -618,7 +618,7 @@ Status MlaGatherLatents(const TensorView& cache, const TensorView& block_table,
 Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
                     const TensorView& k_nope, const TensorView& k_rope,
                     const TensorView& v, const TensorView& out,
-                    int64_t query_base, float scale, cudaStream_t stream) {
+                    int64_t query_base, float scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q_nope, DataType::kBFloat16, 3, "q_nope"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_rope, DataType::kBFloat16, 3, "q_rope"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k_nope, DataType::kBFloat16, 3, "k_nope"));
@@ -687,7 +687,7 @@ Status MlaAttention(const TensorView& q_nope, const TensorView& q_rope,
 
 Status MlaAbsorbQ(const TensorView& q_nope, const TensorView& kv_b,
                   const TensorView& q_lat, int64_t v_head_dim,
-                  cudaStream_t stream) {
+                  Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q_nope, DataType::kBFloat16, 3, "q_nope"));
   INFERX_RETURN_IF_ERROR(CheckTensor(kv_b, DataType::kBFloat16, 2, "kv_b"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_lat, DataType::kBFloat16, 3, "q_lat"));
@@ -730,7 +730,7 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
                           const TensorView& cache,
                           const TensorView& block_table, int64_t context_len,
                           const TensorView& out_lat, int64_t query_base,
-                          float scale, cudaStream_t stream) {
+                          float scale, Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q_lat, DataType::kBFloat16, 3, "q_lat"));
   INFERX_RETURN_IF_ERROR(CheckTensor(q_rope, DataType::kBFloat16, 3, "q_rope"));
   INFERX_RETURN_IF_ERROR(CheckTensor(cache, DataType::kBFloat16, 4, "cache"));
@@ -794,7 +794,7 @@ Status MlaLatentAttention(const TensorView& q_lat, const TensorView& q_rope,
 
 Status MlaUnabsorbOut(const TensorView& attn_lat, const TensorView& kv_b,
                       const TensorView& out, int64_t qk_nope_head_dim,
-                      cudaStream_t stream) {
+                      Stream stream) {
   INFERX_RETURN_IF_ERROR(
       CheckTensor(attn_lat, DataType::kBFloat16, 3, "attn_lat"));
   INFERX_RETURN_IF_ERROR(CheckTensor(kv_b, DataType::kBFloat16, 2, "kv_b"));

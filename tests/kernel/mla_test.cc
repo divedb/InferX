@@ -15,14 +15,16 @@
 ///     off by one — silently, because both paths still produce plausible
 ///     numbers.
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <vector>
+#include "inferx/kernels/mla.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 
 #include "inferx/core/cuda_utils.h"
 #include "inferx/core/device_buffer.h"
@@ -31,7 +33,6 @@
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
 #include "inferx/kernels/gpt_oss.h"
-#include "inferx/kernels/mla.h"
 #include "inferx/model/config.h"
 #include "inferx/model/mla.h"
 
@@ -81,8 +82,8 @@ TensorView Upload(std::vector<DeviceBuffer>& keep, const std::vector<T>& host,
 
   keep.push_back(*std::move(buf));
 
-  auto v = TensorView::Create(keep.back().data(), dtype, shape,
-                              DeviceId::Cuda(0));
+  auto v =
+      TensorView::Create(keep.back().data(), dtype, shape, DeviceId::Cuda(0));
   EXPECT_TRUE(v.ok()) << v.status();
   return *v;
 }
@@ -96,8 +97,8 @@ TensorView Empty(std::vector<DeviceBuffer>& keep, DataType dtype,
 
   keep.push_back(*std::move(buf));
 
-  auto v = TensorView::Create(keep.back().data(), dtype, shape,
-                              DeviceId::Cuda(0));
+  auto v =
+      TensorView::Create(keep.back().data(), dtype, shape, DeviceId::Cuda(0));
   EXPECT_TRUE(v.ok()) << v.status();
   return *v;
 }
@@ -193,9 +194,9 @@ MlaWeights UploadWeights(std::vector<DeviceBuffer>& keep, const ModelConfig& c,
                    Shape({c.kv_lora_rank + c.qk_rope_head_dim, h}));
   mw.kv_a_norm = Upload(keep, ToBf16(w.kv_a_norm), DataType::kBFloat16,
                         Shape({c.kv_lora_rank}));
-  mw.kv_b = Upload(keep, ToBf16(w.kv_b), DataType::kBFloat16,
-                   Shape({heads * (c.qk_nope_head_dim + c.v_head_dim),
-                          c.kv_lora_rank}));
+  mw.kv_b = Upload(
+      keep, ToBf16(w.kv_b), DataType::kBFloat16,
+      Shape({heads * (c.qk_nope_head_dim + c.v_head_dim), c.kv_lora_rank}));
   mw.o = Upload(keep, ToBf16(w.o), DataType::kBFloat16,
                 Shape({h, heads * c.v_head_dim}));
   return mw;
@@ -281,8 +282,7 @@ std::vector<float> ReferenceMla(const ModelConfig& c, const Weights& w,
   std::vector<float> q_a = MatMulT(x, w.q_a, tokens, h, c.q_lora_rank);
   RmsNormRows(q_a, w.q_a_norm, tokens, c.q_lora_rank,
               static_cast<float>(c.rms_norm_eps));
-  std::vector<float> q =
-      MatMulT(q_a, w.q_b, tokens, c.q_lora_rank, heads * qk);
+  std::vector<float> q = MatMulT(q_a, w.q_b, tokens, c.q_lora_rank, heads * qk);
   RopeTail(q, tokens * heads, qk, rope, positions, heads,
            static_cast<float>(c.rope_theta));
 
@@ -345,7 +345,8 @@ std::vector<float> ReferenceMla(const ModelConfig& c, const Weights& w,
         float acc = 0.0f;
         for (int64_t j = 0; j <= i; ++j) {
           acc += scores[static_cast<size_t>(j)] *
-                 kv[static_cast<size_t>((j * heads + hd) * (nope + vd) + nope + d)];
+                 kv[static_cast<size_t>((j * heads + hd) * (nope + vd) + nope +
+                                        d)];
         }
         attn[static_cast<size_t>((i * heads + hd) * vd + d)] = acc / sum;
       }
@@ -385,8 +386,9 @@ TEST(MlaLayout, PoolRefusesToHandOutAValueCache) {
   if (!CudaAvailable()) GTEST_SKIP() << "no CUDA device available";
 
   const ModelConfig c = SmallMlaConfig();
-  auto pool = KvBlockPool::Create(/*num_layers=*/1, /*num_blocks=*/4,
-                                  /*block_size=*/8, MlaAttentionLayer::LayoutFor(c));
+  auto pool =
+      KvBlockPool::Create(/*num_layers=*/1, /*num_blocks=*/4,
+                          /*block_size=*/8, MlaAttentionLayer::LayoutFor(c));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   EXPECT_TRUE(pool->KeyCache(0).ok());
@@ -412,8 +414,8 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
   const std::vector<float> x =
       RandomTensor(static_cast<size_t>(tokens * c.hidden_size), 0.33f);
 
-  auto pool = KvBlockPool::Create(1, 8, block_size,
-                                  MlaAttentionLayer::LayoutFor(c));
+  auto pool =
+      KvBlockPool::Create(1, 8, block_size, MlaAttentionLayer::LayoutFor(c));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   std::vector<int32_t> blocks;
@@ -439,9 +441,9 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
       Upload(keep, positions, DataType::kInt32, Shape({tokens}));
   const TensorView slots_v =
       Upload(keep, slots, DataType::kInt32, Shape({tokens}));
-  const TensorView table_v = Upload(
-      keep, blocks, DataType::kInt32,
-      Shape({static_cast<int64_t>(blocks.size())}));
+  const TensorView table_v =
+      Upload(keep, blocks, DataType::kInt32,
+             Shape({static_cast<int64_t>(blocks.size())}));
   const TensorView out_v =
       Empty(keep, DataType::kBFloat16, Shape({tokens, c.hidden_size}));
 
@@ -453,11 +455,12 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
   auto gemm = kernels::CublasLtGemm::Create();
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
-  auto layer = MlaAttentionLayer::Create(c, tokens, tokens);
+  auto layer = MlaAttentionLayer::Create(c, tokens, tokens, DeviceId::Cuda(0));
   ASSERT_TRUE(layer.ok()) << layer.status();
 
-  ASSERT_TRUE(layer->Forward(x_v, pos_v, slots_v, table_v, tokens, *cache, mw,
-                             out_v, &*gemm)
+  ASSERT_TRUE(layer
+                  ->Forward(x_v, pos_v, slots_v, table_v, tokens, *cache, mw,
+                            out_v, &*gemm)
                   .ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -470,8 +473,8 @@ TEST_F(MlaLayerTest, PrefillMatchesTheHostReference) {
 
   double worst = 0.0;
   for (size_t i = 0; i < want.size(); ++i) {
-    worst = std::max<double>(worst,
-                             std::abs(__bfloat162float(got[i]) - want[i]));
+    worst =
+        std::max<double>(worst, std::abs(__bfloat162float(got[i]) - want[i]));
   }
 
   // Four GEMMs, two norms, a softmax and a rotation, all in bf16 with 8
@@ -504,8 +507,8 @@ void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
   ASSERT_TRUE(gemm.ok()) << gemm.status();
 
   auto run = [&](bool one_at_a_time) {
-    auto pool = KvBlockPool::Create(1, 8, block_size,
-                                    MlaAttentionLayer::LayoutFor(c));
+    auto pool =
+        KvBlockPool::Create(1, 8, block_size, MlaAttentionLayer::LayoutFor(c));
     EXPECT_TRUE(pool.ok()) << pool.status();
 
     std::vector<int32_t> blocks;
@@ -519,11 +522,12 @@ void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
     EXPECT_TRUE(cache.ok()) << cache.status();
 
     std::vector<DeviceBuffer> local;
-    const TensorView table_v = Upload(
-        local, blocks, DataType::kInt32,
-        Shape({static_cast<int64_t>(blocks.size())}));
+    const TensorView table_v =
+        Upload(local, blocks, DataType::kInt32,
+               Shape({static_cast<int64_t>(blocks.size())}));
 
-    auto layer = MlaAttentionLayer::Create(c, tokens, tokens);
+    auto layer =
+        MlaAttentionLayer::Create(c, tokens, tokens, DeviceId::Cuda(0));
     EXPECT_TRUE(layer.ok()) << layer.status();
 
     std::vector<float> last_row;
@@ -555,8 +559,9 @@ void ExpectDecodeMatchesPrefill(const ModelConfig& c) {
       const TensorView out_v =
           Empty(local, DataType::kBFloat16, Shape({n, c.hidden_size}));
 
-      EXPECT_TRUE(layer->Forward(x_v, pos_v, slots_v, table_v, begin + n,
-                                 *cache, mw, out_v, &*gemm)
+      EXPECT_TRUE(layer
+                      ->Forward(x_v, pos_v, slots_v, table_v, begin + n, *cache,
+                                mw, out_v, &*gemm)
                       .ok());
       EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -636,13 +641,13 @@ TEST_F(MlaLayerTest, DeepSeekV2LiteSoftmaxScaleIsPinned) {
   c.yarn_mscale = 0.707;
   c.yarn_mscale_all_dim = 0.707;
 
-  auto layer = MlaAttentionLayer::Create(c, 1, 1);
+  auto layer = MlaAttentionLayer::Create(c, 1, 1, DeviceId::Cuda(0));
   ASSERT_TRUE(layer.ok()) << layer.status();
   EXPECT_NEAR(layer->softmax_scale(), 0.114721f, 1e-4f);
 
   // Without YaRN the same shape falls back to the plain inverse square root.
   c.yarn_factor = 0.0;
-  auto plain = MlaAttentionLayer::Create(c, 1, 1);
+  auto plain = MlaAttentionLayer::Create(c, 1, 1, DeviceId::Cuda(0));
   ASSERT_TRUE(plain.ok()) << plain.status();
   EXPECT_NEAR(plain->softmax_scale(), 1.0f / std::sqrt(192.0f), 1e-6f);
 }
@@ -652,8 +657,7 @@ TEST_F(MlaLayerTest, DeepSeekV2LiteSoftmaxScaleIsPinned) {
 TEST_F(MlaTest, RopeInPlaceRotatesOnlyTheTail) {
   constexpr int64_t tokens = 3, heads = 2, head_dim = 12, rope_dim = 4;
 
-  std::vector<float> x(
-      static_cast<size_t>(tokens * heads * head_dim));
+  std::vector<float> x(static_cast<size_t>(tokens * heads * head_dim));
   for (size_t i = 0; i < x.size(); ++i) {
     x[i] = Fill(static_cast<int64_t>(i), 3, 0.5f) + 0.7f;
   }
@@ -767,8 +771,8 @@ TEST_F(MlaTest, YarnFrequenciesAreExactAtTheLadderEnds) {
       /*original_max=*/4096, /*truncate=*/true, got.data());
 
   for (int64_t j = 0; j < rope_dim / 2; ++j) {
-    const double original = std::pow(theta, -2.0 * static_cast<double>(j) /
-                                                static_cast<double>(rope_dim));
+    const double original = std::pow(
+        theta, -2.0 * static_cast<double>(j) / static_cast<double>(rope_dim));
     if (j <= 10) {
       EXPECT_NEAR(got[static_cast<size_t>(j)], original, original * 1e-6)
           << "dimension " << j << " should extrapolate";
@@ -787,7 +791,7 @@ TEST_F(MlaTest, YarnFrequenciesAreExactAtTheLadderEnds) {
   // 1 — and DeepSeek's parameterized form must agree with it there.
   EXPECT_NEAR(attn, kernels::YarnMscale(factor, 1.0), 1e-6f);
   EXPECT_NEAR(kernels::YarnMscale(factor, 0.707), 1.260804f, 1e-5f);
-  EXPECT_FLOAT_EQ(kernels::YarnMscale(0.5, 0.707), 1.0f);  // factor <= 1
+  EXPECT_FLOAT_EQ(kernels::YarnMscale(0.5, 0.707), 1.0f);   // factor <= 1
   EXPECT_FLOAT_EQ(kernels::YarnMscale(factor, 0.0), 1.0f);  // coefficient 0
 }
 
@@ -799,8 +803,8 @@ TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
   c.kv_lora_rank = latent_dim;
   c.qk_rope_head_dim = rope_dim;
 
-  auto pool = KvBlockPool::Create(1, 6, block_size,
-                                  MlaAttentionLayer::LayoutFor(c));
+  auto pool =
+      KvBlockPool::Create(1, 6, block_size, MlaAttentionLayer::LayoutFor(c));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   // Blocks allocated out of order, which is the case a block-table walk that
@@ -832,34 +836,31 @@ TEST_F(MlaTest, AppendAndGatherRoundTripThroughTheBlockTable) {
                                    Shape({tokens, rope_dim}));
   const TensorView slots_v =
       Upload(keep, slots, DataType::kInt32, Shape({tokens}));
-  const TensorView table_v = Upload(
-      keep, blocks, DataType::kInt32,
-      Shape({static_cast<int64_t>(blocks.size())}));
+  const TensorView table_v =
+      Upload(keep, blocks, DataType::kInt32,
+             Shape({static_cast<int64_t>(blocks.size())}));
   const TensorView out_v =
       Empty(keep, DataType::kBFloat16, Shape({tokens, width}));
 
   auto cache = pool->KeyCache(0);
   ASSERT_TRUE(cache.ok()) << cache.status();
 
-  ASSERT_TRUE(
-      kernels::MlaAppendLatent(latent_v, rope_v, *cache, slots_v).ok());
-  ASSERT_TRUE(
-      kernels::MlaGatherLatents(*cache, table_v, tokens, out_v).ok());
+  ASSERT_TRUE(kernels::MlaAppendLatent(latent_v, rope_v, *cache, slots_v).ok());
+  ASSERT_TRUE(kernels::MlaGatherLatents(*cache, table_v, tokens, out_v).ok());
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
   const auto got = Download<bf16>(out_v, tokens * width);
 
   for (int64_t t = 0; t < tokens; ++t) {
     for (int64_t d = 0; d < latent_dim; ++d) {
-      EXPECT_FLOAT_EQ(
-          __bfloat162float(got[static_cast<size_t>(t * width + d)]),
-          latent[static_cast<size_t>(t * latent_dim + d)])
+      EXPECT_FLOAT_EQ(__bfloat162float(got[static_cast<size_t>(t * width + d)]),
+                      latent[static_cast<size_t>(t * latent_dim + d)])
           << "latent, token " << t << " column " << d;
     }
     for (int64_t d = 0; d < rope_dim; ++d) {
-      EXPECT_FLOAT_EQ(
-          __bfloat162float(got[static_cast<size_t>(t * width + latent_dim + d)]),
-          rope[static_cast<size_t>(t * rope_dim + d)])
+      EXPECT_FLOAT_EQ(__bfloat162float(
+                          got[static_cast<size_t>(t * width + latent_dim + d)]),
+                      rope[static_cast<size_t>(t * rope_dim + d)])
           << "rope key, token " << t << " column " << d;
     }
   }
@@ -879,8 +880,8 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   c.kv_lora_rank = latent_dim;
   c.qk_rope_head_dim = rope;
 
-  auto pool = KvBlockPool::Create(1, 6, block_size,
-                                  MlaAttentionLayer::LayoutFor(c));
+  auto pool =
+      KvBlockPool::Create(1, 6, block_size, MlaAttentionLayer::LayoutFor(c));
   ASSERT_TRUE(pool.ok()) << pool.status();
 
   std::vector<int32_t> blocks;
@@ -917,24 +918,21 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
       keep, ToBf16(rope_keys), DataType::kBFloat16, Shape({context, rope}));
   const TensorView slots_v =
       Upload(keep, slots, DataType::kInt32, Shape({context}));
-  const TensorView table_v = Upload(
-      keep, blocks, DataType::kInt32,
-      Shape({static_cast<int64_t>(blocks.size())}));
+  const TensorView table_v =
+      Upload(keep, blocks, DataType::kInt32,
+             Shape({static_cast<int64_t>(blocks.size())}));
 
   auto cache = pool->KeyCache(0);
   ASSERT_TRUE(cache.ok()) << cache.status();
   ASSERT_TRUE(
       kernels::MlaAppendLatent(latents_v, rope_keys_v, *cache, slots_v).ok());
 
-  const TensorView q_nope_v = Upload(keep, ToBf16(q_nope),
-                                     DataType::kBFloat16,
+  const TensorView q_nope_v = Upload(keep, ToBf16(q_nope), DataType::kBFloat16,
                                      Shape({1, heads, nope}));
-  const TensorView q_rope_v = Upload(keep, ToBf16(q_rope),
-                                     DataType::kBFloat16,
+  const TensorView q_rope_v = Upload(keep, ToBf16(q_rope), DataType::kBFloat16,
                                      Shape({1, heads, rope}));
-  const TensorView kv_b_v =
-      Upload(keep, ToBf16(kv_b), DataType::kBFloat16,
-             Shape({heads * (nope + vd), latent_dim}));
+  const TensorView kv_b_v = Upload(keep, ToBf16(kv_b), DataType::kBFloat16,
+                                   Shape({heads * (nope + vd), latent_dim}));
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(nope + rope));
 
@@ -948,8 +946,7 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
 
   ASSERT_TRUE(kernels::MlaAbsorbQ(q_nope_v, kv_b_v, q_lat, vd).ok());
   ASSERT_TRUE(kernels::MlaLatentAttention(q_lat, q_rope_v, *cache, table_v,
-                                          context, attn_lat, context - 1,
-                                          scale)
+                                          context, attn_lat, context - 1, scale)
                   .ok());
   ASSERT_TRUE(
       kernels::MlaUnabsorbOut(attn_lat, kv_b_v, absorbed_out, nope).ok());
@@ -975,11 +972,10 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
     }
   }
 
-  const TensorView k_nope_v = Upload(keep, ToBf16(k_nope),
-                                     DataType::kBFloat16,
+  const TensorView k_nope_v = Upload(keep, ToBf16(k_nope), DataType::kBFloat16,
                                      Shape({context, heads, nope}));
-  const TensorView v_v = Upload(keep, ToBf16(v), DataType::kBFloat16,
-                                Shape({context, heads, vd}));
+  const TensorView v_v =
+      Upload(keep, ToBf16(v), DataType::kBFloat16, Shape({context, heads, vd}));
   const TensorView unabsorbed_out =
       Empty(keep, DataType::kBFloat16, Shape({1, heads, vd}));
 
@@ -994,7 +990,8 @@ TEST_F(MlaTest, AbsorbedKernelsMatchTheUnabsorbedAttention) {
   double out_scale = 0.0;
   for (int64_t i = 0; i < heads * vd; ++i) {
     out_scale = std::max<double>(
-        out_scale, std::abs(__bfloat162float(unabsorbed[static_cast<size_t>(i)])));
+        out_scale,
+        std::abs(__bfloat162float(unabsorbed[static_cast<size_t>(i)])));
   }
   ASSERT_GT(out_scale, 0.0);
 

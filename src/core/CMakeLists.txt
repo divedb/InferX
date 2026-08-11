@@ -11,6 +11,7 @@ add_library(inferx_core
   cuda_utils.cc
   kv_cache.cc
   device_buffer.cc
+  device_runtime.cc
   shape.cc
   storage.cc
   tensor.cc

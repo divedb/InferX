@@ -228,7 +228,7 @@ Status CheckTensor(const TensorView& t, DataType dtype, int rank,
 
 Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
                            const TensorView& sinks, bool lse_is_log2,
-                           cudaStream_t stream) {
+                           Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 3, "out"));
   INFERX_RETURN_IF_ERROR(CheckTensor(lse, DataType::kFloat, 2, "lse"));
   INFERX_RETURN_IF_ERROR(CheckTensor(sinks, DataType::kBFloat16, 1, "sinks"));
@@ -263,7 +263,7 @@ Status ApplyAttentionSinks(const TensorView& out, const TensorView& lse,
 Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
                           const TensorView& v, const TensorView& out,
                           const TensorView& lse, int64_t window, float scale,
-                          cudaStream_t stream) {
+                          Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(CheckTensor(v, DataType::kBFloat16, 3, "v"));
@@ -317,7 +317,7 @@ Status GptOssAttentionRef(const TensorView& q, const TensorView& k,
 }
 
 Status GptOssSwiGlu(const TensorView& gate_up, const TensorView& out,
-                    float limit, float alpha, cudaStream_t stream) {
+                    float limit, float alpha, Stream stream) {
   INFERX_RETURN_IF_ERROR(
       CheckTensor(gate_up, DataType::kBFloat16, 2, "gate_up"));
   INFERX_RETURN_IF_ERROR(CheckTensor(out, DataType::kBFloat16, 2, "out"));
@@ -347,7 +347,7 @@ Status GptOssSwiGlu(const TensorView& gate_up, const TensorView& out,
 Status RotaryEmbeddingFromTable(const TensorView& q, const TensorView& k,
                                 const TensorView& positions,
                                 const TensorView& inv_freq, float attn_factor,
-                                cudaStream_t stream) {
+                                Stream stream) {
   INFERX_RETURN_IF_ERROR(CheckTensor(q, DataType::kBFloat16, 3, "q"));
   INFERX_RETURN_IF_ERROR(CheckTensor(k, DataType::kBFloat16, 3, "k"));
   INFERX_RETURN_IF_ERROR(

@@ -118,7 +118,7 @@ Status CheckPacked(const TensorView& blocks, const TensorView& scales,
 }
 
 Status Launch(const TensorView& blocks, const TensorView& scales,
-              const TensorView& out, bool deinterleave, cudaStream_t stream) {
+              const TensorView& out, bool deinterleave, Stream stream) {
   int64_t rows = 0;
   int64_t num_blocks = 0;
   INFERX_RETURN_IF_ERROR(CheckPacked(blocks, scales, out, &rows, &num_blocks));
@@ -143,14 +143,14 @@ Status Launch(const TensorView& blocks, const TensorView& scales,
 }  // namespace
 
 Status DequantizeMxfp4ToBf16(const TensorView& blocks, const TensorView& scales,
-                             const TensorView& out, cudaStream_t stream) {
+                             const TensorView& out, Stream stream) {
   return Launch(blocks, scales, out, /*deinterleave=*/false, stream);
 }
 
 Status DequantizeMxfp4GateUpToBf16(const TensorView& blocks,
                                    const TensorView& scales,
                                    const TensorView& out,
-                                   cudaStream_t stream) {
+                                   Stream stream) {
   return Launch(blocks, scales, out, /*deinterleave=*/true, stream);
 }
 

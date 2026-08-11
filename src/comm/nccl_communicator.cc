@@ -61,7 +61,7 @@ class NcclComm final : public Communicator {
     return {.cuda_graph_capture = true, .device_collectives = true};
   }
 
-  Status AllReduceSum(const TensorView& tensor, void* stream) override {
+  Status AllReduceSum(const TensorView& tensor, Stream stream) override {
     if (!tensor.IsDefined()) {
       return InvalidArgumentError("NCCL AllReduceSum: tensor is undefined");
     }
@@ -75,11 +75,10 @@ class NcclComm final : public Communicator {
     INFERX_ASSIGN_OR_RETURN(const ncclDataType_t dtype,
                             NcclDataType(tensor.GetDataType()));
     auto cuda_stream = static_cast<cudaStream_t>(stream);
-    return NcclStatus(
-        ncclAllReduce(tensor.Data(), tensor.Data(),
-                      static_cast<size_t>(tensor.Numel()), dtype, ncclSum,
-                      comm_, cuda_stream),
-        "ncclAllReduce");
+    return NcclStatus(ncclAllReduce(tensor.Data(), tensor.Data(),
+                                    static_cast<size_t>(tensor.Numel()), dtype,
+                                    ncclSum, comm_, cuda_stream),
+                      "ncclAllReduce");
   }
 
   Status Abort() override {
@@ -142,9 +141,9 @@ StatusOr<std::unique_ptr<Communicator>> CreateNcclCommunicator(
   ncclUniqueId id;
   std::memcpy(&id, config.unique_id.data(), sizeof(id));
   ncclComm_t raw = nullptr;
-  INFERX_RETURN_IF_ERROR(NcclStatus(
-      ncclCommInitRank(&raw, config.world_size, id, config.rank),
-      "ncclCommInitRank"));
+  INFERX_RETURN_IF_ERROR(
+      NcclStatus(ncclCommInitRank(&raw, config.world_size, id, config.rank),
+                 "ncclCommInitRank"));
   return std::unique_ptr<Communicator>(new NcclComm(
       config.rank, config.world_size,
       DeviceId::Cuda(static_cast<int8_t>(config.local_device)), raw));

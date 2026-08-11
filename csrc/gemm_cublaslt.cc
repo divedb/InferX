@@ -537,7 +537,7 @@ Status CublasLtGemm::Warm(int64_t m, int64_t n, int64_t k, bool fp8) {
 }
 
 Status CublasLtGemm::LinearBF16(const TensorView& x, const TensorView& w,
-                                const TensorView& y, cudaStream_t stream) {
+                                const TensorView& y, Stream stream) {
   for (const auto& [name, t] : {std::pair{"x", &x}, {"w", &w}, {"y", &y}}) {
     if (!t->IsDefined()) {
       return InvalidArgumentError("LinearBF16: ", name, " is undefined");
@@ -588,7 +588,7 @@ Status CublasLtGemm::LinearBF16(const TensorView& x, const TensorView& w,
 }
 
 Status CublasLtGemm::LinearF16(const TensorView& x, const TensorView& w,
-                               const TensorView& y, cudaStream_t stream) {
+                               const TensorView& y, Stream stream) {
   // Validated up front and in full, rather than trusting the caller: a wrong
   // extent here is a silent out-of-bounds read on the device, which surfaces
   // later as a corrupted tensor somewhere unrelated.
@@ -642,7 +642,7 @@ Status CublasLtGemm::LinearF16(const TensorView& x, const TensorView& w,
 Status CublasLtGemm::LinearF8E4M3(const TensorView& x, const TensorView& w,
                                   const TensorView& y, const float* x_scale_dev,
                                   const float* w_scale_dev,
-                                  cudaStream_t stream) {
+                                  Stream stream) {
   // The output dtype selects the path. f16 is M1's benchmark form; bf16 is what
   // the model uses, and having one entry point means the two cannot drift.
   if (y.GetDataType() != DataType::kFloat16 &&

@@ -126,7 +126,7 @@ __global__ void W4A16GemmVectorKernel(const bf16* __restrict__ x,
 
 Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
                  const TensorView& scales, const TensorView& y, int64_t group,
-                 cudaStream_t stream) {
+                 Stream stream) {
   if (!x.IsDefined() || !x.IsCuda()) {
     return InvalidArgumentError("W4A16Gemm: x must be a defined CUDA tensor");
   }

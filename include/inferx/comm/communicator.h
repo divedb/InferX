@@ -8,6 +8,7 @@
 
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::comm {
@@ -45,7 +46,7 @@ inline constexpr std::array<double, 13> kCollectiveLatencyBuckets = {
     .0025,  .005,    .01,    .025,  .05,    .1};
 
 struct CommObservationConfig {
-  /// Zero disables CUDA-event timing. N samples every Nth collective.
+  /// Zero disables device-event timing. N samples every Nth collective.
   uint64_t timing_sample_every = 0;
   size_t timing_ring_size = 256;
 };
@@ -89,17 +90,16 @@ class Communicator {
 
   /// Sums corresponding elements across ranks and writes the result in-place
   /// on every rank. All ranks must provide the same dtype and element count.
-  /// `stream` is the backend's opaque execution stream (a cudaStream_t for
-  /// CUDA/NCCL). Host tensors ignore it.
-  virtual Status AllReduceSum(const TensorView& tensor,
-                              void* stream = nullptr) = 0;
+  /// `stream` is the backend's opaque execution stream. Host tensors ignore
+  /// it.
+  virtual Status AllReduceSum(const TensorView& tensor, Stream stream = {}) = 0;
 
   /// Breaks outstanding backend work during fatal rank failure. Idempotent.
   virtual Status Abort() = 0;
 };
 
 /// Wraps any communicator with lock-free call/byte/error accounting. The
-/// wrapper adds no CUDA operations and measures no host-call duration.
+/// wrapper measures device events rather than host-call duration.
 std::unique_ptr<Communicator> ObserveCommunicator(
     std::unique_ptr<Communicator> inner, std::shared_ptr<CommMetrics> metrics,
     CommObservationConfig config = {});
@@ -117,8 +117,7 @@ class SingleRankComm final : public Communicator {
   CommCapabilities capabilities() const override {
     return {.cuda_graph_capture = true, .device_collectives = true};
   }
-  Status AllReduceSum(const TensorView& tensor,
-                      void* stream = nullptr) override;
+  Status AllReduceSum(const TensorView& tensor, Stream stream = {}) override;
   Status Abort() override { return OkStatus(); }
 
  private:
@@ -132,6 +131,6 @@ class SingleRankComm final : public Communicator {
 /// Reduction order is rank 0..N-1, making numerical tests reproducible without
 /// multi-GPU hardware. CUDA staging is a correctness backend, not a benchmark.
 StatusOr<std::vector<std::unique_ptr<Communicator>>> CreateHostSimCommunicators(
-    int size);
+    int size, DeviceId device);
 
 }  // namespace inferx::comm

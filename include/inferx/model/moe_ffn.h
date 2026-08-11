@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 #include "inferx/kernels/gemm.h"
 
@@ -132,9 +133,11 @@ class MoeFfn {
   /// \brief Builds the layer and sizes its scratch for `max_tokens`.
   ///
   /// Scratch is allocated once rather than per call, for the reason §6.1 gives:
-  /// a `cudaFree` in the steady state synchronizes the device. It grows on
+  /// freeing accelerator memory in the steady state may synchronize the
+  /// device. Scratch grows on
   /// demand and never shrinks, so the first prefill sets the high-water mark.
-  static StatusOr<MoeFfn> Create(const Config& config, int64_t max_tokens);
+  static StatusOr<MoeFfn> Create(const Config& config, int64_t max_tokens,
+                                 DeviceId device);
 
   ~MoeFfn();
   MoeFfn(const MoeFfn&) = delete;
@@ -153,7 +156,7 @@ class MoeFfn {
   ///             and every layer sharing one is the point of that cache.
   Status Forward(const TensorView& x, const MoeWeights& weights,
                  const TensorView& out, kernels::CublasLtGemm* gemm,
-                 cudaStream_t stream = nullptr);
+                 Stream stream = {});
 
   /// \brief The per-expert row counts of the last `Forward`, for tests and
   ///        for the load-imbalance metric a scheduler would want.

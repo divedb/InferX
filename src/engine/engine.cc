@@ -14,8 +14,8 @@
 #include <utility>
 
 #include "inferx/api/openai.h"
-#include "inferx/model/forward_batch.h"
 #include "inferx/model/deepseek_v2.h"
+#include "inferx/model/forward_batch.h"
 #include "inferx/model/gpt_oss.h"
 #include "inferx/observe/metrics.h"
 #include "inferx/support/log.h"
@@ -117,11 +117,9 @@ int32_t HostSampleRow(float* row, int64_t vocab,
     }
 
     // Descending by probability; index breaks ties so the order is total.
-    std::sort(probs.begin(), probs.end(),
-              [](const auto& a, const auto& b) {
-                return a.first != b.first ? a.first > b.first
-                                          : a.second < b.second;
-              });
+    std::sort(probs.begin(), probs.end(), [](const auto& a, const auto& b) {
+      return a.first != b.first ? a.first > b.first : a.second < b.second;
+    });
 
     // The surviving prefix under all three truncations at once.
     size_t keep = probs.size();
@@ -173,9 +171,9 @@ int32_t HostSampleRow(float* row, int64_t vocab,
     logprob_out->present = true;
     logprob_out->logprob = row[chosen] - log_z;
 
-    const size_t want = std::min<size_t>(
-        static_cast<size_t>(logprob_k),
-        static_cast<size_t>(FB::kMaxTopLogprobs));
+    const size_t want =
+        std::min<size_t>(static_cast<size_t>(logprob_k),
+                         static_cast<size_t>(FB::kMaxTopLogprobs));
     if (want > 0) {
       std::vector<int32_t> order(static_cast<size_t>(vocab));
       std::iota(order.begin(), order.end(), 0);
@@ -266,9 +264,9 @@ struct ServingMetrics {
   }
 
   void ConfigureRanks(const std::vector<RankTelemetry>& ranks) {
-    const std::vector<double> buckets = {
-        .00001, .000025, .00005, .0001, .00025, .0005, .001,
-        .0025,  .005,    .01,    .025,  .05,    .1};
+    const std::vector<double> buckets = {.00001, .000025, .00005, .0001, .00025,
+                                         .0005,  .001,    .0025,  .005,  .01,
+                                         .025,   .05,     .1};
     for (const RankTelemetry& rank : ranks) {
       const observe::Labels prefill_labels = {
           {"phase", "prefill"}, {"rank", std::to_string(rank.rank)}};
@@ -360,8 +358,7 @@ std::string RenderRankMetrics(const std::vector<RankTelemetry>& ranks) {
     registry
         .AddCounter("inferx_communicator_aborts_total",
                     "Communicator abort calls by rank.",
-                    {{"backend", backend},
-                     {"rank", std::to_string(rank.rank)}})
+                    {{"backend", backend}, {"rank", std::to_string(rank.rank)}})
         ->Increment(rank.communication.aborts);
   }
   return registry.Render();
@@ -534,8 +531,8 @@ struct Engine::Impl {
 
         if (state.emitted < state.text.size() || state.want_logprobs) {
           Generation::Event event;
-          event.text = state.text.substr(
-              std::min(state.emitted, state.text.size()));
+          event.text =
+              state.text.substr(std::min(state.emitted, state.text.size()));
           attach(&event);
 
           state.generation->Emit(std::move(event));
@@ -822,8 +819,7 @@ struct Engine::Impl {
         }
 
         if (const Status committed = scheduler->CommitStep(
-                sampled, &deltas,
-                wants_logprobs ? &step_logprobs : nullptr);
+                sampled, &deltas, wants_logprobs ? &step_logprobs : nullptr);
             !committed.ok()) {
           FailAll(committed);
           stopping.store(true, std::memory_order_relaxed);
@@ -985,8 +981,8 @@ struct Engine::Impl {
       bool wants_logprobs = false;
       for (size_t i = 0; i < batch.logits_indices.size(); ++i) {
         float* row = logits.data() + i * static_cast<size_t>(vocab);
-        sampled.push_back(HostSampleRow(row, vocab, batch, i,
-                                        &step_logprobs[i]));
+        sampled.push_back(
+            HostSampleRow(row, vocab, batch, i, &step_logprobs[i]));
         wants_logprobs = wants_logprobs || step_logprobs[i].present;
       }
 
@@ -1075,9 +1071,8 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
         "TP=1 requires comm_backend=single and TP=2 requires nccl");
   }
 
-  INFERX_ASSIGN_OR_RETURN(
-      std::unique_ptr<tokenizer::Tokenizer> tok,
-      tokenizer::Tokenizer::LoadFrom(config.model_dir));
+  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<tokenizer::Tokenizer> tok,
+                          tokenizer::Tokenizer::LoadFrom(config.model_dir));
 
   // Architecture dispatch. The checkpoint's config.json says which model class
   // to build, and the two classes expose different contracts: Qwen2Model has
@@ -1125,14 +1120,16 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // model's thousands, so the same block count buys ~14x the cached context.
     INFERX_ASSIGN_OR_RETURN(
         const int64_t kv_blocks,
-        AutosizeKvBlocksOnCurrentDevice(KvSizingSpec{
-            .explicit_blocks = config.kv_blocks,
-            .explicit_bytes = config.kv_cache_memory_bytes,
-            .gpu_memory_utilization = config.gpu_memory_utilization,
-            .block_bytes = deepseek.KvBlockBytes(config.block_size),
-            .min_blocks = (config.scheduler.max_seq_len + config.block_size -
-                           1) /
-                          config.block_size}));
+        AutosizeKvBlocksOnDevice(
+            KvSizingSpec{
+                .explicit_blocks = config.kv_blocks,
+                .explicit_bytes = config.kv_cache_memory_bytes,
+                .gpu_memory_utilization = config.gpu_memory_utilization,
+                .block_bytes = deepseek.KvBlockBytes(config.block_size),
+                .min_blocks =
+                    (config.scheduler.max_seq_len + config.block_size - 1) /
+                    config.block_size},
+            DeviceId::Cuda(static_cast<int8_t>(config.devices.front()))));
     INFERX_RETURN_IF_ERROR(
         deepseek.AttachKvCache(kv_blocks, config.block_size));
 
@@ -1170,16 +1167,17 @@ StatusOr<std::unique_ptr<Engine>> Engine::Create(const EngineConfig& config) {
     // Qwen2, auto-sized unless pinned.
     INFERX_ASSIGN_OR_RETURN(
         const int64_t kv_blocks,
-        AutosizeKvBlocksOnCurrentDevice(KvSizingSpec{
-            .explicit_blocks = config.kv_blocks,
-            .explicit_bytes = config.kv_cache_memory_bytes,
-            .gpu_memory_utilization = config.gpu_memory_utilization,
-            .block_bytes = gpt_oss.KvBlockBytes(config.block_size),
-            .min_blocks = (config.scheduler.max_seq_len + config.block_size -
-                           1) /
-                          config.block_size}));
-    INFERX_RETURN_IF_ERROR(
-        gpt_oss.AttachKvCache(kv_blocks, config.block_size));
+        AutosizeKvBlocksOnDevice(
+            KvSizingSpec{
+                .explicit_blocks = config.kv_blocks,
+                .explicit_bytes = config.kv_cache_memory_bytes,
+                .gpu_memory_utilization = config.gpu_memory_utilization,
+                .block_bytes = gpt_oss.KvBlockBytes(config.block_size),
+                .min_blocks =
+                    (config.scheduler.max_seq_len + config.block_size - 1) /
+                    config.block_size},
+            DeviceId::Cuda(static_cast<int8_t>(config.devices.front()))));
+    INFERX_RETURN_IF_ERROR(gpt_oss.AttachKvCache(kv_blocks, config.block_size));
 
     INFERX_ASSIGN_OR_RETURN(
         Scheduler scheduler,

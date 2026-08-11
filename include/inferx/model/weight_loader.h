@@ -40,8 +40,8 @@ struct WeightLoaderStats {
 /// stack of tensors, a row permutation — to a list of contiguous host extents
 /// and streams them through a fixed pinned ring: worker threads pack a slot
 /// (parallelizing the page-fault + memcpy that dominate a cold load), a
-/// `cudaMemcpyAsync` drains it at link rate while the next slot packs. Device
-/// memory is bump-allocated from large chunks rather than one `cudaMalloc`
+/// asynchronous copies drain it at link rate while the next slot packs. Device
+/// memory is bump-allocated from large chunks rather than one allocation
 /// per tensor.
 ///
 /// The contract that buys the overlap: **a returned view's bytes are not on

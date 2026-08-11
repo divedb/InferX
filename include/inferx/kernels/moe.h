@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 /// The kernels a mixture-of-experts FFN needs that a dense one does not.
@@ -43,8 +44,9 @@ namespace inferx::kernels {
 /// pure function of the logits. That matters because two experts with bitwise
 /// equal scores is not a hypothetical at bf16 precision.
 ///
-/// \param logits      `[tokens, num_experts]` bf16, straight from the gate GEMM.
-/// \param out_weights `[tokens, k]` fp32, the gate value for each chosen expert,
+/// \param logits      `[tokens, num_experts]` bf16, straight from the gate
+/// GEMM. \param out_weights `[tokens, k]` fp32, the gate value for each chosen
+/// expert,
 ///                    descending by score. fp32 because it multiplies an
 ///                    expert's whole output and a bf16 gate would quantize the
 ///                    mixture itself.
@@ -56,7 +58,7 @@ namespace inferx::kernels {
 ///                    shared expert (added later) does not. 1 everywhere else.
 Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
                     const TensorView& out_experts, bool renormalize,
-                    float scale = 1.0f, cudaStream_t stream = nullptr);
+                    float scale = 1.0f, Stream stream = {});
 
 /// \brief Groups the `tokens × k` assignments by expert, stably.
 ///
@@ -75,7 +77,7 @@ Status MoeRouteTopK(const TensorView& logits, const TensorView& out_weights,
 Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
                         const TensorView& out_offsets,
                         const TensorView& out_rows, const TensorView& out_dest,
-                        cudaStream_t stream = nullptr);
+                        Stream stream = {});
 
 /// \brief `out[i, :] = x[rows[i], :]`.
 ///
@@ -86,7 +88,7 @@ Status MoeBuildDispatch(const TensorView& experts, int64_t num_experts,
 /// \param rows `[n]` int32, indices into `x`'s first dimension.
 /// \param out  `[n, width]` bf16.
 Status MoeGatherRows(const TensorView& x, const TensorView& rows,
-                     const TensorView& out, cudaStream_t stream = nullptr);
+                     const TensorView& out, Stream stream = {});
 
 /// \brief Undoes the permutation and mixes: `out[t,:] = Σ_slot w[t,slot] ·
 ///        y[dest[t·k + slot], :]`.
@@ -101,7 +103,7 @@ Status MoeGatherRows(const TensorView& x, const TensorView& rows,
 ///                kernel's contract depend on what the caller left in `out`.
 Status MoeCombineRows(const TensorView& y, const TensorView& dest,
                       const TensorView& weights, const TensorView& out,
-                      cudaStream_t stream = nullptr);
+                      Stream stream = {});
 
 /// \brief One ragged GEMM over stacked bf16 expert weights, offsets on the
 ///        device.
@@ -122,7 +124,7 @@ Status MoeCombineRows(const TensorView& y, const TensorView& dest,
 /// \param y       `[assignments, n]` bf16, written.
 Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
                           const TensorView& w, const TensorView& bias,
-                          const TensorView& y, cudaStream_t stream = nullptr);
+                          const TensorView& y, Stream stream = {});
 
 /// \brief `out = sigmoid(gate_logit) · shared`, elementwise over each row.
 ///
@@ -135,6 +137,6 @@ Status MoeGroupedGemmBf16(const TensorView& x, const TensorView& offsets,
 /// \param out         `[tokens, width]` bf16, accumulated into (`out += ...`).
 Status MoeAddSharedExpert(const TensorView& shared,
                           const TensorView& gate_logits, const TensorView& out,
-                          cudaStream_t stream = nullptr);
+                          Stream stream = {});
 
 }  // namespace inferx::kernels

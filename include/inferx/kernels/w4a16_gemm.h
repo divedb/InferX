@@ -1,8 +1,7 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include "inferx/core/status.h"
+#include "inferx/core/stream.h"
 #include "inferx/core/tensor_view.h"
 
 namespace inferx::kernels {
@@ -16,9 +15,9 @@ namespace inferx::kernels {
 /// This is the fused dequant-then-GEMM: each int4 weight element is read from
 /// global memory exactly once and dequantized in registers, rather than
 /// materializing the whole `[n, k]` bf16 weight and reading it back. On the
-/// weight-bandwidth-bound decode step (small `m`) that is the difference between
-/// reading 1.54 GB (int4) and 12.3 GB (int4 dequanted to bf16 then read by a
-/// bf16 GEMM) per token -- which is the whole point of W4A16.
+/// weight-bandwidth-bound decode step (small `m`) that is the difference
+/// between reading 1.54 GB (int4) and 12.3 GB (int4 dequanted to bf16 then read
+/// by a bf16 GEMM) per token -- which is the whole point of W4A16.
 ///
 /// CUTLASS 4.6.1's mixed-input collectives are SM90/SM100 only and cuBLASLt has
 /// no int4 x bf16 GEMM, so on sm_89 this is hand-rolled. The kernel is aimed at
@@ -27,6 +26,6 @@ namespace inferx::kernels {
 /// route to by shape.
 Status W4A16Gemm(const TensorView& x, const TensorView& w_int4,
                  const TensorView& scales, const TensorView& y, int64_t group,
-                 cudaStream_t stream = nullptr);
+                 Stream stream = {});
 
 }  // namespace inferx::kernels
