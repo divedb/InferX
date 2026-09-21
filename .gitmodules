@@ -1,0 +1,24 @@
+[submodule "third_party/folly"]
+	path = third_party/folly
+	url = https://github.com/facebook/folly.git
+[submodule "third_party/abseil-cpp"]
+	path = third_party/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "third_party/tokenizers-cpp"]
+	path = third_party/tokenizers-cpp
+	url = https://github.com/mlc-ai/tokenizers-cpp.git
+[submodule "third_party/beast"]
+	path = third_party/beast
+	url = https://github.com/boostorg/beast.git
+[submodule "third_party/flashinfer"]
+	path = third_party/flashinfer
+	url = https://github.com/flashinfer-ai/flashinfer.git
+[submodule "third_party/highway"]
+	path = third_party/highway
+	url = https://github.com/google/highway.git
+[submodule "third_party/onednn"]
+	path = third_party/onednn
+	url = https://github.com/oneapi-src/oneDNN.git
+[submodule "third_party/cli11"]
+	path = third_party/cli11
+	url = https://github.com/CLIUtils/CLI11.git

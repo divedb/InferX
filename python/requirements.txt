@@ -1,0 +1,6 @@
+# Reference oracle for M0 correctness testing (not a runtime dependency).
+torch
+transformers
+safetensors
+numpy
+matplotlib

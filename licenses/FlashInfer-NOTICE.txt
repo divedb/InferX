@@ -1,0 +1,12 @@
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+InferX adapts RMSNormKernel from include/flashinfer/norm.cuh at commit
+01045366e15df38e19e76050592f82e49b4cff64. The original file also carries:
+Copyright (c) 2024 by FlashInfer team.
+
+The adaptation is in src/ops/cuda/norm_kernel.cu and is distributed under the
+Apache License, Version 2.0; see FlashInfer-Apache-2.0.txt in this directory.
+Modifications are listed in the adapted file and docs/norm_cuda.md.
+No other FlashInfer components are copied into this implementation.

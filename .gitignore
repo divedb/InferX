@@ -1,0 +1,8 @@
+# Build output
+/build/
+compile_commands.json
+
+# Python reference-oracle virtualenv
+/python/.venv/
+__pycache__/
+*.pyc
