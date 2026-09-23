@@ -42,6 +42,7 @@ struct RecurrentState {};
 struct ModelState {
   /// Pool backing every PagedKvState layer.
   const KvBlockPool* paged_kv = nullptr;
+
   /// One entry per decoder layer, matching StateRequirements order.
   std::vector<std::variant<PagedKvState, RecurrentState>> layers;
 };

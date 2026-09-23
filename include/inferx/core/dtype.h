@@ -16,8 +16,7 @@ struct DummyInt {};
 
 /// \brief Runtime data type for tensor elements.
 enum class DataType : std::uint8_t {
-  kUndefined = 0,
-  kBool,
+  kBool = 0,
   kFloat,
   kUInt2,
   kInt2,
@@ -96,37 +95,28 @@ INFERX_FOR_EACH_DATA_TYPE(X)
 
 /// \brief Get the logical width in bits of a fixed-width data type.
 ///
-/// \tparam dtype The DataType to query; must not be kUndefined.
+/// \tparam dtype The DataType to query.
 /// \return       The type's logical width in bits.
 template <DataType dtype>
 constexpr std::size_t DataTypeBitWidth() noexcept {
-  static_assert(dtype != DataType::kUndefined,
-                "the undefined data type has no bit width");
-
   return DataTypeTrait<dtype>::kBitWidth;
 }
 
 /// \brief Get the host storage size in bytes of a fixed-width data type.
 ///
-/// \tparam dtype The DataType to query; must not be kUndefined.
+/// \tparam dtype The DataType to query.
 /// \return       The type's host storage size in bytes.
 template <DataType dtype>
 constexpr std::size_t DataTypeSize() noexcept {
-  static_assert(dtype != DataType::kUndefined,
-                "the undefined data type has no size");
-
   return DataTypeTrait<dtype>::kSize;
 }
 
 /// \brief Get the host storage alignment in bytes of a fixed-width data type.
 ///
-/// \tparam dtype The DataType to query; must not be kUndefined.
+/// \tparam dtype The DataType to query.
 /// \return       The type's host storage alignment in bytes.
 template <DataType dtype>
 constexpr std::size_t DataTypeAlign() noexcept {
-  static_assert(dtype != DataType::kUndefined,
-                "the undefined data type has no alignment");
-
   return DataTypeTrait<dtype>::kAlign;
 }
 
@@ -139,18 +129,11 @@ constexpr const char* DataTypeName() noexcept {
   return DataTypeTrait<dtype>::kName;
 }
 
-/// The runtime counterparts of the queries above.
-///
-/// The templated forms are for code that knows its dtype at compile time; these
-/// are for the tensor layer, where the dtype arrives from a model file or a
-/// request and is only ever a value. Both are generated from the same table, so
-/// they cannot drift. `kUndefined` has no layout and answers 0 in every width
-/// query rather than aborting -- callers gate on DataTypeIsValid().
-
 /// \brief Get the human-readable name of `dtype`.
 ///
 /// \param dtype The data type to name.
-/// \return      The type's short name, or "undefined".
+/// \return      The type's short name, or "undefined" for a value outside the
+///              table.
 constexpr std::string_view DataTypeName(DataType dtype) noexcept {
   switch (dtype) {
 #define X(kind, cpp_type, name, bit_width) \
@@ -158,8 +141,6 @@ constexpr std::string_view DataTypeName(DataType dtype) noexcept {
     return name;
     INFERX_FOR_EACH_DATA_TYPE(X)
 #undef X
-    case DataType::kUndefined:
-      return "undefined";
   }
 
   return "undefined";
@@ -168,7 +149,7 @@ constexpr std::string_view DataTypeName(DataType dtype) noexcept {
 /// \brief Get the logical width of `dtype` in bits, or 0 if it has none.
 ///
 /// \param dtype The data type to query.
-/// \return      The logical bit width, or 0 for kUndefined.
+/// \return      The logical bit width, or 0 for a value outside the table.
 constexpr std::size_t DataTypeBitWidth(DataType dtype) noexcept {
   switch (dtype) {
 #define X(kind, cpp_type, name, bit_width) \
@@ -176,8 +157,6 @@ constexpr std::size_t DataTypeBitWidth(DataType dtype) noexcept {
     return bit_width;
     INFERX_FOR_EACH_DATA_TYPE(X)
 #undef X
-    case DataType::kUndefined:
-      return 0;
   }
 
   return 0;
@@ -187,7 +166,8 @@ constexpr std::size_t DataTypeBitWidth(DataType dtype) noexcept {
 ///        it has none.
 ///
 /// \param dtype The data type to query.
-/// \return      The host storage size in bytes, or 0 for kUndefined.
+/// \return      The host storage size in bytes, or 0 for a value outside the
+///              table.
 constexpr std::size_t DataTypeSize(DataType dtype) noexcept {
   switch (dtype) {
 #define X(kind, cpp_type, name, bit_width) \
@@ -195,23 +175,9 @@ constexpr std::size_t DataTypeSize(DataType dtype) noexcept {
     return sizeof(cpp_type);
     INFERX_FOR_EACH_DATA_TYPE(X)
 #undef X
-    case DataType::kUndefined:
-      return 0;
   }
 
   return 0;
-}
-
-/// \brief True if `dtype` names a type at all.
-///
-/// `kUndefined` is the zero value a default-constructed view or spec carries;
-/// every other DataType has a row in the table above and therefore a width, a
-/// size, and a byte count for a given element count.
-///
-/// \param dtype The data type to check.
-/// \return      True for every DataType except kUndefined.
-constexpr bool DataTypeIsValid(DataType dtype) noexcept {
-  return dtype != DataType::kUndefined;
 }
 
 /// \brief True for types packed several elements to a byte.
@@ -238,8 +204,7 @@ constexpr bool DataTypeIsSubByte(DataType dtype) noexcept {
 /// \param dtype The data type to query.
 /// \return      The storage width in bits.
 constexpr std::size_t DataTypeStorageBits(DataType dtype) noexcept {
-  return DataTypeIsSubByte(dtype) ? DataTypeBitWidth(dtype)
-                                  : DataTypeSize(dtype) * 8;
+  return DataTypeIsSubByte(dtype) ? DataTypeBitWidth(dtype) : DataTypeSize(dtype) * 8;
 }
 
 /// \brief Get the number of bytes `count` elements of `dtype` occupy.

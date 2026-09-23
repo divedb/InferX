@@ -102,18 +102,18 @@ class Tensor {
   ///               extents.
   /// \param device The DeviceId of the device on which to allocate the tensor.
   /// \return       A StatusOr containing a Tensor on success, or an error
-  /// status on failure.
+  ///               status on failure.
   static StatusOr<Tensor> Empty(DataType dtype, const Shape& shape, DeviceId device);
 
   /// \brief Allocates uninitialized memory from a specific allocator -- a
   ///        per-rank workspace, say.
   ///
-  /// \param dtype    The DataType of the tensor elements.
-  /// \param shape    The Shape of the tensor, describing the dimensions and
-  ///                 extents.
+  /// \param dtype     The DataType of the tensor elements.
+  /// \param shape     The Shape of the tensor, describing the dimensions and
+  ///                  extents.
   /// \param allocator The allocator to allocate from; must not be nullptr.
-  /// \return         A StatusOr containing a Tensor on success, or an error
-  /// status on failure.
+  /// \return          A StatusOr containing a Tensor on success, or an error
+  ///                  status on failure.
   static StatusOr<Tensor> Empty(DataType dtype, const Shape& shape, Allocator* allocator);
 
   /// \brief Wraps memory owned elsewhere, freeing nothing.
@@ -149,6 +149,7 @@ class Tensor {
 
   /// \brief True when this handle points at a TensorImpl.
   bool IsDefined() const { return static_cast<bool>(impl_); }
+
   /// \brief True when the tensor holds zero elements.
   bool IsEmpty() const { return Numel() == 0; }
 
@@ -157,12 +158,17 @@ class Tensor {
   /// Undefined-tensor access returns zero/empty rather than dereferencing
   /// null, so a missing IsDefined() check is a wrong answer, not a crash.
   void* Data() const { return impl_ ? impl_->Data() : nullptr; }
-  /// \brief Returns the tensor's element type, or kUndefined if undefined.
-  DataType GetDataType() const { return impl_ ? impl_->GetDataType() : DataType::kUndefined; }
+
+  /// \brief Returns the tensor's element type, or the zero-initialized
+  ///        DataType if undefined.
+  DataType GetDataType() const { return impl_ ? impl_->GetDataType() : DataType{}; }
+
   /// \brief Returns the device the tensor's bytes live on.
   DeviceId Device() const { return impl_ ? impl_->Device() : DeviceId::Cpu(); }
+
   /// \brief Returns the tensor's shape, or an empty shape if undefined.
   Shape GetShape() const { return impl_ ? impl_->GetShape() : Shape{}; }
+
   /// \brief Zero-copy access to the extents.
   ///
   /// Unlike GetShape(), which returns a copy, the span points into storage
@@ -173,17 +179,22 @@ class Tensor {
   }
   /// \brief Returns the tensor's rank, or 0 if undefined.
   int Rank() const { return impl_ ? impl_->GetShape().Rank() : 0; }
+
   /// \brief Returns the extent along dimension `i`, or 0 if undefined.
   int64_t Dim(int i) const { return impl_ ? impl_->GetShape().Dim(i) : 0; }
+
   /// \brief Returns the number of elements, or 0 if undefined.
   int64_t Numel() const { return impl_ ? impl_->GetShape().Numel() : 0; }
+
   /// \brief Returns the number of bytes occupied, or 0 if undefined.
   int64_t NBytes() const { return impl_ ? impl_->NBytes() : 0; }
+
   /// \brief Returns the byte offset into the Storage, or 0 if undefined.
   int64_t StorageOffset() const { return impl_ ? impl_->StorageOffset() : 0; }
 
   /// \brief True when the tensor's bytes live in host memory.
   bool IsCpu() const { return Device().IsCpu(); }
+
   /// \brief True when the tensor's bytes live on a CUDA device.
   bool IsCuda() const { return Device().IsCuda(); }
 
@@ -205,37 +216,24 @@ class Tensor {
   /// \param end   Last row index (exclusive).
   /// \return      The slice as a new Tensor, or an error status.
   StatusOr<Tensor> Slice(int64_t begin, int64_t end) const;
+
   /// \brief Returns the same storage under a new shape.
   ///
   /// \param shape The new shape; its element count must match exactly.
   /// \return      The reshaped Tensor, or an error status.
   StatusOr<Tensor> Reshape(const Shape& shape) const;
+
   /// \brief Reinterprets the buffer as another dtype.
   ///
   /// \param dtype The new element type; the total byte count must match.
   /// \return      The bitcast Tensor, or an error status.
   StatusOr<Tensor> Bitcast(DataType dtype) const;
 
-  /// \brief True when both handles are backed by the same Storage.
-  ///
-  /// That is, when writing through one may be observed through the other.
-  bool IsAliasOf(const Tensor& other) const {
-    return impl_ && other.impl_ && impl_->GetStorage().Get() == other.impl_->GetStorage().Get();
-  }
-
   /// \brief Returns the number of handles to this tensor's impl.
   ///
   /// Approximate under concurrency. Delegates to the vendored header's
   /// UseCount(); LLVM's naming stops at intrusive_ref_cnt_ptr.h.
   uint32_t UseCount() const { return impl_.UseCount(); }
-
-  /// \brief Returns the number of TensorImpls sharing the underlying bytes.
-  uint32_t StorageUseCount() const { return impl_ ? impl_->GetStorage().UseCount() : 0; }
-
-  /// \brief Returns the Storage backing this tensor.
-  const StoragePtr& GetStorage() const { return impl_->GetStorage(); }
-  /// \brief Returns the TensorImpl this handle points at.
-  const IntrusiveRefCntPtr<TensorImpl>& GetImpl() const { return impl_; }
 
   /// \brief Drops this handle's reference, leaving the tensor undefined.
   void Reset() { impl_.Reset(); }

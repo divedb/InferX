@@ -105,13 +105,14 @@ StatusOr<Tensor> Tensor::Bitcast(DataType new_dtype) const {
   if (!IsDefined()) {
     return FailedPreconditionError("Bitcast on an undefined tensor");
   }
-  if (!DataTypeIsValid(new_dtype)) {
-    return InvalidArgumentError("bitcast target dtype ", DataTypeName(new_dtype),
-                                " has no layout");
-  }
 
   const int64_t src_bits = static_cast<int64_t>(DataTypeStorageBits(GetDataType())) * Numel();
   const int64_t dst_bits = static_cast<int64_t>(DataTypeStorageBits(new_dtype));
+
+  if (dst_bits == 0) {
+    return InvalidArgumentError("bitcast target dtype ", DataTypeName(new_dtype),
+                                " has no layout");
+  }
 
   if (src_bits % dst_bits != 0) {
     return InvalidArgumentError("cannot bitcast ", DataTypeName(GetDataType()), " ",

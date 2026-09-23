@@ -21,7 +21,7 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers, int64_t num_blocks
                                 " kv_heads=", layout.kv_heads, " head_dim=", layout.head_dim);
   }
 
-  if (!DataTypeIsValid(layout.dtype) || DataTypeIsSubByte(layout.dtype)) {
+  if (DataTypeIsSubByte(layout.dtype)) {
     // Sub-byte KV would need the block stride to be a bit count rather than a
     // byte count, and nothing needs that yet. FP8 KV (§6.4) is one byte and
     // works here unchanged.

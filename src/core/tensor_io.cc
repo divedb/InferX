@@ -7,12 +7,11 @@
 namespace inferx {
 
 Status CopyTensor(const Tensor& src, const Tensor& dst) {
-  if (src.GetDataType() == DataType::kUndefined || src.GetDataType() != dst.GetDataType() ||
+  if (!src.IsDefined() || !dst.IsDefined() || src.GetDataType() != dst.GetDataType() ||
       src.GetShape() != dst.GetShape()) {
     return InvalidArgumentError("copy requires matching shapes and dtypes");
   }
   if (src.Numel() == 0) return OkStatus();
-  if (!src.IsDefined() || !dst.IsDefined()) return InvalidArgumentError("null copy buffer");
   if (src.IsCpu() && dst.IsCpu()) {
     std::memmove(dst.Data(), src.Data(), src.NBytes());
     return OkStatus();

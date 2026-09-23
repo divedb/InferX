@@ -14,7 +14,7 @@ Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indice
   if (src.Rank() != 2 || indices.Rank() != 1 || out.Rank() != 2) {
     return InvalidArgumentError("GatherRows expects rank-2 src/out and rank-1 indices");
   }
-  if (src.GetDataType() == DataType::kUndefined || out.GetDataType() != src.GetDataType()) {
+  if (out.GetDataType() != src.GetDataType()) {
     return InvalidArgumentError("GatherRows out dtype must match src dtype");
   }
   if (indices.GetDataType() != DataType::kInt32) {

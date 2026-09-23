@@ -12,7 +12,8 @@ namespace inferx {
 /// \brief A validated (dtype, shape) pair, the layout half of a tensor.
 class TensorSpec {
  public:
-  /// \brief Constructs an undefined spec.
+  /// \brief Constructs a spec with the zero-initialized dtype and an empty
+  ///        shape.
   TensorSpec() = default;
   /// \brief Constructs a spec from a dtype and shape.
   ///
@@ -36,19 +37,13 @@ class TensorSpec {
 
   /// \brief Checks the joint dtype/shape invariants of this spec.
   ///
-  /// Verifies that the dtype is valid, no extent is negative, and -- for
-  /// sub-byte dtypes -- the innermost extent is a multiple of the elements that
-  /// pack into one byte. Rank itself is unchecked: a Shape holds any rank, and
-  /// the tensor factories accept whatever TensorSpec::Verify passes.
+  /// Verifies that no extent is negative, and -- for sub-byte dtypes -- the
+  /// innermost extent is a multiple of the elements that pack into one byte.
+  /// Rank itself is unchecked: a Shape holds any rank, and the tensor factories
+  /// accept whatever TensorSpec::Verify passes.
   ///
   /// \return OK, or InvalidArgument naming the violated invariant.
   Status Verify() const {
-    // Checked first: every width query below is meaningless for a dtype with
-    // no layout, and would answer 0.
-    if (!DataTypeIsValid(dtype_)) {
-      return InvalidArgumentError("tensor dtype ", DataTypeName(dtype_), " has no layout");
-    }
-
     for (const int64_t extent : shape_.Dims()) {
       if (extent < 0) {
         return InvalidArgumentError("tensor shape ", shape_.ToString(),
@@ -83,7 +78,7 @@ class TensorSpec {
   friend bool operator!=(const TensorSpec& a, const TensorSpec& b) { return !(a == b); }
 
  private:
-  DataType dtype_ = DataType::kUndefined;
+  DataType dtype_{};
   Shape shape_;
 };
 

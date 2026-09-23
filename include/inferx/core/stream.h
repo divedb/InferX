@@ -15,8 +15,10 @@ struct Stream {
 
   /// \brief Constructs a null stream.
   constexpr Stream() = default;
+
   /// \brief Constructs a null stream from nullptr.
   constexpr Stream(std::nullptr_t) {}
+
   /// \brief Constructs a stream from a raw handle value.
   ///
   /// \param value The native handle.
@@ -50,6 +52,7 @@ struct Stream {
 struct DeviceEvent {
   /// The runtime's native handle value.
   void* handle = nullptr;
+
   /// \brief Compares two events for equality (same handle).
   friend constexpr bool operator==(DeviceEvent, DeviceEvent) = default;
 };
@@ -58,6 +61,7 @@ struct DeviceEvent {
 struct GraphExec {
   /// The runtime's native handle value.
   void* handle = nullptr;
+
   /// \brief Compares two graph handles for equality.
   friend constexpr bool operator==(GraphExec, GraphExec) = default;
 };

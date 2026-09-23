@@ -20,10 +20,6 @@ Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight
         weight.Rank(), ", and ", out.Rank());
   }
   const DataType dtype = x.GetDataType();
-  if (dtype == DataType::kUndefined || weight.GetDataType() == DataType::kUndefined ||
-      out.GetDataType() == DataType::kUndefined) {
-    return InvalidArgumentError("RmsNorm requires typed x, weight, and out tensors");
-  }
   if (weight.GetDataType() != dtype || out.GetDataType() != dtype) {
     return InvalidArgumentError("RmsNorm dtype mismatch: x is ", DataTypeName(dtype),
                                 " but weight is ", DataTypeName(weight.GetDataType()),
