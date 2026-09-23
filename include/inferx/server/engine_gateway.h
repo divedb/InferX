@@ -117,7 +117,10 @@ struct SubmitResult {
 class EngineGateway {
  public:
   /// \brief Creates the model runner (loading weights) and starts the
-  /// engine thread. `io` must outlive the gateway.
+  /// engine thread. `io` must outlive the gateway. `tokenizer` backs the
+  /// engine thread's detokenizer only — prompt encoding happens in the
+  /// TokenizerPool's worker threads, so this instance is single-owner
+  /// and needs no serialization.
   EngineGateway(boost::asio::io_context& io, ModelConfig model_config,
                 CacheConfig cache_config, SchedulerConfig scheduler_config,
                 ExecutionConfig execution_config,
@@ -127,10 +130,6 @@ class EngineGateway {
   EngineGateway(const EngineGateway&) = delete;
   EngineGateway& operator=(const EngineGateway&) = delete;
 
-  /// \brief Encodes prompt text. Serialized: the tokenizer is shared with
-  /// the engine thread's detokenizer.
-  StatusOr<std::vector<int>> Encode(const std::string& text) const;
-
   /// \brief Submits a completion; never blocks. Fails fast with
   /// ResourceExhausted while waiting+running requests are at capacity
   /// (the session maps that to 503).
@@ -139,6 +138,15 @@ class EngineGateway {
   /// \brief Aborts a request (disconnect, consumer error). Idempotent;
   /// applied on the next engine step.
   void Cancel(std::uint64_t id);
+
+  /// \brief Requests a stop without joining: the engine thread drains its
+  /// live requests and exits its loop. Safe from any thread, including
+  /// io callbacks; pair with WaitDrained/Shutdown.
+  void RequestStop();
+
+  /// \brief Completes when the engine thread has left its loop (live
+  /// requests drained or failed). Coalesces with an already-exited engine.
+  boost::asio::awaitable<void> WaitDrained();
 
   /// \brief Stops the engine thread. Idempotent; joins.
   void Shutdown();

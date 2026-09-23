@@ -19,6 +19,11 @@ struct ServeArgs {
   SamplingArgs sampling;
   std::string host = "127.0.0.1";  // vLLM: --host
   int port = 8000;                 // vLLM: --port
+  int tokenizer_workers = 2;
+  int tokenizer_queue_max_requests = 128;
+  int tokenizer_queue_max_mb = 32;
+  int tokenizer_request_timeout_ms = 10000;
+  int tokenizer_startup_timeout_ms = 30000;
 
   server::ServeParams Build() const {
     server::ServeParams p;
@@ -31,6 +36,15 @@ struct ServeArgs {
     p.host = host;
     p.port = port;
     p.served_model_name = model.ServedName();
+    p.tokenizer.workers = tokenizer_workers;
+    p.tokenizer.queue_max_requests =
+        static_cast<std::size_t>(tokenizer_queue_max_requests);
+    p.tokenizer.queue_max_bytes =
+        static_cast<std::size_t>(tokenizer_queue_max_mb) << 20;
+    p.tokenizer.request_timeout =
+        std::chrono::milliseconds(tokenizer_request_timeout_ms);
+    p.tokenizer.startup_timeout =
+        std::chrono::milliseconds(tokenizer_startup_timeout_ms);
     return p;
   }
 
@@ -72,6 +86,31 @@ void RegisterServe(CLI::App& root) {
   sub->add_option("--port", args->port, "Port number")
       ->capture_default_str()
       ->check(CLI::Range(1, 65535));
+  // Prompt-preparation worker pool (docs/tokenizer_process_pool.md): the
+  // exposed surface is worker count, queue bounds, and deadlines.
+  sub->add_option("--tokenizer-workers", args->tokenizer_workers,
+                  "CPU tokenizer worker processes (no inline fallback)")
+      ->capture_default_str()
+      ->check(CLI::Range(1, 1024));
+  sub->add_option("--tokenizer-queue-max-requests",
+                  args->tokenizer_queue_max_requests,
+                  "Max pending+running tokenizer requests")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  sub->add_option("--tokenizer-queue-max-mb", args->tokenizer_queue_max_mb,
+                  "Max pending tokenizer input in MiB")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  sub->add_option("--tokenizer-request-timeout-ms",
+                  args->tokenizer_request_timeout_ms,
+                  "Per-request prompt preprocessing budget incl. queueing")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  sub->add_option("--tokenizer-startup-timeout-ms",
+                  args->tokenizer_startup_timeout_ms,
+                  "Worker startup handshake timeout")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
   sub->callback([args] { ThrowIfError(server::RunServe(args->Build())); });
 }
 

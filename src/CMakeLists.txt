@@ -120,12 +120,14 @@ target_compile_options(inferx_diagnostic PRIVATE -Wall -Wextra -Wpedantic)
 
 # inferx_server -- OpenAI-compatible HTTP server (`inferx serve`). The
 # gateway owns the engine thread; the coroutine front end runs on
-# Boost.Beast/Asio (interface targets from InferXDependencies.cmake).
+# Boost.Beast/Asio (interface targets from InferXDependencies.cmake); the
+# TokenizerPool runs the prompt-preparation worker threads.
 add_library(inferx_server
   server/serve.cc
   server/api.cc
   server/engine_gateway.cc
   server/http_server.cc
+  server/tokenizer_pool.cc
 )
 add_library(inferx::server ALIAS inferx_server)
 target_link_libraries(inferx_server

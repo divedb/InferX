@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "inferx/core/status_util.h"
+#include "inferx/server/completion_signal.h"
 #include "inferx/server/text_delta.h"
 
 namespace inferx::server {
@@ -59,6 +60,7 @@ struct EngineGateway::Impl {
   std::thread engine;
   std::atomic<bool> stopping{false};
   std::atomic<bool> joined{false};
+  CompletionSignal drained;  // Fired from the engine thread at loop exit.
 
   // Shared between I/O threads and the engine thread.
   std::mutex mu;
@@ -282,6 +284,7 @@ struct EngineGateway::Impl {
     }
     Emit(std::move(batch));
     live.clear();
+    drained.Fire();  // Releases WaitDrained waiters (posted via the channel).
   }
 };
 
@@ -296,11 +299,6 @@ EngineGateway::EngineGateway(boost::asio::io_context& io, ModelConfig model_conf
 }
 
 EngineGateway::~EngineGateway() { Shutdown(); }
-
-StatusOr<std::vector<int>> EngineGateway::Encode(const std::string& text) const {
-  std::lock_guard<std::mutex> lock(impl_->mu);
-  return impl_->tokenizer->Encode(text);
-}
 
 StatusOr<SubmitResult> EngineGateway::Submit(CompletionSpec spec) {
   if (impl_->stopping.load()) {
@@ -324,11 +322,18 @@ StatusOr<SubmitResult> EngineGateway::Submit(CompletionSpec spec) {
 
 void EngineGateway::Cancel(std::uint64_t id) { impl_->RequestCancel(id); }
 
+void EngineGateway::RequestStop() {
+  if (!impl_.get()) return;
+  impl_->stopping.store(true);
+  impl_->cv.notify_all();
+}
+
+boost::asio::awaitable<void> EngineGateway::WaitDrained() { co_await impl_->drained.Wait(); }
+
 void EngineGateway::Shutdown() {
   if (!impl_.get()) return;
   if (impl_->joined.exchange(true)) return;
-  impl_->stopping.store(true);
-  impl_->cv.notify_all();
+  RequestStop();
   if (impl_->engine.joinable()) impl_->engine.join();
 }
 

@@ -78,6 +78,19 @@ target_compile_options(inferx_text_delta_test PRIVATE -Wall -Wextra
                        -Wpedantic)
 add_test(NAME text_delta_test COMMAND inferx_text_delta_test)
 
+if(INFERX_ENABLE_TOKENIZERS)
+  # Integration tests for the prompt-preparation worker pool (token-for-token
+  # parity with the facade, admission bounds, cancellation, timeouts, drain).
+  add_executable(inferx_tokenizer_pool_test tokenizer_pool_test.cc)
+  target_link_libraries(inferx_tokenizer_pool_test
+    PRIVATE inferx::server GTest::gtest_main)
+  target_compile_options(inferx_tokenizer_pool_test PRIVATE -Wall -Wextra
+                         -Wpedantic)
+  add_test(NAME tokenizer_pool_test COMMAND inferx_tokenizer_pool_test
+           WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+  set_tests_properties(tokenizer_pool_test PROPERTIES TIMEOUT 120)
+endif()
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME cli_output_test
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_output_test.py

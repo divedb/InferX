@@ -15,8 +15,18 @@ compile_commands.json
 __pycache__/
 *.pyc
 
-# Benchmark transient logs
-/benchmarks/*.log
+# Benchmark artifacts: run archives, session records, generated outputs.
+# The framework itself (bench.py, inferx_bench/, qwen3 code and docs) is source.
+benchmarks/**/results/
+benchmarks/**/serve_results/
+benchmarks/qwen3/diagnostics/
+benchmarks/qwen3/investigation_*/
+benchmarks/qwen3/flashinfer_default_*/
+benchmarks/qwen3/optimization_*/
+benchmarks/qwen3/profiles/
+benchmarks/qwen3/summary.*
+benchmarks/qwen3/agreement.json
+benchmarks/qwen3/comparison.*
+*.log
 .zcode/
 *.sqlite
-benchmarks/

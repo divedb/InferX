@@ -189,7 +189,8 @@ timings.
   │        ├─ parse HTTP (beast)                         │
   │        ├─ Route: /v1/completions → CompletionsHandler│
   │        │    ├─ validate JSON → RequestSpec           │
-  │        │    ├─ Tokenizer::Encode (I/O thread)        │
+  │        │    ├─ TokenizerPool::Prepare (worker     │
+  │        │    │   thread; bounded queue, 503)       │
   │        │    └─ EngineGateway::Submit ───────────┐    │
   │        │         └─ StreamHandle (asio channel) │    │
   │        │    StreamingResponder (SSE writer      │    │
@@ -284,7 +285,9 @@ as planned in §7.
 HTTP request
   → parse+validate (400 on error) ───────────────► error object, done
   → model check (404) 
-  → Tokenizer::Encode(prompt) → token ids (400 on failure)
+  → TokenizerPool::Prepare(prompt) on a worker thread
+       (bounded queue → 503 + Retry-After; invalid input → 400;
+        budget elapsed → 503)
   → EngineGateway::Submit(RequestSpec)
        engine: Scheduler::AddRequest
          ResourceExhausted (queue_capacity) ─────► 503 + Retry-After
