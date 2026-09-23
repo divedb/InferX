@@ -25,6 +25,7 @@ else()
   target_sources(inferx_core PRIVATE accelerator_runtime_stub.cc)
 endif()
 add_library(inferx::core ALIAS inferx_core)
+target_compile_features(inferx_core PUBLIC cxx_std_23)
 
 target_include_directories(inferx_core PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)

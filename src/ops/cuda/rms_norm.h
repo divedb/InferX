@@ -7,6 +7,8 @@
 #include "inferx/ops/rms_norm.h"
 
 namespace inferx::ops::cuda {
+Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+                  const Tensor& weight, Tensor& out, const RMSNormConfig& config);
 
 /// \brief FlashInfer-backed RMSNorm for CUDA devices.
 ///

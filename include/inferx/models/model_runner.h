@@ -2,12 +2,17 @@
 #define INFERX_MODELS_MODEL_RUNNER_H_
 
 #include <memory>
+#include <string>
+#include <vector>
 
+#include "inferx/cache/cache_config.h"
 #include "inferx/cache/kv_block_pool.h"
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
+#include "inferx/engine/execution_config.h"
+#include "inferx/engine/scheduler.h"
 #include "inferx/engine/scheduler_output.h"
 #include "inferx/models/model.h"
 #include "inferx/models/model_config.h"
@@ -15,21 +20,6 @@
 namespace inferx {
 
 struct ModelRunnerImpl;
-
-/// \brief Configuration for one model runner instance.
-struct ModelRunnerConfig {
-  std::string model_dir;                ///< Checkpoint directory.
-  DeviceId device = DeviceId::Cuda(0);  ///< Placement device.
-  /// \brief Upper bound on tokens per step; sizes input buffers. Must match
-  ///        the scheduler's token budget.
-  int max_num_batched_tokens = 4096;
-  /// \brief Upper bound on concurrently scheduled requests.
-  int max_num_seqs = 32;
-  /// \brief Total KV blocks to allocate across all layers.
-  int64_t num_kv_blocks = 2048;
-  /// \brief Tokens per KV block.
-  int64_t block_size = 16;
-};
 
 /// \brief Executes one scheduler step on the model.
 ///
@@ -45,19 +35,26 @@ struct ModelRunnerConfig {
 class ModelRunner {
  public:
   /// \brief Loads the model and allocates the execution lane and KV pool.
-  static StatusOr<std::unique_ptr<ModelRunner>> Create(const ModelRunnerConfig& config);
+  ///
+  /// `scheduler` sizes the input buffers (token budget and sequence
+  /// capacity) and must match the scheduler the engine steps with.
+  static StatusOr<std::unique_ptr<ModelRunner>> Create(
+      const ModelConfig& model, const CacheConfig& cache,
+      const SchedulerConfig& scheduler, const ExecutionConfig& execution);
 
   /// \brief Same, with a model supplied by the caller (tests).
-  static StatusOr<std::unique_ptr<ModelRunner>> Create(const ModelRunnerConfig& config,
-                                                       std::unique_ptr<Model> model);
+  static StatusOr<std::unique_ptr<ModelRunner>> Create(
+      const ModelConfig& model, const CacheConfig& cache,
+      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
+      std::unique_ptr<Model> loaded);
 
   ~ModelRunner();
 
   /// \brief The KV pool the scheduler allocates blocks from.
   KvBlockPool* kv_pool();
 
-  /// \brief The loaded model's configuration.
-  const ModelConfig& model_config() const;
+  /// \brief The loaded model's checkpoint configuration.
+  const CheckpointConfig& checkpoint_config() const;
 
   /// \brief Executes one scheduler step.
   ///

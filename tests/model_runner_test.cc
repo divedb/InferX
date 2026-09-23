@@ -8,6 +8,7 @@
 #include "inferx/engine/scheduler.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/execution_context.h"
+#include "inferx/ops/gather.h"
 
 namespace inferx {
 namespace {
@@ -32,10 +33,15 @@ class TestModel final : public Model {
     config_.vocab_size = 128;
     config_.max_position_embeddings = 32;
   }
-  const ModelConfig& config() const override { return config_; }
+  const CheckpointConfig& config() const override { return config_; }
 
-  StatusOr<Tensor> Forward(const ModelInput& input, KvBlockPool& /*cache*/,
+  std::vector<LayerStateSpec> StateRequirements() const override { return requirements; }
+  std::vector<LayerStateSpec> requirements = {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
+
+  StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
                            ops::ExecutionContext& /*ctx*/) override {
+    EXPECT_NE(state.paged_kv, nullptr);
+    EXPECT_EQ(state.layers.size(), requirements.size());
     auto read = [](const Tensor& t, int size) {
       return std::vector<int32_t>(t.DataAs<int32_t>(), t.DataAs<int32_t>() + size);
     };
@@ -57,7 +63,7 @@ class TestModel final : public Model {
     return logits;
   }
 
-  ModelConfig config_;
+  CheckpointConfig config_;
   std::vector<ObservedBatch> batches;
 
  private:
@@ -67,21 +73,20 @@ class TestModel final : public Model {
 class ModelRunnerTest : public ::testing::Test {
  protected:
   void MakeRunner(int budget) {
-    ModelRunnerConfig config;
-    config.device = DeviceId::Cpu();
-    config.max_num_batched_tokens = budget;
-    config.max_num_seqs = 4;
-    config.num_kv_blocks = 64;
-    config.block_size = 2;
+    ModelConfig mc;
+    mc.device = DeviceId::Cpu();
+    SchedulerConfig sc;
+    sc.max_num_batched_tokens = budget;
+    sc.max_num_seqs = 4;
+    CacheConfig cc;
+    cc.num_kv_blocks = 64;
+    cc.block_size = 2;
     auto model = std::make_unique<TestModel>();
     model_ = model.get();
-    auto runner = ModelRunner::Create(config, std::move(model));
+    auto runner = ModelRunner::Create(mc, cc, sc, ExecutionConfig{}, std::move(model));
     ASSERT_TRUE(runner.ok()) << runner.status();
     runner_ = std::move(*runner);
-    SchedulerConfig scheduler_config;
-    scheduler_config.max_num_batched_tokens = budget;
-    scheduler_config.max_num_seqs = 4;
-    scheduler_ = std::make_unique<Scheduler>(scheduler_config, runner_->kv_pool(), 127);
+    scheduler_ = std::make_unique<Scheduler>(sc, runner_->kv_pool(), 127);
   }
   Status Step() {
     INFERX_ASSIGN_OR_RETURN(auto output, scheduler_->Schedule());
@@ -95,7 +100,8 @@ class ModelRunnerTest : public ::testing::Test {
 
 TEST_F(ModelRunnerTest, RepeatedDecodeUsesLastSampleAndAdvancesPositions) {
   MakeRunner(8);
-  SamplingParams params;
+  sampling::SamplingParams params;
+  params.temperature = 0;
   params.max_tokens = 4;
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
   for (int i = 0; i < 4; ++i) ASSERT_TRUE(Step().ok());
@@ -113,7 +119,8 @@ TEST_F(ModelRunnerTest, RepeatedDecodeUsesLastSampleAndAdvancesPositions) {
 
 TEST_F(ModelRunnerTest, ChunkedPrefillDoesNotSkipPromptTokens) {
   MakeRunner(2);
-  SamplingParams params;
+  sampling::SamplingParams params;
+  params.temperature = 0;
   params.max_tokens = 2;
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3, 4, 5}, params)).ok());
   for (int i = 0; i < 4; ++i) ASSERT_TRUE(Step().ok());
@@ -132,8 +139,10 @@ TEST_F(ModelRunnerTest, ChunkedPrefillDoesNotSkipPromptTokens) {
 
 TEST_F(ModelRunnerTest, MixedPrefillAndDecodePreserveBatchBoundaries) {
   MakeRunner(4);
-  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3})).ok());
-  ASSERT_TRUE(scheduler_->AddRequest(Request(2, {4, 5})).ok());
+  sampling::SamplingParams greedy;
+  greedy.temperature = 0;
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, greedy)).ok());
+  ASSERT_TRUE(scheduler_->AddRequest(Request(2, {4, 5}, greedy)).ok());
   ASSERT_TRUE(Step().ok());
   ASSERT_TRUE(Step().ok());
   ASSERT_EQ(model_->batches.size(), 2);
@@ -148,7 +157,8 @@ TEST_F(ModelRunnerTest, MixedPrefillAndDecodePreserveBatchBoundaries) {
 
 TEST_F(ModelRunnerTest, FinishOnlyStepAllowsRequestIdReuse) {
   MakeRunner(4);
-  SamplingParams params;
+  sampling::SamplingParams params;
+  params.temperature = 0;
   params.max_tokens = 1;
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1}, params)).ok());
   ASSERT_TRUE(Step().ok());
@@ -174,6 +184,143 @@ TEST_F(ModelRunnerTest, RejectsInvalidTokenBeforeForward) {
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {128})).ok());
   EXPECT_EQ(Step().code(), absl::StatusCode::kInvalidArgument);
   EXPECT_TRUE(model_->batches.empty());
+}
+
+TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
+  auto model = std::make_unique<TestModel>();
+  model->requirements = {PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kFloat}}};
+  ModelConfig mc;
+  mc.device = DeviceId::Cpu();
+  CacheConfig cc;
+  cc.num_kv_blocks = 2;
+  auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  EXPECT_EQ((*runner)->kv_pool()->layout().kv_heads, 2);
+  EXPECT_EQ((*runner)->kv_pool()->layout().head_dim, 4);
+  EXPECT_EQ((*runner)->kv_pool()->layout().dtype, DataType::kFloat);
+}
+
+TEST(ModelRunnerStateTest, RejectsRecurrentStateBeforeAllocation) {
+  auto model = std::make_unique<TestModel>();
+  model->requirements = {RecurrentStateSpec{1, 2, 4, 4, 4}};
+  // Default CUDA device deliberately exercises rejection before device setup.
+  auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
+                                   ExecutionConfig{}, std::move(model));
+  EXPECT_EQ(runner.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(ModelRunnerStateTest, RejectsMixedPagedLayoutsBeforeAllocation) {
+  auto model = std::make_unique<TestModel>();
+  model->config_.num_hidden_layers = 2;
+  model->requirements.push_back(PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kBFloat16}});
+  auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
+                                   ExecutionConfig{}, std::move(model));
+  EXPECT_EQ(runner.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(ModelRunnerStateTest, RejectsMissingLayerState) {
+  auto model = std::make_unique<TestModel>();
+  model->requirements.clear();
+  auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
+                                   ExecutionConfig{}, std::move(model));
+  EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+// A graph-safe model with a known answer: token (position + 10). Its output
+// depends on live device positions and logit-row indices, including after a
+// smaller batch reuses a previously captured graph.
+class PositionModel final : public Model {
+ public:
+  PositionModel() {
+    config_.num_hidden_layers = 1;
+    config_.vocab_size = 128;
+    config_.max_position_embeddings = 64;
+  }
+  Status Init() {
+    const auto device = DeviceId::Cuda(0);
+    INFERX_ASSIGN_OR_RETURN(table_, Tensor::Empty(DataType::kBFloat16, Shape({64, 128}), device));
+    INFERX_ASSIGN_OR_RETURN(hidden_, Tensor::Empty(DataType::kBFloat16, Shape({8, 128}), device));
+    INFERX_ASSIGN_OR_RETURN(logits_, Tensor::Empty(DataType::kBFloat16, Shape({4, 128}), device));
+    std::vector<uint16_t> table(64 * 128, 0);
+    for (int p = 0; p < 64; ++p) table[p * 128 + p + 10] = 0x3f80;
+    INFERX_ASSIGN_OR_RETURN(auto runtime, RuntimeFor(device));
+    return runtime->Copy(table_.Data(), table.data(), table.size() * sizeof(uint16_t),
+                         CopyKind::kHostToDevice);
+  }
+  bool SupportsCudaGraphs() const override { return true; }
+  const CheckpointConfig& config() const override { return config_; }
+  std::vector<LayerStateSpec> StateRequirements() const override {
+    return {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
+  }
+  StatusOr<Tensor> Forward(const ModelInput& input, ModelState&,
+                           ops::ExecutionContext& ctx) override {
+    ++calls;
+    INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_.Slice(0, input.attention.num_tokens));
+    INFERX_ASSIGN_OR_RETURN(auto logits, logits_.Slice(0, input.attention.num_seqs));
+    INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, table_, input.attention.positions, hidden));
+    INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, hidden, input.logit_rows, logits));
+    return logits;
+  }
+  int calls = 0;
+ private:
+  CheckpointConfig config_;
+  Tensor table_, hidden_, logits_;
+};
+
+TEST_F(ModelRunnerTest, RejectsUnknownAttentionBackendBeforeLoadingWeights) {
+  ModelConfig mc;
+  mc.model_dir = "/nonexistent";
+  ExecutionConfig ec;
+  ec.attention_backend = "cutlass";
+  auto runner = ModelRunner::Create(mc, CacheConfig{}, SchedulerConfig{}, ec);
+  EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_NE(std::string(runner.status().message()).find("attention backend"), std::string::npos);
+}
+
+TEST(ModelRunnerCudaTest, GraphSamplingTracksBatchTurnoverAndPageTransitions) {
+  ModelConfig mc;
+  SchedulerConfig sc;
+  sc.max_num_batched_tokens = 8;
+  sc.max_num_seqs = 4;
+  CacheConfig cc;
+  cc.num_kv_blocks = 64;
+  cc.block_size = 2;
+  ExecutionConfig ec;
+  ec.enable_cuda_graphs = true;
+  auto model = std::make_unique<PositionModel>();
+  ASSERT_TRUE(model->Init().ok());
+  auto* observed = model.get();
+  auto created = ModelRunner::Create(mc, cc, sc, ec, std::move(model));
+  ASSERT_TRUE(created.ok()) << created.status();
+  auto runner = std::move(*created);
+  Scheduler scheduler(sc, runner->kv_pool(), 127);
+  int steps = 0;
+  for (int wave = 0; wave < 2; ++wave) {
+    for (int i = 0; i < 4; ++i) {
+      sampling::SamplingParams params;
+      params.temperature = 0;
+      params.ignore_eos = true;
+      params.max_tokens = 8 + 3 * i;
+      ASSERT_TRUE(scheduler.AddRequest(Request(wave * 4 + i,
+          std::vector<int>(3 + i, 1), params)).ok());
+    }
+    while (scheduler.HasRequests()) {
+      auto plan = scheduler.Schedule();
+      ASSERT_TRUE(plan.ok()) << plan.status();
+      auto result = runner->Run(*plan);
+      ASSERT_TRUE(result.ok()) << result.status();
+      ASSERT_TRUE(scheduler.UpdateFromOutput(*plan, *result).ok());
+      ++steps;
+      while (auto finished = scheduler.PopFinished()) {
+        const int i = finished->id() % 4;
+        ASSERT_EQ(finished->output().size(), 8 + 3 * i);
+        for (int j = 0; j < 8 + 3 * i; ++j) {
+          EXPECT_EQ(finished->output()[j], 12 + i + j);
+        }
+      }
+    }
+  }
+  EXPECT_LT(observed->calls, steps);
 }
 
 }  // namespace

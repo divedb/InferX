@@ -18,8 +18,10 @@ target_link_libraries(kvc_missing_entry PRIVATE kvc::abi)
 
 add_executable(kvc_loader_test loader_test.cc)
 target_link_libraries(kvc_loader_test PRIVATE kvc::runtime Threads::Threads)
-add_test(NAME kvc_loader COMMAND kvc_loader_test $<TARGET_FILE:kvc_bad_abi>
-         $<TARGET_FILE:kvc_missing_entry> $<TARGET_FILE:kvc_host>)
+if(TARGET kvc_host)
+  add_test(NAME kvc_loader COMMAND kvc_loader_test $<TARGET_FILE:kvc_bad_abi>
+           $<TARGET_FILE:kvc_missing_entry> $<TARGET_FILE:kvc_host>)
+endif()
 
 # A provider with delayed background transfers and failure injection.
 add_library(kvc_async_fixture MODULE async_fixture.cc)
@@ -29,8 +31,10 @@ set_target_properties(kvc_async_fixture PROPERTIES CXX_STANDARD 23 CXX_STANDARD_
 add_executable(kvc_provider_conformance provider_conformance.cc)
 target_link_libraries(kvc_provider_conformance PRIVATE kvc::runtime Threads::Threads)
 set_target_properties(kvc_provider_conformance PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
-add_test(NAME kvc_provider_conformance COMMAND kvc_provider_conformance
-         $<TARGET_FILE:kvc_host>)
+if(TARGET kvc_host)
+  add_test(NAME kvc_provider_conformance COMMAND kvc_provider_conformance
+           $<TARGET_FILE:kvc_host>)
+endif()
 add_test(NAME kvc_async_lifetime COMMAND kvc_provider_conformance
          $<TARGET_FILE:kvc_async_fixture> async)
 
@@ -57,7 +61,7 @@ if(TARGET kvc_cuda_provider_test AND NOT MSVC)
 endif()
 
 
-if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+if(TARGET kvc_cuda_provider_test AND EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   # WSL2 ships two libcuda copies; only the WSL one can see the GPU.
   set_tests_properties(kvc_cuda_provider kvc_cuda_conformance
                        PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")

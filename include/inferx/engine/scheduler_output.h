@@ -37,7 +37,7 @@ struct ScheduledRequest {
 struct NewRequestData {
   RequestId request_id = 0;  ///< The request being introduced.
   absl::Span<const TokenId> prompt_token_ids;  ///< Prompt tokens, borrowed.
-  SamplingParams sampling_params;  ///< The request's sampling parameters.
+  sampling::SamplingParams sampling_params;  ///< The request's sampling parameters.
   std::vector<int32_t> block_ids;  ///< Initial KV block table, logical order.
   int num_computed_tokens = 0;     ///< Prompt tokens already computed.
 };

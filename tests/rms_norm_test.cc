@@ -167,6 +167,42 @@ class RmsNormTest : public ::testing::Test {
     }
   }
 
+  void ExpectReferenceRounding() {
+    // Independent PyTorch BF16 fixture: n = x.float() * rsqrt(mean(x^2) +
+    // 1e-6); expected = n.bfloat16() * weight. Single-rounding RMSNorm
+    // differs in every column, by up to 0.001953125.
+    const float values[] = {0.125f, 1.75f, -2.375f, 4.5f};
+    const float expected[] = {0.0086669921875f, 0.12158203125f, -0.166015625f, 0.3125f};
+    for (int dim : {4, 128, 1024}) {
+      std::vector<uint16_t> input(2 * dim), weight(dim, FloatToBf16Bits(0.1875f));
+      for (size_t i = 0; i < input.size(); ++i) input[i] = FloatToBf16Bits(values[i % 4]);
+      auto x_alloc = Tensor::Empty(DataType::kBFloat16, Shape({2, dim}), device_);
+      auto w_alloc = Tensor::Empty(DataType::kBFloat16, Shape({dim}), device_);
+      auto out_alloc = Tensor::Empty(DataType::kBFloat16, Shape({2, dim}), device_);
+      ASSERT_TRUE(x_alloc.ok());
+      ASSERT_TRUE(w_alloc.ok());
+      ASSERT_TRUE(out_alloc.ok());
+      Tensor x = *x_alloc, w = *w_alloc, out = *out_alloc;
+      ASSERT_TRUE(runtime_->Copy(w.Data(), weight.data(), dim * sizeof(uint16_t),
+                                 CopyKind::kHostToDevice).ok());
+      auto exec = ctx();
+      for (bool in_place : {false, true}) {
+        ASSERT_TRUE(runtime_->Copy(x.Data(), input.data(), input.size() * sizeof(uint16_t),
+                                   CopyKind::kHostToDevice).ok());
+        Tensor& dst = in_place ? x : out;
+        ASSERT_TRUE(RmsNorm(exec, x, w, dst, RMSNormConfig{1e-6f, false, true}).ok());
+        ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+        std::vector<uint16_t> actual(input.size());
+        ASSERT_TRUE(runtime_->Copy(actual.data(), dst.Data(), actual.size() * sizeof(uint16_t),
+                                   CopyKind::kDeviceToHost).ok());
+        for (size_t i = 0; i < actual.size(); ++i) {
+          EXPECT_EQ(actual[i], FloatToBf16Bits(expected[i % 4]))
+              << "dim=" << dim << " in_place=" << in_place << " index=" << i;
+        }
+      }
+    }
+  }
+
   ExecutionContext ctx() { return ExecutionContext(*runtime_, stream_); }
 
   DeviceRuntime* runtime_ = nullptr;
@@ -183,6 +219,9 @@ class CpuRmsNormTest : public RmsNormTest {
  protected:
   void SetUp() override { SetUpOn(DeviceId::Cpu()); }
 };
+
+TEST_F(CpuRmsNormTest, RoundsBeforeWeightLikeQwenReference) { ExpectReferenceRounding(); }
+TEST_F(CudaRmsNormTest, RoundsBeforeWeightLikeQwenReference) { ExpectReferenceRounding(); }
 
 TEST_F(CudaRmsNormTest, StandardMatchesReference) {
   ExpectMatchesReference<Bf16Policy>(/*rows=*/7, /*dim=*/96, /*eps=*/1e-6f, /*plus_one=*/false);

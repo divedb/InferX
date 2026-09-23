@@ -113,17 +113,23 @@ uint16_t FloatToF16Bits(float value) {
 /// \brief Half-precision path: convert each row to fp32, normalize with the
 ///        vector kernel, convert back.
 Status RmsNormConverted(const uint16_t* x, const uint16_t* w, uint16_t* out, int64_t rows,
-                        int64_t dim, float eps, float bias, float (*decode)(uint16_t),
+                        int64_t dim, float eps, float bias, bool round_before_weight,
+                        float (*decode)(uint16_t),
                         uint16_t (*encode)(float)) {
   std::vector<float> w_row(dim), x_row(dim), out_row(dim);
-  for (int64_t j = 0; j < dim; ++j) w_row[j] = decode(w[j]);
+  for (int64_t j = 0; j < dim; ++j) w_row[j] = round_before_weight ? 1.0f : decode(w[j]);
   for (int64_t r = 0; r < rows; ++r) {
     const uint16_t* x_src = x + r * dim;
     for (int64_t j = 0; j < dim; ++j) x_row[j] = decode(x_src[j]);
     HWY_DYNAMIC_DISPATCH(RmsNormRowF32)
-    (x_row.data(), w_row.data(), out_row.data(), static_cast<size_t>(dim), eps, bias);
+    (x_row.data(), w_row.data(), out_row.data(), static_cast<size_t>(dim), eps,
+     round_before_weight ? 0.0f : bias);
     uint16_t* out_dst = out + r * dim;
-    for (int64_t j = 0; j < dim; ++j) out_dst[j] = encode(out_row[j]);
+    for (int64_t j = 0; j < dim; ++j) {
+      out_dst[j] = round_before_weight
+                       ? encode(decode(encode(out_row[j])) * (decode(w[j]) + bias))
+                       : encode(out_row[j]);
+    }
   }
   return OkStatus();
 }
@@ -149,11 +155,13 @@ Status RmsNorm(ExecutionContext& /*ctx*/, const Tensor& x, const Tensor& weight,
       return RmsNormConverted(static_cast<const uint16_t*>(x.Data()),
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
+                              config.round_before_weight,
                               F16BitsToFloat, FloatToF16Bits);
     case DataType::kBFloat16:
       return RmsNormConverted(static_cast<const uint16_t*>(x.Data()),
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
+                              config.round_before_weight,
                               Bf16BitsToFloat, FloatToBf16Bits);
     default:
       return UnimplementedError("RmsNorm on CPU does not support dtype ",

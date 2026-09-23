@@ -49,6 +49,7 @@ class ModelTest : public ::testing::Test {
     INFERX_RETURN_IF_ERROR(runtime_->Copy(batch_indices.Data(), zeros.data(),
                                           num_tokens * sizeof(int32_t),
                                           CopyKind::kHostToDevice));
+    host_qo_ = {0, num_tokens};
     const int32_t qo[] = {0, num_tokens};
     const int32_t kv[] = {0, 1};
     const int32_t block[] = {0};
@@ -68,12 +69,13 @@ class ModelTest : public ::testing::Test {
     ModelInput input;
     input.token_ids = token_ids;
     input.attention = {
-        positions, batch_indices, qo_indptr, kv_indptr, kv_indices, last_page_len, {},
+        positions, batch_indices, qo_indptr, kv_indptr, kv_indices, last_page_len, host_qo_,
         {},        num_tokens,    1};
     input.logit_rows = logit_rows;
     return input;
   }
 
+  std::vector<int32_t> host_qo_;
   DeviceRuntime* runtime_ = nullptr;
   Stream stream_;
 };
@@ -82,7 +84,7 @@ TEST_F(ModelTest, LoadsQwen3CheckpointAndConfig) {
   auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), /*max_tokens=*/8,
                            /*max_seqs=*/2);
   ASSERT_TRUE(model.ok()) << model.status();
-  const ModelConfig& config = (*model)->config();
+  const CheckpointConfig& config = (*model)->config();
   EXPECT_EQ(config.model_type, "qwen3");
   EXPECT_EQ(config.architectures, "Qwen3ForCausalLM");
   EXPECT_EQ(config.hidden_size, 1024);
@@ -97,11 +99,11 @@ TEST_F(ModelTest, LoadsQwen3CheckpointAndConfig) {
   EXPECT_TRUE(config.tie_word_embeddings);
 }
 
-TEST_F(ModelTest, ForwardReportsPendingOps) {
+TEST_F(ModelTest, ForwardReturnsLogits) {
   auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), /*max_tokens=*/8,
                            /*max_seqs=*/2);
   ASSERT_TRUE(model.ok()) << model.status();
-  const ModelConfig& config = (*model)->config();
+  const CheckpointConfig& config = (*model)->config();
   KvLayout layout;
   layout.entries_per_token = 2;
   layout.kv_heads = config.num_key_value_heads;
@@ -113,8 +115,15 @@ TEST_F(ModelTest, ForwardReportsPendingOps) {
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
   ops::ExecutionContext ctx(*runtime_, stream_);
-  const StatusOr<Tensor> logits = (*model)->Forward(*input, *pool, ctx);
-  EXPECT_EQ(logits.status().code(), absl::StatusCode::kUnimplemented);
+  ModelState state;
+  state.paged_kv = &*pool;
+  for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
+  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx);
+  ASSERT_TRUE(logits.ok()) << logits.status();
+  EXPECT_EQ(logits->Rank(), 2);
+  EXPECT_EQ(logits->Dim(0), 1);
+  EXPECT_EQ(logits->Dim(1), config.vocab_size);
+  EXPECT_EQ(logits->GetDataType(), DataType::kBFloat16);
 }
 
 TEST_F(ModelTest, RejectsUnsupportedArchitecture) {
@@ -126,6 +135,13 @@ TEST_F(ModelTest, RejectsUnsupportedArchitecture) {
       << R"( "vocab_size": 16})";
   auto model = Model::Load(dir, DeviceId::Cuda(0), 8, 2);
   EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST_F(ModelTest, RejectsUnavailableBackendBeforeUploadingWeights) {
+  auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), 8, 2,
+                           static_cast<ops::AttentionBackend>(999));
+  EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
+  EXPECT_NE(std::string(model.status().message()).find("backend"), std::string::npos);
 }
 
 TEST_F(ModelTest, RejectsMissingConfig) {

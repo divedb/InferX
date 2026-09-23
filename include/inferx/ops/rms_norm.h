@@ -15,6 +15,10 @@ struct RMSNormConfig {
   ///        weight. Checkpoints that already fold the constant into the
   ///        weight leave this false.
   bool plus_one_weight = false;
+  /// Round normalized activations to the input dtype before multiplying by
+  /// weight, as in the Llama/Qwen reference implementations. The default
+  /// retains the single-rounding mathematical operator (also used by Gemma).
+  bool round_before_weight = false;
 };
 
 /// \brief RMS-normalizes each row of `x` into `out`.
@@ -37,5 +41,10 @@ struct RMSNormConfig {
 /// \return        OK, or InvalidArgument/Unimplemented for bad inputs.
 Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config);
+
+/// Add x into residual with activation-dtype rounding, then normalize residual
+/// into out. Out must be separate from residual so both results are retained.
+Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+                  const Tensor& weight, Tensor& out, const RMSNormConfig& config);
 
 }  // namespace inferx::ops

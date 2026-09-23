@@ -1,8 +1,22 @@
 # Build output
 /build/
+/build-engine/
+/build-cuda13/
 compile_commands.json
+
+# Local editor state
+/.vscode/
+
+# Checkpoint directories: multi-GB weights, not source
+/models/
 
 # Python reference-oracle virtualenv
 /python/.venv/
 __pycache__/
 *.pyc
+
+# Benchmark transient logs
+/benchmarks/*.log
+.zcode/
+*.sqlite
+benchmarks/

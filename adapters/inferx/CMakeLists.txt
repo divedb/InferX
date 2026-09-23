@@ -19,8 +19,8 @@ if(INFERX_BUILD_TESTS AND INFERX_BUILD_KVCACHE_PLUGINS)
 endif()
 
 
-if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+if(TARGET inferx_kvc_adapter_test AND EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   # WSL2 ships two libcuda copies; only the WSL one can see the GPU.
-  set_tests_properties(kvc_adapter PROPERTIES ENVIRONMENT
-                       "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+  set_property(TEST kvc_adapter APPEND PROPERTY ENVIRONMENT
+               "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()

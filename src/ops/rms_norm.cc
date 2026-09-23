@@ -1,4 +1,5 @@
 #include "inferx/ops/rms_norm.h"
+#include "inferx/ops/elementwise.h"
 
 #include <limits>
 
@@ -7,8 +8,9 @@
 
 namespace inferx::ops {
 
-Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
-               const RMSNormConfig& config) {
+namespace {
+Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+                    const RMSNormConfig& config) {
   if (!x.IsDefined() || !weight.IsDefined() || !out.IsDefined()) {
     return InvalidArgumentError("RmsNorm requires defined x, weight, and out tensors");
   }
@@ -50,14 +52,35 @@ Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Ten
     return InvalidArgumentError("RmsNorm tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind) {
+  return OkStatus();
+}
+}  // namespace
+
+Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+               const RMSNormConfig& config) {
+  INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, x, weight, out, config));
+  switch (ctx.device().kind) {
     case DeviceKind::kCuda:
       return cuda::RmsNorm(ctx, x, weight, out, config);
     case DeviceKind::kCpu:
       return cpu::RmsNorm(ctx, x, weight, out, config);
     default:
-      return UnimplementedError("RmsNorm has no implementation for device ", device.ToString());
+      return UnimplementedError("RmsNorm has no implementation for device ", ctx.device().ToString());
   }
+}
+
+Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+                  const Tensor& weight, Tensor& out, const RMSNormConfig& config) {
+  INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, x, weight, out, config));
+  INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, residual, weight, out, config));
+  if (residual.Data() == out.Data())
+    return InvalidArgumentError("AddRmsNorm requires distinct residual and output buffers");
+  if (ctx.device().IsCuda() && config.round_before_weight &&
+      x.GetDataType() == DataType::kBFloat16) {
+    return cuda::AddRmsNorm(ctx, x, residual, weight, out, config);
+  }
+  INFERX_RETURN_IF_ERROR(Add(ctx, x, residual, residual));
+  return RmsNorm(ctx, residual, weight, out, config);
 }
 
 }  // namespace inferx::ops

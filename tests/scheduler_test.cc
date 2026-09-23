@@ -84,7 +84,7 @@ TEST_F(SchedulerTest, DecodeStepsScheduleOneTokenEach) {
 
 TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
   MakeScheduler(SchedulerConfig{});
-  SamplingParams params;
+  sampling::SamplingParams params;
   params.max_tokens = 2;
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
 
@@ -112,7 +112,7 @@ TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
 
 TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
   MakeScheduler(SchedulerConfig{});
-  SamplingParams params;
+  sampling::SamplingParams params;
   params.max_tokens = 10;
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
 
@@ -123,7 +123,7 @@ TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
   EXPECT_EQ(scheduler_->PopFinished()->finish_reason(), FinishReason::kStopped);
 
   // ignore_eos keeps the request running through the EOS token.
-  SamplingParams ignoring;
+  sampling::SamplingParams ignoring;
   ignoring.max_tokens = 10;
   ignoring.ignore_eos = true;
   ASSERT_TRUE(scheduler_->AddRequest(Request(2, {1, 2, 3}, ignoring)).ok());

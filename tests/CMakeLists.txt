@@ -37,8 +37,62 @@ add_executable(inferx_rms_norm_test rms_norm_test.cc)
 target_link_libraries(inferx_rms_norm_test PRIVATE inferx::ops GTest::gtest_main)
 target_compile_options(inferx_rms_norm_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME rms_norm_test COMMAND inferx_rms_norm_test)
+
+add_executable(inferx_ops_test ops_test.cc)
+target_link_libraries(inferx_ops_test PRIVATE inferx::ops GTest::gtest_main)
+target_compile_options(inferx_ops_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME ops_test COMMAND inferx_ops_test)
 if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   # WSL2 ships two libcuda copies; only the WSL one can see the GPU.
-  set_tests_properties(rms_norm_test model_test PROPERTIES ENVIRONMENT
+  set_tests_properties(rms_norm_test model_test ops_test PROPERTIES ENVIRONMENT
                        "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+endif()
+
+add_executable(inferx_cli_args_test cli_args_test.cc)
+target_link_libraries(inferx_cli_args_test PRIVATE inferx::cli GTest::gtest_main)
+target_compile_options(inferx_cli_args_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME cli_args_test COMMAND inferx_cli_args_test)
+
+add_executable(inferx_cli_presentation_test cli_presentation_test.cc)
+target_link_libraries(inferx_cli_presentation_test
+  PRIVATE inferx::cli_presentation GTest::gtest_main)
+add_test(NAME cli_presentation_test COMMAND inferx_cli_presentation_test)
+
+add_executable(inferx_server_api_test server_api_test.cc)
+target_link_libraries(inferx_server_api_test
+  PRIVATE inferx::server nlohmann_json::nlohmann_json GTest::gtest_main)
+target_compile_options(inferx_server_api_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME server_api_test COMMAND inferx_server_api_test)
+
+add_executable(inferx_event_queue_test event_queue_test.cc)
+target_link_libraries(inferx_event_queue_test
+  PRIVATE inferx::server GTest::gtest_main)
+target_compile_options(inferx_event_queue_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME event_queue_test COMMAND inferx_event_queue_test)
+set_tests_properties(event_queue_test PROPERTIES TIMEOUT 30)
+
+add_executable(inferx_text_delta_test text_delta_test.cc)
+target_link_libraries(inferx_text_delta_test
+  PRIVATE inferx::server GTest::gtest_main)
+target_compile_options(inferx_text_delta_test PRIVATE -Wall -Wextra
+                       -Wpedantic)
+add_test(NAME text_delta_test COMMAND inferx_text_delta_test)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME cli_output_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_output_test.py
+          $<TARGET_FILE:inferx>)
+
+add_executable(inferx_sampling_test sampling_test.cc)
+target_link_libraries(inferx_sampling_test PRIVATE inferx::sampling
+                      GTest::gtest_main)
+target_compile_options(inferx_sampling_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME sampling_test COMMAND inferx_sampling_test)
+
+add_executable(inferx_attention_test attention_test.cc)
+target_link_libraries(inferx_attention_test PRIVATE inferx::ops GTest::gtest_main)
+target_compile_options(inferx_attention_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME attention_test COMMAND inferx_attention_test)
+if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+  set_tests_properties(attention_test PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()

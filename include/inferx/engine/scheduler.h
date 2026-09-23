@@ -22,6 +22,10 @@ struct SchedulerConfig {
   int max_num_seqs = 32;
   /// \brief Bound on the waiting queue; admissions beyond it are rejected.
   int queue_capacity = 64;
+  /// \brief Whether a long prompt may be split across steps within the token
+  ///        budget (the scheduler's native mode; CLI contract for vLLM's
+  ///        --enable-chunked-prefill).
+  bool chunked_prefill = true;
 };
 
 /// \brief Snapshot of scheduler occupancy and cumulative counters.

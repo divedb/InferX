@@ -15,6 +15,7 @@ Scheduler::Scheduler(SchedulerConfig config, KvBlockPool* pool, TokenId eos_toke
 }
 
 Status Scheduler::AddRequest(Request request) {
+  INFERX_RETURN_IF_ERROR(request.sampling_params().Validate());
   Status status = waiting_.Push(std::move(request));
   if (!status.ok()) {
     ++stats_.num_rejected;
@@ -149,7 +150,7 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
     const TokenId token = sample.token_ids.front();
     INFERX_RETURN_IF_ERROR(request.AppendOutput(absl::MakeConstSpan(&token, 1)));
 
-    const SamplingParams& params = request.sampling_params();
+    const sampling::SamplingParams& params = request.sampling_params();
     bool finish = false;
     FinishReason reason = FinishReason::kStopped;
     if (static_cast<int>(request.output().size()) >= request.max_new_tokens()) {

@@ -22,3 +22,9 @@
 [submodule "third_party/cli11"]
 	path = third_party/cli11
 	url = https://github.com/CLIUtils/CLI11.git
+[submodule "third_party/mimalloc"]
+	path = third_party/mimalloc
+	url = https://github.com/microsoft/mimalloc.git
+[submodule "third_party/nlohmann_json"]
+	path = third_party/nlohmann_json
+	url = https://github.com/nlohmann/json.git
