@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <system_error>
 #include <vector>
 
@@ -69,42 +71,46 @@ StatusOr<SafeTensorReader> OpenShard(const std::filesystem::path& path) {
   return std::move(*reader);
 }
 
-/// \brief Uploads a host tensor to `device` as bfloat16.
-///
-/// Bf16 tensors copy straight through; f32/f16 are converted on the host
-/// first. Everything else has no sensible bf16 rendering.
-StatusOr<Tensor> UploadAsBf16(const Tensor& host, DeviceId device) {
+}  // namespace
+
+StatusOr<Tensor> Checkpoint::AsHostBf16(const Tensor& host) {
+  if (host.GetDataType() == DataType::kBFloat16) return host;
+
   const int64_t numel = host.Numel();
-
-  if (host.GetDataType() == DataType::kBFloat16) {
-    return host.To(device);
-  }
-
-  std::vector<uint16_t> bf16(static_cast<size_t>(numel));
+  INFERX_ASSIGN_OR_RETURN(
+      auto converted, Tensor::Empty(DataType::kBFloat16, host.GetShape(), DeviceId::Cpu()));
+  auto* out = static_cast<uint16_t*>(converted.Data());
   switch (host.GetDataType()) {
     case DataType::kFloat32: {
       const auto* p = static_cast<const float*>(host.Data());
-      for (int64_t i = 0; i < numel; ++i) bf16[static_cast<size_t>(i)] = FloatToBf16Bits(p[i]);
+      for (int64_t i = 0; i < numel; ++i) out[i] = FloatToBf16Bits(p[i]);
       break;
     }
     case DataType::kFloat16: {
       const auto* p = static_cast<const uint16_t*>(host.Data());
-      for (int64_t i = 0; i < numel; ++i) {
-        bf16[static_cast<size_t>(i)] = FloatToBf16Bits(HalfToFloat(p[i]));
-      }
+      for (int64_t i = 0; i < numel; ++i) out[i] = FloatToBf16Bits(HalfToFloat(p[i]));
       break;
     }
     default:
       return UnimplementedError("cannot load ",
                                 DataTypeName(host.GetDataType()), " tensor as bfloat16");
   }
-
-  INFERX_ASSIGN_OR_RETURN(auto staged, Tensor::FromBlob(bf16.data(), DataType::kBFloat16,
-                                                        host.GetShape(), DeviceId::Cpu()));
-  return staged.To(device);
+  return converted;
 }
 
-}  // namespace
+StatusOr<Tensor> Checkpoint::FindHostBf16(std::string_view name,
+                                          const Shape& expected_full) const {
+  std::optional<Tensor> host = Find(name);
+  if (!host.has_value()) {
+    return NotFoundError("checkpoint is missing tensor ", name);
+  }
+  if (host->GetShape() != expected_full) {
+    return InvalidArgumentError("unexpected shape for ", name, ": got ",
+                                host->GetShape().ToString(), ", want ",
+                                expected_full.ToString());
+  }
+  return AsHostBf16(*host);
+}
 
 StatusOr<Checkpoint> Checkpoint::Open(const std::string& dir) {
   const std::filesystem::path root(dir);
@@ -158,16 +164,33 @@ std::optional<Tensor> Checkpoint::Find(std::string_view name) const {
 
 StatusOr<Tensor> Checkpoint::UploadBf16(std::string_view name, const Shape& expected,
                                         DeviceId device) const {
-  std::optional<Tensor> host = Find(name);
-  if (!host.has_value()) {
-    return NotFoundError("checkpoint is missing tensor ", name);
+  INFERX_ASSIGN_OR_RETURN(auto host, FindHostBf16(name, expected));
+  return host.To(device);
+}
+
+StatusOr<LoadedCheckpoint> LoadCheckpointConfig(const std::string& dir) {
+  LoadedCheckpoint checkpoint;
+  std::ifstream file(dir + "/config.json");
+  if (!file) {
+    return NotFoundError("could not open config: ", dir);
   }
-  if (host->GetShape() != expected) {
-    return InvalidArgumentError("unexpected shape for ", name, ": got ",
-                                host->GetShape().ToString(), ", want ",
-                                expected.ToString());
-  }
-  return UploadAsBf16(*host, device);
+  std::ostringstream text;
+  text << file.rdbuf();
+  checkpoint.config_json = text.str();
+  INFERX_ASSIGN_OR_RETURN(checkpoint.config,
+                          CheckpointConfig::FromJson(checkpoint.config_json));
+  return checkpoint;
+}
+
+Status OpenCheckpointWeights(LoadedCheckpoint& checkpoint, const std::string& dir) {
+  INFERX_ASSIGN_OR_RETURN(checkpoint.weights, Checkpoint::Open(dir));
+  return OkStatus();
+}
+
+StatusOr<LoadedCheckpoint> LoadCheckpoint(const std::string& dir) {
+  INFERX_ASSIGN_OR_RETURN(auto checkpoint, LoadCheckpointConfig(dir));
+  INFERX_RETURN_IF_ERROR(OpenCheckpointWeights(checkpoint, dir));
+  return checkpoint;
 }
 
 }  // namespace inferx::models

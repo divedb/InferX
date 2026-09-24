@@ -75,13 +75,12 @@ class CliOutputTest(unittest.TestCase):
                       "--disable-log-stats", "--dtype", "--seed",
                       "--max-model-len", "--kv-cache-memory-bytes",
                       "--enable-chunked-prefill", "--no-enable-chunked-prefill",
-                      "--attention-backend", "--cudagraph-capture-sizes",
+                      "--cudagraph-capture-sizes",
                       "--max-cudagraph-capture-size"]:
             self.assertIn(value, text)
         for path in [["bench", "throughput"], ["bench", "workload"]]:
             text = self.run_cli(*path, "--help").stdout
-            for value in ["--output-json", "--disable-log-stats", "--dtype",
-                          "--attention-backend"]:
+            for value in ["--output-json", "--disable-log-stats", "--dtype"]:
                 self.assertIn(value, text)
         # --seed moved to the engine group; it must not appear twice.
         text = self.run_cli("bench", "throughput", "--help").stdout
@@ -89,8 +88,6 @@ class CliOutputTest(unittest.TestCase):
 
     def test_vllm_parity_option_validation(self):
         self.assert_error(["serve", "--dtype", "fp8"], "invalid value 'fp8'", "--dtype")
-        self.assert_error(["bench", "latency", "--attention-backend", "cutlass"],
-                          "invalid value 'cutlass'", "--attention-backend")
         self.assert_error(["bench", "latency", "--cudagraph-capture-sizes", "0"],
                           "invalid value", "--cudagraph-capture-sizes")
         self.assert_error(["serve", "--max-model-len", "-1"], "invalid value")

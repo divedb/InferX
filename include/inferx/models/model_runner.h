@@ -12,6 +12,7 @@
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
 #include "inferx/engine/execution_config.h"
+#include "inferx/engine/parallel_config.h"
 #include "inferx/engine/scheduler.h"
 #include "inferx/engine/scheduler_output.h"
 #include "inferx/models/model.h"
@@ -40,7 +41,8 @@ class ModelRunner {
   /// capacity) and must match the scheduler the engine steps with.
   static StatusOr<std::unique_ptr<ModelRunner>> Create(
       const ModelConfig& model, const CacheConfig& cache,
-      const SchedulerConfig& scheduler, const ExecutionConfig& execution);
+      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
+      const ParallelConfig& parallel = {});
 
   /// \brief Same, with a model supplied by the caller (tests).
   static StatusOr<std::unique_ptr<ModelRunner>> Create(

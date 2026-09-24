@@ -11,7 +11,7 @@
 
 #include "inferx/ops/execution_context.h"
 
-namespace inferx::lm {
+namespace inferx {
 // Explicit eager-only diagnostic. Disabled unless a trace directory is set;
 // synchronization and file I/O must never be enabled in throughput measurements.
 class DiagnosticTrace {
@@ -54,4 +54,4 @@ class DiagnosticTrace {
   ops::ExecutionContext& ctx_;
   std::filesystem::path directory_;
 };
-}  // namespace inferx::lm
+}  // namespace inferx

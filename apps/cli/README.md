@@ -28,11 +28,11 @@ Run `ctest --test-dir build-cuda13 -R 'cli_' --output-on-failure` after building
 The process tests check stdout/stderr, pipes, files, pseudo-terminals, color
 precedence, and common parsing failures without starting an inference engine.
 
-## Attention backend
+## Attention kernels
 
-CUDA models use FlashInfer by default. `--attention-backend flashinfer` selects it
-explicitly; `default` and `flash` are compatibility aliases. Unknown backends fail
-validation. `INFERX_EXPERIMENTAL_FLASH_ATTENTION` no longer selects execution.
+Attention kernels are selected automatically by the runtime from execution
+geometry (batch shape, GQA ratio, head dimension); there is no backend option
+to set. `INFERX_EXPERIMENTAL_FLASH_ATTENTION` no longer selects execution.
 
 The BF16 integration supports full causal attention, head dimensions 64/128/256,
 and query/KV-head ratios 1 through 32. It handles prefill, cached-prefix chunks,

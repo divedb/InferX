@@ -1,22 +1,18 @@
 /// \file
-/// \brief Feed-forward components: gated dense MLPs and routed experts.
+/// \brief Top-k routed mixture of experts.
 
-#ifndef INFERX_MODELS_LAYERS_FEED_FORWARD_H_
-#define INFERX_MODELS_LAYERS_FEED_FORWARD_H_
+#ifndef INFERX_MODELS_COMPONENTS_MOE_H_
+#define INFERX_MODELS_COMPONENTS_MOE_H_
 
 #include <cstdint>
 #include <optional>
 #include <vector>
 
 #include "inferx/core/tensor.h"
-#include "inferx/models/layers/mixer.h"
+#include "inferx/models/components/mlp.h"
+#include "inferx/ops/execution_context.h"
 
-namespace inferx::layers {
-
-/// \brief Bias-free SwiGLU feed-forward.
-struct SwiGluConfig {
-  int64_t intermediate_size = 0;  ///< Gate/up width.
-};
+namespace inferx::components {
 
 /// \brief Top-k routed mixture of SwiGLU experts.
 struct MoeConfig {
@@ -28,14 +24,6 @@ struct MoeConfig {
   bool gate_shared_expert = false;
 };
 
-/// \brief SwiGLU projections for one expert or a dense layer.
-struct SwiGluWeights {
-  std::optional<Tensor> packed_gate_up;  ///< Concatenated gate/up rows, when packed.
-  LinearWeights gate;  ///< [intermediate, hidden]
-  LinearWeights up;    ///< [intermediate, hidden]
-  LinearWeights down;  ///< [hidden, intermediate]
-};
-
 /// \brief Router, routed experts, and optional shared expert.
 struct MoeWeights {
   Tensor router;                       ///< [num_experts, hidden]
@@ -44,6 +32,13 @@ struct MoeWeights {
   std::optional<Tensor> shared_expert_gate;    ///< [1, hidden]; present only when gated.
 };
 
-}  // namespace inferx::layers
+/// \brief Runs the routed expert feed-forward into `mixed_out`.
+///
+/// The single home for expert execution; until it is implemented,
+/// ValidateExecutable() rejects MoE models at build time.
+Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& normed,
+              ops::ExecutionContext& ctx, Tensor& mixed_out);
 
-#endif  // INFERX_MODELS_LAYERS_FEED_FORWARD_H_
+}  // namespace inferx::components
+
+#endif  // INFERX_MODELS_COMPONENTS_MOE_H_

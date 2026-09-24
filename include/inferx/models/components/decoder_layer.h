@@ -1,0 +1,50 @@
+/// \file
+/// \brief The decoder layer: the one place transformer topology lives. A
+/// layer is a pre-norm residual unit — norm -> mixer -> add, norm ->
+/// feed-forward -> add — with the mixer and feed-forward chosen per layer
+/// from variants.
+
+#ifndef INFERX_MODELS_COMPONENTS_DECODER_LAYER_H_
+#define INFERX_MODELS_COMPONENTS_DECODER_LAYER_H_
+
+#include <variant>
+
+#include "inferx/models/components/attention.h"
+#include "inferx/models/components/mlp.h"
+#include "inferx/models/components/moe.h"
+#include "inferx/models/components/norm.h"
+
+namespace inferx {
+
+class DiagnosticTrace;
+
+namespace components {
+
+/// \brief Configuration for one pre-norm decoder layer.
+struct DecoderLayerConfig {
+  NormConfig norm;  ///< Applied before the mixer and before the feed-forward.
+  std::variant<AttentionConfig, GatedDeltaNetConfig> mixer;
+  std::variant<SwiGluConfig, MoeConfig> feed_forward;
+};
+
+/// \brief Weights for one pre-norm decoder layer.
+struct DecoderLayerWeights {
+  Tensor input_norm;       ///< [hidden] mixer-side norm.
+  Tensor post_mixer_norm;  ///< [hidden] feed-forward-side norm.
+  AttentionWeights mixer;  ///< Recurrent mixers are not loadable yet.
+  std::variant<SwiGluWeights, MoeWeights> feed_forward;
+};
+
+/// \brief Runs whichever feed-forward the layer configures into `mixed_out`.
+///
+/// Dispatches SwiGLU and MoE; the hot path stays a direct call.
+Status RunFeedForward(const std::variant<SwiGluConfig, MoeConfig>& config,
+                      const std::variant<SwiGluWeights, MoeWeights>& weights,
+                      const Tensor& normed, MlpWorkspace& ws, Tensor* packed_buffer,
+                      ops::ExecutionContext& ctx, DiagnosticTrace* trace,
+                      std::string_view prefix, Tensor& mixed_out);
+
+}  // namespace inferx::components
+}  // namespace inferx
+
+#endif  // INFERX_MODELS_COMPONENTS_DECODER_LAYER_H_

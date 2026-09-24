@@ -268,15 +268,6 @@ class PositionModel final : public Model {
   std::optional<Tensor> table_, hidden_, logits_;
 };
 
-TEST_F(ModelRunnerTest, RejectsUnknownAttentionBackendBeforeLoadingWeights) {
-  ModelConfig mc;
-  mc.model_dir = "/nonexistent";
-  ExecutionConfig ec;
-  ec.attention_backend = "cutlass";
-  auto runner = ModelRunner::Create(mc, CacheConfig{}, SchedulerConfig{}, ec);
-  EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
-  EXPECT_NE(std::string(runner.status().message()).find("attention backend"), std::string::npos);
-}
 
 TEST(ModelRunnerCudaTest, GraphSamplingTracksBatchTurnoverAndPageTransitions) {
   ModelConfig mc;

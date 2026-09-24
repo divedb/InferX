@@ -230,6 +230,14 @@ class Tensor {
   /// \return       The tensor on `device`, or an error status.
   StatusOr<Tensor> To(DeviceId device) const;
 
+  /// \brief Copies this tensor's bytes into `dst`, an existing tensor.
+  ///
+  /// A slice destination is fine; element count and dtype must match, while
+  /// shapes may differ (rank-1 into rank-2, say). The host path is a memmove;
+  /// device paths enqueue on the runtime's copy stream synchronously. `dst`
+  /// must not partially overlap this tensor's bytes.
+  Status CopyTo(Tensor& dst) const;
+
   /// \brief Returns the number of handles to this tensor's impl.
   ///
   /// Approximate under concurrency. Delegates to the vendored header's

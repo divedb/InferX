@@ -56,28 +56,60 @@ add_library(inferx::sampling ALIAS inferx_sampling)
 target_link_libraries(inferx_sampling PUBLIC inferx::ops absl::status absl::span)
 target_compile_options(inferx_sampling PRIVATE -Wall -Wextra -Wpedantic)
 
-# inferx_models -- shared LM components: weight-carrying layers under
-# models/layers, the generic causal-LM skeleton (stack, head, loader) under
-# models/lm, family builders that translate checkpoint configuration into
-# component choices, and the mmap'd checkpoint reader those loaders use.
+# inferx_model_families -- architecture families that self-register from
+# their own translation units, plus the config-translation closure those
+# families build on. The archive is whole-archived (see inferx_models), so
+# registration always runs even though its TUs export no referenced symbols.
+# CONSTRAINT: members must reference nothing from inferx_models -- only each
+# other, headers, and libraries later on the link line -- or links that never
+# pull those models members fail. RegisterFamily is header-inline for the
+# same reason. Adding a translate/build-tier family = one .cc listed here;
+# tier-1 families are just rows in model_registry.cc.
+add_library(inferx_model_families STATIC
+  models/qwen3.cc
+  models/causal/config_parser.cc
+  models/checkpoint_config.cc
+)
+add_library(inferx::model_families ALIAS inferx_model_families)
+target_link_libraries(inferx_model_families PUBLIC inferx::core inferx::boost
+                      PRIVATE nlohmann_json::nlohmann_json absl::status
+                              absl::statusor absl::strings)
+target_include_directories(inferx_model_families PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(inferx_model_families PRIVATE -Wall -Wextra -Wpedantic)
+
+# inferx_models -- reusable transformer components under models/components
+# (config + weights + execution, paired), the shared dense causal decoder
+# under models/causal (stack, LM head, fused-QKV weight mapping), the mmap'd
+# checkpoint reader those loaders use, and the tiered registry selecting a
+# family by checkpoint identity.
 add_library(inferx_models
   models/model.cc
+  models/model_registry.cc
   models/checkpoint.cc
-  models/checkpoint_config.cc
   models/safe_tensors_reader.cc
   models/safe_tensors_view.cc
-  models/llama/builder.cc
-  models/qwen3/builder.cc
-  models/lm/config_parser.cc
-  models/lm/stack.cc
-  models/lm/causal_lm.cc
-  models/lm/loader.cc
+  models/components/attention.cc
+  models/components/decoder_layer.cc
+  models/components/mlp.cc
+  models/components/moe.cc
+  models/components/qkv_linear.cc
+  models/causal/causal_lm.cc
+  models/causal/decoder_stack.cc
+  models/causal/weight_mapping.cc
 )
 add_library(inferx::models ALIAS inferx_models)
 target_link_libraries(inferx_models
   PUBLIC inferx::core inferx::cache inferx::ops inferx::boost
-  PRIVATE nlohmann_json::nlohmann_json absl::flat_hash_map absl::span
+         nlohmann_json::nlohmann_json
+  PRIVATE absl::flat_hash_map absl::span
           absl::status absl::statusor absl::strings)
+# The family archive rides in the interface, whole-archived: registration
+# TUs export no referenced symbols, so plain archive selection would drop
+# them and their families would never enter the registry. Order on the
+# final link line does not matter -- see the CONSTRAINT on
+# inferx_model_families.
+set_property(TARGET inferx_models APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+  "$<LINK_LIBRARY:WHOLE_ARCHIVE,inferx_model_families>")
 target_include_directories(inferx_models PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(inferx_models PRIVATE -Wall -Wextra -Wpedantic)
 

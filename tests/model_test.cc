@@ -142,12 +142,6 @@ TEST_F(ModelTest, RejectsUnsupportedArchitecture) {
   EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
 }
 
-TEST_F(ModelTest, RejectsUnavailableBackendBeforeUploadingWeights) {
-  auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), 8, 2,
-                           static_cast<ops::AttentionBackend>(999));
-  EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
-  EXPECT_NE(std::string(model.status().message()).find("backend"), std::string::npos);
-}
 
 TEST_F(ModelTest, RejectsMissingConfig) {
   auto model = Model::Load("/nonexistent/model-dir", DeviceId::Cuda(0), 8, 2);

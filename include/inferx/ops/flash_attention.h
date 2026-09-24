@@ -1,4 +1,7 @@
 #pragma once
+#include <optional>
+
+#include "absl/types/span.h"
 #include "inferx/ops/attention.h"
 namespace inferx::ops {
 struct FlashDecodeWorkspace {
@@ -7,6 +10,46 @@ struct FlashDecodeWorkspace {
   static constexpr int kMaxBatch = 16;
   Tensor plan, values, scores;
 };
+
+/// \brief Kernel-selection and planning state for paged attention.
+///
+/// The engine-facing attention entry points own their kernel choice: which
+/// implementation runs is decided from batch geometry and workspace
+/// contents, never requested by the caller. The flash-attention plan is
+/// rebuilt when the step's GQA group changes; the decode workspace, when
+/// allocated, enables the split-decode kernel for small pure-decode steps.
+struct AttentionPlanWorkspace {
+  std::optional<Tensor> plan;  ///< int32 [3 * max_tokens + 1] plan, once sized.
+  std::optional<FlashDecodeWorkspace> decode;  ///< Present iff split decode is enabled.
+  /// Selection state for the current step; updated by BeginAttentionStep
+  /// and PagedAttention, meaningless between steps.
+  int planned_group = 0;
+  int attention_tiles = 0;
+  int prefill_tile_rows = 64;
+  bool split_decode_selected = false;
+};
+
+/// \brief Marks a new attention step and selects this step's decode kernel.
+///
+/// Chooses the split-decode kernel when its workspace is allocated and the
+/// batch is pure decode within its capacity, else the shared paged path.
+Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
+                          const Tensor& last_page_len, int64_t block_size, int num_tokens,
+                          int num_seqs, AttentionPlanWorkspace& ws);
+
+/// \brief Runs causal paged attention for one layer, kernels chosen
+///        internally.
+///
+/// Rebuilds the flash-attention plan when the GQA group changes, then
+/// dispatches to the kernel BeginAttentionStep selected for the step.
+/// `host_qo_indptr` mirrors `qo_indptr` for host-side tile planning.
+Status PagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+                      const Tensor& kv_indptr, const Tensor& kv_indices,
+                      const Tensor& last_page_len, absl::Span<const int32_t> host_qo_indptr,
+                      int num_seqs, const Tensor& key_cache, const Tensor& value_cache,
+                      int64_t block_size, const AttentionParams& params,
+                      AttentionPlanWorkspace& ws, Tensor& attn_out);
+
 Status PrepareFlashDecode(ExecutionContext& ctx, const Tensor& kv_indptr,
                           const Tensor& last_page_len, int block_size,
                           FlashDecodeWorkspace& workspace);

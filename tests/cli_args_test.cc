@@ -61,32 +61,18 @@ TEST(EngineArgsTest, ParsesVllmParityOptions) {
   CLI::App app{"test"};
   model.AddOptions(app);
   args.AddOptions(app);
-  Parse(app, {"--kv-cache-memory-bytes", "3758096384", "--attention-backend", "flash",
+  Parse(app, {"--kv-cache-memory-bytes", "3758096384",
               "--cudagraph-capture-sizes", "1,2,4", "--max-cudagraph-capture-size", "8",
               "--no-enable-chunked-prefill"});
   const CacheConfig cache = args.BuildCacheConfig();
   const ExecutionConfig execution = args.BuildExecutionConfig();
   const SchedulerConfig scheduler = args.BuildSchedulerConfig();
   EXPECT_EQ(cache.kv_cache_memory_bytes, 3758096384);
-  EXPECT_EQ(execution.attention_backend, "flash");
   EXPECT_EQ(execution.cudagraph_capture_sizes, (std::vector<int>{1, 2, 4}));
   EXPECT_EQ(execution.max_cudagraph_capture_size, 8);
   EXPECT_FALSE(scheduler.chunked_prefill);
 }
 
-TEST(EngineArgsTest, FlashInferIsDefaultAndAliasesSelectIt) {
-  inferx::cli::EngineArgs defaults;
-  EXPECT_EQ(defaults.BuildExecutionConfig().attention_backend, "flashinfer");
-  for (const char* name : {"flashinfer", "default", "flash"}) {
-    inferx::cli::EngineArgs args;
-    CLI::App app{"test"};
-    args.AddOptions(app);
-    EXPECT_NO_THROW(Parse(app, {"--attention-backend", name}));
-    auto backend = ops::ParseAttentionBackend(args.BuildExecutionConfig().attention_backend);
-    ASSERT_TRUE(backend.ok());
-    EXPECT_EQ(*backend, ops::AttentionBackend::kFlashInfer);
-  }
-}
 
 TEST(EngineArgsTest, ChunkedPrefillDefaultsOn) {
   {
@@ -118,7 +104,6 @@ TEST(EngineArgsTest, RejectsInvalidValues) {
   const std::vector<std::vector<std::string>> bad = {
       {"--block-size", "24"},
       {"--max-num-seqs", "0"},
-      {"--attention-backend", "cutlass"},
       {"--cudagraph-capture-sizes", "0"},
       {"--max-cudagraph-capture-size", "-1"},
       {"--kv-cache-memory-bytes", "-1"}};

@@ -120,6 +120,16 @@ target_link_libraries(inferx_safe_tensors_reader_test PRIVATE inferx::models GTe
 target_compile_options(inferx_safe_tensors_reader_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME safe_tensors_reader_test COMMAND inferx_safe_tensors_reader_test)
 
+add_executable(inferx_family_config_test unit/models/family_config_test.cc)
+target_link_libraries(inferx_family_config_test PRIVATE inferx::models GTest::gtest_main)
+target_compile_options(inferx_family_config_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME family_config_test COMMAND inferx_family_config_test)
+
+add_executable(inferx_qkv_linear_test unit/models/qkv_linear_test.cc)
+target_link_libraries(inferx_qkv_linear_test PRIVATE inferx::models GTest::gtest_main)
+target_compile_options(inferx_qkv_linear_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME qkv_linear_test COMMAND inferx_qkv_linear_test)
+
 add_executable(inferx_tensor_test unit/core/tensor_test.cc)
 target_link_libraries(inferx_tensor_test PRIVATE inferx::core GTest::gtest_main)
 target_compile_options(inferx_tensor_test PRIVATE -Wall -Wextra -Wpedantic)

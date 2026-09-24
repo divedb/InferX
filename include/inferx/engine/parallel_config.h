@@ -1,0 +1,37 @@
+/// \file
+/// \brief Parallel execution topology (vLLM ParallelConfig analogue).
+
+#ifndef INFERX_ENGINE_PARALLEL_CONFIG_H_
+#define INFERX_ENGINE_PARALLEL_CONFIG_H_
+
+#include "inferx/core/status.h"
+
+namespace inferx {
+
+/// \brief How one engine instance shards a model across ranks.
+///
+/// Mirrors vLLM's ParallelConfig field names so the correspondence reads
+/// directly; SGLang keeps the same values flat in ServerArgs. Only tensor
+/// parallelism exists today, and only its geometry: collectives (all-reduce,
+/// NCCL process groups) arrive with the tensor-parallel milestone. Rank-local
+/// values derived from it -- per-rank attention heads, packed-projection row
+/// shards -- flow through model build; the defaults make every derived value
+/// identical to the unsharded model.
+struct ParallelConfig {
+  int tensor_parallel_size = 1;  ///< Ranks the model weights are sharded across.
+  int tensor_parallel_rank = 0;  ///< This instance's rank, in [0, tensor_parallel_size).
+
+  /// \brief Checks rank/size sanity.
+  Status Validate() const {
+    if (tensor_parallel_size <= 0 || tensor_parallel_rank < 0 ||
+        tensor_parallel_rank >= tensor_parallel_size) {
+      return InvalidArgumentError("invalid tensor-parallel topology: size ",
+                                  tensor_parallel_size, ", rank ", tensor_parallel_rank);
+    }
+    return OkStatus();
+  }
+};
+
+}  // namespace inferx
+
+#endif  // INFERX_ENGINE_PARALLEL_CONFIG_H_

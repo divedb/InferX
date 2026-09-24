@@ -8,9 +8,9 @@
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
+#include "inferx/engine/parallel_config.h"
 #include "inferx/models/checkpoint_config.h"
 #include "inferx/ops/execution_context.h"
-#include "inferx/ops/attention.h"
 
 namespace inferx {
 
@@ -58,14 +58,18 @@ class Model {
 
   /// \brief Loads a checkpoint, selecting the implementation by architecture.
   ///
+  /// Attention kernels are chosen by the runtime from execution geometry;
+  /// there is no backend to select here.
+  ///
   /// \param directory Checkpoint directory with `config.json` and weights.
   /// \param device    Device to place weights on.
   /// \param max_tokens Workspace capacity for one step's token batch.
   /// \param max_seqs   Workspace capacity for concurrently sampled sequences.
+  /// \param parallel   Tensor-parallel topology; defaults shard nothing.
   /// \return           The model, or an error status.
   static StatusOr<std::unique_ptr<Model>> Load(const std::string& directory, DeviceId device,
                                                int max_tokens, int max_seqs,
-                                               ops::AttentionBackend backend = ops::AttentionBackend::kFlashInfer);
+                                               const ParallelConfig& parallel = {});
 
   /// \brief The parsed checkpoint configuration.
   virtual const CheckpointConfig& config() const = 0;

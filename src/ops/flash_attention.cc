@@ -58,7 +58,7 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
                            const Tensor& key, const Tensor& value, int64_t block_size,
                            const AttentionParams& p, const Tensor& plan, int tiles, Tensor& out,
                            const FlashDecodeWorkspace* decode, int tile_rows) {
-  INFERX_RETURN_IF_ERROR(ValidateAttentionGeometry(AttentionBackend::kFlashInfer, p));
+  INFERX_RETURN_IF_ERROR(ValidateAttentionGeometry(p));
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
   INFERX_RETURN_IF_ERROR(CheckPlan(ctx, plan, tiles, tile_rows));
   for (const Tensor* t : {&qo, &kv, &indices, &last}) {
@@ -100,5 +100,44 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
     return cuda::FlashPagedAttention(ctx, q, qo, kv, indices, last, key, value, block_size, p,
                                      plan, tiles, out, decode, tile_rows);
   });
+}
+
+Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
+                          const Tensor& last_page_len, int64_t block_size, int num_tokens,
+                          int num_seqs, AttentionPlanWorkspace& ws) {
+  // The flash-attention plan carries last step's tile layout; the first
+  // PagedAttention call of the step rebuilds it.
+  ws.planned_group = 0;
+  ws.split_decode_selected =
+      ws.decode.has_value() && num_tokens == num_seqs &&
+      num_seqs <= FlashDecodeWorkspace::kMaxBatch;
+  if (ws.split_decode_selected) {
+    INFERX_RETURN_IF_ERROR(
+        PrepareFlashDecode(ctx, kv_indptr, last_page_len, static_cast<int>(block_size), *ws.decode));
+  }
+  return OkStatus();
+}
+
+Status PagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+                      const Tensor& kv_indptr, const Tensor& kv_indices,
+                      const Tensor& last_page_len, absl::Span<const int32_t> host_qo_indptr,
+                      int num_seqs, const Tensor& key_cache, const Tensor& value_cache,
+                      int64_t block_size, const AttentionParams& params,
+                      AttentionPlanWorkspace& ws, Tensor& attn_out) {
+  const int group = static_cast<int>(params.query_heads / params.kv_heads);
+  if (ws.planned_group != group) {
+    ws.attention_tiles = 0;
+    for (int seq = 0; seq < num_seqs; ++seq) {
+      const int length = host_qo_indptr[seq + 1] - host_qo_indptr[seq];
+      ws.attention_tiles += (group * length + ws.prefill_tile_rows - 1) / ws.prefill_tile_rows;
+    }
+    INFERX_RETURN_IF_ERROR(PrepareFlashAttention(ctx, qo_indptr, *ws.plan, group,
+                                                 ws.attention_tiles, ws.prefill_tile_rows));
+    ws.planned_group = group;
+  }
+  return FlashPagedAttention(ctx, q, qo_indptr, kv_indptr, kv_indices, last_page_len, key_cache,
+                             value_cache, block_size, params, *ws.plan, ws.attention_tiles,
+                             attn_out, ws.split_decode_selected ? &*ws.decode : nullptr,
+                             ws.prefill_tile_rows);
 }
 }  // namespace inferx::ops

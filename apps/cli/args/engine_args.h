@@ -25,7 +25,6 @@ struct EngineArgs {
   int64_t kv_cache_memory_bytes = 0;    // vLLM: --kv-cache-memory-bytes; 0
                                         //             derives from num_kv_blocks
   bool chunked_prefill = true;          // vLLM: --enable-chunked-prefill
-  std::string attention_backend = "flashinfer";  // vLLM: --attention-backend
   std::vector<int> cudagraph_capture_sizes;   // vLLM: --cudagraph-capture-sizes
   int max_cudagraph_capture_size = 0;         // vLLM: --max-cudagraph-capture-size
 
@@ -62,9 +61,6 @@ struct EngineArgs {
         "--no-enable-chunked-prefill", [this](std::int64_t) { chunked_prefill = false; },
         "Require whole prompts to prefill in one step");
     whole->excludes(chunked);
-    g->add_option("--attention-backend", attention_backend, "Attention implementation (default/flash are aliases for flashinfer)")
-        ->capture_default_str()
-        ->check(CLI::IsMember(std::set<std::string>{"flashinfer", "default", "flash"}));
     g->add_option("--cudagraph-capture-sizes", cudagraph_capture_sizes,
                   "Decode batch sizes to capture graphs for; empty selects "
                   "automatically")
@@ -86,12 +82,11 @@ struct EngineArgs {
     return cfg;
   }
 
-  /// \brief Execution strategy: CUDA graphs and attention backend (vLLM
-  ///        CompilationConfig analogue).
+  /// \brief Execution strategy: CUDA graphs (vLLM CompilationConfig
+  ///        analogue).
   ExecutionConfig BuildExecutionConfig() const {
     ExecutionConfig cfg;
     cfg.enable_cuda_graphs = cuda_graphs;
-    cfg.attention_backend = attention_backend;
     cfg.cudagraph_capture_sizes = cudagraph_capture_sizes;
     cfg.max_cudagraph_capture_size = max_cudagraph_capture_size;
     return cfg;

@@ -79,21 +79,20 @@ const CheckpointConfig& ModelRunner::checkpoint_config() const {
 
 StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     const ModelConfig& model, const CacheConfig& cache,
-    const SchedulerConfig& scheduler, const ExecutionConfig& execution) {
+    const SchedulerConfig& scheduler, const ExecutionConfig& execution,
+    const ParallelConfig& parallel) {
   if (scheduler.max_num_batched_tokens <= 0 || scheduler.max_num_seqs <= 0) {
     return InvalidArgumentError("runner requires positive token and sequence capacities");
   }
-  INFERX_ASSIGN_OR_RETURN(auto backend, ops::ParseAttentionBackend(execution.attention_backend));
   INFERX_ASSIGN_OR_RETURN(
       auto loaded, Model::Load(model.model_dir, model.device, scheduler.max_num_batched_tokens,
-                               scheduler.max_num_seqs, backend));
+                               scheduler.max_num_seqs, parallel));
   return Create(model, cache, scheduler, execution, std::move(loaded));
 }
 
 StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
     const ExecutionConfig& execution, std::unique_ptr<Model> loaded) {
-  INFERX_RETURN_IF_ERROR(ops::ParseAttentionBackend(execution.attention_backend).status());
   if (!loaded || scheduler.max_num_batched_tokens <= 0 || scheduler.max_num_seqs <= 0 ||
       cache.num_kv_blocks <= 0 || cache.num_kv_blocks > std::numeric_limits<int32_t>::max() ||
       cache.block_size <= 0 || cache.block_size > std::numeric_limits<int32_t>::max()) {

@@ -1,17 +1,15 @@
-#include "models/lm/config_parser.h"
+#include "models/causal/config_parser.h"
 
 #include <cmath>
-#include <fstream>
-#include <sstream>
 
-namespace inferx::lm {
+namespace inferx::causal {
 
-StatusOr<std::string> ReadConfig(const std::string& directory) {
-  std::ifstream file(directory + "/config.json");
-  if (!file) return NotFoundError("could not open config: ", directory);
-  std::ostringstream text;
-  text << file.rdbuf();
-  return text.str();
+StatusOr<nlohmann::json> ParseConfigJson(std::string_view text) {
+  try {
+    return nlohmann::json::parse(text);
+  } catch (const nlohmann::json::exception& e) {
+    return InvalidArgumentError("invalid config.json: ", e.what());
+  }
 }
 
 StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
@@ -26,7 +24,7 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
   if (model.hidden_act != "silu" || j.value("mlp_bias", false)) {
     return UnimplementedError("decoder requires bias-free SwiGLU feed-forward layers");
   }
-  layers::AttentionConfig attention;
+  components::AttentionConfig attention;
   attention.query_heads = model.num_attention_heads;
   attention.kv_heads = model.num_key_value_heads;
   attention.head_dim = model.head_dim;
@@ -51,14 +49,14 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
   }
   DecoderConfig config;
   config.model = model;
-  config.final_norm = layers::NormConfig{model.rms_norm_eps, plus_one_norm};
+  config.final_norm = components::NormConfig{model.rms_norm_eps, plus_one_norm};
   config.blocks.resize(model.num_hidden_layers);
   for (auto& block : config.blocks) {
     block.norm = config.final_norm;
     block.mixer = attention;
-    block.feed_forward = layers::SwiGluConfig{model.intermediate_size};
+    block.feed_forward = components::SwiGluConfig{model.intermediate_size};
   }
   return config;
 }
 
-}  // namespace inferx::lm
+}  // namespace inferx::causal

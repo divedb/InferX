@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string_view>
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
@@ -26,14 +25,16 @@ Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
 struct AttentionParams {
   int64_t query_heads = 0;
   int64_t kv_heads = 0;   ///< Divides query_heads (grouped-query attention).
-  int64_t head_dim = 0;   ///< FlashInfer: 64, 128 or 256.
+  int64_t head_dim = 0;
   float scale = 1.0f;     ///< Query-key product scale, typically 1/sqrt(head_dim).
   int64_t sliding_window = 0;  ///< 0 disables windowing; >0 is unimplemented.
 };
 
-/// Backend selection is explicit; the removed scalar CUDA path is not a fallback.
-enum class AttentionBackend { kFlashInfer };
-StatusOr<AttentionBackend> ParseAttentionBackend(std::string_view name);
-Status ValidateAttentionGeometry(AttentionBackend backend, const AttentionParams& params);
+/// \brief Checks `params` against what the kernel dispatcher supports.
+///
+/// The engine never selects kernels by name; this validates geometry
+/// (head dims, GQA ratio, windowing) against every implementation the
+/// internal dispatcher may choose.
+Status ValidateAttentionGeometry(const AttentionParams& params);
 
 }  // namespace inferx::ops

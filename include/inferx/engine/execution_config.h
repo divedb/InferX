@@ -20,9 +20,6 @@ struct ExecutionConfig {
   std::vector<int> cudagraph_capture_sizes;
   /// \brief Largest decode batch size to capture; 0 chooses automatically.
   int max_cudagraph_capture_size = 0;
-  /// \brief Attention implementation: flashinfer; default/flash are
-  ///        aliases.
-  std::string attention_backend = "flashinfer";
 };
 
 }  // namespace inferx

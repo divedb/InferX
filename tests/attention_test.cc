@@ -207,24 +207,16 @@ TEST_F(AttentionTest, GraphReplayAndSplitDecodeReadChangedMetadata) {
   }
   Check(128, 16, 16, {129, 33}, {1, 1}, false, true);
 }
-TEST(AttentionBackendTest, ResolvesDefaultAndExplicitBackend) {
-  for (const char* name : {"flashinfer", "default", "flash"}) {
-    auto result = ops::ParseAttentionBackend(name);
-    ASSERT_TRUE(result.ok());
-    EXPECT_EQ(*result, ops::AttentionBackend::kFlashInfer);
-  }
-  EXPECT_FALSE(ops::ParseAttentionBackend("cutlass").ok());
-  EXPECT_FALSE(ops::ParseAttentionBackend("typo").ok());
+TEST(AttentionGeometryTest, ValidatesKernelCapabilities) {
   for (auto p : {ops::AttentionParams{4, 0, 128}, ops::AttentionParams{3, 2, 128},
                  ops::AttentionParams{4, 2, 128, std::numeric_limits<float>::quiet_NaN()}}) {
-    EXPECT_EQ(ops::ValidateAttentionGeometry(ops::AttentionBackend::kFlashInfer, p).code(),
-              absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(ops::ValidateAttentionGeometry(p).code(), absl::StatusCode::kInvalidArgument);
   }
   for (auto p : {ops::AttentionParams{4, 2, 96}, ops::AttentionParams{66, 2, 128},
                  ops::AttentionParams{4, 2, 128, 1.0f, 64}}) {
-    EXPECT_EQ(ops::ValidateAttentionGeometry(ops::AttentionBackend::kFlashInfer, p).code(),
-              absl::StatusCode::kUnimplemented);
+    EXPECT_EQ(ops::ValidateAttentionGeometry(p).code(), absl::StatusCode::kUnimplemented);
   }
+  EXPECT_TRUE(ops::ValidateAttentionGeometry(ops::AttentionParams{4, 2, 64}).ok());
 }
 TEST_F(AttentionTest, RejectsMalformedMetadataAndWorkspacesBeforeLaunching) {
   ops::ExecutionContext ctx(*runtime_, stream_);

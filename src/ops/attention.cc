@@ -4,18 +4,7 @@
 #include "ops/cuda/attention.h"
 
 namespace inferx::ops {
-StatusOr<AttentionBackend> ParseAttentionBackend(std::string_view name) {
-  if (name == "flashinfer" || name == "default" || name == "flash") {
-    return AttentionBackend::kFlashInfer;
-  }
-  return InvalidArgumentError("unsupported attention backend: ", name,
-                              "; available: flashinfer (aliases: default, flash)");
-}
-
-Status ValidateAttentionGeometry(AttentionBackend backend, const AttentionParams& p) {
-  if (backend != AttentionBackend::kFlashInfer) {
-    return UnimplementedError("attention backend has no implementation");
-  }
+Status ValidateAttentionGeometry(const AttentionParams& p) {
   if (p.query_heads <= 0 || p.kv_heads <= 0 || p.head_dim <= 0 ||
       p.query_heads % p.kv_heads != 0 || !std::isfinite(p.scale) || p.sliding_window < 0) {
     return InvalidArgumentError("invalid attention heads, head dimension, scale or window");

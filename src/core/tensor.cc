@@ -147,6 +147,35 @@ StatusOr<Tensor> Tensor::To(DeviceId device) const {
   return out;
 }
 
+Status Tensor::CopyTo(Tensor& dst) const {
+  if (GetDataType() != dst.GetDataType()) {
+    return InvalidArgumentError("copy dtype mismatch: ",
+                                DataTypeName(GetDataType()), " to ",
+                                DataTypeName(dst.GetDataType()));
+  }
+  if (Numel() != dst.Numel()) {
+    return InvalidArgumentError("copy element count mismatch: ", Numel(), " to ",
+                                dst.Numel());
+  }
+  if (NBytes() == 0 || Data() == dst.Data()) return OkStatus();
+
+  if (IsCpu() && dst.IsCpu()) {
+    std::memmove(dst.Data(), Data(), static_cast<size_t>(NBytes()));
+    return OkStatus();
+  }
+  if (!IsCpu() && !dst.IsCpu() && Device() != dst.Device()) {
+    return UnimplementedError("cross-device copy requires an explicit transfer");
+  }
+
+  const CopyKind kind = IsCpu()       ? CopyKind::kHostToDevice
+                        : dst.IsCpu() ? CopyKind::kDeviceToHost
+                                      : CopyKind::kDeviceToDevice;
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.Device() : Device()));
+  INFERX_RETURN_IF_ERROR(
+      runtime->Copy(dst.Data(), Data(), static_cast<size_t>(NBytes()), kind));
+  return OkStatus();
+}
+
 std::string Tensor::ToString() const {
   return absl::StrCat("Tensor(", DataTypeName(GetDataType()), ", ",
                       impl_->GetShape().ToString(), ", ", Device().ToString(), ", ", NBytes(),

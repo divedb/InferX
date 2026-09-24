@@ -8,6 +8,7 @@
 #include "inferx/core/device.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
+#include "inferx/models/checkpoint_config.h"
 #include "inferx/models/safe_tensors_reader.h"
 
 namespace inferx::models {
@@ -40,6 +41,23 @@ class Checkpoint {
   /// \return     The tensor, or nullopt if no shard has it.
   std::optional<Tensor> Find(std::string_view name) const;
 
+  /// \brief Converts a host tensor to a bfloat16 host tensor, owned.
+  ///
+  /// Works on slices of checkpoint tensors as well as whole tensors. Bf16
+  /// inputs pass through unchanged (still borrowing their storage); f32/f16
+  /// convert elementwise into a fresh allocation.
+  static StatusOr<Tensor> AsHostBf16(const Tensor& host);
+
+  /// \brief Host bf16 view of `name`, validated against the FULL tensor shape.
+  ///
+  /// Sharded loaders check the whole checkpoint tensor here, then slice the
+  /// result to their rank's rows before uploading.
+  ///
+  /// \param name         Tensor name.
+  /// \param expected_full Shape of the whole checkpoint tensor.
+  /// \return             The host bf16 tensor, or an error status.
+  StatusOr<Tensor> FindHostBf16(std::string_view name, const Shape& expected_full) const;
+
   /// \brief Uploads `name` to `device` as bfloat16.
   ///
   /// \param name     Tensor name.
@@ -54,5 +72,30 @@ class Checkpoint {
  private:
   std::vector<SafeTensorReader> shards_;
 };
+
+/// \brief A checkpoint directory opened exactly once: the parsed config.json
+///        and the mapped weights, ready for a family to translate.
+struct LoadedCheckpoint {
+  CheckpointConfig config;  ///< Parsed `config.json`.
+  std::string config_json;  ///< Raw `config.json` text; families read their own
+                            ///< fields (MoE, layer types) from here.
+  Checkpoint weights;       ///< Mapped `.safetensors` shards.
+};
+
+/// \brief Reads and parses `config.json` of `dir`; weights stay unopened.
+///
+/// Identity is knowable from the config alone, so the registry rejects
+/// unsupported architectures before any shard is mapped.
+StatusOr<LoadedCheckpoint> LoadCheckpointConfig(const std::string& dir);
+
+/// \brief Maps the `.safetensors` shards of `dir` into `checkpoint`.
+Status OpenCheckpointWeights(LoadedCheckpoint& checkpoint, const std::string& dir);
+
+/// \brief Reads `config.json` and maps the weights of `dir` in one pass.
+///
+/// One open serves the whole build: the selected family reads extra fields
+/// from `config_json` and maps tensors out of `weights` without touching the
+/// directory again.
+StatusOr<LoadedCheckpoint> LoadCheckpoint(const std::string& dir);
 
 }  // namespace inferx::models
