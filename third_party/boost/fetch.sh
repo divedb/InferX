@@ -2,8 +2,9 @@
 # Records exactly how the checked-in Boost subset was produced.
 # Beast 361 (third_party/beast, post-1.89 develop) requires Boost develop
 # headers; this is the minimal header-only closure, pinned to the develop
-# commit SHAs below (resolved 2026-09-22). The include/ tree is checked in;
-# re-run only after reviewing the diff and refreshing the SHAs.
+# commit SHAs below (resolved 2026-09-22; interprocess, for the
+# SafeTensorReader mmap, resolved 2026-09-24). The include/ tree is checked
+# in; re-run only after reviewing the diff and refreshing the SHAs.
 set -e
 cd "$(dirname "$0")"
 mkdir -p include/boost
@@ -17,6 +18,7 @@ curl -sL "https://github.com/boostorg/core/archive/c434b91503c97da219d7987cba89f
 curl -sL "https://github.com/boostorg/describe/archive/5e7b4b84c8d105093687b940a45ac22df47b1ab4.tar.gz" | tar -xz -C include/boost --strip-components=3 "describe-5e7b4b84c8d105093687b940a45ac22df47b1ab4/include/boost"
 curl -sL "https://github.com/boostorg/function/archive/18650af5175ea247aebc60ff12db1b477123d5dc.tar.gz" | tar -xz -C include/boost --strip-components=3 "function-18650af5175ea247aebc60ff12db1b477123d5dc/include/boost"
 curl -sL "https://github.com/boostorg/intrusive/archive/69abbe445685b8a311db925e581bf4a770686752.tar.gz" | tar -xz -C include/boost --strip-components=3 "intrusive-69abbe445685b8a311db925e581bf4a770686752/include/boost"
+curl -sL "https://github.com/boostorg/interprocess/archive/e52fe5a3dd38953b80540f43919f8bfa8eaaefe6.tar.gz" | tar -xz -C include/boost --strip-components=3 "interprocess-e52fe5a3dd38953b80540f43919f8bfa8eaaefe6/include/boost"
 curl -sL "https://github.com/boostorg/io/archive/5c738076aa9aafc7392b2004c6b6f268b076a9f0.tar.gz" | tar -xz -C include/boost --strip-components=3 "io-5c738076aa9aafc7392b2004c6b6f268b076a9f0/include/boost"
 curl -sL "https://github.com/boostorg/logic/archive/ebff10a43bf6512548eae231a1b9c81260dd98dc.tar.gz" | tar -xz -C include/boost --strip-components=3 "logic-ebff10a43bf6512548eae231a1b9c81260dd98dc/include/boost"
 curl -sL "https://github.com/boostorg/move/archive/ee8a65dcc6e1f2a232d6f6dbb8a9230916715b35.tar.gz" | tar -xz -C include/boost --strip-components=3 "move-ee8a65dcc6e1f2a232d6f6dbb8a9230916715b35/include/boost"

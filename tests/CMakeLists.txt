@@ -109,3 +109,27 @@ add_test(NAME attention_test COMMAND inferx_attention_test)
 if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   set_tests_properties(attention_test PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()
+
+# SafeTensorsView is not part of a library target yet; compile it straight
+# into the test until it lands in inferx::models.
+add_executable(inferx_safe_tensors_view_test unit/models/safe_tensors_view_test.cc
+               ${PROJECT_SOURCE_DIR}/src/models/safe_tensors_view.cc)
+target_include_directories(inferx_safe_tensors_view_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(inferx_safe_tensors_view_test PRIVATE
+                      inferx::core nlohmann_json::nlohmann_json inferx::boost
+                      GTest::gtest_main)
+target_compile_options(inferx_safe_tensors_view_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME safe_tensors_view_test COMMAND inferx_safe_tensors_view_test)
+
+# Same arrangement for the reader: its sources are not in a library target
+# yet, so compile them straight into the test.
+add_executable(inferx_safe_tensors_reader_test
+               unit/models/safe_tensors_reader_test.cc
+               ${PROJECT_SOURCE_DIR}/src/models/safe_tensors_reader.cc
+               ${PROJECT_SOURCE_DIR}/src/models/safe_tensors_view.cc)
+target_include_directories(inferx_safe_tensors_reader_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(inferx_safe_tensors_reader_test PRIVATE
+                      inferx::core nlohmann_json::nlohmann_json inferx::boost
+                      GTest::gtest_main)
+target_compile_options(inferx_safe_tensors_reader_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME safe_tensors_reader_test COMMAND inferx_safe_tensors_reader_test)
