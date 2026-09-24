@@ -66,13 +66,18 @@ class ModelTest : public ::testing::Test {
     INFERX_RETURN_IF_ERROR(
         runtime_->Copy(logit_rows.Data(), row, sizeof(row), CopyKind::kHostToDevice));
 
-    ModelInput input;
-    input.token_ids = token_ids;
-    input.attention = {
-        positions, batch_indices, qo_indptr, kv_indptr, kv_indices, last_page_len, host_qo_,
-        {},        num_tokens,    1};
-    input.logit_rows = logit_rows;
-    return input;
+    return ModelInput{std::move(token_ids),
+                      AttentionBatch{std::move(positions),
+                                     std::move(batch_indices),
+                                     std::move(qo_indptr),
+                                     std::move(kv_indptr),
+                                     std::move(kv_indices),
+                                     std::move(last_page_len),
+                                     host_qo_,
+                                     {},
+                                     num_tokens,
+                                     1},
+                      std::move(logit_rows)};
   }
 
   std::vector<int32_t> host_qo_;

@@ -90,7 +90,7 @@ Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
 Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config) {
   switch (x.GetDataType()) {
-    case DataType::kFloat:
+    case DataType::kFloat32:
       return RmsNormImpl<float>(ctx, x, weight, out, config);
     case DataType::kFloat16:
       return RmsNormImpl<__half>(ctx, x, weight, out, config);

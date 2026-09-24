@@ -6,14 +6,11 @@
 namespace inferx::ops {
 
 Status Linear(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out) {
-  if (!x.IsDefined() || !weight.IsDefined() || !out.IsDefined()) {
-    return InvalidArgumentError("Linear requires defined x, weight, and out tensors");
-  }
   if (x.Rank() != 2 || weight.Rank() != 2 || out.Rank() != 2) {
     return InvalidArgumentError("Linear expects rank-2 x, weight, and out");
   }
   const DataType dtype = x.GetDataType();
-  if (dtype != DataType::kBFloat16 && dtype != DataType::kFloat) {
+  if (dtype != DataType::kBFloat16 && dtype != DataType::kFloat32) {
     return UnimplementedError("Linear supports bfloat16 and float32 activations, got ",
                               DataTypeName(dtype));
   }

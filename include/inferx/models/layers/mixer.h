@@ -6,6 +6,7 @@
 #define INFERX_MODELS_LAYERS_MIXER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "inferx/core/tensor.h"
@@ -52,18 +53,18 @@ struct GatedDeltaNetConfig {
 /// \brief One affine projection, stored as the checkpoint stores it.
 struct LinearWeights {
   Tensor weight;  ///< [out, in]
-  Tensor bias;    ///< [out]; undefined when the projection is bias-free.
+  std::optional<Tensor> bias;  ///< [out]; absent when the projection is bias-free.
 };
 
 /// \brief Attention projections; shapes follow AttentionConfig.
 struct AttentionWeights {
-  Tensor packed_qkv;     ///< Optional concatenated projection rows.
+  std::optional<Tensor> packed_qkv;  ///< Concatenated projection rows, when packed.
   LinearWeights query;   ///< [query_heads * head_dim (* 2 when gated), hidden]
   LinearWeights key;     ///< [kv_heads * head_dim, hidden]
   LinearWeights value;   ///< [kv_heads * head_dim, hidden]
   LinearWeights output;  ///< [hidden, query_heads * head_dim]
-  Tensor query_norm;     ///< [head_dim]; undefined unless qk_norm.
-  Tensor key_norm;       ///< [head_dim]; undefined unless qk_norm.
+  std::optional<Tensor> query_norm;  ///< [head_dim]; present only with qk_norm.
+  std::optional<Tensor> key_norm;    ///< [head_dim]; present only with qk_norm.
 };
 
 }  // namespace inferx::layers

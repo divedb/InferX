@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -38,13 +39,18 @@ struct ModelRunnerImpl {
   std::unique_ptr<KvBlockPool> pool;
   ModelState model_state;
   absl::flat_hash_map<RequestId, RunnerRequestState> states;
-  Tensor token_ids, positions, batch_indices, qo_indptr, kv_indptr;
-  Tensor kv_indices, last_page_len, logit_rows;
-  Tensor input_storage;
+  std::optional<Tensor> token_ids, positions, batch_indices, qo_indptr, kv_indptr;
+  std::optional<Tensor> kv_indices, last_page_len, logit_rows;
+  std::optional<Tensor> input_storage;
   int32_t* host_inputs = nullptr;
   std::unique_ptr<sampling::Sampler> sampler;
   int32_t* host_samples = nullptr;
-  struct DecodeGraph { GraphExec exec; Tensor logits; sampling::SamplerOutput output; bool warmed = false; };
+  struct DecodeGraph {
+    GraphExec exec;
+    std::optional<Tensor> logits;
+    std::optional<sampling::SamplerOutput> output;
+    bool warmed = false;
+  };
   absl::flat_hash_map<int, DecodeGraph> decode_graphs;
   Status failure;
 
@@ -139,7 +145,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->input_storage, alloc(3 * T + 4 * S + 2 + cache.num_kv_blocks));
   int64_t offset = 0;
   auto input_view = [&](int64_t size) -> StatusOr<Tensor> {
-    INFERX_ASSIGN_OR_RETURN(auto view, impl->input_storage.Slice(offset, offset + size));
+    INFERX_ASSIGN_OR_RETURN(auto view, impl->input_storage->Slice(offset, offset + size));
     offset += size;
     return view;
   };
@@ -153,9 +159,9 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->logit_rows, input_view(S));
   if (model.device.IsCuda()) {
     INFERX_ASSIGN_OR_RETURN(void* inputs,
-        impl->runtime->AllocatePinnedHost(impl->input_storage.NBytes()));
+        impl->runtime->AllocatePinnedHost(impl->input_storage->NBytes()));
     impl->host_inputs = static_cast<int32_t*>(inputs);
-    std::memset(inputs, 0, impl->input_storage.NBytes());
+    std::memset(inputs, 0, impl->input_storage->NBytes());
     INFERX_ASSIGN_OR_RETURN(void* host, impl->runtime->AllocatePinnedHost(S * sizeof(int32_t)));
     impl->host_samples = static_cast<int32_t*>(host);
   }
@@ -249,51 +255,52 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
     if (token < 0 || token >= mc.vocab_size)
       return InvalidArgumentError("token outside vocabulary");
   }
-  auto upload = [&](Tensor& dst, const std::vector<int32_t>& src) {
+  auto upload = [&](const Tensor& dst, const std::vector<int32_t>& src) {
     if (host_inputs != nullptr) {
-      const auto offset = dst.DataAs<int32_t>() - input_storage.DataAs<int32_t>();
+      const auto offset = dst.DataAs<int32_t>() - input_storage->DataAs<int32_t>();
       std::memcpy(host_inputs + offset, src.data(), src.size() * sizeof(int32_t));
       return OkStatus();
     }
     return runtime->Copy(dst.Data(), src.data(), src.size() * sizeof(int32_t),
                          CopyKind::kHostToDevice);
   };
-  INFERX_RETURN_IF_ERROR(upload(token_ids, tokens));
-  INFERX_RETURN_IF_ERROR(upload(positions, positions_h));
-  INFERX_RETURN_IF_ERROR(upload(batch_indices, batches));
-  INFERX_RETURN_IF_ERROR(upload(qo_indptr, qo));
-  INFERX_RETURN_IF_ERROR(upload(kv_indptr, kv));
-  INFERX_RETURN_IF_ERROR(upload(kv_indices, blocks));
-  INFERX_RETURN_IF_ERROR(upload(last_page_len, last_lengths));
-  INFERX_RETURN_IF_ERROR(upload(logit_rows, rows));
+  INFERX_RETURN_IF_ERROR(upload(*token_ids, tokens));
+  INFERX_RETURN_IF_ERROR(upload(*positions, positions_h));
+  INFERX_RETURN_IF_ERROR(upload(*batch_indices, batches));
+  INFERX_RETURN_IF_ERROR(upload(*qo_indptr, qo));
+  INFERX_RETURN_IF_ERROR(upload(*kv_indptr, kv));
+  INFERX_RETURN_IF_ERROR(upload(*kv_indices, blocks));
+  INFERX_RETURN_IF_ERROR(upload(*last_page_len, last_lengths));
+  INFERX_RETURN_IF_ERROR(upload(*logit_rows, rows));
   if (host_inputs != nullptr) {
-    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(input_storage.Data(), host_inputs,
-        input_storage.NBytes(), CopyKind::kHostToDevice, stream));
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(input_storage->Data(), host_inputs,
+        input_storage->NBytes(), CopyKind::kHostToDevice, stream));
   }
   // ModelInput carries exact-size views of the capacity buffers; the padded
   // tails of the upload buffers are never visible to the model.
-  ModelInput input;
-  INFERX_ASSIGN_OR_RETURN(input.token_ids, token_ids.Slice(0, tokens.size()));
-  INFERX_ASSIGN_OR_RETURN(Tensor positions_v, positions.Slice(0, tokens.size()));
-  INFERX_ASSIGN_OR_RETURN(Tensor batch_indices_v, batch_indices.Slice(0, tokens.size()));
-  INFERX_ASSIGN_OR_RETURN(Tensor qo_indptr_v, qo_indptr.Slice(0, batch + 1));
-  INFERX_ASSIGN_OR_RETURN(Tensor kv_indptr_v, kv_indptr.Slice(0, batch + 1));
-  INFERX_ASSIGN_OR_RETURN(Tensor kv_indices_v, kv_indices.Slice(0, blocks.size()));
-  INFERX_ASSIGN_OR_RETURN(Tensor last_page_len_v, last_page_len.Slice(0, batch));
-  INFERX_ASSIGN_OR_RETURN(input.logit_rows, logit_rows.Slice(0, batch));
-  input.attention = {std::move(positions_v),
-                     std::move(batch_indices_v),
-                     std::move(qo_indptr_v),
-                     std::move(kv_indptr_v),
-                     std::move(kv_indices_v),
-                     std::move(last_page_len_v),
-                     absl::MakeConstSpan(qo),
-                     absl::MakeConstSpan(kv),
-                     static_cast<int>(tokens.size()),
-                     batch};
+  INFERX_ASSIGN_OR_RETURN(Tensor token_ids_v, token_ids->Slice(0, tokens.size()));
+  INFERX_ASSIGN_OR_RETURN(Tensor positions_v, positions->Slice(0, tokens.size()));
+  INFERX_ASSIGN_OR_RETURN(Tensor batch_indices_v, batch_indices->Slice(0, tokens.size()));
+  INFERX_ASSIGN_OR_RETURN(Tensor qo_indptr_v, qo_indptr->Slice(0, batch + 1));
+  INFERX_ASSIGN_OR_RETURN(Tensor kv_indptr_v, kv_indptr->Slice(0, batch + 1));
+  INFERX_ASSIGN_OR_RETURN(Tensor kv_indices_v, kv_indices->Slice(0, blocks.size()));
+  INFERX_ASSIGN_OR_RETURN(Tensor last_page_len_v, last_page_len->Slice(0, batch));
+  INFERX_ASSIGN_OR_RETURN(Tensor logit_rows_v, logit_rows->Slice(0, batch));
+  ModelInput input{std::move(token_ids_v),
+                   AttentionBatch{std::move(positions_v),
+                                  std::move(batch_indices_v),
+                                  std::move(qo_indptr_v),
+                                  std::move(kv_indptr_v),
+                                  std::move(kv_indices_v),
+                                  std::move(last_page_len_v),
+                                  absl::MakeConstSpan(qo),
+                                  absl::MakeConstSpan(kv),
+                                  static_cast<int>(tokens.size()),
+                                  batch},
+                   std::move(logit_rows_v)};
   ops::ExecutionContext ctx(*runtime, stream);
-  Tensor logits;
-  sampling::SamplerOutput sampled;
+  std::optional<Tensor> logits;
+  std::optional<sampling::SamplerOutput> sampled;
   // Per-request sampling knobs plus RNG offsets, resolved for this batch.
   std::vector<sampling::SamplingMetadata::PerRequest> per(batch);
   for (int i = 0; i < batch; ++i) {
@@ -313,17 +320,17 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
       if (graph.exec.handle == nullptr) {
         INFERX_RETURN_IF_ERROR(runtime->BeginCapture(stream));
         auto captured = model->Forward(input, model_state, ctx);
-        Status sampling_status;
-        if (captured.ok()) {
-          sampling_status = sampler->Sample(ctx, *captured, metadata, graph.output);
-        }
+        absl::StatusOr<sampling::SamplerOutput> samples =
+            captured.ok() ? sampler->Sample(ctx, *captured, metadata)
+                          : absl::StatusOr<sampling::SamplerOutput>(captured.status());
         // End the capture even on failure, so teardown never leaves a stream capturing.
         auto instantiated = runtime->EndCaptureAndInstantiate(stream);
-        if (!captured.ok() || !sampling_status.ok()) {
+        if (!captured.ok() || !samples.ok()) {
           if (instantiated.ok()) (void)runtime->DestroyGraph(*instantiated);
-          return captured.ok() ? sampling_status : captured.status();
+          return captured.ok() ? samples.status() : captured.status();
         }
         INFERX_ASSIGN_OR_RETURN(graph.exec, std::move(instantiated));
+        graph.output = *std::move(samples);
         graph.logits = *std::move(captured);
       }
       INFERX_RETURN_IF_ERROR(runtime->LaunchGraph(graph.exec, stream));
@@ -332,31 +339,31 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
     }
   } else {
     INFERX_ASSIGN_OR_RETURN(logits, model->Forward(input, model_state, ctx));
-    INFERX_RETURN_IF_ERROR(sampler->Sample(ctx, logits, metadata, sampled));
+    INFERX_ASSIGN_OR_RETURN(sampled, sampler->Sample(ctx, *logits, metadata));
   }
   // The graph warm-up iteration runs Forward eagerly without capture; sample
   // its logits through the normal path.
-  if (!sampled.IsDefined()) {
-    INFERX_RETURN_IF_ERROR(sampler->Sample(ctx, logits, metadata, sampled));
+  if (!sampled.has_value()) {
+    INFERX_ASSIGN_OR_RETURN(sampled, sampler->Sample(ctx, *logits, metadata));
   }
-  if (!logits.IsDefined() || logits.Rank() != 2 || logits.Dim(0) != batch ||
-      (logits.GetDataType() != DataType::kBFloat16 &&
-       logits.GetDataType() != DataType::kFloat) ||
-      logits.Device() != config.device) {
+  if (logits->Rank() != 2 || logits->Dim(0) != batch ||
+      (logits->GetDataType() != DataType::kBFloat16 &&
+       logits->GetDataType() != DataType::kFloat32) ||
+      logits->Device() != config.device) {
     return InternalError("model returned malformed logits for the scheduled batch");
   }
-  if (!sampled.IsDefined() || sampled.sampled_token_ids.Dim(0) != batch)
+  if (sampled->sampled_token_ids.Dim(0) != batch)
     return InternalError("sampler returned malformed results for the scheduled batch");
   std::vector<int32_t> samples;
   if (host_samples != nullptr) {
-    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(host_samples, sampled.sampled_token_ids.Data(),
+    INFERX_RETURN_IF_ERROR(runtime->CopyAsync(host_samples, sampled->sampled_token_ids.Data(),
         batch * sizeof(int32_t), CopyKind::kDeviceToHost, stream));
     INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
     samples.assign(host_samples, host_samples + batch);
   } else {
     // CPU device: tensors are host-accessible once the stream has drained.
     INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
-    const int32_t* ids = sampled.sampled_token_ids.DataAs<int32_t>();
+    const int32_t* ids = sampled->sampled_token_ids.DataAs<int32_t>();
     samples.assign(ids, ids + batch);
   }
   for (int i = 0; i < batch; ++i) {

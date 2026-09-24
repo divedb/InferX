@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -96,24 +97,23 @@ class AttentionTest : public ::testing::Test {
     int tiles = 0;
     for (int n : queries) tiles += (n * group + 63) / 64;
     auto plan = Ints(std::vector<int>(3 * tiles + 1));
-    ops::FlashDecodeWorkspace workspace;
+    std::optional<ops::FlashDecodeWorkspace> workspace;
     if (split) {
       const int n = batch * ops::FlashDecodeWorkspace::kPartitions;
-      workspace.plan = Ints(std::vector<int>(3 * n + batch + 2));
-      workspace.values =
+      workspace = ops::FlashDecodeWorkspace{
+          Ints(std::vector<int>(3 * n + batch + 2)),
           Tensor::Empty(DataType::kBFloat16, Shape({n * heads * dim}), DeviceId::Cuda(0))
-              .value();
-      workspace.scores =
-          Tensor::Empty(DataType::kFloat, Shape({n * heads}), DeviceId::Cuda(0)).value();
+              .value(),
+          Tensor::Empty(DataType::kFloat32, Shape({n * heads}), DeviceId::Cuda(0)).value()};
     }
     ops::ExecutionContext ctx(*runtime_, stream_);
     ops::AttentionParams p{heads, kvheads, dim, scale_multiplier / std::sqrt(float(dim))};
     auto run = [&]() -> Status {
       INFERX_RETURN_IF_ERROR(ops::PrepareFlashAttention(ctx, qo_d, plan, group, tiles));
       if (split)
-        INFERX_RETURN_IF_ERROR(ops::PrepareFlashDecode(ctx, kv_d, last_d, page, workspace));
+        INFERX_RETURN_IF_ERROR(ops::PrepareFlashDecode(ctx, kv_d, last_d, page, *workspace));
       return ops::FlashPagedAttention(ctx, q, qo_d, kv_d, ids_d, last_d, key, value, page, p,
-                                      plan, tiles, out, split ? &workspace : nullptr);
+                                      plan, tiles, out, split ? &*workspace : nullptr);
     };
     ASSERT_TRUE(run().ok());
     if (graph) {
@@ -247,7 +247,10 @@ TEST_F(AttentionTest, RejectsMalformedMetadataAndWorkspacesBeforeLaunching) {
   EXPECT_FALSE(
       ops::FlashPagedAttention(ctx, q, qo, kv, ids, wrong_last, key, key, 16, p, plan, 1, out)
           .ok());
-  ops::FlashDecodeWorkspace empty;
+  ops::FlashDecodeWorkspace empty{
+      Ints(std::vector<int32_t>(2)),
+      Tensor::Empty(DataType::kBFloat16, Shape({0}), DeviceId::Cuda(0)).value(),
+      Tensor::Empty(DataType::kFloat32, Shape({0}), DeviceId::Cuda(0)).value()};
   EXPECT_FALSE(ops::PrepareFlashDecode(ctx, kv, last, 16, empty).ok());
   EXPECT_FALSE(
       ops::FlashPagedAttention(ctx, q, qo, kv, ids, last, key, key, 16, p, plan, 1, out, &empty)

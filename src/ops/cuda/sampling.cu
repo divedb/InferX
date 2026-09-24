@@ -66,10 +66,10 @@ __global__ void Finish(const T* x, int vocab, int parts, const float* values,
 Status GreedyArgmax(ExecutionContext& ctx, const Tensor& logits, Tensor& values,
                     Tensor& indices, Tensor& output) {
   if (ctx.device().kind != DeviceKind::kCuda || logits.Rank() != 2 || logits.IsEmpty() ||
-      (logits.GetDataType() != DataType::kBFloat16 && logits.GetDataType() != DataType::kFloat))
+      (logits.GetDataType() != DataType::kBFloat16 && logits.GetDataType() != DataType::kFloat32))
     return InvalidArgumentError("GreedyArgmax requires CUDA float32/bfloat16 matrix");
   const int batch = logits.Dim(0), vocab = logits.Dim(1), parts = (vocab + 4095) / 4096;
-  if (values.GetDataType() != DataType::kFloat || indices.GetDataType() != DataType::kInt32 ||
+  if (values.GetDataType() != DataType::kFloat32 || indices.GetDataType() != DataType::kInt32 ||
       output.GetDataType() != DataType::kInt32 || values.Numel() < batch * parts ||
       indices.Numel() < batch * parts || output.Numel() < batch)
     return InvalidArgumentError("GreedyArgmax workspace too small or wrong dtype");

@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include "inferx/ops/sampling.h"
 #include "inferx/ops/flash_attention.h"
 #include <cstring>
@@ -98,15 +99,15 @@ TEST_F(OpsTest, GreedyArgmaxMatchesHostIncludingTiesAndNonFiniteValues) {
   x[3*vocab+3]=std::numeric_limits<float>::quiet_NaN(); x[3*vocab+vocab-1]=99;
   std::fill(x.begin()+4*vocab,x.end(),-std::numeric_limits<float>::infinity());
   auto alloc=[&](DataType dtype,int64_t n) { return Tensor::Empty(dtype,Shape({n}),DeviceId::Cuda(0)).value(); };
-  auto values=alloc(DataType::kFloat,rows*parts);
+  auto values=alloc(DataType::kFloat32,rows*parts);
   auto indices=alloc(DataType::kInt32,rows*parts);
   auto output=alloc(DataType::kInt32,rows);
   ops::ExecutionContext ctx(*runtime_,stream_);
-  for(auto dtype:{DataType::kFloat,DataType::kBFloat16}) {
-    Tensor logits;
-    if(dtype==DataType::kBFloat16) logits=Upload(x,Shape({rows,vocab}));
-    else {
-      logits=Tensor::Empty(dtype,Shape({rows,vocab}),DeviceId::Cuda(0)).value();
+  for(auto dtype:{DataType::kFloat32,DataType::kBFloat16}) {
+    const bool is_bf16 = dtype==DataType::kBFloat16;
+    Tensor logits = is_bf16 ? Upload(x,Shape({rows,vocab}))
+                            : Tensor::Empty(dtype,Shape({rows,vocab}),DeviceId::Cuda(0)).value();
+    if (!is_bf16) {
       ASSERT_TRUE(runtime_->Copy(logits.Data(),x.data(),x.size()*sizeof(float),CopyKind::kHostToDevice).ok());
     }
     ASSERT_TRUE(ops::GreedyArgmax(ctx,logits,values,indices,output).ok());
@@ -152,17 +153,17 @@ TEST_F(OpsTest, FlashAttentionMatchesDoubleReferenceWithRaggedPrefixAndShuffledP
     auto out=MakeBf16(Shape({tokens,heads*dim}));
     ASSERT_TRUE(ops::PrepareFlashAttention(ctx,qo_d,plan,2,tiles,tile_rows).ok());
     ops::AttentionParams p; p.query_heads=heads;p.kv_heads=kvheads;p.head_dim=dim;p.scale=1/std::sqrt(float(dim));
-    ops::FlashDecodeWorkspace workspace;
+    std::optional<ops::FlashDecodeWorkspace> workspace;
     if (mode == 2) {
       const int splits = 2 * ops::FlashDecodeWorkspace::kPartitions;
-      workspace.plan = UploadInt(std::vector<int>(3 * splits + 4));
-      workspace.values = MakeBf16(Shape({splits * heads * dim}));
-      workspace.scores = Tensor::Empty(DataType::kFloat, Shape({splits * heads}),
-                                       DeviceId::Cuda(0)).value();
-      ASSERT_TRUE(ops::PrepareFlashDecode(ctx, kv, last, page, workspace).ok());
+      workspace = ops::FlashDecodeWorkspace{
+          UploadInt(std::vector<int>(3 * splits + 4)),
+          MakeBf16(Shape({splits * heads * dim})),
+          Tensor::Empty(DataType::kFloat32, Shape({splits * heads}), DeviceId::Cuda(0)).value()};
+      ASSERT_TRUE(ops::PrepareFlashDecode(ctx, kv, last, page, *workspace).ok());
     }
     ASSERT_TRUE(ops::FlashPagedAttention(ctx,q,qo_d,kv,ids,last,key,value,page,p,plan,tiles,out,
-                                        mode == 2 ? &workspace : nullptr,tile_rows).ok());
+                                        mode == 2 ? &*workspace : nullptr,tile_rows).ok());
     const auto got=Download(out);
     for(int t=0;t<tokens;++t) for(int h=0;h<heads;++h) {
       const int s=t<qo[1]?0:1;

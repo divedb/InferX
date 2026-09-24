@@ -6,6 +6,7 @@
 #define INFERX_MODELS_LM_CAUSAL_LM_H_
 
 #include <memory>
+#include <optional>
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
@@ -17,6 +18,10 @@ namespace inferx::lm {
 
 /// \brief Vocabulary projection over selected hidden-state rows.
 struct LanguageModelHead {
+  /// \brief Projects with `w`, a [vocab, hidden] matrix that may alias the
+  ///        token embedding.
+  explicit LanguageModelHead(Tensor w) : weight(std::move(w)) {}
+
   int capacity = 0;  ///< Stable row capacity for graph replay.
   Tensor weight;  ///< [vocab, hidden]; may alias the token embedding.
 
@@ -27,7 +32,7 @@ struct LanguageModelHead {
 
  private:
   bool workspace_ready_ = false;
-  Tensor rows_, logits_;
+  std::optional<Tensor> rows_, logits_;
 };
 
 /// \brief Causal language model over any Decoder backbone.

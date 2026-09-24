@@ -1,6 +1,9 @@
 #include "inferx/core/tensor.h"
 
+#include <cstring>
+
 #include "absl/strings/str_cat.h"
+#include "inferx/core/device_runtime.h"
 #include "inferx/core/tensor_spec.h"
 
 namespace inferx {
@@ -54,9 +57,6 @@ StatusOr<Tensor> Tensor::FromStorage(StoragePtr storage, int64_t offset, DataTyp
 }
 
 StatusOr<Tensor> Tensor::Slice(int64_t begin, int64_t end) const {
-  if (!IsDefined()) {
-    return FailedPreconditionError("Slice on an undefined tensor");
-  }
   const Shape& shape = impl_->GetShape();
   if (shape.Rank() == 0) {
     return InvalidArgumentError("cannot slice a rank-0 tensor");
@@ -88,9 +88,6 @@ StatusOr<Tensor> Tensor::Slice(int64_t begin, int64_t end) const {
 }
 
 StatusOr<Tensor> Tensor::Reshape(const Shape& new_shape) const {
-  if (!IsDefined()) {
-    return FailedPreconditionError("Reshape on an undefined tensor");
-  }
   if (new_shape.Numel() != Numel()) {
     return InvalidArgumentError("reshape ", GetShape().ToString(), " -> ", new_shape.ToString(),
                                 " changes element count (", Numel(), " vs ", new_shape.Numel(),
@@ -102,10 +99,6 @@ StatusOr<Tensor> Tensor::Reshape(const Shape& new_shape) const {
 }
 
 StatusOr<Tensor> Tensor::Bitcast(DataType new_dtype) const {
-  if (!IsDefined()) {
-    return FailedPreconditionError("Bitcast on an undefined tensor");
-  }
-
   const int64_t src_bits = static_cast<int64_t>(DataTypeStorageBits(GetDataType())) * Numel();
   const int64_t dst_bits = static_cast<int64_t>(DataTypeStorageBits(new_dtype));
 
@@ -129,9 +122,32 @@ StatusOr<Tensor> Tensor::Bitcast(DataType new_dtype) const {
   return FromStorage(impl_->GetStorage(), StorageOffset(), new_dtype, out);
 }
 
-std::string Tensor::ToString() const {
-  if (!IsDefined()) return "Tensor(<undefined>)";
+StatusOr<Tensor> Tensor::To(DeviceId device) const {
+  if (Device() == device) return *this;
 
+  if (!IsCpu() && !device.IsCpu() && Device() != device) {
+    return UnimplementedError("cross-device copy requires an explicit transfer");
+  }
+
+  INFERX_ASSIGN_OR_RETURN(Tensor out, Empty(GetDataType(), GetShape(), device));
+  if (Numel() == 0) return out;
+
+  if (IsCpu() && out.IsCpu()) {
+    std::memmove(out.Data(), Data(), static_cast<size_t>(NBytes()));
+    return out;
+  }
+
+  const auto kind = IsCpu()       ? CopyKind::kHostToDevice
+                    : out.IsCpu() ? CopyKind::kDeviceToHost
+                                  : CopyKind::kDeviceToDevice;
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.Device() : Device()));
+  INFERX_RETURN_IF_ERROR(
+      runtime->Copy(out.Data(), Data(), static_cast<size_t>(NBytes()), kind));
+
+  return out;
+}
+
+std::string Tensor::ToString() const {
   return absl::StrCat("Tensor(", DataTypeName(GetDataType()), ", ",
                       impl_->GetShape().ToString(), ", ", Device().ToString(), ", ", NBytes(),
                       "B, refs=", UseCount(), ", ", impl_->GetStorage()->ToString(), ")");

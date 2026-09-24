@@ -89,7 +89,7 @@ class SamplerTest : public ::testing::Test {
   Tensor MakeLogits(const std::vector<std::vector<float>>& rows) {
     const int batch = static_cast<int>(rows.size());
     const int64_t vocab = static_cast<int64_t>(rows[0].size());
-    auto tensor = Tensor::Empty(inferx::DataType::kFloat, inferx::Shape({batch, vocab}),
+    auto tensor = Tensor::Empty(inferx::DataType::kFloat32, inferx::Shape({batch, vocab}),
                                 DeviceId::Cpu());
     EXPECT_TRUE(tensor.ok()) << tensor.status();
     float* out = (*tensor).DataAs<float>();
@@ -113,10 +113,9 @@ TEST_F(SamplerTest, GreedyCpuPathPicksArgmaxWithLowestIndexTieBreak) {
   const SamplingMetadata::PerRequest batch[] = {{&greedy, 0}, {&greedy, 3}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
   ExecutionContext ctx(*runtime_, stream_);
-  SamplerOutput output;
-  ASSERT_TRUE((*sampler)->Sample(ctx, logits, metadata, output).ok());
-  ASSERT_TRUE(output.IsDefined());
-  const int32_t* ids = output.sampled_token_ids.DataAs<int32_t>();
+  auto output = (*sampler)->Sample(ctx, logits, metadata);
+  ASSERT_TRUE(output.ok()) << output.status();
+  const int32_t* ids = output->sampled_token_ids.DataAs<int32_t>();
   EXPECT_EQ(ids[0], 5);
   EXPECT_EQ(ids[1], 2);  // Tie break matches the CUDA op.
 }
@@ -129,10 +128,9 @@ TEST_F(SamplerTest, NonGreedyBatchIsReportedUnimplemented) {
   const SamplingMetadata::PerRequest batch[] = {{&random, 0}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
   ExecutionContext ctx(*runtime_, stream_);
-  SamplerOutput output;
-  const Status status = (*sampler)->Sample(ctx, logits, metadata, output);
-  ASSERT_FALSE(status.ok());
-  EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
+  const auto output = (*sampler)->Sample(ctx, logits, metadata);
+  ASSERT_FALSE(output.ok());
+  EXPECT_EQ(output.status().code(), absl::StatusCode::kUnimplemented);
 }
 
 TEST_F(SamplerTest, RejectsMetadataMismatch) {
@@ -145,8 +143,7 @@ TEST_F(SamplerTest, RejectsMetadataMismatch) {
   const SamplingMetadata::PerRequest batch[] = {{&greedy, 0}};  // One of two rows.
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
   ExecutionContext ctx(*runtime_, stream_);
-  SamplerOutput output;
-  EXPECT_FALSE((*sampler)->Sample(ctx, logits, metadata, output).ok());
+  EXPECT_FALSE((*sampler)->Sample(ctx, logits, metadata).ok());
 }
 
 }  // namespace

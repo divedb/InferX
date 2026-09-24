@@ -1,6 +1,7 @@
 #include "inferx/models/model_runner.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -51,7 +52,7 @@ class TestModel final : public Model {
                        read(a.last_page_len, a.num_seqs), read(input.logit_rows, a.num_seqs)});
     const int num_seqs = a.num_seqs;
     INFERX_ASSIGN_OR_RETURN(
-        Tensor logits, Tensor::Empty(DataType::kFloat, Shape({num_seqs, config_.vocab_size}),
+        Tensor logits, Tensor::Empty(DataType::kFloat32, Shape({num_seqs, config_.vocab_size}),
                                      input.token_ids.Device()));
     float* rows = logits.DataAs<float>();
     for (int i = 0; i < num_seqs; ++i) {
@@ -188,7 +189,7 @@ TEST_F(ModelRunnerTest, RejectsInvalidTokenBeforeForward) {
 
 TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   auto model = std::make_unique<TestModel>();
-  model->requirements = {PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kFloat}}};
+  model->requirements = {PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kFloat32}}};
   ModelConfig mc;
   mc.device = DeviceId::Cpu();
   CacheConfig cc;
@@ -197,7 +198,7 @@ TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   ASSERT_TRUE(runner.ok()) << runner.status();
   EXPECT_EQ((*runner)->kv_pool()->layout().kv_heads, 2);
   EXPECT_EQ((*runner)->kv_pool()->layout().head_dim, 4);
-  EXPECT_EQ((*runner)->kv_pool()->layout().dtype, DataType::kFloat);
+  EXPECT_EQ((*runner)->kv_pool()->layout().dtype, DataType::kFloat32);
 }
 
 TEST(ModelRunnerStateTest, RejectsRecurrentStateBeforeAllocation) {
@@ -244,7 +245,7 @@ class PositionModel final : public Model {
     std::vector<uint16_t> table(64 * 128, 0);
     for (int p = 0; p < 64; ++p) table[p * 128 + p + 10] = 0x3f80;
     INFERX_ASSIGN_OR_RETURN(auto runtime, RuntimeFor(device));
-    return runtime->Copy(table_.Data(), table.data(), table.size() * sizeof(uint16_t),
+    return runtime->Copy(table_->Data(), table.data(), table.size() * sizeof(uint16_t),
                          CopyKind::kHostToDevice);
   }
   bool SupportsCudaGraphs() const override { return true; }
@@ -255,16 +256,16 @@ class PositionModel final : public Model {
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState&,
                            ops::ExecutionContext& ctx) override {
     ++calls;
-    INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_.Slice(0, input.attention.num_tokens));
-    INFERX_ASSIGN_OR_RETURN(auto logits, logits_.Slice(0, input.attention.num_seqs));
-    INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, table_, input.attention.positions, hidden));
+    INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_->Slice(0, input.attention.num_tokens));
+    INFERX_ASSIGN_OR_RETURN(auto logits, logits_->Slice(0, input.attention.num_seqs));
+    INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, *table_, input.attention.positions, hidden));
     INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, hidden, input.logit_rows, logits));
     return logits;
   }
   int calls = 0;
  private:
   CheckpointConfig config_;
-  Tensor table_, hidden_, logits_;
+  std::optional<Tensor> table_, hidden_, logits_;
 };
 
 TEST_F(ModelRunnerTest, RejectsUnknownAttentionBackendBeforeLoadingWeights) {

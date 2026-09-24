@@ -9,7 +9,7 @@ namespace inferx::lm {
 
 StatusOr<Tensor> LanguageModelHead::Forward(const Tensor& hidden, const Tensor& rows,
                                             ops::ExecutionContext& ctx) {
-  if (!weight.IsDefined() || hidden.Rank() != 2 || rows.Rank() != 1 ||
+  if (hidden.Rank() != 2 || rows.Rank() != 1 ||
       weight.Rank() != 2 || hidden.Dim(1) != weight.Dim(1) ||
       rows.GetDataType() != DataType::kInt32 || hidden.Device() != ctx.device() ||
       rows.Device() != ctx.device() || weight.Device() != ctx.device()) {
@@ -17,7 +17,7 @@ StatusOr<Tensor> LanguageModelHead::Forward(const Tensor& hidden, const Tensor& 
   }
   const int64_t count = rows.Numel();
   if (count == 0) return InvalidArgumentError("language-model head needs at least one row");
-  if (!workspace_ready_ || rows_.Dim(0) < count) {
+  if (!workspace_ready_ || rows_->Dim(0) < count) {
     // Reserve all sequence slots before any capture: later batch growth must
     // not invalidate the row buffer referenced by an earlier decode graph.
     const int64_t reserve = std::max<int64_t>(count, capacity);
@@ -27,9 +27,9 @@ StatusOr<Tensor> LanguageModelHead::Forward(const Tensor& hidden, const Tensor& 
         logits_, Tensor::Empty(DataType::kBFloat16, Shape({reserve, weight.Dim(0)}), ctx.device()));
     workspace_ready_ = true;
   }
-  INFERX_ASSIGN_OR_RETURN(Tensor row_batch, rows_.Slice(0, count));
+  INFERX_ASSIGN_OR_RETURN(Tensor row_batch, rows_->Slice(0, count));
   INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, hidden, rows, row_batch));
-  INFERX_ASSIGN_OR_RETURN(Tensor logits, logits_.Slice(0, count));
+  INFERX_ASSIGN_OR_RETURN(Tensor logits, logits_->Slice(0, count));
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, row_batch, weight, logits));
   return logits;
 }

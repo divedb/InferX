@@ -11,9 +11,6 @@ namespace inferx::ops {
 namespace {
 Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                     const RMSNormConfig& config) {
-  if (!x.IsDefined() || !weight.IsDefined() || !out.IsDefined()) {
-    return InvalidArgumentError("RmsNorm requires defined x, weight, and out tensors");
-  }
   if (x.Rank() != 2 || weight.Rank() != 1 || out.Rank() != 2) {
     return InvalidArgumentError(
         "RmsNorm expects rank-2 x and out and rank-1 weight, got ranks ", x.Rank(), ", ",

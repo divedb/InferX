@@ -5,6 +5,7 @@
 #define INFERX_MODELS_LAYERS_FEED_FORWARD_H_
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "inferx/core/tensor.h"
@@ -29,7 +30,7 @@ struct MoeConfig {
 
 /// \brief SwiGLU projections for one expert or a dense layer.
 struct SwiGluWeights {
-  Tensor packed_gate_up;  ///< Optional concatenated gate/up projection rows.
+  std::optional<Tensor> packed_gate_up;  ///< Concatenated gate/up rows, when packed.
   LinearWeights gate;  ///< [intermediate, hidden]
   LinearWeights up;    ///< [intermediate, hidden]
   LinearWeights down;  ///< [hidden, intermediate]
@@ -39,8 +40,8 @@ struct SwiGluWeights {
 struct MoeWeights {
   Tensor router;                       ///< [num_experts, hidden]
   std::vector<SwiGluWeights> experts;  ///< One per routed expert.
-  SwiGluWeights shared_expert;         ///< Empty when disabled.
-  Tensor shared_expert_gate;           ///< [1, hidden]; undefined unless gated.
+  std::optional<SwiGluWeights> shared_expert;  ///< Absent when disabled.
+  std::optional<Tensor> shared_expert_gate;    ///< [1, hidden]; present only when gated.
 };
 
 }  // namespace inferx::layers

@@ -15,9 +15,10 @@ template <unsigned int NBits>
 struct DummyInt {};
 
 /// \brief Runtime data type for tensor elements.
+///
+/// https://onnx.com.cn/onnx/technical/float8.html
 enum class DataType : std::uint8_t {
   kBool = 0,
-  kFloat,
   kUInt2,
   kInt2,
   kUInt4,
@@ -30,17 +31,37 @@ enum class DataType : std::uint8_t {
   kInt32,
   kUInt64,
   kInt64,
+
+  /// https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+  kFloat4E2M1,
+
+  /// https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+  kFloat6E2M3,
+
+  /// https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+  kFloat6E3M2,
+
+  /// https://arxiv.org/pdf/2209.05433.pdf
+  kFloat8E4M3FN,
+
+  /// https://arxiv.org/pdf/2206.02915.pdf
+  kFloat8E4M3FNUZ,
+
+  /// https://arxiv.org/pdf/2209.05433.pdf
+  kFloat8E5M2,
+
+  /// https://arxiv.org/pdf/2206.02915.pdf
+  kFloat8E5M2FNUZ,
+
+  /// https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+  kFloat8E8M0,
+
   kFloat16,
-  kDouble,
+  kBFloat16,
+  kFloat32,
+  kFloat64,
   kComplex64,
   kComplex128,
-  kBFloat16,
-  kFloat8E4M3FN,
-  kFloat8E4M3FNUZ,
-  kFloat8E5M2,
-  kFloat8E5M2FNUZ,
-  kFloat8E8M0,
-  kFloat4E2M1,
 };
 
 /// \brief Placeholder for a float8/float4 type with no host arithmetic.
@@ -50,7 +71,6 @@ struct DummyFloat {};
 /// \brief Invokes `X(kind, cpp_type, name, bit_width)` for every DataType.
 #define INFERX_FOR_EACH_DATA_TYPE(X)                                         \
   X(kBool, bool, "i1", 1)                                                    \
-  X(kFloat, float, "f32", 32)                                                \
   X(kUInt2, DummyUInt<2>, "u2", 2)                                           \
   X(kInt2, DummyInt<2>, "i2", 2)                                             \
   X(kUInt4, DummyUInt<4>, "u4", 4)                                           \
@@ -63,17 +83,20 @@ struct DummyFloat {};
   X(kInt32, std::int32_t, "i32", 32)                                         \
   X(kUInt64, std::uint64_t, "u64", 64)                                       \
   X(kInt64, std::int64_t, "i64", 64)                                         \
-  X(kFloat16, std::uint16_t, "f16", 16)                                      \
-  X(kDouble, double, "f64", 64)                                              \
-  X(kComplex64, std::complex<float>, "complex<f32>", 64)                     \
-  X(kComplex128, std::complex<double>, "complex<f64>", 128)                  \
-  X(kBFloat16, std::uint16_t, "bf16", 16)                                    \
+  X(kFloat4E2M1, DummyFloat<DataType::kFloat4E2M1>, "f4e2m1", 4)             \
+  X(kFloat6E2M3, DummyFloat<DataType::kFloat6E2M3>, "f6e2m3", 6)             \
+  X(kFloat6E3M2, DummyFloat<DataType::kFloat6E3M2>, "f6e3m2", 6)             \
   X(kFloat8E4M3FN, DummyFloat<DataType::kFloat8E4M3FN>, "f8e4m3fn", 8)       \
   X(kFloat8E4M3FNUZ, DummyFloat<DataType::kFloat8E4M3FNUZ>, "f8e4m3fnuz", 8) \
   X(kFloat8E5M2, DummyFloat<DataType::kFloat8E5M2>, "f8e5m2", 8)             \
   X(kFloat8E5M2FNUZ, DummyFloat<DataType::kFloat8E5M2FNUZ>, "f8e5m2fnuz", 8) \
   X(kFloat8E8M0, DummyFloat<DataType::kFloat8E8M0>, "f8e8m0", 8)             \
-  X(kFloat4E2M1, DummyFloat<DataType::kFloat4E2M1>, "f4e2m1", 4)
+  X(kFloat16, std::uint16_t, "f16", 16)                                      \
+  X(kBFloat16, std::uint16_t, "bf16", 16)                                    \
+  X(kFloat32, float, "f32", 32)                                              \
+  X(kFloat64, double, "f64", 64)                                             \
+  X(kComplex64, std::complex<float>, "complex<f32>", 64)                     \
+  X(kComplex128, std::complex<double>, "complex<f64>", 128)
 
 /// \brief Compile-time traits for a fixed DataType: its C++ type, name, bit
 ///        width, size, and alignment.
@@ -226,7 +249,7 @@ constexpr int64_t DataTypeByteSize(DataType dtype, int64_t count) noexcept {
 /// \brief Maps a C++ type to the DataType it stores.
 ///
 /// Only the types the host actually manipulates are listed. f16, bf16 and the
-/// f8/f4 formats are deliberately absent: they have no host arithmetic type
+/// f8/f6/f4 formats are deliberately absent: they have no host arithmetic type
 /// here, so there is nothing to map them to that would not be a lie.
 template <typename T>
 struct DataTypeOf;
@@ -239,8 +262,8 @@ struct DataTypeOf;
   };
 
 INFERX_DATA_TYPE_OF(bool, kBool)
-INFERX_DATA_TYPE_OF(float, kFloat)
-INFERX_DATA_TYPE_OF(double, kDouble)
+INFERX_DATA_TYPE_OF(float, kFloat32)
+INFERX_DATA_TYPE_OF(double, kFloat64)
 INFERX_DATA_TYPE_OF(std::uint8_t, kUInt8)
 INFERX_DATA_TYPE_OF(std::int8_t, kInt8)
 INFERX_DATA_TYPE_OF(std::uint16_t, kUInt16)
@@ -257,7 +280,7 @@ INFERX_DATA_TYPE_OF(std::complex<double>, kComplex128)
 /// \brief The DataType that stores values of C++ type `T`.
 ///
 /// \return Only the host arithmetic types are mapped; there is no entry for
-///         f16, bf16, or the f8/f4 formats.
+///         f16, bf16, or the f8/f6/f4 formats.
 template <typename T>
 inline constexpr DataType kDataTypeOf = DataTypeOf<T>::value;
 

@@ -7,6 +7,7 @@
 #define INFERX_MODELS_LM_STACK_H_
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "inferx/core/status.h"
@@ -43,8 +44,8 @@ struct DecoderWeights {
 
 /// \brief One step's stack input; prepared embeddings may replace token ids.
 struct DecoderInput {
-  Tensor token_ids;          ///< [num_tokens] int32, unless embeddings is set.
-  Tensor embeddings;         ///< [num_tokens, hidden] prepared embeddings.
+  Tensor token_ids;  ///< [num_tokens] int32, unless embeddings is set.
+  std::optional<Tensor> embeddings;  ///< [num_tokens, hidden] prepared embeddings.
   AttentionBatch attention;  ///< Ragged batch and KV geometry.
 };
 
@@ -82,16 +83,16 @@ class DecoderStack final : public Decoder {
   int max_tokens_;
 
   /// \brief Persistent activation workspace, sized by max_tokens_ and the
-  /// widest per-block geometry. Forward returns views into these buffers;
-  /// they stay valid until the next Forward call.
+  /// widest per-block geometry, allocated on first use. Forward returns views
+  /// into these buffers; they stay valid until the next Forward call.
   bool workspace_ready_ = false;
   int64_t max_intermediate_ = 0;
   bool enable_split_decode_ = false;
   int prefill_tile_rows_ = 64;
-  ops::FlashDecodeWorkspace decode_workspace_;
-  Tensor attention_plan_;
-  Tensor packed_projection_;
-  Tensor hidden_, normed_, query_, key_, value_, attn_out_, mixed_, gate_, up_;
+  std::optional<ops::FlashDecodeWorkspace> decode_workspace_;
+  std::optional<Tensor> attention_plan_;
+  std::optional<Tensor> packed_projection_;
+  std::optional<Tensor> hidden_, normed_, query_, key_, value_, attn_out_, mixed_, gate_, up_;
 };
 
 }  // namespace inferx::lm

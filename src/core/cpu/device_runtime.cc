@@ -98,6 +98,7 @@ class CpuRuntime final : public DeviceRuntime {
     if (bytes != 0 && dst != nullptr && src != nullptr) {
       std::memcpy(dst, src, bytes);
     }
+
     return OkStatus();
   }
 

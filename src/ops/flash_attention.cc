@@ -8,7 +8,7 @@
 namespace inferx::ops {
 namespace {
 Status CheckTensor(const Tensor& t, DataType dtype, int rank, const DeviceId& device) {
-  if (!t.IsDefined() || t.Rank() != rank || t.GetDataType() != dtype || t.Device() != device) {
+  if (t.Rank() != rank || t.GetDataType() != dtype || t.Device() != device) {
     return InvalidArgumentError("FlashInfer tensor rank, dtype or device mismatch");
   }
   return OkStatus();
@@ -87,7 +87,7 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
   if (decode != nullptr) {
     INFERX_RETURN_IF_ERROR(CheckTensor(decode->plan, DataType::kInt32, 1, ctx.device()));
     INFERX_RETURN_IF_ERROR(CheckTensor(decode->values, DataType::kBFloat16, 1, ctx.device()));
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat, 1, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat32, 1, ctx.device()));
     const int64_t splits = batch * FlashDecodeWorkspace::kPartitions;
     if (batch > FlashDecodeWorkspace::kMaxBatch || q.Dim(0) != batch ||
         decode->plan.Numel() < 3 * splits + batch + 2 ||

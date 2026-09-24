@@ -2,6 +2,7 @@
 #define INFERX_SAMPLING_SAMPLER_H_
 
 #include <memory>
+#include <optional>
 
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
@@ -33,22 +34,23 @@ class Sampler {
                                                    std::int64_t vocab_size,
                                                    DeviceId device);
 
-  /// \brief Samples one token per row of `logits` into `output`.
+  /// \brief Samples one token per row of `logits`.
   ///
   /// \param ctx      Execution lane; work is enqueued on ctx.stream().
   /// \param logits   [batch, vocab] float32 or bfloat16 matrix.
   /// \param metadata Batch description, requests.size() == batch.
-  /// \param output   Receives tensors aliasing this sampler's workspace;
-  ///                 valid until the next Sample call.
-  Status Sample(ops::ExecutionContext& ctx, const Tensor& logits,
-                const SamplingMetadata& metadata, SamplerOutput& output);
+  /// \return         Tensors aliasing this sampler's workspace, valid until
+  ///                 the next Sample call.
+  StatusOr<SamplerOutput> Sample(ops::ExecutionContext& ctx, const Tensor& logits,
+                                 const SamplingMetadata& metadata);
 
  private:
-  Sampler(Tensor values, Tensor indices, Tensor results, std::int64_t vocab_size);
+  Sampler(std::optional<Tensor> values, std::optional<Tensor> indices, Tensor results,
+          std::int64_t vocab_size);
 
-  Tensor values_;    ///< float32 argmax partials, [max_num_seqs * parts].
-  Tensor indices_;   ///< int32 argmax partial indices, same shape.
-  Tensor results_;   ///< int32 sampled ids, [max_num_seqs].
+  std::optional<Tensor> values_;   ///< float32 argmax partials, [max_num_seqs * parts]; CUDA only.
+  std::optional<Tensor> indices_;  ///< int32 argmax partial indices, same shape; CUDA only.
+  Tensor results_;                 ///< int32 sampled ids, [max_num_seqs].
   std::int64_t vocab_size_ = 0;
 };
 

@@ -58,13 +58,14 @@ target_compile_options(inferx_sampling PRIVATE -Wall -Wextra -Wpedantic)
 
 # inferx_models -- shared LM components: weight-carrying layers under
 # models/layers, the generic causal-LM skeleton (stack, head, loader) under
-# models/lm, and family builders that translate checkpoint configuration
-# into component choices.
+# models/lm, family builders that translate checkpoint configuration into
+# component choices, and the mmap'd checkpoint reader those loaders use.
 add_library(inferx_models
   models/model.cc
+  models/checkpoint.cc
   models/checkpoint_config.cc
-  models/safetensors.cc
-  models/weight_upload.cc
+  models/safe_tensors_reader.cc
+  models/safe_tensors_view.cc
   models/llama/builder.cc
   models/qwen3/builder.cc
   models/lm/config_parser.cc
@@ -74,7 +75,7 @@ add_library(inferx_models
 )
 add_library(inferx::models ALIAS inferx_models)
 target_link_libraries(inferx_models
-  PUBLIC inferx::core inferx::cache inferx::ops
+  PUBLIC inferx::core inferx::cache inferx::ops inferx::boost
   PRIVATE nlohmann_json::nlohmann_json absl::flat_hash_map absl::span
           absl::status absl::statusor absl::strings)
 target_include_directories(inferx_models PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

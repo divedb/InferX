@@ -14,7 +14,6 @@ add_library(inferx_core
   shape.cc
   storage.cc
   tensor.cc
-  tensor_io.cc
 )
 
 if(INFERX_ENABLE_CUDA)

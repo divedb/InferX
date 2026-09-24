@@ -69,7 +69,7 @@ struct F16Policy {
 
 struct F32Policy {
   using Bits = float;
-  static constexpr DataType kDtype = DataType::kFloat;
+  static constexpr DataType kDtype = DataType::kFloat32;
   static constexpr float kRel = 1e-4f;
   static constexpr float kAbs = 1e-4f;
   static Bits Encode(float v) { return v; }
@@ -291,9 +291,9 @@ TEST_F(CudaRmsNormTest, RejectsOutputShapeMismatch) {
 }
 
 TEST_F(CudaRmsNormTest, RejectsUnsupportedDtype) {
-  auto x = Tensor::Empty(DataType::kDouble, Shape({4, 8}), device_);
-  auto w = Tensor::Empty(DataType::kDouble, Shape({8}), device_);
-  auto out = Tensor::Empty(DataType::kDouble, Shape({4, 8}), device_);
+  auto x = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
+  auto w = Tensor::Empty(DataType::kFloat64, Shape({8}), device_);
+  auto out = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
   ExecutionContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
@@ -341,9 +341,9 @@ TEST_F(CpuRmsNormTest, RejectsWeightLengthMismatch) {
 }
 
 TEST_F(CpuRmsNormTest, RejectsUnsupportedDtype) {
-  auto x = Tensor::Empty(DataType::kDouble, Shape({4, 8}), device_);
-  auto w = Tensor::Empty(DataType::kDouble, Shape({8}), device_);
-  auto out = Tensor::Empty(DataType::kDouble, Shape({4, 8}), device_);
+  auto x = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
+  auto w = Tensor::Empty(DataType::kFloat64, Shape({8}), device_);
+  auto out = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
   ExecutionContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});

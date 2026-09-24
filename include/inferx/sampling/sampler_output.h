@@ -1,6 +1,8 @@
 #ifndef INFERX_SAMPLING_SAMPLER_OUTPUT_H_
 #define INFERX_SAMPLING_SAMPLER_OUTPUT_H_
 
+#include <optional>
+
 #include "inferx/core/tensor.h"
 
 namespace inferx::sampling {
@@ -15,14 +17,12 @@ struct SamplerOutput {
   /// \brief Sampled token per batch row, int32 [batch].
   Tensor sampled_token_ids;
 
-  /// \brief Log-probability of each sampled token, float [batch]; undefined
+  /// \brief Log-probability of each sampled token, float [batch]; absent
   ///        until the logprob path is implemented and requested.
-  Tensor logprobs;
+  std::optional<Tensor> logprobs;
 
   /// \brief Top-k (token, logprob) pairs per row arrive here once logprobs
   ///        land; planned as CSR tensors, not a host container.
-
-  bool IsDefined() const { return sampled_token_ids.IsDefined(); }
 };
 
 }  // namespace inferx::sampling

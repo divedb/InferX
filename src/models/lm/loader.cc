@@ -1,9 +1,12 @@
 #include "inferx/models/lm/loader.h"
 #include <cstdlib>
+#include <optional>
 #include <string_view>
+#include <variant>
+#include <vector>
 
+#include "inferx/models/checkpoint.h"
 #include "inferx/models/lm/causal_lm.h"
-#include "models/weight_upload.h"
 
 namespace inferx::lm {
 namespace {
@@ -29,84 +32,91 @@ StatusOr<Tensor> Pack(std::initializer_list<Tensor*> weights, DeviceId device) {
   return packed;
 }
 
-StatusOr<Tensor> Weight(const SafeTensors& tensors, const std::string& name,
+StatusOr<Tensor> Weight(const models::Checkpoint& checkpoint, const std::string& name,
                         std::vector<int64_t> shape, DeviceId device) {
-  const auto* tensor = tensors.Find(name);
-  if (tensor == nullptr) return NotFoundError("checkpoint is missing tensor ", name);
-  if (tensor->shape != shape) return InvalidArgumentError("unexpected shape for ", name);
-  return models::UploadBf16(*tensor, device);
+  return checkpoint.UploadBf16(name, Shape(absl::MakeConstSpan(shape)), device);
 }
 
-StatusOr<layers::LinearWeights> Linear(const SafeTensors& tensors, const std::string& prefix,
+StatusOr<layers::LinearWeights> Linear(const models::Checkpoint& checkpoint,
+                                       const std::string& prefix,
                                        int64_t out, int64_t in, bool bias, DeviceId device) {
-  layers::LinearWeights weights;
-  INFERX_ASSIGN_OR_RETURN(weights.weight, Weight(tensors, prefix + ".weight", {out, in}, device));
+  INFERX_ASSIGN_OR_RETURN(auto weight, Weight(checkpoint, prefix + ".weight", {out, in}, device));
+  std::optional<Tensor> bias_weight;
   if (bias) {
-    INFERX_ASSIGN_OR_RETURN(weights.bias, Weight(tensors, prefix + ".bias", {out}, device));
+    INFERX_ASSIGN_OR_RETURN(bias_weight, Weight(checkpoint, prefix + ".bias", {out}, device));
   }
-  return weights;
+  return layers::LinearWeights{std::move(weight), std::move(bias_weight)};
 }
 
-StatusOr<layers::SwiGluWeights> SwiGlu(const SafeTensors& tensors, const std::string& prefix,
+StatusOr<layers::SwiGluWeights> SwiGlu(const models::Checkpoint& checkpoint,
+                                       const std::string& prefix,
                                        int64_t hidden, int64_t width, DeviceId device) {
-  layers::SwiGluWeights weights;
-  INFERX_ASSIGN_OR_RETURN(weights.gate, Linear(tensors, prefix + "gate_proj", width, hidden, false, device));
-  INFERX_ASSIGN_OR_RETURN(weights.up, Linear(tensors, prefix + "up_proj", width, hidden, false, device));
-  INFERX_ASSIGN_OR_RETURN(weights.down, Linear(tensors, prefix + "down_proj", hidden, width, false, device));
+  INFERX_ASSIGN_OR_RETURN(auto gate, Linear(checkpoint, prefix + "gate_proj", width, hidden, false, device));
+  INFERX_ASSIGN_OR_RETURN(auto up, Linear(checkpoint, prefix + "up_proj", width, hidden, false, device));
+  INFERX_ASSIGN_OR_RETURN(auto down, Linear(checkpoint, prefix + "down_proj", hidden, width, false, device));
+  std::optional<Tensor> packed_gate_up;
   if (PackProjections()) {
-    INFERX_ASSIGN_OR_RETURN(weights.packed_gate_up, Pack({&weights.gate.weight, &weights.up.weight}, device));
+    INFERX_ASSIGN_OR_RETURN(packed_gate_up, Pack({&gate.weight, &up.weight}, device));
   }
-  return weights;
+  return layers::SwiGluWeights{std::move(packed_gate_up), std::move(gate), std::move(up),
+                               std::move(down)};
 }
 
-StatusOr<layers::BlockWeights> LoadBlock(const SafeTensors& tensors,
+StatusOr<layers::BlockWeights> LoadBlock(const models::Checkpoint& checkpoint,
                                          const layers::BlockConfig& config,
                                          const CheckpointLayout& names,
                                          const std::string& prefix, int64_t hidden,
                                          DeviceId device) {
-  layers::BlockWeights weights;
-  INFERX_ASSIGN_OR_RETURN(weights.input_norm, Weight(tensors, prefix + "input_layernorm.weight", {hidden}, device));
-  INFERX_ASSIGN_OR_RETURN(weights.post_mixer_norm, Weight(tensors, prefix + "post_attention_layernorm.weight", {hidden}, device));
+  INFERX_ASSIGN_OR_RETURN(auto input_norm,
+                          Weight(checkpoint, prefix + "input_layernorm.weight", {hidden}, device));
+  INFERX_ASSIGN_OR_RETURN(auto post_mixer_norm,
+                          Weight(checkpoint, prefix + "post_attention_layernorm.weight", {hidden}, device));
   const auto& a = std::get<layers::AttentionConfig>(config.mixer);
   const std::string ap = prefix + names.attention_name;
   const int64_t qdim = a.query_heads * a.head_dim;
   const int64_t kvdim = a.kv_heads * a.head_dim;
-  layers::AttentionWeights attn;
-  INFERX_ASSIGN_OR_RETURN(attn.query, Linear(tensors, ap + "q_proj", qdim * (a.output_gate == layers::OutputGate::kNone ? 1 : 2), hidden, a.projection_bias, device));
-  INFERX_ASSIGN_OR_RETURN(attn.key, Linear(tensors, ap + "k_proj", kvdim, hidden, a.projection_bias, device));
-  INFERX_ASSIGN_OR_RETURN(attn.value, Linear(tensors, ap + "v_proj", kvdim, hidden, a.projection_bias, device));
-  INFERX_ASSIGN_OR_RETURN(attn.output, Linear(tensors, ap + "o_proj", hidden, qdim, a.projection_bias, device));
+  INFERX_ASSIGN_OR_RETURN(auto query, Linear(checkpoint, ap + "q_proj", qdim * (a.output_gate == layers::OutputGate::kNone ? 1 : 2), hidden, a.projection_bias, device));
+  INFERX_ASSIGN_OR_RETURN(auto key, Linear(checkpoint, ap + "k_proj", kvdim, hidden, a.projection_bias, device));
+  INFERX_ASSIGN_OR_RETURN(auto value, Linear(checkpoint, ap + "v_proj", kvdim, hidden, a.projection_bias, device));
+  INFERX_ASSIGN_OR_RETURN(auto output, Linear(checkpoint, ap + "o_proj", hidden, qdim, a.projection_bias, device));
+  std::optional<Tensor> packed_qkv;
   if (PackProjections()) {
-    INFERX_ASSIGN_OR_RETURN(attn.packed_qkv,
-        Pack({&attn.query.weight, &attn.key.weight, &attn.value.weight}, device));
+    INFERX_ASSIGN_OR_RETURN(packed_qkv,
+        Pack({&query.weight, &key.weight, &value.weight}, device));
   }
+  std::optional<Tensor> query_norm, key_norm;
   if (a.qk_norm) {
-    INFERX_ASSIGN_OR_RETURN(attn.query_norm, Weight(tensors, ap + "q_norm.weight", {a.head_dim}, device));
-    INFERX_ASSIGN_OR_RETURN(attn.key_norm, Weight(tensors, ap + "k_norm.weight", {a.head_dim}, device));
+    INFERX_ASSIGN_OR_RETURN(query_norm, Weight(checkpoint, ap + "q_norm.weight", {a.head_dim}, device));
+    INFERX_ASSIGN_OR_RETURN(key_norm, Weight(checkpoint, ap + "k_norm.weight", {a.head_dim}, device));
   }
-  weights.mixer = std::move(attn);
+  layers::AttentionWeights attn{std::move(packed_qkv), std::move(query), std::move(key),
+                                std::move(value), std::move(output), std::move(query_norm),
+                                std::move(key_norm)};
   const std::string fp = prefix + names.feed_forward_name;
   if (const auto* dense = std::get_if<layers::SwiGluConfig>(&config.feed_forward)) {
-    INFERX_ASSIGN_OR_RETURN(auto ffn, SwiGlu(tensors, fp, hidden, dense->intermediate_size, device));
-    weights.feed_forward = std::move(ffn);
-  } else {
-    const auto& m = std::get<layers::MoeConfig>(config.feed_forward);
-    layers::MoeWeights moe;
-    INFERX_ASSIGN_OR_RETURN(moe.router, Weight(tensors, fp + "gate.weight", {m.num_experts, hidden}, device));
-    for (int64_t i = 0; i < m.num_experts; ++i) {
-      INFERX_ASSIGN_OR_RETURN(auto expert, SwiGlu(tensors, fp + "experts." + std::to_string(i) + ".", hidden, m.intermediate_size, device));
-      moe.experts.push_back(std::move(expert));
-    }
-    if (m.shared_intermediate_size > 0) {
-      INFERX_ASSIGN_OR_RETURN(auto shared, SwiGlu(tensors, fp + "shared_expert.", hidden, m.shared_intermediate_size, device));
-      moe.shared_expert = std::move(shared);
-      if (m.gate_shared_expert) {
-        INFERX_ASSIGN_OR_RETURN(moe.shared_expert_gate, Weight(tensors, fp + "shared_expert_gate.weight", {1, hidden}, device));
-      }
-    }
-    weights.feed_forward = std::move(moe);
+    INFERX_ASSIGN_OR_RETURN(auto ffn, SwiGlu(checkpoint, fp, hidden, dense->intermediate_size, device));
+    return layers::BlockWeights{std::move(input_norm), std::move(post_mixer_norm), std::move(attn),
+                                std::move(ffn)};
   }
-  return weights;
+  const auto& m = std::get<layers::MoeConfig>(config.feed_forward);
+  INFERX_ASSIGN_OR_RETURN(auto router, Weight(checkpoint, fp + "gate.weight", {m.num_experts, hidden}, device));
+  std::vector<layers::SwiGluWeights> experts;
+  for (int64_t i = 0; i < m.num_experts; ++i) {
+    INFERX_ASSIGN_OR_RETURN(auto expert, SwiGlu(checkpoint, fp + "experts." + std::to_string(i) + ".", hidden, m.intermediate_size, device));
+    experts.push_back(std::move(expert));
+  }
+  std::optional<layers::SwiGluWeights> shared_expert;
+  std::optional<Tensor> shared_expert_gate;
+  if (m.shared_intermediate_size > 0) {
+    INFERX_ASSIGN_OR_RETURN(shared_expert, SwiGlu(checkpoint, fp + "shared_expert.", hidden, m.shared_intermediate_size, device));
+    if (m.gate_shared_expert) {
+      INFERX_ASSIGN_OR_RETURN(shared_expert_gate, Weight(checkpoint, fp + "shared_expert_gate.weight", {1, hidden}, device));
+    }
+  }
+  layers::MoeWeights moe{std::move(router), std::move(experts), std::move(shared_expert),
+                         std::move(shared_expert_gate)};
+  return layers::BlockWeights{std::move(input_norm), std::move(post_mixer_norm), std::move(attn),
+                              std::move(moe)};
 }
 
 }  // namespace
@@ -128,22 +138,26 @@ StatusOr<std::unique_ptr<Model>> LoadCausalLM(const std::string& directory,
     ops::AttentionParams p{a.query_heads, a.kv_heads, a.head_dim, 1.0f, a.sliding_window};
     INFERX_RETURN_IF_ERROR(ops::ValidateAttentionGeometry(config.attention_backend, p));
   }
-  INFERX_ASSIGN_OR_RETURN(auto tensors, SafeTensors::FromDirectory(directory));
-  DecoderWeights weights;
+  INFERX_ASSIGN_OR_RETURN(auto checkpoint, models::Checkpoint::Open(directory));
   const auto& mc = config.model;
-  INFERX_ASSIGN_OR_RETURN(weights.token_embedding, Weight(tensors, names.backbone_prefix + "embed_tokens.weight", {mc.vocab_size, mc.hidden_size}, device));
-  INFERX_ASSIGN_OR_RETURN(weights.final_norm, Weight(tensors, names.backbone_prefix + "norm.weight", {mc.hidden_size}, device));
+  INFERX_ASSIGN_OR_RETURN(auto token_embedding,
+      Weight(checkpoint, names.backbone_prefix + "embed_tokens.weight", {mc.vocab_size, mc.hidden_size}, device));
+  INFERX_ASSIGN_OR_RETURN(auto final_norm,
+      Weight(checkpoint, names.backbone_prefix + "norm.weight", {mc.hidden_size}, device));
+  std::vector<layers::BlockWeights> blocks;
   for (size_t i = 0; i < config.blocks.size(); ++i) {
-    INFERX_ASSIGN_OR_RETURN(auto block, LoadBlock(tensors, config.blocks[i], names,
+    INFERX_ASSIGN_OR_RETURN(auto block, LoadBlock(checkpoint, config.blocks[i], names,
         names.backbone_prefix + "layers." + std::to_string(i) + ".", mc.hidden_size, device));
-    weights.blocks.push_back(std::move(block));
+    blocks.push_back(std::move(block));
   }
-  LanguageModelHead head;
+  DecoderWeights weights{std::move(token_embedding), std::move(final_norm), std::move(blocks)};
+  std::optional<Tensor> head_weight;
   if (mc.tie_word_embeddings) {
-    head.weight = weights.token_embedding;
+    head_weight = weights.token_embedding;
   } else {
-    INFERX_ASSIGN_OR_RETURN(head.weight, Weight(tensors, names.head_name, {mc.vocab_size, mc.hidden_size}, device));
+    INFERX_ASSIGN_OR_RETURN(head_weight, Weight(checkpoint, names.head_name, {mc.vocab_size, mc.hidden_size}, device));
   }
+  LanguageModelHead head{std::move(*head_weight)};
   auto decoder = std::make_unique<DecoderStack>(config, std::move(weights), max_tokens);
   return std::unique_ptr<Model>(new CausalLM(std::move(decoder), std::move(head), max_seqs));
 }

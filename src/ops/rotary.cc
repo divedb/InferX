@@ -8,9 +8,6 @@ namespace inferx::ops {
 namespace {
 Status ValidateRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params) {
-  if (!q.IsDefined() || !k.IsDefined() || !positions.IsDefined()) {
-    return InvalidArgumentError("ApplyRope requires defined q, k, and positions");
-  }
   if (q.Rank() != 3 || k.Rank() != 3) {
     return InvalidArgumentError("ApplyRope expects rank-3 q and k of [tokens, heads, head_dim]");
   }
@@ -65,7 +62,7 @@ Status NormalizeAndApplyRope(ExecutionContext& ctx, const Tensor& q, const Tenso
                              const Tensor& positions, float eps, const RotaryParams& params) {
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   for (const auto* weight : {&q_weight, &k_weight}) {
-    if (!weight->IsDefined() || weight->Rank() != 1 || weight->Dim(0) != q.Dim(2) ||
+    if (weight->Rank() != 1 || weight->Dim(0) != q.Dim(2) ||
         weight->GetDataType() != q.GetDataType() || weight->Device() != ctx.device())
       return InvalidArgumentError("NormalizeAndApplyRope requires per-head BF16 weights");
   }

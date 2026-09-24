@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <optional>
+#include <utility>
 #include <vector>
 
 #include "inferx/core/device_runtime.h"
@@ -24,7 +26,7 @@ float Bf16BitsToFloat(uint16_t h) {
 
 }  // namespace
 
-Sampler::Sampler(Tensor values, Tensor indices, Tensor results,
+Sampler::Sampler(std::optional<Tensor> values, std::optional<Tensor> indices, Tensor results,
                  std::int64_t vocab_size)
     : values_(std::move(values)),
       indices_(std::move(indices)),
@@ -38,25 +40,25 @@ StatusOr<std::unique_ptr<Sampler>> Sampler::Create(int max_num_seqs,
     return InvalidArgumentError("sampler requires positive capacities");
   if (!device.IsCpu() && !device.IsCuda())
     return UnimplementedError("unsupported sampling device");
-  Tensor values, indices, results;
+  std::optional<Tensor> values, indices;
   if (device.IsCuda()) {
     const std::int64_t parts = (vocab_size + 4095) / 4096;
     INFERX_ASSIGN_OR_RETURN(values,
-        Tensor::Empty(DataType::kFloat, Shape({max_num_seqs * parts}), device));
+        Tensor::Empty(DataType::kFloat32, Shape({max_num_seqs * parts}), device));
     INFERX_ASSIGN_OR_RETURN(indices,
         Tensor::Empty(DataType::kInt32, Shape({max_num_seqs * parts}), device));
   }
-  INFERX_ASSIGN_OR_RETURN(results,
+  INFERX_ASSIGN_OR_RETURN(auto results,
       Tensor::Empty(DataType::kInt32, Shape({max_num_seqs}), device));
   return std::unique_ptr<Sampler>(
       new Sampler(std::move(values), std::move(indices), std::move(results), vocab_size));
 }
 
-Status Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
-                       const SamplingMetadata& metadata, SamplerOutput& output) {
-  if (!logits.IsDefined() || logits.Rank() != 2 ||
+StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
+                                        const SamplingMetadata& metadata) {
+  if (logits.Rank() != 2 ||
       (logits.GetDataType() != DataType::kBFloat16 &&
-       logits.GetDataType() != DataType::kFloat) ||
+       logits.GetDataType() != DataType::kFloat32) ||
       logits.Device() != ctx.device()) {
     return InvalidArgumentError("sampler requires a float32/bfloat16 [batch, vocab] matrix");
   }
@@ -65,14 +67,15 @@ Status Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
       static_cast<int>(metadata.requests.size()) != batch) {
     return InvalidArgumentError("logits and sampling metadata disagree on the batch");
   }
-  INFERX_ASSIGN_OR_RETURN(output.sampled_token_ids, results_.Slice(0, batch));
-  output.logprobs = Tensor{};
-  if (batch == 0) return OkStatus();
+  INFERX_ASSIGN_OR_RETURN(Tensor sampled, results_.Slice(0, batch));
+  if (batch == 0) return SamplerOutput{std::move(sampled), std::nullopt};
   if (!metadata.all_greedy)
     return UnimplementedError("random sampling (temperature/top-k/top-p) is not implemented yet");
 
   if (ctx.device().IsCuda()) {
-    return ops::GreedyArgmax(ctx, logits, values_, indices_, output.sampled_token_ids);
+    INFERX_RETURN_IF_ERROR(
+        ops::GreedyArgmax(ctx, logits, *values_, *indices_, sampled));
+    return SamplerOutput{std::move(sampled), std::nullopt};
   }
 
   // CPU reference path: retains the GPU op's lowest-index tie break and its
@@ -95,7 +98,7 @@ Status Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
     std::memcpy(&h, p, sizeof(h));
     return Bf16BitsToFloat(h);
   };
-  int32_t* out = output.sampled_token_ids.DataAs<int32_t>();
+  int32_t* out = sampled.DataAs<int32_t>();
   for (int i = 0; i < batch; ++i) {
     float best = value_at(i, 0);
     int32_t best_idx = 0;
@@ -108,7 +111,7 @@ Status Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
     }
     out[i] = std::isnan(value_at(i, 0)) ? 0 : best_idx;
   }
-  return OkStatus();
+  return SamplerOutput{std::move(sampled), std::nullopt};
 }
 
 }  // namespace inferx::sampling

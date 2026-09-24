@@ -1,6 +1,3 @@
-/// \file
-/// \brief Parsed HuggingFace model configuration.
-
 #ifndef INFERX_CHECKPOINT_CONFIG_H_
 #define INFERX_CHECKPOINT_CONFIG_H_
 
@@ -12,12 +9,6 @@
 
 namespace inferx {
 
-/// \brief Sampling-relevant defaults parsed from a HuggingFace
-///        `generation_config.json`.
-///
-/// Mirrors the fields vLLM adopts from the checkpoint: absent fields stay
-/// nullopt so the server defaults pass through unchanged. This type carries
-/// no policy; front ends decide precedence against their own defaults.
 struct GenerationConfig {
   std::optional<float> temperature;
   std::optional<float> top_p;
@@ -38,9 +29,9 @@ struct GenerationConfig {
 /// \brief Model dimensions and hyperparameters parsed from a HuggingFace
 ///        `config.json`.
 struct CheckpointConfig {
-  std::string architectures;  ///< e.g. "Qwen3ForCausalLM".
+  std::string architectures;    ///< e.g. "Qwen3ForCausalLM".
   std::string text_model_type;  ///< Nested text architecture, if present.
-  std::string model_type;     ///< e.g. "qwen3".
+  std::string model_type;       ///< e.g. "qwen3".
   int64_t hidden_size = 0;
   int64_t intermediate_size = 0;
   int64_t num_hidden_layers = 0;
@@ -58,8 +49,10 @@ struct CheckpointConfig {
 
   /// \brief Returns the number of query heads times head_dim.
   int64_t QueryDim() const { return num_attention_heads * head_dim; }
+
   /// \brief Returns the number of key/value heads times head_dim.
   int64_t KvDim() const { return num_key_value_heads * head_dim; }
+
   /// \brief Returns the number of rotated columns per attention head; even
   ///        and at most `head_dim`.
   int64_t RotaryDim() const;
@@ -67,13 +60,13 @@ struct CheckpointConfig {
   /// \brief Parses a HuggingFace `config.json` file.
   ///
   /// \param path Path to the `config.json` file.
-  /// \return The parsed configuration, or an error status.
+  /// \return     The parsed configuration, or an error status.
   static absl::StatusOr<CheckpointConfig> FromFile(const std::string& path);
 
   /// \brief Parses a `config.json` string.
   ///
   /// \param json_text Raw JSON text of a `config.json` file.
-  /// \return The parsed configuration, or an error status.
+  /// \return          The parsed configuration, or an error status.
   static absl::StatusOr<CheckpointConfig> FromJson(const std::string& json_text);
 };
 

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <random>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,7 +80,7 @@ void Replay(const ReplayLogitsParams& params) {
   for (const auto& entry : fixture.at("cases")) {
     const auto tokens = entry.at("tokens").get<std::vector<int32_t>>();
     const int prompt_length = entry.at("prompt_length");
-    Tensor logits;
+    std::optional<Tensor> logits;
     for (int start = 0; start < static_cast<int>(tokens.size());) {
       const int count = start < prompt_length ? std::min(params.chunk_size, prompt_length - start) : 1;
       const int end = start + count;
@@ -88,21 +89,22 @@ void Replay(const ReplayLogitsParams& params) {
       const int used_blocks = (end + page_size - 1) / page_size;
       std::vector<int32_t> kv{0, used_blocks}, pages(used_blocks);
       for (int i = 0; i < used_blocks; ++i) pages[i] = physical_pages[i];
-      ModelInput input;
-      input.token_ids = upload(std::vector<int32_t>(tokens.begin() + start, tokens.begin() + end));
-      input.attention = {upload(positions), upload(std::vector<int32_t>(count, 0)),
-                         upload(qo), upload(kv), upload(pages),
-                         upload({(end - 1) % page_size + 1}), qo, kv, count, 1};
-      input.logit_rows = upload({count - 1});
+      const Tensor token_ids = upload(std::vector<int32_t>(tokens.begin() + start, tokens.begin() + end));
+      const Tensor logit_rows = upload({count - 1});
+      ModelInput input{token_ids,
+                       {upload(positions), upload(std::vector<int32_t>(count, 0)),
+                        upload(qo), upload(kv), upload(pages),
+                        upload({(end - 1) % page_size + 1}), qo, kv, count, 1},
+                       logit_rows};
       logits = Take(model->Forward(input, state, ctx));
       // Keep all input allocations alive until the forward has finished.
       Check(runtime->SynchronizeStream(stream));
       start = end;
     }
-    if (logits.GetDataType() != DataType::kBFloat16 || logits.Numel() != config.vocab_size)
+    if (logits->GetDataType() != DataType::kBFloat16 || logits->Numel() != config.vocab_size)
       throw std::runtime_error("unexpected replay logit dtype or shape");
     std::vector<uint16_t> bits(config.vocab_size);
-    Check(runtime->Copy(bits.data(), logits.Data(), bits.size() * sizeof(uint16_t),
+    Check(runtime->Copy(bits.data(), logits->Data(), bits.size() * sizeof(uint16_t),
                         CopyKind::kDeviceToHost));
     std::vector<float> values(bits.size());
     for (size_t i = 0; i < bits.size(); ++i)

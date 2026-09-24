@@ -7,11 +7,8 @@ namespace {
 
 /// Shared validation for the elementwise ops: matching shapes and dtype.
 Status CheckElementwise(absl::string_view op, const Tensor& a, const Tensor& b, Tensor& out) {
-  if (!a.IsDefined() || !b.IsDefined() || !out.IsDefined()) {
-    return InvalidArgumentError(op, " requires defined a, b, and out tensors");
-  }
   const DataType dtype = a.GetDataType();
-  if (dtype != DataType::kBFloat16 && dtype != DataType::kFloat) {
+  if (dtype != DataType::kBFloat16 && dtype != DataType::kFloat32) {
     return UnimplementedError(op, " supports bfloat16 and float32, got ", DataTypeName(dtype));
   }
   if (b.GetDataType() != dtype || out.GetDataType() != dtype) {
@@ -33,7 +30,7 @@ Status CheckElementwise(absl::string_view op, const Tensor& a, const Tensor& b, 
 Status SplitQkv(ExecutionContext& ctx, const Tensor& packed, Tensor& q, Tensor& k, Tensor& v) {
   const Tensor* tensors[] = {&packed, &q, &k, &v};
   for (const Tensor* t : tensors) {
-    if (!t->IsDefined() || t->Rank() != 2 || t->GetDataType() != DataType::kBFloat16 ||
+    if (t->Rank() != 2 || t->GetDataType() != DataType::kBFloat16 ||
         t->Device() != ctx.device() || t->Dim(0) != packed.Dim(0))
       return InvalidArgumentError("SplitQkv requires compatible BF16 matrices");
   }
@@ -45,7 +42,7 @@ Status SplitQkv(ExecutionContext& ctx, const Tensor& packed, Tensor& q, Tensor& 
 }
 
 Status PackedSiluAndMul(ExecutionContext& ctx, const Tensor& packed, Tensor& out) {
-  if (!packed.IsDefined() || !out.IsDefined() || packed.Rank() != 2 || out.Rank() != 2 ||
+  if (packed.Rank() != 2 || out.Rank() != 2 ||
       packed.GetDataType() != DataType::kBFloat16 || out.GetDataType() != DataType::kBFloat16 ||
       packed.Device() != ctx.device() || out.Device() != ctx.device() ||
       packed.Dim(0) != out.Dim(0) || packed.Dim(1) != 2 * out.Dim(1))

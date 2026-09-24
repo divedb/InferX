@@ -143,7 +143,7 @@ Status RmsNorm(ExecutionContext& /*ctx*/, const Tensor& x, const Tensor& weight,
   const int64_t dim = x.Dim(1);
   const float bias = config.plus_one_weight ? 1.0f : 0.0f;
   switch (x.GetDataType()) {
-    case DataType::kFloat:
+    case DataType::kFloat32:
       for (int64_t r = 0; r < rows; ++r) {
         HWY_DYNAMIC_DISPATCH(RmsNormRowF32)
         (static_cast<const float*>(x.Data()) + r * dim,

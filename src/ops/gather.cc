@@ -8,9 +8,6 @@ namespace inferx::ops {
 
 Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indices,
                   Tensor& out) {
-  if (!src.IsDefined() || !indices.IsDefined() || !out.IsDefined()) {
-    return InvalidArgumentError("GatherRows requires defined src, indices, and out");
-  }
   if (src.Rank() != 2 || indices.Rank() != 1 || out.Rank() != 2) {
     return InvalidArgumentError("GatherRows expects rank-2 src/out and rank-1 indices");
   }

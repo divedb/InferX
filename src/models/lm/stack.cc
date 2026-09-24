@@ -125,9 +125,9 @@ Status DecoderStack::InitWorkspace(DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(up_, alloc_flat(max_intermediate_));
   bool packed = false;
   for (const auto& weights : weights_.blocks) {
-    packed = packed || weights.mixer.packed_qkv.IsDefined();
+    packed = packed || weights.mixer.packed_qkv.has_value();
     if (const auto* ffn = std::get_if<layers::SwiGluWeights>(&weights.feed_forward))
-      packed = packed || ffn->packed_gate_up.IsDefined();
+      packed = packed || ffn->packed_gate_up.has_value();
   }
   if (packed) {
     INFERX_ASSIGN_OR_RETURN(packed_projection_,
@@ -138,12 +138,14 @@ Status DecoderStack::InitWorkspace(DeviceId device) {
   if (enable_split_decode_) {
     constexpr int batch = ops::FlashDecodeWorkspace::kMaxBatch;
     constexpr int tiles = batch * ops::FlashDecodeWorkspace::kPartitions;
-    INFERX_ASSIGN_OR_RETURN(decode_workspace_.plan,
+    INFERX_ASSIGN_OR_RETURN(auto plan,
         Tensor::Empty(DataType::kInt32, Shape({3 * tiles + batch + 2}), device));
-    INFERX_ASSIGN_OR_RETURN(decode_workspace_.values,
+    INFERX_ASSIGN_OR_RETURN(auto values,
         Tensor::Empty(DataType::kBFloat16, Shape({tiles * query_dim}), device));
-    INFERX_ASSIGN_OR_RETURN(decode_workspace_.scores,
-        Tensor::Empty(DataType::kFloat, Shape({tiles * query_heads}), device));
+    INFERX_ASSIGN_OR_RETURN(auto scores,
+        Tensor::Empty(DataType::kFloat32, Shape({tiles * query_heads}), device));
+    decode_workspace_ = ops::FlashDecodeWorkspace{std::move(plan), std::move(values),
+                                                  std::move(scores)};
   }
   workspace_ready_ = true;
   return OkStatus();
@@ -156,13 +158,13 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
   if (rows <= 0 || rows > max_tokens_) {
     return InvalidArgumentError("decoder token count exceeds workspace capacity");
   }
-  if (input.embeddings.IsDefined()) {
-    if (input.embeddings.Rank() != 2 || input.embeddings.Dim(0) != rows ||
-        input.embeddings.Dim(1) != config_.model.hidden_size ||
-        input.embeddings.Device() != ctx.device()) {
+  if (input.embeddings.has_value()) {
+    if (input.embeddings->Rank() != 2 || input.embeddings->Dim(0) != rows ||
+        input.embeddings->Dim(1) != config_.model.hidden_size ||
+        input.embeddings->Device() != ctx.device()) {
       return InvalidArgumentError("invalid prepared decoder embeddings");
     }
-  } else if (!input.token_ids.IsDefined() || input.token_ids.Rank() != 1 ||
+  } else if (input.token_ids.Rank() != 1 ||
              input.token_ids.Numel() != rows || input.token_ids.GetDataType() != DataType::kInt32 ||
              input.token_ids.Device() != ctx.device()) {
     return InvalidArgumentError("invalid decoder token input");
@@ -187,10 +189,10 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
   }
 
   // Embed tokens, or accept prepared embeddings, into the hidden workspace.
-  INFERX_ASSIGN_OR_RETURN(Tensor hidden, hidden_.Slice(0, rows));
-  if (input.embeddings.IsDefined()) {
+  INFERX_ASSIGN_OR_RETURN(Tensor hidden, hidden_->Slice(0, rows));
+  if (input.embeddings.has_value()) {
     INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(
-        hidden.Data(), input.embeddings.Data(), hidden.NBytes(), CopyKind::kDeviceToDevice,
+        hidden.Data(), input.embeddings->Data(), hidden.NBytes(), CopyKind::kDeviceToDevice,
         ctx.stream()));
   } else {
     INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, weights_.token_embedding, input.token_ids, hidden));
@@ -213,7 +215,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
       rows <= ops::FlashDecodeWorkspace::kMaxBatch;
   if (split_decode) {
     INFERX_RETURN_IF_ERROR(ops::PrepareFlashDecode(ctx, attention_batch.kv_indptr,
-        attention_batch.last_page_len, state.paged_kv->block_size(), decode_workspace_));
+        attention_batch.last_page_len, state.paged_kv->block_size(), *decode_workspace_));
   }
   for (size_t i = 0; i < config_.blocks.size(); ++i) {
     const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";
@@ -229,12 +231,12 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     if (a.projection_bias) {
       return UnimplementedError("biased projections are not implemented");
     }
-    INFERX_ASSIGN_OR_RETURN(Tensor normed, normed_.Slice(0, rows));
+    INFERX_ASSIGN_OR_RETURN(Tensor normed, normed_->Slice(0, rows));
     ops::RMSNormConfig norm{block.norm.eps, block.norm.plus_one, !block.norm.plus_one};
     if (i == 0) {
       INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, hidden, weights.input_norm, normed, norm));
     } else {
-      INFERX_ASSIGN_OR_RETURN(Tensor previous_mixed, mixed_.Slice(0, rows));
+      INFERX_ASSIGN_OR_RETURN(Tensor previous_mixed, mixed_->Slice(0, rows));
       INFERX_RETURN_IF_ERROR(ops::AddRmsNorm(ctx, previous_mixed, hidden,
                                             weights.input_norm, normed, norm));
     }
@@ -243,17 +245,17 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     if (trace.enabled()) trace.Write(prefix + "input_norm", normed);
     const int64_t query_width = a.query_heads * a.head_dim;
     const int64_t kv_width = a.kv_heads * a.head_dim;
-    INFERX_ASSIGN_OR_RETURN(Tensor q_flat, query_.Slice(0, rows * query_width));
+    INFERX_ASSIGN_OR_RETURN(Tensor q_flat, query_->Slice(0, rows * query_width));
     INFERX_ASSIGN_OR_RETURN(Tensor q, q_flat.Reshape(Shape({rows, query_width})));
-    INFERX_ASSIGN_OR_RETURN(Tensor k_flat, key_.Slice(0, rows * kv_width));
+    INFERX_ASSIGN_OR_RETURN(Tensor k_flat, key_->Slice(0, rows * kv_width));
     INFERX_ASSIGN_OR_RETURN(Tensor k, k_flat.Reshape(Shape({rows, kv_width})));
-    INFERX_ASSIGN_OR_RETURN(Tensor v_flat, value_.Slice(0, rows * kv_width));
+    INFERX_ASSIGN_OR_RETURN(Tensor v_flat, value_->Slice(0, rows * kv_width));
     INFERX_ASSIGN_OR_RETURN(Tensor v, v_flat.Reshape(Shape({rows, kv_width})));
-    if (weights.mixer.packed_qkv.IsDefined()) {
+    if (weights.mixer.packed_qkv.has_value()) {
       const int64_t width = query_width + 2 * kv_width;
-      INFERX_ASSIGN_OR_RETURN(auto flat, packed_projection_.Slice(0, rows * width));
+      INFERX_ASSIGN_OR_RETURN(auto flat, packed_projection_->Slice(0, rows * width));
       INFERX_ASSIGN_OR_RETURN(auto packed, flat.Reshape(Shape({rows, width})));
-      INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.mixer.packed_qkv, packed));
+      INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, *weights.mixer.packed_qkv, packed));
       INFERX_RETURN_IF_ERROR(ops::SplitQkv(ctx, packed, q, k, v));
     } else {
       INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.mixer.query.weight, q));
@@ -267,18 +269,18 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     if (a.qk_norm && !fused_norm_rope) {
       INFERX_ASSIGN_OR_RETURN(Tensor q_heads,
                               q.Reshape(Shape({rows * a.query_heads, a.head_dim})));
-      INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, q_heads, weights.mixer.query_norm, q_heads,
+      INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, q_heads, *weights.mixer.query_norm, q_heads,
                                           ops::RMSNormConfig{block.norm.eps, false, true}));
       INFERX_ASSIGN_OR_RETURN(Tensor k_heads,
                               k.Reshape(Shape({rows * a.kv_heads, a.head_dim})));
-      INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, k_heads, weights.mixer.key_norm, k_heads,
+      INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, k_heads, *weights.mixer.key_norm, k_heads,
                                           ops::RMSNormConfig{block.norm.eps, false, true}));
     }
     INFERX_ASSIGN_OR_RETURN(Tensor q3, q.Reshape(Shape({rows, a.query_heads, a.head_dim})));
     INFERX_ASSIGN_OR_RETURN(Tensor k3, k.Reshape(Shape({rows, a.kv_heads, a.head_dim})));
     if (fused_norm_rope) {
       INFERX_RETURN_IF_ERROR(ops::NormalizeAndApplyRope(ctx, q3, k3,
-          weights.mixer.query_norm, weights.mixer.key_norm, attention_batch.positions,
+          *weights.mixer.query_norm, *weights.mixer.key_norm, attention_batch.positions,
           block.norm.eps, ops::RotaryParams{a.rotary.dim, a.rotary.theta}));
     } else {
       INFERX_RETURN_IF_ERROR(
@@ -297,7 +299,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
                                              attention_batch.batch_indices,
                                              attention_batch.kv_indptr, attention_batch.kv_indices,
                                              key_cache, value_cache, block_size));
-    INFERX_ASSIGN_OR_RETURN(Tensor attn_flat, attn_out_.Slice(0, rows * query_width));
+    INFERX_ASSIGN_OR_RETURN(Tensor attn_flat, attn_out_->Slice(0, rows * query_width));
     INFERX_ASSIGN_OR_RETURN(Tensor attn_out, attn_flat.Reshape(Shape({rows, query_width})));
     ops::AttentionParams params;
     params.query_heads = a.query_heads;
@@ -314,14 +316,14 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
         attention_tiles += (group * length + prefill_tile_rows_ - 1) / prefill_tile_rows_;
       }
       INFERX_RETURN_IF_ERROR(ops::PrepareFlashAttention(ctx, attention_batch.qo_indptr,
-          attention_plan_, group, attention_tiles, prefill_tile_rows_));
+          *attention_plan_, group, attention_tiles, prefill_tile_rows_));
       planned_group = group;
     }
     INFERX_RETURN_IF_ERROR(ops::FlashPagedAttention(ctx, q, attention_batch.qo_indptr,
         attention_batch.kv_indptr, attention_batch.kv_indices, attention_batch.last_page_len,
-        key_cache, value_cache, block_size, params, attention_plan_, attention_tiles, attn_out,
-        split_decode ? &decode_workspace_ : nullptr, prefill_tile_rows_));
-    INFERX_ASSIGN_OR_RETURN(Tensor mixed, mixed_.Slice(0, rows));
+        key_cache, value_cache, block_size, params, *attention_plan_, attention_tiles, attn_out,
+        split_decode ? &*decode_workspace_ : nullptr, prefill_tile_rows_));
+    INFERX_ASSIGN_OR_RETURN(Tensor mixed, mixed_->Slice(0, rows));
     if (trace.enabled()) trace.Write(prefix + "attention", attn_out);
     INFERX_RETURN_IF_ERROR(ops::Linear(ctx, attn_out, weights.mixer.output.weight, mixed));
     if (trace.enabled()) trace.Write(prefix + "o_proj", mixed);
@@ -334,15 +336,15 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     }
     const auto& ffn = std::get<layers::SwiGluConfig>(block.feed_forward);
     const auto& ffn_weights = std::get<layers::SwiGluWeights>(weights.feed_forward);
-    INFERX_ASSIGN_OR_RETURN(Tensor gate_flat, gate_.Slice(0, rows * ffn.intermediate_size));
+    INFERX_ASSIGN_OR_RETURN(Tensor gate_flat, gate_->Slice(0, rows * ffn.intermediate_size));
     INFERX_ASSIGN_OR_RETURN(Tensor gate, gate_flat.Reshape(Shape({rows, ffn.intermediate_size})));
-    INFERX_ASSIGN_OR_RETURN(Tensor up_flat, up_.Slice(0, rows * ffn.intermediate_size));
+    INFERX_ASSIGN_OR_RETURN(Tensor up_flat, up_->Slice(0, rows * ffn.intermediate_size));
     INFERX_ASSIGN_OR_RETURN(Tensor up, up_flat.Reshape(Shape({rows, ffn.intermediate_size})));
-    if (ffn_weights.packed_gate_up.IsDefined()) {
+    if (ffn_weights.packed_gate_up.has_value()) {
       const int64_t width = 2 * ffn.intermediate_size;
-      INFERX_ASSIGN_OR_RETURN(auto flat, packed_projection_.Slice(0, rows * width));
+      INFERX_ASSIGN_OR_RETURN(auto flat, packed_projection_->Slice(0, rows * width));
       INFERX_ASSIGN_OR_RETURN(auto packed, flat.Reshape(Shape({rows, width})));
-      INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, ffn_weights.packed_gate_up, packed));
+      INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, *ffn_weights.packed_gate_up, packed));
       INFERX_RETURN_IF_ERROR(ops::PackedSiluAndMul(ctx, packed, gate));
     } else {
       INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, ffn_weights.gate.weight, gate));
@@ -355,8 +357,8 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     // The residual addition is fused into the next block's normalization.
   }
 
-  INFERX_ASSIGN_OR_RETURN(Tensor final_rows, normed_.Slice(0, rows));
-  INFERX_ASSIGN_OR_RETURN(Tensor last_mixed, mixed_.Slice(0, rows));
+  INFERX_ASSIGN_OR_RETURN(Tensor final_rows, normed_->Slice(0, rows));
+  INFERX_ASSIGN_OR_RETURN(Tensor last_mixed, mixed_->Slice(0, rows));
   INFERX_RETURN_IF_ERROR(ops::AddRmsNorm(
       ctx, last_mixed, hidden, weights_.final_norm, final_rows,
       ops::RMSNormConfig{config_.final_norm.eps, config_.final_norm.plus_one,
