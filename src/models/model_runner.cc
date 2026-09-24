@@ -9,6 +9,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
+#include "inferx/core/logging.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
 #include "inferx/ops/execution_context.h"
@@ -130,6 +131,11 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
                           KvBlockPool::Create(mc.num_hidden_layers, cache.num_kv_blocks,
                                               cache.block_size, layout, model.device));
   impl->pool = std::make_unique<KvBlockPool>(std::move(pool));
+  INFERX_LOG(INFO) << "runner ready: device=" << model.device.ToString() << " model="
+                   << model.model_dir << " kv_blocks=" << cache.num_kv_blocks
+                   << " block_size=" << cache.block_size
+                   << " max_tokens=" << scheduler.max_num_batched_tokens
+                   << " max_seqs=" << scheduler.max_num_seqs;
   impl->model_state.paged_kv = impl->pool.get();
   for (size_t i = 0; i < requirements.size(); ++i) {
     impl->model_state.layers.push_back(PagedKvState{static_cast<int64_t>(i)});
@@ -300,6 +306,8 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   ops::ExecutionContext ctx(*runtime, stream);
   std::optional<Tensor> logits;
   std::optional<sampling::SamplerOutput> sampled;
+  INFERX_VLOG(2) << "step: tokens=" << tokens.size() << " seqs=" << batch
+                 << " pure_decode=" << pure_decode;
   // Per-request sampling knobs plus RNG offsets, resolved for this batch.
   std::vector<sampling::SamplingMetadata::PerRequest> per(batch);
   for (int i = 0; i < batch; ++i) {
@@ -317,6 +325,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
       graph.warmed = true;
     } else {
       if (graph.exec.handle == nullptr) {
+        INFERX_VLOG(1) << "capturing decode graph for batch " << batch;
         INFERX_RETURN_IF_ERROR(runtime->BeginCapture(stream));
         auto captured = model->Forward(input, model_state, ctx);
         absl::StatusOr<sampling::SamplerOutput> samples =

@@ -9,6 +9,7 @@
 #include <memory>
 #include <utility>
 
+#include "inferx/core/logging.h"
 #include "inferx/server/api.h"
 
 namespace inferx::server {
@@ -118,7 +119,7 @@ net::awaitable<void> HttpServer::Session(beast::tcp_stream stream) {
       // session releases the connection and, via the completions handler's
       // cancel guard, the engine request. Log the reason: silent EOFs hide
       // real server bugs.
-      std::fprintf(stderr, "inferx serve: session ended: %s\n", e.what());
+      INFERX_LOG(WARNING) << "inferx serve: session ended: " << e.what();
       break;
     }
     // Pipelined leftovers, if any, belong to the next request's parse.

@@ -1,12 +1,11 @@
 #pragma once
 
-#include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <string_view>
 #include <vector>
 
 #include "inferx/core/device.h"
+#include "inferx/core/logging.h"
 #include "inferx/core/status.h"
 #include "inferx/engine/parallel_config.h"
 #include "inferx/models/causal/decoder_stack.h"
@@ -69,9 +68,8 @@ inline std::vector<Family>& RegisteredFamilies() {
 inline void RegisterFamily(Family family) {
   for (const auto& existing : RegisteredFamilies()) {
     if (existing.model_type == family.model_type) {
-      std::fprintf(stderr, "inferx: duplicate model family registration for '%s'\n",
-                   std::string(family.model_type).c_str());
-      std::abort();
+      INFERX_LOG(FATAL) << "duplicate model family registration for '"
+                        << std::string(family.model_type) << "'";
     }
   }
   RegisteredFamilies().push_back(std::move(family));

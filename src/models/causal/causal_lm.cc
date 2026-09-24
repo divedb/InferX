@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "inferx/core/logging.h"
 #include "inferx/models/causal/weight_mapping.h"
 #include "inferx/models/components/qkv_linear.h"
 #include "inferx/ops/gather.h"
@@ -107,6 +108,14 @@ StatusOr<std::unique_ptr<Model>> BuildCausalLM(models::LoadedCheckpoint& checkpo
                                            mc.hidden_size, parallel, device));
   }
   LanguageModelHead head{std::move(*head_weight)};
+  const auto& first_attention =
+      std::get<components::AttentionConfig>(rank_local.blocks.front().mixer);
+  INFERX_LOG(INFO) << "loaded decoder: layers=" << mc.num_hidden_layers
+                   << " hidden=" << mc.hidden_size << " vocab=" << mc.vocab_size
+                   << " q_heads=" << first_attention.query_heads
+                   << " kv_heads=" << first_attention.kv_heads
+                   << " head_dim=" << first_attention.head_dim
+                   << " tp=" << parallel.tensor_parallel_size;
   DecoderStack decoder(std::move(rank_local), std::move(weights), max_tokens);
   return std::unique_ptr<Model>(new CausalLM(std::move(decoder), std::move(head), max_seqs));
 }

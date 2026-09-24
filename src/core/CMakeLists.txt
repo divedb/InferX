@@ -1,4 +1,4 @@
-# inferx_core -- element types, tensors, status, and the memory layer.
+# inferx_core -- element types, tensors, status, logging, and the memory layer.
 #
 # Everything here builds with the host compiler. Files that use the CUDA runtime
 # API include <cuda_runtime_api.h>, which is plain C; only files containing
@@ -11,6 +11,7 @@ add_library(inferx_core
   caching_allocator.cc
   device_buffer.cc
   device_runtime.cc
+  logging.cc
   shape.cc
   storage.cc
   tensor.cc
@@ -31,6 +32,7 @@ target_include_directories(inferx_core PUBLIC
 
 target_link_libraries(inferx_core
   PUBLIC
+    absl::log
     absl::status
     absl::statusor
     absl::flat_hash_map
@@ -38,6 +40,7 @@ target_link_libraries(inferx_core
     absl::span
     absl::strings
   PRIVATE
+    absl::log_initialize
     mimalloc-static
 )
 

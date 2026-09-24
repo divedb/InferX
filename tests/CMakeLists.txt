@@ -138,3 +138,8 @@ if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   # Same WSL2 libcuda caveat as model_test: only the WSL copy sees the GPU.
   set_tests_properties(tensor_test PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()
+
+add_executable(inferx_logging_test unit/core/logging_test.cc)
+target_link_libraries(inferx_logging_test PRIVATE inferx::core GTest::gtest_main)
+target_compile_options(inferx_logging_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME logging_test COMMAND inferx_logging_test)

@@ -8,6 +8,8 @@
 // queued and running jobs.
 #include "inferx/server/tokenizer_pool.h"
 
+#include "inferx/core/logging.h"
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -176,9 +178,9 @@ struct TokenizerPool::Impl : std::enable_shared_from_this<Impl> {
       tokenizer = std::move(*loaded);
       ready_count.fetch_add(1);
     } else {
-      std::fprintf(stderr, "inferx serve: tokenizer worker failed to load %s: %s\n",
-                   config.tokenizer_path.c_str(),
-                   std::string(loaded.status().message()).c_str());
+      INFERX_LOG(ERROR) << "inferx serve: tokenizer worker failed to load "
+                         << config.tokenizer_path << ": "
+                         << std::string(loaded.status().message());
       failed_count.fetch_add(1);
     }
     std::lock_guard<std::mutex> lock(ready_mu);
