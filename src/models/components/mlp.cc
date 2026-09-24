@@ -19,19 +19,12 @@ Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights,
 
   INFERX_ASSIGN_OR_RETURN(Tensor gate_flat, ws.gate->Slice(0, rows * config.intermediate_size));
   INFERX_ASSIGN_OR_RETURN(Tensor gate, gate_flat.Reshape(Shape({rows, config.intermediate_size})));
-  INFERX_ASSIGN_OR_RETURN(Tensor up_flat, ws.up->Slice(0, rows * config.intermediate_size));
-  INFERX_ASSIGN_OR_RETURN(Tensor up, up_flat.Reshape(Shape({rows, config.intermediate_size})));
-  if (weights.packed_gate_up.has_value()) {
-    const int64_t width = 2 * config.intermediate_size;
-    INFERX_ASSIGN_OR_RETURN(auto flat, packed_buffer->Slice(0, rows * width));
-    INFERX_ASSIGN_OR_RETURN(auto packed, flat.Reshape(Shape({rows, width})));
-    INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, *weights.packed_gate_up, packed));
-    INFERX_RETURN_IF_ERROR(ops::PackedSiluAndMul(ctx, packed, gate));
-  } else {
-    INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.gate.weight, gate));
-    INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.up.weight, up));
-    INFERX_RETURN_IF_ERROR(ops::SiluAndMul(ctx, gate, up, gate));
-  }
+  // One fused GEMM over the packed gate/up weight, then a column de-interleave.
+  const int64_t width = 2 * config.intermediate_size;
+  INFERX_ASSIGN_OR_RETURN(auto flat, packed_buffer->Slice(0, rows * width));
+  INFERX_ASSIGN_OR_RETURN(auto packed, flat.Reshape(Shape({rows, width})));
+  INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.packed_gate_up, packed));
+  INFERX_RETURN_IF_ERROR(ops::PackedSiluAndMul(ctx, packed, gate));
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, gate, weights.down.weight, mixed_out));
   write("silu", gate);
   write("down_proj", mixed_out);

@@ -58,13 +58,19 @@ components (attention, mlp, qkv_linear, ...)  --  ops
   (`engine/parallel_config.h`, vLLM ParallelConfig analogue; defaults shard
   nothing), and loads weights with this rank's row slices.
 - **`components/`** holds the reusable transformer pieces (attention, mlp,
-  moe, norm, rope, linear, qkv_linear): config + weights + execution as
-  concrete, non-virtual pieces the stack composes. `qkv_linear` is the
-  QKVParallelLinear analogue: `ShardQkv` derives one rank's head geometry
-  (query heads divided across ranks, KV heads divided or replicated below the
-  rank count), and attention always projects through one fused
-  `[query | key | value]` GEMM whose per-projection weights are views into
-  the packed allocation.
+  moe, norm, rope, linear, qkv_linear, parallel_linear): config + weights +
+  execution as concrete, non-virtual pieces the stack composes. The
+  parallel-linear family mirrors vLLM's: `qkv_linear` is QKVParallelLinear
+  (`ShardQkv` derives one rank's head geometry — query heads divided, KV
+  heads divided or replicated below the rank count — and attention always
+  projects through one fused `[q | k | v]` GEMM whose per-projection weights
+  are views into the packed allocation); `parallel_linear`'s `ShardDim`
+  serves MergedColumnParallelLinear (fused gate|up, same view invariant),
+  RowParallelLinear (o_proj/down_proj input-column shards; partial sums
+  await collectives), and VocabParallelEmbedding (embedding and lm_head
+  vocab-row shards). `BuildCausalLM` rejects `tensor_parallel_size > 1`
+  until cross-rank collectives exist; at size 1 every shard is the whole
+  tensor and execution is unchanged.
 - **ops** holds the reusable, backend-portable operations the forwards call.
   Each op is a free function: a public header with the agnostic API and
   config, one common source that validates arguments and dispatches on the

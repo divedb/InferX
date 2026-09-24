@@ -1,55 +1,69 @@
 #include "inferx/models/causal/weight_mapping.h"
-#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
 #include "inferx/engine/parallel_config.h"
 #include "inferx/models/checkpoint.h"
+#include "inferx/models/components/parallel_linear.h"
 #include "inferx/models/components/qkv_linear.h"
 
 namespace inferx::causal {
 namespace {
-
-bool PackProjections() {
-  const char* flag = std::getenv("INFERX_EXPERIMENTAL_PACKED_PROJECTIONS");
-  return flag != nullptr && std::string_view(flag) == "1";
-}
-
-StatusOr<Tensor> Pack(std::initializer_list<Tensor*> weights, DeviceId device) {
-  const int64_t width = (*weights.begin())->Dim(1);
-  int64_t rows = 0;
-  for (const auto* w : weights) rows += w->Dim(0);
-  INFERX_ASSIGN_OR_RETURN(auto packed, Tensor::Empty(DataType::kBFloat16, Shape({rows, width}), device));
-  int64_t offset = 0;
-  for (auto* w : weights) {
-    INFERX_ASSIGN_OR_RETURN(auto view, packed.Slice(offset, offset + w->Dim(0)));
-    INFERX_RETURN_IF_ERROR(w->CopyTo(view));
-    offset += w->Dim(0);
-    *w = std::move(view);
-  }
-  return packed;
-}
 
 StatusOr<Tensor> Weight(const models::Checkpoint& checkpoint, const std::string& name,
                         std::vector<int64_t> shape, DeviceId device) {
   return checkpoint.UploadBf16(name, Shape(absl::MakeConstSpan(shape)), device);
 }
 
-StatusOr<components::LinearWeights> Linear(const models::Checkpoint& checkpoint,
-                                       const std::string& prefix,
-                                       int64_t out, int64_t in, bool bias, DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto weight, Weight(checkpoint, prefix + ".weight", {out, in}, device));
-  std::optional<Tensor> bias_weight;
-  if (bias) {
-    INFERX_ASSIGN_OR_RETURN(bias_weight, Weight(checkpoint, prefix + ".bias", {out}, device));
+/// \brief Copies columns [begin, end) of a rank-2 host tensor into a fresh
+///        contiguous host tensor.
+///
+/// RowParallelLinear shards along the input dimension, which dimension-0
+/// Tensor slices cannot express; this gather runs on the host before
+/// upload. Only tensor-parallel loads pay it -- a single rank uploads the
+/// checkpoint tensor directly.
+StatusOr<Tensor> CopyColumnRange(const Tensor& src, int64_t begin, int64_t end) {
+  if (src.Rank() != 2 || begin < 0 || end <= begin || end > src.Dim(1)) {
+    return InvalidArgumentError("invalid column range [", begin, ", ", end, ") of ",
+                                src.GetShape().ToString());
   }
-  return components::LinearWeights{std::move(weight), std::move(bias_weight)};
+  const int64_t rows = src.Dim(0);
+  const int64_t width = end - begin;
+  const int64_t elem = DataTypeByteSize(src.GetDataType(), 1);
+  INFERX_ASSIGN_OR_RETURN(
+      auto dst, Tensor::Empty(src.GetDataType(), Shape({rows, width}), DeviceId::Cpu()));
+  for (int64_t r = 0; r < rows; ++r) {
+    const auto* from = src.Bytes() + (r * src.Dim(1) + begin) * elem;
+    auto* to = dst.Bytes() + r * width * elem;
+    std::memmove(to, from, static_cast<size_t>(width * elem));
+  }
+  return dst;
 }
 
-/// \brief Loads the fused, head-sharded QKV projection (QKVParallelLinear).
+/// \brief Loads a RowParallelLinear weight: full tensor is [rows, total_cols],
+///        this rank gets its input-column shard [rows, shard.size].
+///
+/// The rank-local GEMM yields partial sums over its input slice; the
+/// cross-rank reduction arrives with the tensor-parallel milestone.
+StatusOr<Tensor> LoadRowParallel(const models::Checkpoint& checkpoint, const std::string& name,
+                                 int64_t rows, int64_t total_cols,
+                                 const ParallelConfig& parallel, DeviceId device) {
+  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(total_cols, parallel));
+  if (parallel.tensor_parallel_size == 1) {
+    return checkpoint.UploadBf16(name, Shape({rows, total_cols}), device);
+  }
+  INFERX_ASSIGN_OR_RETURN(auto host, checkpoint.FindHostBf16(name, Shape({rows, total_cols})));
+  INFERX_ASSIGN_OR_RETURN(auto gathered,
+                          CopyColumnRange(host, shard.begin, shard.begin + shard.size));
+  return gathered.To(device);
+}
+
+/// \brief Loads the fused, head-agnostic QKV projection (QKVParallelLinear).
 ///
 /// Allocates one packed device tensor of [query_rows | kv_rows | kv_rows]
 /// rows and uploads this rank's row slices of the checkpoint's q/k/v
@@ -58,8 +72,8 @@ StatusOr<components::LinearWeights> Linear(const models::Checkpoint& checkpoint,
 /// into the packed allocation, so both stay valid and share storage.
 ///
 /// The config here carries TOTAL head counts; ShardQkv derives this rank's
-/// rows and offsets. o_proj stays unsharded: column-parallel loading arrives
-/// with the tensor-parallel milestone. Projection biases are never loaded --
+/// rows and offsets. o_proj is RowParallel: its input columns shard by this
+/// rank's (undoubled) query width. Projection biases are never loaded --
 /// ValidateExecutable() rejects biased projections before any weight is read.
 StatusOr<components::AttentionWeights> LoadAttentionWeights(
     const models::Checkpoint& checkpoint, const std::string& ap,
@@ -101,9 +115,10 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
     *views[i] = std::move(dst);
     offset += part.rows;
   }
-  const int64_t qdim = a.query_heads * a.head_dim;
-  INFERX_ASSIGN_OR_RETURN(auto output, Linear(checkpoint, ap + "o_proj", hidden, qdim,
-                                              a.projection_bias, device));
+  const int64_t total_query_width = a.query_heads * a.head_dim;  // Undoubled: o_proj input.
+  INFERX_ASSIGN_OR_RETURN(auto output,
+                          LoadRowParallel(checkpoint, ap + "o_proj.weight", hidden,
+                                          total_query_width, parallel, device));
   std::optional<Tensor> query_norm, key_norm;
   if (a.qk_norm) {
     INFERX_ASSIGN_OR_RETURN(query_norm, Weight(checkpoint, ap + "q_norm.weight", {a.head_dim}, device));
@@ -114,21 +129,39 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
       components::LinearWeights{std::move(*query_view), std::nullopt},
       components::LinearWeights{std::move(*key_view), std::nullopt},
       components::LinearWeights{std::move(*value_view), std::nullopt},
-      std::move(output), std::move(query_norm), std::move(key_norm)};
+      components::LinearWeights{std::move(output), std::nullopt},
+      std::move(query_norm), std::move(key_norm)};
 }
 
+/// \brief Loads a SwiGLU block: fused gate|up (MergedColumnParallelLinear --
+///        one [2 * shard, hidden] allocation, per-rank row slices uploaded
+///        directly) plus a RowParallel down projection.
 StatusOr<components::SwiGluWeights> SwiGlu(const models::Checkpoint& checkpoint,
-                                       const std::string& prefix,
-                                       int64_t hidden, int64_t width, DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto gate, Linear(checkpoint, prefix + "gate_proj", width, hidden, false, device));
-  INFERX_ASSIGN_OR_RETURN(auto up, Linear(checkpoint, prefix + "up_proj", width, hidden, false, device));
-  INFERX_ASSIGN_OR_RETURN(auto down, Linear(checkpoint, prefix + "down_proj", hidden, width, false, device));
-  std::optional<Tensor> packed_gate_up;
-  if (PackProjections()) {
-    INFERX_ASSIGN_OR_RETURN(packed_gate_up, Pack({&gate.weight, &up.weight}, device));
+                                       const std::string& prefix, int64_t hidden,
+                                       int64_t total_intermediate,
+                                       const ParallelConfig& parallel, DeviceId device) {
+  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(total_intermediate, parallel));
+  const int64_t rows = shard.size;
+  INFERX_ASSIGN_OR_RETURN(auto packed,
+      Tensor::Empty(DataType::kBFloat16, Shape({2 * rows, hidden}), device));
+  const struct { const char* name; int64_t offset; } parts[] = {
+      {"gate_proj", 0}, {"up_proj", rows}};
+  for (const auto& part : parts) {
+    INFERX_ASSIGN_OR_RETURN(auto host, checkpoint.FindHostBf16(
+        prefix + part.name + ".weight", Shape({total_intermediate, hidden})));
+    INFERX_ASSIGN_OR_RETURN(auto slice, host.Slice(shard.begin, shard.begin + rows));
+    INFERX_ASSIGN_OR_RETURN(auto dst, packed.Slice(part.offset, part.offset + rows));
+    INFERX_RETURN_IF_ERROR(slice.CopyTo(dst));
   }
-  return components::SwiGluWeights{std::move(packed_gate_up), std::move(gate), std::move(up),
-                               std::move(down)};
+  INFERX_ASSIGN_OR_RETURN(Tensor gate_view, packed.Slice(0, rows));
+  INFERX_ASSIGN_OR_RETURN(Tensor up_view, packed.Slice(rows, 2 * rows));
+  INFERX_ASSIGN_OR_RETURN(auto down,
+                          LoadRowParallel(checkpoint, prefix + "down_proj.weight", hidden,
+                                          total_intermediate, parallel, device));
+  return components::SwiGluWeights{std::move(packed),
+      components::LinearWeights{std::move(gate_view), std::nullopt},
+      components::LinearWeights{std::move(up_view), std::nullopt},
+      components::LinearWeights{std::move(down), std::nullopt}};
 }
 
 StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(const models::Checkpoint& checkpoint,
@@ -145,7 +178,8 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(const models::Checkpo
   INFERX_ASSIGN_OR_RETURN(auto attn, LoadAttentionWeights(checkpoint, ap, a, parallel, hidden, device));
   const std::string fp = prefix + names.feed_forward_name;
   if (const auto* dense = std::get_if<components::SwiGluConfig>(&config.feed_forward)) {
-    INFERX_ASSIGN_OR_RETURN(auto ffn, SwiGlu(checkpoint, fp, hidden, dense->intermediate_size, device));
+    INFERX_ASSIGN_OR_RETURN(auto ffn, SwiGlu(checkpoint, fp, hidden, dense->intermediate_size,
+                                             parallel, device));
     return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm), std::move(attn),
                                 std::move(ffn)};
   }
@@ -153,13 +187,15 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(const models::Checkpo
   INFERX_ASSIGN_OR_RETURN(auto router, Weight(checkpoint, fp + "gate.weight", {m.num_experts, hidden}, device));
   std::vector<components::SwiGluWeights> experts;
   for (int64_t i = 0; i < m.num_experts; ++i) {
-    INFERX_ASSIGN_OR_RETURN(auto expert, SwiGlu(checkpoint, fp + "experts." + std::to_string(i) + ".", hidden, m.intermediate_size, device));
+    INFERX_ASSIGN_OR_RETURN(auto expert, SwiGlu(checkpoint, fp + "experts." + std::to_string(i) + ".", hidden,
+                                                m.intermediate_size, parallel, device));
     experts.push_back(std::move(expert));
   }
   std::optional<components::SwiGluWeights> shared_expert;
   std::optional<Tensor> shared_expert_gate;
   if (m.shared_intermediate_size > 0) {
-    INFERX_ASSIGN_OR_RETURN(shared_expert, SwiGlu(checkpoint, fp + "shared_expert.", hidden, m.shared_intermediate_size, device));
+    INFERX_ASSIGN_OR_RETURN(shared_expert, SwiGlu(checkpoint, fp + "shared_expert.", hidden,
+                                                  m.shared_intermediate_size, parallel, device));
     if (m.gate_shared_expert) {
       INFERX_ASSIGN_OR_RETURN(shared_expert_gate, Weight(checkpoint, fp + "shared_expert_gate.weight", {1, hidden}, device));
     }
@@ -177,6 +213,16 @@ StatusOr<Tensor> LoadWeight(const models::Checkpoint& checkpoint, std::string_vi
   return checkpoint.UploadBf16(name, expected, device);
 }
 
+StatusOr<Tensor> LoadVocabShard(const models::Checkpoint& checkpoint, std::string_view name,
+                                int64_t vocab, int64_t hidden, const ParallelConfig& parallel,
+                                DeviceId device) {
+  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(vocab, parallel));
+  INFERX_ASSIGN_OR_RETURN(auto host,
+                          checkpoint.FindHostBf16(name, Shape({vocab, hidden})));
+  INFERX_ASSIGN_OR_RETURN(auto slice, host.Slice(shard.begin, shard.begin + shard.size));
+  return slice.To(device);
+}
+
 StatusOr<DecoderWeights> LoadDecoderWeights(const models::Checkpoint& checkpoint,
                                             const DecoderConfig& config,
                                             const CheckpointLayout& names,
@@ -188,7 +234,8 @@ StatusOr<DecoderWeights> LoadDecoderWeights(const models::Checkpoint& checkpoint
   }
   const auto& mc = config.model;
   INFERX_ASSIGN_OR_RETURN(auto token_embedding,
-      Weight(checkpoint, names.backbone_prefix + "embed_tokens.weight", {mc.vocab_size, mc.hidden_size}, device));
+      LoadVocabShard(checkpoint, names.backbone_prefix + "embed_tokens.weight", mc.vocab_size,
+                     mc.hidden_size, parallel, device));
   INFERX_ASSIGN_OR_RETURN(auto final_norm,
       Weight(checkpoint, names.backbone_prefix + "norm.weight", {mc.hidden_size}, device));
   std::vector<components::DecoderLayerWeights> blocks;

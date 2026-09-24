@@ -148,7 +148,6 @@ Status DecoderStack::InitWorkspace(DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(attention_->value, alloc_flat(kv_dim));
   INFERX_ASSIGN_OR_RETURN(attention_->attn_out, alloc_flat(query_dim));
   INFERX_ASSIGN_OR_RETURN(mlp_->gate, alloc_flat(max_intermediate_));
-  INFERX_ASSIGN_OR_RETURN(mlp_->up, alloc_flat(max_intermediate_));
   // Attention always runs the fused QKV projection, and packed gate/up rows
   // can be wider; one buffer serves both since they never overlap in time.
   INFERX_ASSIGN_OR_RETURN(packed_projection_,
@@ -253,8 +252,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     INFERX_RETURN_IF_ERROR(components::RunAttention(
         a, weights.mixer, normed, layer.norm.eps, attention_batch,
         std::get<PagedKvState>(state.layers[i]), *state.paged_kv, *attention_,
-        packed_projection_.has_value() ? &*packed_projection_ : nullptr, ctx, &trace, prefix,
-        mixed));
+        &*packed_projection_, ctx, &trace, prefix, mixed));
 
     // Feed-forward: norm, SwiGLU, project back; residual is fused into the
     // next layer's normalization.
@@ -263,8 +261,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     if (trace.enabled()) trace.Write(prefix + "residual", hidden);
     INFERX_RETURN_IF_ERROR(components::RunFeedForward(
         layer.feed_forward, weights.feed_forward, normed, *mlp_,
-        packed_projection_.has_value() ? &*packed_projection_ : nullptr, ctx, &trace, prefix,
-        mixed));
+        &*packed_projection_, ctx, &trace, prefix, mixed));
   }
 
   INFERX_ASSIGN_OR_RETURN(Tensor final_rows, normed_->Slice(0, rows));

@@ -92,6 +92,7 @@ add_library(inferx_models
   models/components/decoder_layer.cc
   models/components/mlp.cc
   models/components/moe.cc
+  models/components/parallel_linear.cc
   models/components/qkv_linear.cc
   models/causal/causal_lm.cc
   models/causal/decoder_stack.cc

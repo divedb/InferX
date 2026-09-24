@@ -80,6 +80,14 @@ StatusOr<std::unique_ptr<Model>> BuildCausalLM(models::LoadedCheckpoint& checkpo
                                                DeviceId device, int max_tokens, int max_seqs,
                                                const ParallelConfig& parallel) {
   INFERX_RETURN_IF_ERROR(parallel.Validate());
+  if (parallel.tensor_parallel_size > 1) {
+    // Geometry and loading are shard-ready (QKV, merged gate/up, row-parallel
+    // o_proj/down, vocab shards); forward is not: RowParallel partial sums
+    // and sharded-vocab logits need cross-rank collectives.
+    return UnimplementedError(
+        "tensor-parallel execution awaits collectives; geometry and loading "
+        "are shard-ready, forward is not");
+  }
   INFERX_RETURN_IF_ERROR(config.Validate());
   DecoderConfig rank_local = config;  // Execution copy; loading uses totals.
   INFERX_RETURN_IF_ERROR(ApplyParallelSharding(rank_local, parallel));
@@ -94,8 +102,9 @@ StatusOr<std::unique_ptr<Model>> BuildCausalLM(models::LoadedCheckpoint& checkpo
   if (mc.tie_word_embeddings) {
     head_weight = weights.token_embedding;
   } else {
-    INFERX_ASSIGN_OR_RETURN(head_weight, LoadWeight(checkpoint.weights, layout.head_name,
-                                                    Shape({mc.vocab_size, mc.hidden_size}), device));
+    INFERX_ASSIGN_OR_RETURN(head_weight,
+                            LoadVocabShard(checkpoint.weights, layout.head_name, mc.vocab_size,
+                                           mc.hidden_size, parallel, device));
   }
   LanguageModelHead head{std::move(*head_weight)};
   DecoderStack decoder(std::move(rank_local), std::move(weights), max_tokens);

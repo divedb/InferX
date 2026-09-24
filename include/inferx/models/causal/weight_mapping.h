@@ -30,6 +30,15 @@ struct CheckpointLayout {
 StatusOr<Tensor> LoadWeight(const models::Checkpoint& checkpoint, std::string_view name,
                             const Shape& expected, DeviceId device);
 
+/// \brief Loads one rank's vocab-dim row shard of `name`
+///        (VocabParallelEmbedding analogue), shape-checked against the
+///        full [vocab, hidden] tensor.
+///
+/// At tensor_parallel_size == 1 this is the whole embedding.
+StatusOr<Tensor> LoadVocabShard(const models::Checkpoint& checkpoint, std::string_view name,
+                                int64_t vocab, int64_t hidden, const ParallelConfig& parallel,
+                                DeviceId device);
+
 /// \brief Maps every decoder tensor (embedding, final norm, all layers) of
 /// `checkpoint` through `layout`, with shape checks before upload.
 ///
