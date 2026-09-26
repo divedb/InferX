@@ -5,18 +5,18 @@
 #include <string>
 #include <vector>
 
-#include "inferx/cache/cache_config.h"
+#include "inferx/config/cache_config.h"
 #include "inferx/cache/kv_block_pool.h"
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/status.h"
 #include "inferx/core/stream.h"
-#include "inferx/engine/execution_config.h"
-#include "inferx/engine/parallel_config.h"
-#include "inferx/engine/scheduler.h"
+#include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
+#include "inferx/config/scheduler_config.h"
 #include "inferx/engine/scheduler_output.h"
 #include "inferx/models/model.h"
-#include "inferx/models/model_config.h"
+#include "inferx/config/model_config.h"
 
 namespace inferx {
 
@@ -39,16 +39,18 @@ class ModelRunner {
   ///
   /// `scheduler` sizes the input buffers (token budget and sequence
   /// capacity) and must match the scheduler the engine steps with.
-  static StatusOr<std::unique_ptr<ModelRunner>> Create(
-      const ModelConfig& model, const CacheConfig& cache,
-      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
-      const ParallelConfig& parallel = {});
+  static StatusOr<std::unique_ptr<ModelRunner>> Create(const ModelConfig& model,
+                                                       const CacheConfig& cache,
+                                                       const SchedulerConfig& scheduler,
+                                                       const ExecutionConfig& execution,
+                                                       const ParallelConfig& parallel = {});
 
   /// \brief Same, with a model supplied by the caller (tests).
-  static StatusOr<std::unique_ptr<ModelRunner>> Create(
-      const ModelConfig& model, const CacheConfig& cache,
-      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
-      std::unique_ptr<Model> loaded);
+  static StatusOr<std::unique_ptr<ModelRunner>> Create(const ModelConfig& model,
+                                                       const CacheConfig& cache,
+                                                       const SchedulerConfig& scheduler,
+                                                       const ExecutionConfig& execution,
+                                                       std::unique_ptr<Model> loaded);
 
   ~ModelRunner();
 
@@ -67,6 +69,7 @@ class ModelRunner {
 
  private:
   explicit ModelRunner(std::unique_ptr<ModelRunnerImpl> impl);
+
   std::unique_ptr<ModelRunnerImpl> impl_;
 };
 

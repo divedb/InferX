@@ -1,8 +1,8 @@
 /// \file
 /// \brief Execution strategy selection (vLLM CompilationConfig analogue).
 
-#ifndef INFERX_ENGINE_EXECUTION_CONFIG_H_
-#define INFERX_ENGINE_EXECUTION_CONFIG_H_
+#ifndef INFERX_CONFIG_EXECUTION_CONFIG_H_
+#define INFERX_CONFIG_EXECUTION_CONFIG_H_
 
 #include <string>
 #include <vector>
@@ -24,4 +24,4 @@ struct ExecutionConfig {
 
 }  // namespace inferx
 
-#endif  // INFERX_ENGINE_EXECUTION_CONFIG_H_
+#endif  // INFERX_CONFIG_EXECUTION_CONFIG_H_

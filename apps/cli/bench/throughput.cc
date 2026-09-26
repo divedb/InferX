@@ -7,7 +7,7 @@
 #include "cli/args/bench_output_args.h"
 #include "cli/args/dataset_args.h"
 #include "cli/args/engine_args.h"
-#include "cli/args/model_config.h"
+#include "cli/args/model_config_args.h"
 #include "cli/commands.h"
 #include "cli/error.h"
 #include "inferx/bench/throughput.h"
@@ -34,7 +34,7 @@ struct ThroughputArgs {
     p.scheduler = engine.BuildSchedulerConfig();
     p.execution = engine.BuildExecutionConfig();
     p.dataset = dataset.Build();
-    p.dataset.seed = model.seed;  // vLLM folds --seed into the model args
+    p.dataset.seed = model.config.seed;  // vLLM folds --seed into the model args
     p.num_prompts = num_prompts;
     p.num_iters = num_iters;
     p.num_iters_warmup = num_iters_warmup;

@@ -8,6 +8,17 @@
 
 namespace inferx {
 
+/// \brief Whether this build carries the CUDA runtime.
+///
+/// Compile-time capability only: it constrains device-type choices (a
+/// CPU-only build rejects "cuda" up front). Whether a GPU is actually
+/// attached is a runtime question answered at device activation.
+#ifdef INFERX_WITH_CUDA
+inline constexpr bool kCudaBuilt = true;
+#else
+inline constexpr bool kCudaBuilt = false;
+#endif
+
 /// \brief The alignment of anything a kernel reads.
 ///
 /// 128 B is the L1/L2 cache line, so a row start maps a warp's 128 B request

@@ -24,6 +24,14 @@ struct GenerationConfig {
 
   /// \brief Parses a `generation_config.json` file.
   static absl::StatusOr<GenerationConfig> FromFile(const std::string& path);
+
+  /// \brief vLLM --generation-config semantics: "vllm" keeps engine
+  ///        defaults (nullopt), "auto" loads generation_config.json from
+  ///        `model_dir` (absent -> nullopt; minimal checkpoints ship none),
+  ///        and any other value is a directory to load it from. An explicit
+  ///        directory that cannot be read is an error.
+  static absl::StatusOr<std::optional<GenerationConfig>> Resolve(
+      const std::string& model_dir, const std::string& generation_config);
 };
 
 /// \brief Model dimensions and hyperparameters parsed from a HuggingFace

@@ -143,3 +143,8 @@ add_executable(inferx_logging_test unit/core/logging_test.cc)
 target_link_libraries(inferx_logging_test PRIVATE inferx::core GTest::gtest_main)
 target_compile_options(inferx_logging_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME logging_test COMMAND inferx_logging_test)
+
+add_executable(inferx_device_config_test unit/config/device_config_test.cc)
+target_link_libraries(inferx_device_config_test PRIVATE inferx::core GTest::gtest_main)
+target_compile_options(inferx_device_config_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME device_config_test COMMAND inferx_device_config_test)

@@ -4,7 +4,7 @@
 
 #include "cli/args/bench_output_args.h"
 #include "cli/args/engine_args.h"
-#include "cli/args/model_config.h"
+#include "cli/args/model_config_args.h"
 #include "cli/commands.h"
 #include "cli/error.h"
 #include "inferx/bench/latency.h"

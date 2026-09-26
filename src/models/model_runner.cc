@@ -34,6 +34,7 @@ struct ModelRunnerImpl {
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
+  DeviceId device;  ///< Resolved once from config.device.PrimaryDevice().
   DeviceRuntime* runtime = nullptr;
   Stream stream;
   std::unique_ptr<Model> model;
@@ -86,8 +87,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     return InvalidArgumentError("runner requires positive token and sequence capacities");
   }
   INFERX_ASSIGN_OR_RETURN(
-      auto loaded, Model::Load(model.model_dir, model.device, scheduler.max_num_batched_tokens,
-                               scheduler.max_num_seqs, parallel));
+      auto loaded, Model::Load(model.model_dir, model.device.PrimaryDevice(),
+                               scheduler.max_num_batched_tokens, scheduler.max_num_seqs, parallel));
   return Create(model, cache, scheduler, execution, std::move(loaded));
 }
 
@@ -99,6 +100,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
       cache.block_size <= 0 || cache.block_size > std::numeric_limits<int32_t>::max()) {
     return InvalidArgumentError("runner requires a model, and positive int32 KV capacities");
   }
+  INFERX_RETURN_IF_ERROR(model.device.Validate());
+  const DeviceId device = model.device.PrimaryDevice();
   const auto requirements = loaded->StateRequirements();
   if (requirements.empty() || requirements.size() !=
                                   static_cast<size_t>(loaded->config().num_hidden_layers)) {
@@ -123,15 +126,16 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   impl->scheduler = scheduler;
   impl->execution = execution;
   impl->model = std::move(loaded);
-  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(model.device));
+  impl->device = device;
+  INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(impl->runtime->Activate());
   INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream());
   const auto& mc = impl->model->config();
   INFERX_ASSIGN_OR_RETURN(auto pool,
                           KvBlockPool::Create(mc.num_hidden_layers, cache.num_kv_blocks,
-                                              cache.block_size, layout, model.device));
+                                              cache.block_size, layout, device));
   impl->pool = std::make_unique<KvBlockPool>(std::move(pool));
-  INFERX_LOG(INFO) << "runner ready: device=" << model.device.ToString() << " model="
+  INFERX_LOG(INFO) << "runner ready: device=" << device.ToString() << " model="
                    << model.model_dir << " kv_blocks=" << cache.num_kv_blocks
                    << " block_size=" << cache.block_size
                    << " max_tokens=" << scheduler.max_num_batched_tokens
@@ -141,7 +145,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     impl->model_state.layers.push_back(PagedKvState{static_cast<int64_t>(i)});
   }
   auto alloc = [&](int64_t size) {
-    return Tensor::Empty(DataType::kInt32, Shape({size}), model.device);
+    return Tensor::Empty(DataType::kInt32, Shape({size}), device);
   };
   const int64_t T = scheduler.max_num_batched_tokens;
   const int64_t S = scheduler.max_num_seqs;
@@ -162,7 +166,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->kv_indices, input_view(cache.num_kv_blocks));
   INFERX_ASSIGN_OR_RETURN(impl->last_page_len, input_view(S));
   INFERX_ASSIGN_OR_RETURN(impl->logit_rows, input_view(S));
-  if (model.device.IsCuda()) {
+  if (device.IsCuda()) {
     INFERX_ASSIGN_OR_RETURN(void* inputs,
         impl->runtime->AllocatePinnedHost(impl->input_storage->NBytes()));
     impl->host_inputs = static_cast<int32_t*>(inputs);
@@ -171,7 +175,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     impl->host_samples = static_cast<int32_t*>(host);
   }
   INFERX_ASSIGN_OR_RETURN(impl->sampler,
-                          sampling::Sampler::Create(scheduler.max_num_seqs, mc.vocab_size, model.device));
+                          sampling::Sampler::Create(scheduler.max_num_seqs, mc.vocab_size, device));
   return std::unique_ptr<ModelRunner>(new ModelRunner(std::move(impl)));
 }
 
@@ -316,7 +320,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   }
   const sampling::SamplingMetadata metadata =
       sampling::SamplingMetadata::Build(mc.vocab_size, absl::MakeConstSpan(per));
-  if (pure_decode && execution.enable_cuda_graphs && config.device.IsCuda() &&
+  if (pure_decode && execution.enable_cuda_graphs && device.IsCuda() &&
       model->SupportsCudaGraphs()) {
     auto& graph = decode_graphs[batch];
     if (!graph.warmed) {
@@ -357,7 +361,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   if (logits->Rank() != 2 || logits->Dim(0) != batch ||
       (logits->GetDataType() != DataType::kBFloat16 &&
        logits->GetDataType() != DataType::kFloat32) ||
-      logits->Device() != config.device) {
+      logits->Device() != device) {
     return InternalError("model returned malformed logits for the scheduled batch");
   }
   if (sampled->sampled_token_ids.Dim(0) != batch)

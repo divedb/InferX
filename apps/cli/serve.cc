@@ -5,10 +5,11 @@
 #include <string>
 
 #include "cli/args/engine_args.h"
-#include "cli/args/model_config.h"
+#include "cli/args/model_config_args.h"
 #include "cli/args/sampling_args.h"
 #include "cli/commands.h"
 #include "cli/error.h"
+#include "inferx/models/checkpoint_config.h"
 
 namespace inferx::cli {
 namespace {
@@ -35,7 +36,6 @@ struct ServeArgs {
     ApplyGenerationConfig(&p.default_sampling);
     p.host = host;
     p.port = port;
-    p.served_model_name = model.ServedName();
     p.tokenizer.workers = tokenizer_workers;
     p.tokenizer.queue_max_requests =
         static_cast<std::size_t>(tokenizer_queue_max_requests);
@@ -54,15 +54,16 @@ struct ServeArgs {
   ///        explicitly win over it, and --override-generation-config merges
   ///        last regardless.
   void ApplyGenerationConfig(sampling::SamplingParams* defaults) const {
-    auto resolved = model.ResolveGenerationConfig();
+    auto resolved = GenerationConfig::Resolve(model.config.model_dir,
+                                              model.config.generation_config);
     if (!resolved.ok()) throw CommandError(resolved.status());
     if (resolved->has_value()) {
-      MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
+      server::MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
     }
-    if (!model.override_generation_config.empty()) {
-      auto overrides = GenerationConfig::FromJson(model.override_generation_config);
+    if (!model.config.override_generation_config.empty()) {
+      auto overrides = GenerationConfig::FromJson(model.config.override_generation_config);
       if (!overrides.ok()) throw CommandError(overrides.status());
-      MergeGenerationConfig(*overrides, defaults);
+      server::MergeGenerationConfig(*overrides, defaults);
     }
     ThrowIfError(defaults->Validate());
   }

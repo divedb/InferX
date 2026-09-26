@@ -101,8 +101,7 @@ class InferxDispatcher : public RequestDispatcher {
  public:
   InferxDispatcher(const ServeParams& params, EngineGateway& gateway,
                    TokenizerPool& tokenizer_pool)
-      : model_(params.served_model_name.empty() ? params.model.model_dir
-                                                : params.served_model_name),
+      : model_(params.model.ServedName()),
         defaults_(params.default_sampling),
         gateway_(gateway),
         pool_(tokenizer_pool),
@@ -307,12 +306,27 @@ class InferxDispatcher : public RequestDispatcher {
 
 }  // namespace
 
+void MergeGenerationConfig(const GenerationConfig& gen,
+                           sampling::SamplingParams* sampling,
+                           const std::set<std::string>& skip) {
+  if (gen.temperature && !skip.count("temperature")) {
+    sampling->temperature = *gen.temperature;
+  }
+  if (gen.top_p && !skip.count("top-p")) sampling->top_p = *gen.top_p;
+  if (gen.min_p) sampling->min_p = *gen.min_p;
+  if (gen.top_k) sampling->top_k = *gen.top_k > 0 ? static_cast<std::uint32_t>(*gen.top_k) : 0;
+  if (gen.repetition_penalty) {
+    sampling->repetition_penalty = *gen.repetition_penalty;
+  }
+  if (gen.max_new_tokens && !skip.count("max-tokens") && *gen.max_new_tokens > 0) {
+    sampling->max_tokens = static_cast<std::uint32_t>(*gen.max_new_tokens);
+  }
+}
+
 Status RunServe(const ServeParams& params) {
   return Guarded([&]() -> Status {
     const std::string tokenizer_path =
-        (params.model.tokenizer_dir.empty() ? params.model.model_dir
-                                            : params.model.tokenizer_dir) +
-        "/tokenizer.json";
+        params.model.ResolvedTokenizerDir() + "/tokenizer.json";
     // Decode side only: the engine thread owns this instance exclusively;
     // prompt encoding lives in the pool's worker threads.
     auto decode_tokenizer = Take(Tokenizer::FromFile(tokenizer_path));

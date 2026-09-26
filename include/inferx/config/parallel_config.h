@@ -1,8 +1,8 @@
 /// \file
 /// \brief Parallel execution topology (vLLM ParallelConfig analogue).
 
-#ifndef INFERX_ENGINE_PARALLEL_CONFIG_H_
-#define INFERX_ENGINE_PARALLEL_CONFIG_H_
+#ifndef INFERX_CONFIG_PARALLEL_CONFIG_H_
+#define INFERX_CONFIG_PARALLEL_CONFIG_H_
 
 #include "inferx/core/status.h"
 
@@ -34,4 +34,4 @@ struct ParallelConfig {
 
 }  // namespace inferx
 
-#endif  // INFERX_ENGINE_PARALLEL_CONFIG_H_
+#endif  // INFERX_CONFIG_PARALLEL_CONFIG_H_

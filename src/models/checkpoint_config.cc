@@ -118,6 +118,19 @@ absl::StatusOr<GenerationConfig> GenerationConfig::FromFile(
   return FromJson(buffer.str());
 }
 
+absl::StatusOr<std::optional<GenerationConfig>> GenerationConfig::Resolve(
+    const std::string& model_dir, const std::string& generation_config) {
+  if (generation_config == "vllm") return std::nullopt;
+  const std::string& dir =
+      generation_config == "auto" ? model_dir : generation_config;
+  auto loaded = GenerationConfig::FromFile(dir + "/generation_config.json");
+  if (loaded.ok()) return std::optional<GenerationConfig>(*loaded);
+  if (generation_config == "auto" && absl::IsNotFound(loaded.status())) {
+    return std::nullopt;
+  }
+  return loaded.status();
+}
+
 absl::StatusOr<CheckpointConfig> CheckpointConfig::FromJson(const std::string& text) {
   nlohmann::json j;
   try {

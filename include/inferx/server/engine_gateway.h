@@ -18,12 +18,12 @@
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 
-#include "inferx/cache/cache_config.h"
+#include "inferx/config/cache_config.h"
 #include "inferx/core/status.h"
-#include "inferx/engine/execution_config.h"
+#include "inferx/config/execution_config.h"
 #include "inferx/engine/request.h"
-#include "inferx/engine/scheduler.h"
-#include "inferx/models/model_config.h"
+#include "inferx/config/scheduler_config.h"
+#include "inferx/config/model_config.h"
 #include "inferx/models/model_runner.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/tokenizer/tokenizer.h"

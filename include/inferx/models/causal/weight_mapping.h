@@ -8,7 +8,7 @@
 
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
-#include "inferx/engine/parallel_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/models/causal/decoder_stack.h"
 #include "inferx/models/checkpoint.h"
 

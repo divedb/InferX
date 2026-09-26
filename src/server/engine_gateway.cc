@@ -11,6 +11,7 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "inferx/engine/scheduler.h"
 
 #include <algorithm>
 #include <atomic>

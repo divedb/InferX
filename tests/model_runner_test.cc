@@ -75,7 +75,7 @@ class ModelRunnerTest : public ::testing::Test {
  protected:
   void MakeRunner(int budget) {
     ModelConfig mc;
-    mc.device = DeviceId::Cpu();
+    mc.device.device_type = "cpu";
     SchedulerConfig sc;
     sc.max_num_batched_tokens = budget;
     sc.max_num_seqs = 4;
@@ -191,7 +191,7 @@ TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   auto model = std::make_unique<TestModel>();
   model->requirements = {PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kFloat32}}};
   ModelConfig mc;
-  mc.device = DeviceId::Cpu();
+  mc.device.device_type = "cpu";
   CacheConfig cc;
   cc.num_kv_blocks = 2;
   auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));

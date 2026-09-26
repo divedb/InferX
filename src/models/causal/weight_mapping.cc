@@ -7,7 +7,7 @@
 #include <variant>
 #include <vector>
 
-#include "inferx/engine/parallel_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/models/checkpoint.h"
 #include "inferx/models/components/parallel_linear.h"
 #include "inferx/models/components/qkv_linear.h"

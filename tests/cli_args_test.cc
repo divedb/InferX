@@ -11,9 +11,11 @@
 #include "gtest/gtest.h"
 
 #include "cli/args/dataset_args.h"
+#include "inferx/models/checkpoint_config.h"
 #include "inferx/ops/attention.h"
+#include "inferx/server/serve.h"
 #include "cli/args/engine_args.h"
-#include "cli/args/model_config.h"
+#include "cli/args/model_config_args.h"
 #include "cli/args/sampling_args.h"
 #include "cli/commands.h"
 #include "cli/error.h"
@@ -42,7 +44,7 @@ TEST(EngineArgsTest, ParsesOptionsIntoStruct) {
 
 TEST(EngineArgsTest, BuildsConsistentConfigs) {
   inferx::cli::ModelConfigArgs model;
-  model.model = "models/foo";
+  model.config.model_dir = "models/foo";
   inferx::cli::EngineArgs args;
   args.max_num_seqs = 7;
   args.max_num_batched_tokens = 512;
@@ -123,19 +125,19 @@ TEST(ModelConfigArgsTest, ParsesOptionsIntoStruct) {
               "--dtype", "float16", "--seed", "7", "--max-model-len", "2048",
               "--served-model-name", "foo", "--generation-config", "configs/foo",
               "--override-generation-config", R"({"temperature": 0.5})"});
-  EXPECT_EQ(args.model, "models/foo");
-  EXPECT_EQ(args.tokenizer, "tokenizers/foo");
-  EXPECT_EQ(args.dtype, "float16");
-  EXPECT_EQ(args.seed, 7);
-  EXPECT_EQ(args.max_model_len, 2048);
-  EXPECT_EQ(args.served_model_name, "foo");
-  EXPECT_EQ(args.generation_config, "configs/foo");
-  EXPECT_EQ(args.override_generation_config, R"({"temperature": 0.5})");
+  EXPECT_EQ(args.config.model_dir, "models/foo");
+  EXPECT_EQ(args.config.tokenizer_dir, "tokenizers/foo");
+  EXPECT_EQ(args.config.dtype, "float16");
+  EXPECT_EQ(args.config.seed, 7);
+  EXPECT_EQ(args.config.max_model_len, 2048);
+  EXPECT_EQ(args.config.served_model_name, "foo");
+  EXPECT_EQ(args.config.generation_config, "configs/foo");
+  EXPECT_EQ(args.config.override_generation_config, R"({"temperature": 0.5})");
 
   const ModelConfig built = args.Build();
   EXPECT_EQ(built.model_dir, "models/foo");
   EXPECT_EQ(built.tokenizer_dir, "tokenizers/foo");
-  EXPECT_EQ(built.device, DeviceId::Cuda(0));
+  EXPECT_EQ(built.device.PrimaryDevice(), DeviceId::Cuda(0));
   EXPECT_EQ(built.dtype, "float16");
   EXPECT_EQ(built.seed, 7);
   EXPECT_EQ(built.max_model_len, 2048);
@@ -143,14 +145,16 @@ TEST(ModelConfigArgsTest, ParsesOptionsIntoStruct) {
 
 TEST(ModelConfigArgsTest, DefaultsFallBackToModelDirAndName) {
   inferx::cli::ModelConfigArgs args;
-  EXPECT_EQ(args.dtype, "auto");
-  EXPECT_EQ(args.generation_config, "auto");
-  EXPECT_EQ(args.ServedName(), args.model);
-  EXPECT_EQ(args.TokenizerDir(), args.model);
+  EXPECT_EQ(args.config.dtype, "auto");
+  EXPECT_EQ(args.config.generation_config, "auto");
+  EXPECT_EQ(args.config.ServedName(), args.config.model_dir);
+  EXPECT_EQ(args.config.ResolvedTokenizerDir(), args.config.model_dir);
   const ModelConfig built = args.Build();
-  EXPECT_EQ(built.model_dir, args.model);
-  EXPECT_EQ(built.tokenizer_dir, args.model);
-  EXPECT_EQ(built.device, DeviceId::Cuda(0));
+  EXPECT_EQ(built.model_dir, args.config.model_dir);
+  // The fallback is derived at use, not materialized: empty means "unset".
+  EXPECT_TRUE(built.tokenizer_dir.empty());
+  EXPECT_EQ(built.ResolvedTokenizerDir(), args.config.model_dir);
+  EXPECT_EQ(built.device.PrimaryDevice(), DeviceId::Cuda(0));
 }
 
 TEST(ModelConfigArgsTest, RejectsInvalidValues) {
@@ -164,38 +168,32 @@ TEST(ModelConfigArgsTest, RejectsInvalidValues) {
   }
 }
 
-TEST(ModelConfigArgsTest, GenerationConfigResolution) {
+TEST(GenerationConfigResolveTest, ModeSemantics) {
   // "vllm" always keeps engine defaults.
-  inferx::cli::ModelConfigArgs args;
-  args.generation_config = "vllm";
-  auto none = args.ResolveGenerationConfig();
+  auto none = GenerationConfig::Resolve("models/foo", "vllm");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // "auto" with no generation_config.json is normal, not an error.
-  args.generation_config = "auto";
-  args.model = "/nonexistent-inferx-model-dir";
-  none = args.ResolveGenerationConfig();
+  none = GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // An explicit directory must exist and load.
-  args.generation_config = "/nonexistent-inferx-model-dir";
-  auto missing = args.ResolveGenerationConfig();
+  auto missing = GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
+                                           "/nonexistent-inferx-model-dir");
   EXPECT_FALSE(missing.ok());
 }
 
-TEST(ModelConfigArgsTest, GenerationConfigResolutionLoadsExplicitDirectory) {
+TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
   const std::string dir = "/tmp/inferx_generation_config_test";
   std::filesystem::create_directories(dir);
   { std::ofstream(dir + "/generation_config.json") << R"({"temperature": 0.7})"; }
-  inferx::cli::ModelConfigArgs args;
-  args.generation_config = dir;
-  auto loaded = args.ResolveGenerationConfig();
+  auto loaded = GenerationConfig::Resolve("models/foo", dir);
   ASSERT_TRUE(loaded.ok());
   ASSERT_TRUE(loaded->has_value());
-  ASSERT_TRUE((**loaded).temperature.has_value());
-  EXPECT_FLOAT_EQ(*(**loaded).temperature, 0.7f);
+  ASSERT_TRUE((*loaded)->temperature.has_value());
+  EXPECT_FLOAT_EQ(*(*loaded)->temperature, 0.7f);
 }
 
 TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
@@ -207,7 +205,7 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
   EXPECT_FLOAT_EQ(*gen->temperature, 0.6f);
 
   sampling::SamplingParams merged;
-  inferx::cli::MergeGenerationConfig(*gen, &merged);
+  inferx::server::MergeGenerationConfig(*gen, &merged);
   EXPECT_FLOAT_EQ(merged.temperature, 0.6f);
   EXPECT_FLOAT_EQ(merged.top_p, 0.95f);
   EXPECT_EQ(merged.top_k, 20u);
@@ -218,7 +216,7 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
   sampling::SamplingParams explicit_wins;
   explicit_wins.temperature = 0.1f;
   explicit_wins.max_tokens = 8;
-  inferx::cli::MergeGenerationConfig(*gen, &explicit_wins, {"temperature", "max-tokens"});
+  inferx::server::MergeGenerationConfig(*gen, &explicit_wins, {"temperature", "max-tokens"});
   EXPECT_FLOAT_EQ(explicit_wins.temperature, 0.1f);
   EXPECT_EQ(explicit_wins.max_tokens, 8u);
   EXPECT_FLOAT_EQ(explicit_wins.top_p, 0.95f);
@@ -228,7 +226,7 @@ TEST(GenerationConfigTest, HfDisabledTopKMapsToZero) {
   auto gen = GenerationConfig::FromJson(R"({"top_k": -1})");
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams merged;
-  inferx::cli::MergeGenerationConfig(*gen, &merged);
+  inferx::server::MergeGenerationConfig(*gen, &merged);
   EXPECT_EQ(merged.top_k, 0u);
 }
 
@@ -237,7 +235,7 @@ TEST(GenerationConfigTest, EmptyJsonKeepsDefaults) {
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams defaults;
   const sampling::SamplingParams untouched = defaults;
-  inferx::cli::MergeGenerationConfig(*gen, &defaults);
+  inferx::server::MergeGenerationConfig(*gen, &defaults);
   EXPECT_EQ(defaults.temperature, untouched.temperature);
   EXPECT_EQ(defaults.top_p, untouched.top_p);
 }

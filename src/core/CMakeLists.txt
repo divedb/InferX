@@ -19,7 +19,9 @@ add_library(inferx_core
 
 if(INFERX_ENABLE_CUDA)
   target_sources(inferx_core PRIVATE cuda/device_runtime.cc)
-  target_compile_definitions(inferx_core PRIVATE INFERX_WITH_CUDA=1)
+  # PUBLIC: core/device.h derives kCudaBuilt from it, so every consumer --
+  # CLI option validation, config checks -- sees the compile-time capability.
+  target_compile_definitions(inferx_core PUBLIC INFERX_WITH_CUDA=1)
   target_link_libraries(inferx_core PRIVATE CUDA::cudart)
 else()
   target_sources(inferx_core PRIVATE accelerator_runtime_stub.cc)

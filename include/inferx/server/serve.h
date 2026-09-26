@@ -1,13 +1,15 @@
 #ifndef INFERX_SERVER_SERVE_H_
 #define INFERX_SERVER_SERVE_H_
 
+#include <set>
 #include <string>
 
-#include "inferx/cache/cache_config.h"
+#include "inferx/config/cache_config.h"
 #include "inferx/core/status.h"
-#include "inferx/engine/execution_config.h"
-#include "inferx/engine/scheduler.h"
-#include "inferx/models/model_config.h"
+#include "inferx/config/execution_config.h"
+#include "inferx/config/scheduler_config.h"
+#include "inferx/config/model_config.h"
+#include "inferx/models/checkpoint_config.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/server/tokenizer_pool.h"
 
@@ -29,8 +31,16 @@ struct ServeParams {
   TokenizerPoolConfig tokenizer;              ///< Prompt-preparation worker pool.
   std::string host = "127.0.0.1";
   int port = 8000;
-  std::string served_model_name;  ///< Model name reported by the API.
 };
+
+/// \brief Merges checkpoint generation defaults into `sampling`.
+///
+/// A field named in `skip` keeps the caller's value -- used for fields the
+/// user set explicitly, which must win over the checkpoint file. HF top_k
+/// <= 0 means "disabled" and maps to 0.
+void MergeGenerationConfig(const GenerationConfig& gen,
+                           sampling::SamplingParams* sampling,
+                           const std::set<std::string>& skip = {});
 
 /// \brief Runs the server until shutdown.
 Status RunServe(const ServeParams& params);

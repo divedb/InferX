@@ -8,7 +8,7 @@
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/engine/parallel_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/models/checkpoint_config.h"
 #include "inferx/ops/execution_context.h"
 

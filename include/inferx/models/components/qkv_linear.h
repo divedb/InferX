@@ -8,7 +8,7 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
-#include "inferx/engine/parallel_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/models/components/attention.h"
 
 namespace inferx {
