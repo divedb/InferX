@@ -35,11 +35,17 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   int64_t query_dim = 0;
   int64_t kv_dim = 0;
   int64_t query_heads = 0;
+  bool any_gated = false;
+  int64_t packed_width = 0;
   for (const auto& block : config_.blocks) {
     if (const auto* a = std::get_if<components::AttentionConfig>(&block.mixer)) {
       query_heads = std::max(query_heads, a->query_heads);
       query_dim = std::max<int64_t>(query_dim, a->query_heads * a->head_dim);
       kv_dim = std::max<int64_t>(kv_dim, a->kv_heads * a->head_dim);
+      const bool gated = a->output_gate == components::OutputGate::kSigmoid;
+      any_gated = any_gated || gated;
+      packed_width = std::max<int64_t>(
+          packed_width, (gated ? 2 : 1) * a->query_heads * a->head_dim + 2 * a->kv_heads * a->head_dim);
     }
     if (const auto* dense = std::get_if<components::SwiGluConfig>(&block.feed_forward)) {
       max_intermediate_ = std::max(max_intermediate_, dense->intermediate_size);
@@ -59,11 +65,15 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(attention_->key, alloc_flat(kv_dim));
   INFERX_ASSIGN_OR_RETURN(attention_->value, alloc_flat(kv_dim));
   INFERX_ASSIGN_OR_RETURN(attention_->attn_out, alloc_flat(query_dim));
+  if (any_gated) {
+    INFERX_ASSIGN_OR_RETURN(attention_->gate, alloc_flat(query_dim));
+  }
   INFERX_ASSIGN_OR_RETURN(mlp_->gate, alloc_flat(max_intermediate_));
-  // Attention always runs the fused QKV projection, and packed gate/up rows
-  // can be wider; one buffer serves both since they never overlap in time.
+  // Attention runs the fused QKV projection (with a doubled query section
+  // when gated), and packed gate/up rows can be wider; one buffer serves
+  // both since they never overlap in time.
   INFERX_ASSIGN_OR_RETURN(packed_projection_,
-                          alloc_flat(std::max(query_dim + 2 * kv_dim, 2 * max_intermediate_)));
+                          alloc_flat(std::max(packed_width, 2 * max_intermediate_)));
   INFERX_ASSIGN_OR_RETURN(attention_->plan.plan,
                           Tensor::Empty(DataType::kInt32, Shape({3 * rows + 1}), device));
   attention_->plan.prefill_tile_rows = prefill_tile_rows_;

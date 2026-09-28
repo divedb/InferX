@@ -54,19 +54,16 @@ Status DecoderConfig::ValidateExecutable() const {
     if (a == nullptr) {
       return UnimplementedError("recurrent mixer execution is not implemented");
     }
-    if (a->output_gate != components::OutputGate::kNone) {
-      return UnimplementedError("gated attention output is not implemented");
-    }
-    if (a->qkv_bias || a->output_bias) {
-      return UnimplementedError("biased projections are not implemented");
-    }
     ops::AttentionParams params;
     params.query_heads = a->query_heads;
     params.kv_heads = a->kv_heads;
     params.head_dim = a->head_dim;
-    params.scale = 1.0f;
+    params.scale = a->scale_override > 0.0f ? a->scale_override : 1.0f;
     params.sliding_window = a->sliding_window;
     INFERX_RETURN_IF_ERROR(ops::ValidateAttentionGeometry(params));
+    if (a->head_dim > 8 * 256) {
+      return UnimplementedError("attention head dimension exceeds the generic kernel");
+    }
     if (!std::holds_alternative<components::SwiGluConfig>(block.feed_forward)) {
       return UnimplementedError("expert feed-forward execution is not implemented");
     }

@@ -81,7 +81,7 @@ Status PrepareFlashAttention(ExecutionContext& ctx, const Tensor& qo, Tensor& pl
       Ptr<int>(qo), qo.Numel() - 1, group, tiles, tile_rows, Ptr<int>(plan));
   return Error(cudaGetLastError());
 }
-template <int HeadDim>
+template <int HeadDim, class Variant>
 Status FlashPagedAttentionImpl(ExecutionContext& ctx, const Tensor& q, const Tensor& qo,
                            const Tensor& kv, const Tensor& indices, const Tensor& last,
                            const Tensor& key, const Tensor& value, int64_t block_size,
@@ -89,7 +89,6 @@ Status FlashPagedAttentionImpl(ExecutionContext& ctx, const Tensor& q, const Ten
                            Tensor& out, const FlashDecodeWorkspace* decode, int tile_rows) {
   using namespace flashinfer;
   using T = __nv_bfloat16;
-  using Variant = DefaultAttention<false, false, false, false>;
   const int group = p.query_heads / p.kv_heads;
   const int batch = qo.Numel() - 1;
   paged_kv_t<T, int> cache(p.kv_heads, block_size, HeadDim, batch, QKVLayout::kNHD, Ptr<T>(key),
@@ -107,8 +106,13 @@ Status FlashPagedAttentionImpl(ExecutionContext& ctx, const Tensor& q, const Ten
     params.padded_batch_size = batch;
     params.q_stride_n = p.query_heads * HeadDim;
     params.q_stride_h = HeadDim;
-    params.window_left = -1;
+    // Sliding window rides FlashInfer's window_left: the lowest visible KV
+    // index relative to the query. -1 disables windowing.
+    params.window_left = p.sliding_window > 0
+                             ? static_cast<int32_t>(p.sliding_window - 1)
+                             : -1;
     params.sm_scale = p.scale;
+    params.logits_soft_cap = p.softcap;
     params.request_indices = Ptr<int>(plan);
     params.kv_tile_indices = Ptr<int>(plan) + 2 * tiles;
     params.o_indptr = Ptr<int>(qo);
@@ -139,8 +143,11 @@ Status FlashPagedAttentionImpl(ExecutionContext& ctx, const Tensor& q, const Ten
   params.num_qo_heads = p.query_heads;
   params.q_stride_n = p.query_heads * HeadDim;
   params.q_stride_h = HeadDim;
-  params.window_left = -1;
+  params.window_left = p.sliding_window > 0
+                           ? static_cast<int32_t>(p.sliding_window - 1)
+                           : -1;
   params.sm_scale = p.scale;
+  params.logits_soft_cap = p.softcap;
   params.request_indices = Ptr<int>(plan);
   params.qo_tile_indices = Ptr<int>(plan) + tiles;
   params.kv_tile_indices = Ptr<int>(plan) + 2 * tiles;
@@ -163,14 +170,25 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
                            const Tensor& key, const Tensor& value, int64_t block_size,
                            const AttentionParams& p, const Tensor& plan, int tiles,
                            Tensor& out, const FlashDecodeWorkspace* decode, int tile_rows) {
-  switch (p.head_dim) {
-    case 64: return FlashPagedAttentionImpl<64>(ctx, q, qo, kv, indices, last, key, value,
-                                                block_size, p, plan, tiles, out, decode, tile_rows);
-    case 128: return FlashPagedAttentionImpl<128>(ctx, q, qo, kv, indices, last, key, value,
-                                                  block_size, p, plan, tiles, out, decode, tile_rows);
-    case 256: return FlashPagedAttentionImpl<256>(ctx, q, qo, kv, indices, last, key, value,
-                                                  block_size, p, plan, tiles, out, decode, tile_rows);
-    default: return UnimplementedError("unsupported FlashInfer head dimension");
+  using namespace flashinfer;
+  const bool windowed = p.sliding_window > 0;
+  const bool capped = p.softcap > 0.0f;
+  auto run = [&]<class V>() -> Status {
+    switch (p.head_dim) {
+      case 64: return FlashPagedAttentionImpl<64, V>(ctx, q, qo, kv, indices, last, key, value,
+                                                     block_size, p, plan, tiles, out, decode, tile_rows);
+      case 128: return FlashPagedAttentionImpl<128, V>(ctx, q, qo, kv, indices, last, key, value,
+                                                       block_size, p, plan, tiles, out, decode, tile_rows);
+      case 256: return FlashPagedAttentionImpl<256, V>(ctx, q, qo, kv, indices, last, key, value,
+                                                       block_size, p, plan, tiles, out, decode, tile_rows);
+      default: return UnimplementedError("unsupported FlashInfer head dimension");
+    }
+  };
+  if (windowed && capped) {
+    return run.operator()<DefaultAttention<false, true, true, false>>();
   }
+  if (windowed) return run.operator()<DefaultAttention<false, true, false, false>>();
+  if (capped) return run.operator()<DefaultAttention<false, false, true, false>>();
+  return run.operator()<DefaultAttention<false, false, false, false>>();
 }
 }  // namespace inferx::ops::cuda

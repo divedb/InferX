@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "inferx/ops/cuda/flash_attention.h"
+#include "inferx/ops/cuda/generic_attention.h"
 #include "inferx/ops/profile.h"
 
 namespace inferx::ops {
@@ -124,6 +125,15 @@ Status PagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_i
                       int num_seqs, const Tensor& key_cache, const Tensor& value_cache,
                       int64_t block_size, const AttentionParams& params,
                       AttentionPlanWorkspace& ws, Tensor& attn_out) {
+  if (params.sinks != nullptr || !FlashAttentionSupports(params)) {
+    // Per-head sinks and geometries outside the FlashInfer template set run
+    // on the generic kernel; it needs no plan, so skip planning entirely.
+    return ProfileCall(ctx, "attention", [&] {
+      return cuda::GenericPagedAttention(ctx, q, qo_indptr, kv_indptr, kv_indices,
+                                          last_page_len, key_cache, value_cache, block_size,
+                                          params, attn_out);
+    });
+  }
   const int group = static_cast<int>(params.query_heads / params.kv_heads);
   if (ws.planned_group != group) {
     ws.attention_tiles = 0;

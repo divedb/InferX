@@ -58,9 +58,11 @@ struct GatedDeltaNetConfig {
 /// \brief Attention projections; shapes follow AttentionConfig.
 ///
 /// `packed_qkv` is the fused projection of the QKVParallelLinear component:
-/// rank-local rows in block-contiguous order [query | key | value]. The
+/// rank-local rows in block-contiguous order [query | key | value], where the
+/// query section doubles to [query | gate] rows for a gated output. The
 /// per-projection weights are views into that allocation and share its
-/// storage.
+/// storage. `qkv_bias` matches the packed row layout; `sinks` carries
+/// per-head bf16 sink logits when the family uses them.
 struct AttentionWeights {
   Tensor packed_qkv;                 ///< [query_rows + 2*kv_rows, hidden] fused rows.
   LinearWeights query;               ///< View of packed_qkv's query rows.
@@ -69,6 +71,9 @@ struct AttentionWeights {
   LinearWeights output;              ///< [hidden, query_heads * head_dim]
   std::optional<Tensor> query_norm;  ///< [head_dim]; present only with qk_norm.
   std::optional<Tensor> key_norm;    ///< [head_dim]; present only with qk_norm.
+  std::optional<Tensor> qkv_bias;    ///< Packed rows [q (| gate) | k | v].
+  std::optional<Tensor> output_bias; ///< [hidden]; present only when biased.
+  std::optional<Tensor> sinks;       ///< [query_heads] bf16; gpt-oss.
 };
 
 /// \brief Reusable attention workspace, sized once by the decoder stack.
@@ -77,6 +82,7 @@ struct AttentionWeights {
 /// sizes the buffers.
 struct AttentionWorkspace {
   std::optional<Tensor> query;       ///< [max_tokens * max_query_width] flat.
+  std::optional<Tensor> gate;        ///< Present only for gated outputs.
   std::optional<Tensor> key;         ///< [max_tokens * max_kv_width] flat.
   std::optional<Tensor> value;       ///< [max_tokens * max_kv_width] flat.
   std::optional<Tensor> attn_out;    ///< [max_tokens * max_query_width] flat.

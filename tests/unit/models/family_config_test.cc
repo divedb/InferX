@@ -149,8 +149,7 @@ TEST(FamilyConfigTest, DenseQwen3RejectsUnknownLayerTypes) {
 }
 
 TEST(FamilyConfigTest, TypedBuilderRejectsUnsupportedBlocksBeforeReadingWeights) {
-  for (const auto& json : {Config("qwen3", "\"attention_bias\":true"),
-                           Config("qwen3_moe",
+  for (const auto& json : {Config("qwen3_moe",
                                   "\"num_experts\":4,\"num_experts_per_tok\":2,"
                                   "\"moe_intermediate_size\":32")}) {
     models::LoadedCheckpoint checkpoint;

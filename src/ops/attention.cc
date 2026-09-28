@@ -7,17 +7,22 @@
 namespace inferx::ops {
 Status ValidateAttentionGeometry(const AttentionParams& p) {
   if (p.query_heads <= 0 || p.kv_heads <= 0 || p.head_dim <= 0 ||
-      p.query_heads % p.kv_heads != 0 || !std::isfinite(p.scale) || p.sliding_window < 0) {
+      p.query_heads % p.kv_heads != 0 || !std::isfinite(p.scale) || p.sliding_window < 0 ||
+      !std::isfinite(p.softcap) || p.softcap < 0.0f) {
     return InvalidArgumentError("invalid attention heads, head dimension, scale or window");
   }
-  if (p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256) {
-    return UnimplementedError("FlashInfer integration supports head dimensions 64, 128, 256; got ",
-                              p.head_dim);
-  }
-  if (p.query_heads / p.kv_heads > 32 || p.sliding_window != 0) {
-    return UnimplementedError("FlashInfer integration requires GQA ratio <= 32 and full causal attention");
+  if (p.sinks != nullptr && (p.sinks->Rank() != 1 || p.sinks->Dim(0) != p.query_heads ||
+                             (p.sinks->GetDataType() != DataType::kFloat32 &&
+                              p.sinks->GetDataType() != DataType::kBFloat16))) {
+    return InvalidArgumentError("attention sinks must be [query_heads] float");
   }
   return OkStatus();
+}
+
+bool FlashAttentionSupports(const AttentionParams& p) {
+  if (p.sinks != nullptr) return false;
+  if (p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256) return false;
+  return p.query_heads / p.kv_heads <= 32;
 }
 
 namespace {

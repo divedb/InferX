@@ -207,16 +207,84 @@ TEST_F(AttentionTest, GraphReplayAndSplitDecodeReadChangedMetadata) {
   }
   Check(128, 16, 16, {129, 33}, {1, 1}, false, true);
 }
+TEST_F(AttentionTest, SinksAndSlidingWindowMatchReferenceOnGenericPath) {
+  // One sequence of 40 tokens, window 7, per-head sinks: the generic kernel
+  // must reproduce the reference denominator-only sink and window masks.
+  const int dim = 64, heads = 4, kvheads = 2, page = 16;
+  const int batch = 1, tokens = 40;
+  std::vector<int> qo{0, tokens}, kv{0, (tokens + page - 1) / page}, last{(tokens - 1) % page + 1};
+  std::vector<int> ids(kv.back());
+  for (size_t i = 0; i < ids.size(); ++i) ids[i] = ids.size() - 1 - i;
+  std::vector<float> keys(kv.back() * page * kvheads * dim), values(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    keys[i] = Bf16(std::sin(float(i % 1009) * 0.13f) * 0.7f);
+    values[i] = Bf16(std::cos(float(i % 997) * 0.19f) * 0.8f);
+  }
+  std::vector<float> qv(tokens * heads * dim);
+  for (size_t i = 0; i < qv.size(); ++i) qv[i] = Bf16(std::sin(float(i % 991) * 0.17f) * 0.9f);
+  std::vector<float> sink_values(heads);
+  for (int h = 0; h < heads; ++h) sink_values[h] = Bf16(0.3f * h - 0.4f);
+  auto q = Upload(qv, Shape({tokens, heads * dim}));
+  auto key = Upload(keys, Shape({kv.back(), page, kvheads, dim}));
+  auto value = Upload(values, Shape({kv.back(), page, kvheads, dim}));
+  auto sinks = Upload(sink_values, Shape({heads}));
+  auto out = Tensor::Empty(DataType::kBFloat16, q.GetShape(), DeviceId::Cuda(0)).value();
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::AttentionParams p{heads, kvheads, dim, 1.0f / std::sqrt(float(dim)), 7, &sinks};
+  ASSERT_FALSE(ops::FlashAttentionSupports(p));
+  ops::AttentionPlanWorkspace plan;
+  const auto full = ops::PagedAttention(ctx, q, Ints(qo), Ints(kv), Ints(ids), Ints(last),
+                                        absl::Span<const int32_t>(qo.data(), qo.size()), batch,
+                                        key, value, page, p, plan, out);
+  ASSERT_TRUE(full.ok());
+  const auto got = Read(out);
+  for (int t = 0; t < tokens; ++t)
+    for (int h = 0; h < heads; ++h) {
+      const int qbase = (t * heads + h) * dim;
+      auto address = [&](int pos) {
+        return ((ids[pos / page] * page + pos % page) * kvheads + h / (heads / kvheads)) * dim;
+      };
+      const int lo = std::max(0, t - 6);
+      std::vector<double> scores(t - lo + 1);
+      for (int pos = lo; pos <= t; ++pos) {
+        double dot = 0;
+        const int base = address(pos);
+        for (int d = 0; d < dim; ++d) dot += double(qv[qbase + d]) * keys[base + d];
+        scores[pos - lo] = dot * p.scale;
+      }
+      const double sink = sink_values[h];
+      const double max_score = std::max(*std::max_element(scores.begin(), scores.end()), sink);
+      double sum = std::exp(sink - max_score);
+      for (auto& v : scores) {
+        v = std::exp(v - max_score);
+        sum += v;
+      }
+      for (int d = 0; d < dim; ++d) {
+        double expected = 0;
+        for (int pos = lo; pos <= t; ++pos)
+          expected += scores[pos - lo] / sum * values[address(pos) + d];
+        EXPECT_NEAR(got[qbase + d], expected, 2e-2) << "t=" << t << " h=" << h << " d=" << d;
+      }
+    }
+}
+
 TEST(AttentionGeometryTest, ValidatesKernelCapabilities) {
   for (auto p : {ops::AttentionParams{4, 0, 128}, ops::AttentionParams{3, 2, 128},
                  ops::AttentionParams{4, 2, 128, std::numeric_limits<float>::quiet_NaN()}}) {
     EXPECT_EQ(ops::ValidateAttentionGeometry(p).code(), absl::StatusCode::kInvalidArgument);
   }
-  for (auto p : {ops::AttentionParams{4, 2, 96}, ops::AttentionParams{66, 2, 128},
-                 ops::AttentionParams{4, 2, 128, 1.0f, 64}}) {
-    EXPECT_EQ(ops::ValidateAttentionGeometry(p).code(), absl::StatusCode::kUnimplemented);
+  // Geometries outside the FlashInfer template set stay valid -- the
+  // dispatcher routes them to the generic kernel -- but the fast path
+  // reports them unsupported, as it does for per-head sinks.
+  for (auto p : {ops::AttentionParams{4, 2, 96}, ops::AttentionParams{66, 2, 128}}) {
+    EXPECT_TRUE(ops::ValidateAttentionGeometry(p).ok());
+    EXPECT_FALSE(ops::FlashAttentionSupports(p));
   }
+  ops::AttentionParams windowed{4, 2, 128, 1.0f, 64};
+  EXPECT_TRUE(ops::ValidateAttentionGeometry(windowed).ok());
+  EXPECT_TRUE(ops::FlashAttentionSupports(windowed));
   EXPECT_TRUE(ops::ValidateAttentionGeometry(ops::AttentionParams{4, 2, 64}).ok());
+  EXPECT_TRUE(ops::FlashAttentionSupports(ops::AttentionParams{4, 2, 64}));
 }
 TEST_F(AttentionTest, RejectsMalformedMetadataAndWorkspacesBeforeLaunching) {
   ops::ExecutionContext ctx(*runtime_, stream_);

@@ -27,14 +27,26 @@ struct AttentionParams {
   int64_t kv_heads = 0;   ///< Divides query_heads (grouped-query attention).
   int64_t head_dim = 0;
   float scale = 1.0f;     ///< Query-key product scale, typically 1/sqrt(head_dim).
-  int64_t sliding_window = 0;  ///< 0 disables windowing; >0 is unimplemented.
+  int64_t sliding_window = 0;  ///< 0 disables windowing.
+  /// Optional per-head attention sink logits [query_heads], added to the
+  /// softmax denominator only (gpt-oss). Present selects the generic kernel.
+  const Tensor* sinks = nullptr;
+  /// Logit soft cap c: scores become c * tanh(score / c); 0 disables
+  /// (Gemma 2 lineage). Rides the FlashInfer soft-cap variant.
+  float softcap = 0.0f;
 };
 
 /// \brief Checks `params` against what the kernel dispatcher supports.
 ///
 /// The engine never selects kernels by name; this validates geometry
-/// (head dims, GQA ratio, windowing) against every implementation the
+/// (head counts, windowing, sinks) against every implementation the
 /// internal dispatcher may choose.
 Status ValidateAttentionGeometry(const AttentionParams& params);
+
+/// \brief Whether the FlashInfer fast path can run this call exactly.
+///
+/// Windowing and soft caps ride FlashInfer variants; per-head sinks and
+/// geometries outside its template set fall back to the generic kernel.
+bool FlashAttentionSupports(const AttentionParams& params);
 
 }  // namespace inferx::ops
