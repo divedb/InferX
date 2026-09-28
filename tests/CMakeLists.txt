@@ -27,6 +27,11 @@ target_compile_options(inferx_parity_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME parity_test COMMAND inferx_parity_test
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
+add_executable(inferx_quant_test unit/models/quant_test.cc)
+target_link_libraries(inferx_quant_test PRIVATE inferx::models GTest::gtest_main)
+target_compile_options(inferx_quant_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME quant_test COMMAND inferx_quant_test)
+
 add_executable(inferx_model_test model_test.cc)
 target_link_libraries(inferx_model_test PRIVATE inferx::models GTest::gtest_main)
 target_compile_options(inferx_model_test PRIVATE -Wall -Wextra -Wpedantic)

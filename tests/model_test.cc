@@ -1,5 +1,7 @@
 #include "inferx/models/model.h"
 
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -129,6 +131,85 @@ TEST_F(ModelTest, ForwardReturnsLogits) {
   EXPECT_EQ(logits->Dim(0), 1);
   EXPECT_EQ(logits->Dim(1), config.vocab_size);
   EXPECT_EQ(logits->GetDataType(), DataType::kBFloat16);
+}
+
+namespace {
+
+/// Runs one fixed two-token prompt through a loaded model and returns the
+/// last-row logits on the host.
+StatusOr<std::vector<float>> ForwardLogits(Model& model, const CheckpointConfig& config,
+                                           DeviceRuntime& runtime, Stream stream,
+                                           const ModelInput& input, KvBlockPool& pool) {
+  ops::ExecutionContext ctx(runtime, stream);
+  ModelState state;
+  state.paged_kv = &pool;
+  for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
+  INFERX_ASSIGN_OR_RETURN(auto logits, model.Forward(input, state, ctx));
+  INFERX_RETURN_IF_ERROR(runtime.SynchronizeStream(stream));
+  std::vector<uint16_t> raw(logits.Numel());
+  INFERX_RETURN_IF_ERROR(runtime.Copy(raw.data(), logits.Data(), raw.size() * 2,
+                                      CopyKind::kDeviceToHost));
+  std::vector<float> values(raw.size());
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const uint32_t wide = static_cast<uint32_t>(raw[i]) << 16;
+    std::memcpy(&values[i], &wide, sizeof(float));
+  }
+  return values;
+}
+
+}  // namespace
+
+/// \brief The local GPTQ int8 checkpoint must dequantize into weights close
+///        enough to the bf16 original that the logits agree.
+///
+/// Int8/G=128 quantization noise measured at the weights is ~0.8%; through
+/// 28 layers the logits may drift an order of magnitude more, but the argmax
+/// token has to survive.
+TEST_F(ModelTest, GptqInt8CheckpointMatchesBf16Reference) {
+  if (!std::filesystem::exists("models/Qwen3-0.6B-GPTQ-Int8/model.safetensors") ||
+      !std::filesystem::exists("models/Qwen3-0.6B/model.safetensors")) {
+    GTEST_SKIP() << "local Qwen3-0.6B checkpoints not present";
+  }
+  auto reference = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), 8, 2);
+  ASSERT_TRUE(reference.ok()) << reference.status();
+  auto quantized = Model::Load("models/Qwen3-0.6B-GPTQ-Int8", DeviceId::Cuda(0), 8, 2);
+  ASSERT_TRUE(quantized.ok()) << quantized.status();
+
+  const CheckpointConfig& config = (*quantized)->config();
+  ASSERT_EQ(config.num_hidden_layers, (*reference)->config().num_hidden_layers);
+  KvLayout layout;
+  layout.entries_per_token = 2;
+  layout.kv_heads = config.num_key_value_heads;
+  layout.head_dim = config.head_dim;
+  layout.dtype = DataType::kBFloat16;
+  const DeviceId device = DeviceId::Cuda(0);
+  auto ref_pool = KvBlockPool::Create(config.num_hidden_layers, 4, 2, layout, device);
+  ASSERT_TRUE(ref_pool.ok());
+  auto quant_pool = KvBlockPool::Create(config.num_hidden_layers, 4, 2, layout, device);
+  ASSERT_TRUE(quant_pool.ok());
+  auto input = MakeInput(2);
+  ASSERT_TRUE(input.ok());
+
+  auto ref_logits = ForwardLogits(**reference, (*reference)->config(), *runtime_, stream_,
+                                  *input, *ref_pool);
+  ASSERT_TRUE(ref_logits.ok()) << ref_logits.status();
+  auto quant_logits = ForwardLogits(**quantized, config, *runtime_, stream_, *input,
+                                    *quant_pool);
+  ASSERT_TRUE(quant_logits.ok()) << quant_logits.status();
+  ASSERT_EQ(ref_logits->size(), quant_logits->size());
+
+  double dot = 0, ref_norm = 0;
+  size_t ref_argmax = 0, quant_argmax = 0;
+  for (size_t i = 0; i < ref_logits->size(); ++i) {
+    dot += static_cast<double>((*ref_logits)[i] - (*quant_logits)[i]) *
+           static_cast<double>((*ref_logits)[i] - (*quant_logits)[i]);
+    ref_norm += static_cast<double>((*ref_logits)[i]) * (*ref_logits)[i];
+    if ((*ref_logits)[i] > (*ref_logits)[ref_argmax]) ref_argmax = i;
+    if ((*quant_logits)[i] > (*quant_logits)[quant_argmax]) quant_argmax = i;
+  }
+  const double relative = std::sqrt(dot / ref_norm);
+  EXPECT_LT(relative, 0.08) << "logit relative error " << relative;
+  EXPECT_EQ(ref_argmax, quant_argmax);
 }
 
 namespace {
