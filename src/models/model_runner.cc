@@ -1,4 +1,6 @@
+#include "inferx/cache/recurrent_state_pool.h"
 #include "inferx/models/model_runner.h"
+#include "inferx/ops/execution_context.h"
 
 #include <cstdint>
 #include <cstring>
@@ -25,6 +27,8 @@ struct RunnerRequestState {
   uint64_t generated = 0;  ///< Tokens sampled so far; the request's RNG offset.
   int num_computed = 0;
   TokenId last_sampled = -1;
+  /// Recurrent-state slot; -1 while unassigned or when unneeded.
+  int recurrent_slot = -1;
 };
 
 }  // namespace
@@ -39,10 +43,13 @@ struct ModelRunnerImpl {
   Stream stream;
   std::unique_ptr<Model> model;
   std::unique_ptr<KvBlockPool> pool;
+  std::unique_ptr<RecurrentStatePool> recurrent_pool;
+  /// Free recurrent slots, LIFO; empty when the model has no recurrent layers.
+  std::vector<int32_t> free_recurrent_slots;
   ModelState model_state;
   absl::flat_hash_map<RequestId, RunnerRequestState> states;
   std::optional<Tensor> token_ids, positions, batch_indices, qo_indptr, kv_indptr;
-  std::optional<Tensor> kv_indices, last_page_len, logit_rows;
+  std::optional<Tensor> kv_indices, last_page_len, logit_rows, recurrent_indices;
   std::optional<Tensor> input_storage;
   int32_t* host_inputs = nullptr;
   std::unique_ptr<sampling::Sampler> sampler;
@@ -107,17 +114,13 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
                                   static_cast<size_t>(loaded->config().num_hidden_layers)) {
     return InvalidArgumentError("model must declare state for each decoder layer");
   }
-  KvLayout layout;
+  std::vector<KvLayout> layouts;
+  std::vector<RecurrentStateSpec> recurrent_specs;
   for (size_t i = 0; i < requirements.size(); ++i) {
-    const auto* spec = std::get_if<PagedKvStateSpec>(&requirements[i]);
-    if (!spec) {
-      return UnimplementedError("runner does not yet manage recurrent layer state");
-    }
-    if (i == 0) layout = spec->layout;
-    if (spec->layout.entries_per_token != layout.entries_per_token ||
-        spec->layout.kv_heads != layout.kv_heads || spec->layout.head_dim != layout.head_dim ||
-        spec->layout.dtype != layout.dtype) {
-      return UnimplementedError("runner requires a uniform paged KV layout across layers");
+    if (const auto* spec = std::get_if<PagedKvStateSpec>(&requirements[i])) {
+      layouts.push_back(spec->layout);
+    } else {
+      recurrent_specs.push_back(std::get<RecurrentStateSpec>(requirements[i]));
     }
   }
   auto impl = std::make_unique<ModelRunnerImpl>();
@@ -132,17 +135,34 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream());
   const auto& mc = impl->model->config();
   INFERX_ASSIGN_OR_RETURN(auto pool,
-                          KvBlockPool::Create(mc.num_hidden_layers, cache.num_kv_blocks,
-                                              cache.block_size, layout, device));
+                          KvBlockPool::Create(cache.num_kv_blocks, cache.block_size, layouts,
+                                              device));
   impl->pool = std::make_unique<KvBlockPool>(std::move(pool));
+  if (!recurrent_specs.empty()) {
+    INFERX_ASSIGN_OR_RETURN(auto recurrent, RecurrentStatePool::Create(
+                                                 recurrent_specs, scheduler.max_num_seqs, device));
+    impl->recurrent_pool = std::make_unique<RecurrentStatePool>(std::move(recurrent));
+    impl->free_recurrent_slots.resize(scheduler.max_num_seqs);
+    for (int64_t slot = 0; slot < scheduler.max_num_seqs; ++slot) {
+      impl->free_recurrent_slots[static_cast<size_t>(slot)] =
+          static_cast<int32_t>(scheduler.max_num_seqs - 1 - slot);
+    }
+  }
   INFERX_LOG(INFO) << "runner ready: device=" << device.ToString() << " model="
                    << model.model_dir << " kv_blocks=" << cache.num_kv_blocks
                    << " block_size=" << cache.block_size
                    << " max_tokens=" << scheduler.max_num_batched_tokens
                    << " max_seqs=" << scheduler.max_num_seqs;
   impl->model_state.paged_kv = impl->pool.get();
+  impl->model_state.recurrent = impl->recurrent_pool.get();
+  int64_t next_recurrent_layer = 0;
+  int64_t next_paged_layer = 0;
   for (size_t i = 0; i < requirements.size(); ++i) {
-    impl->model_state.layers.push_back(PagedKvState{static_cast<int64_t>(i)});
+    if (std::holds_alternative<PagedKvStateSpec>(requirements[i])) {
+      impl->model_state.layers.push_back(PagedKvState{next_paged_layer++});
+    } else {
+      impl->model_state.layers.push_back(RecurrentState{next_recurrent_layer++});
+    }
   }
   auto alloc = [&](int64_t size) {
     return Tensor::Empty(DataType::kInt32, Shape({size}), device);
@@ -151,7 +171,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   const int64_t S = scheduler.max_num_seqs;
   // Fixed offsets keep graph pointers stable. One pinned upload replaces eight
   // synchronous copies; Run drains the stream before this staging area is reused.
-  INFERX_ASSIGN_OR_RETURN(impl->input_storage, alloc(3 * T + 4 * S + 2 + cache.num_kv_blocks));
+  INFERX_ASSIGN_OR_RETURN(impl->input_storage,
+                          alloc(3 * T + 5 * S + 2 + cache.num_kv_blocks));
   int64_t offset = 0;
   auto input_view = [&](int64_t size) -> StatusOr<Tensor> {
     INFERX_ASSIGN_OR_RETURN(auto view, impl->input_storage->Slice(offset, offset + size));
@@ -166,6 +187,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->kv_indices, input_view(cache.num_kv_blocks));
   INFERX_ASSIGN_OR_RETURN(impl->last_page_len, input_view(S));
   INFERX_ASSIGN_OR_RETURN(impl->logit_rows, input_view(S));
+  INFERX_ASSIGN_OR_RETURN(impl->recurrent_indices, input_view(S));
   if (device.IsCuda()) {
     INFERX_ASSIGN_OR_RETURN(void* inputs,
         impl->runtime->AllocatePinnedHost(impl->input_storage->NBytes()));
@@ -182,13 +204,31 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
 StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& output) {
   ModelRunnerOutput result;
   // Process removals before admission so a finished ID can safely be reused.
-  for (RequestId id : output.finished_request_ids) states.erase(id);
+  ops::ExecutionContext lifecycle_ctx(*runtime, stream);
+  for (RequestId id : output.finished_request_ids) {
+    const auto it = states.find(id);
+    if (it != states.end() && it->second.recurrent_slot >= 0) {
+      free_recurrent_slots.push_back(it->second.recurrent_slot);
+    }
+    states.erase(id);
+  }
   for (const auto& nr : output.scheduled_new_reqs) {
     RunnerRequestState state;
     state.block_ids = nr.block_ids;
     state.prompt.assign(nr.prompt_token_ids.begin(), nr.prompt_token_ids.end());
     state.params = nr.sampling_params;
     state.num_computed = nr.num_computed_tokens;
+    if (recurrent_pool != nullptr) {
+      if (free_recurrent_slots.empty()) {
+        return ResourceExhaustedError("recurrent state slots are exhausted");
+      }
+      state.recurrent_slot = free_recurrent_slots.back();
+      free_recurrent_slots.pop_back();
+      // A fresh sequence starts from zero state; stream-ordered so the
+      // step's kernels (and captured graphs) read zeros first.
+      INFERX_RETURN_IF_ERROR(
+          recurrent_pool->ResetSlot(lifecycle_ctx, state.recurrent_slot));
+    }
     if (!states.emplace(nr.request_id, std::move(state)).second) {
       return InvalidArgumentError("duplicate runner request ", nr.request_id);
     }
@@ -281,6 +321,18 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   INFERX_RETURN_IF_ERROR(upload(*kv_indices, blocks));
   INFERX_RETURN_IF_ERROR(upload(*last_page_len, last_lengths));
   INFERX_RETURN_IF_ERROR(upload(*logit_rows, rows));
+  if (recurrent_pool != nullptr) {
+    std::vector<int32_t> slots;
+    slots.reserve(batch);
+    for (int i = 0; i < batch; ++i) {
+      const auto it = states.find(output.scheduled[i].request_id);
+      if (it == states.end() || it->second.recurrent_slot < 0) {
+        return InternalError("missing recurrent slot for a scheduled request");
+      }
+      slots.push_back(it->second.recurrent_slot);
+    }
+    INFERX_RETURN_IF_ERROR(upload(*recurrent_indices, slots));
+  }
   if (host_inputs != nullptr) {
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(input_storage->Data(), host_inputs,
         input_storage->NBytes(), CopyKind::kHostToDevice, stream));
@@ -295,6 +347,10 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   INFERX_ASSIGN_OR_RETURN(Tensor kv_indices_v, kv_indices->Slice(0, blocks.size()));
   INFERX_ASSIGN_OR_RETURN(Tensor last_page_len_v, last_page_len->Slice(0, batch));
   INFERX_ASSIGN_OR_RETURN(Tensor logit_rows_v, logit_rows->Slice(0, batch));
+  std::optional<Tensor> recurrent_v;
+  if (recurrent_pool != nullptr) {
+    INFERX_ASSIGN_OR_RETURN(recurrent_v, recurrent_indices->Slice(0, batch));
+  }
   ModelInput input{std::move(token_ids_v),
                    AttentionBatch{std::move(positions_v),
                                   std::move(batch_indices_v),
@@ -307,6 +363,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
                                   static_cast<int>(tokens.size()),
                                   batch},
                    std::move(logit_rows_v)};
+  input.attention.recurrent_indices = std::move(recurrent_v);
   ops::ExecutionContext ctx(*runtime, stream);
   std::optional<Tensor> logits;
   std::optional<sampling::SamplerOutput> sampled;

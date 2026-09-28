@@ -18,6 +18,7 @@
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
 #include "inferx/models/components/rope.h"
+#include "inferx/ops/gdn.h"
 #include "inferx/ops/mla.h"
 #include "inferx/ops/moe.h"
 #include "inferx/ops/rms_norm.h"
@@ -572,6 +573,70 @@ TEST_F(OpsTest, AssembleMlaCachesLaysOutRotatedAndPaddedSlices) {
   EXPECT_NEAR(got_k[18 + 2], 130, 1e-2);
   EXPECT_NEAR(got_k[18 + 5], 133, 1e-2);
   EXPECT_NEAR(got_v[18 + 0], 140, 1e-2);
+}
+
+TEST_F(OpsTest, GdnRecurrentMatchesReferenceUpdate) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  // One sequence of three tokens, one key head, two value heads, dk = dv = 4.
+  const int tokens = 3, kh = 1, vh = 2, dk = 4, dv = 4;
+  const int conv_width = 2 * kh * dk + vh * dv;
+  std::vector<float> conv(tokens * conv_width);
+  for (int i = 0; i < conv.size(); ++i) conv[i] = std::sin(float(i) * 0.7f) * 0.6f;
+  std::vector<float> beta = {0.5f, 0.7f, 0.3f, 0.4f, 0.6f, 0.2f};  // [t, vh]
+  std::vector<float> g = {-0.1f, -0.05f, -0.2f, -0.1f, -0.15f, -0.3f};
+  auto conv_t = Upload(conv, Shape({tokens, conv_width}));
+  auto beta_t = Tensor::Empty(DataType::kFloat32, Shape({tokens * vh}), DeviceId::Cuda(0)).value();
+  auto g_t = Tensor::Empty(DataType::kFloat32, Shape({tokens * vh}), DeviceId::Cuda(0)).value();
+  ASSERT_TRUE(runtime_->Copy(beta_t.Data(), beta.data(), beta.size() * 4,
+                             CopyKind::kHostToDevice).ok());
+  ASSERT_TRUE(runtime_->Copy(g_t.Data(), g.data(), g.size() * 4, CopyKind::kHostToDevice).ok());
+  auto state = Tensor::Empty(DataType::kFloat32, Shape({1, vh, dk, dv}), DeviceId::Cuda(0)).value();
+  ASSERT_TRUE(runtime_->MemsetAsync(state.Data(), state.NBytes(), stream_).ok());
+  auto slots = UploadInt({0});
+  auto qo = UploadInt({0, tokens});
+  auto y = MakeBf16(Shape({tokens, vh * dv}));
+
+  ASSERT_TRUE(ops::GdnRecurrent(ctx, conv_t, kh * dk, beta_t, g_t, state, slots, qo, slots, y)
+                  .ok());
+  const auto got = Download(y);
+
+  // Reference recurrence per head, fp32.
+  double max_error = 0;
+  for (int h = 0; h < vh; ++h) {
+    std::vector<double> s(dk * dv, 0.0);
+    for (int t = 0; t < tokens; ++t) {
+      std::vector<double> k(conv.begin() + t * conv_width + kh * dk,
+                            conv.begin() + t * conv_width + kh * dk + dk);
+      std::vector<double> q(conv.begin() + t * conv_width,
+                            conv.begin() + t * conv_width + dk);
+      double kn = 0, qn = 0;
+      for (int d = 0; d < dk; ++d) {
+        kn += k[d] * k[d];
+        qn += q[d] * q[d];
+      }
+      const double kinv = 1.0 / std::sqrt(kn + 1e-6);
+      const double qinv = 1.0 / std::sqrt(qn + 1e-6) / std::sqrt(double(dk));
+      for (int d = 0; d < dk; ++d) {
+        k[d] *= kinv;
+        q[d] *= qinv;
+      }
+      const double decay = std::exp(g[t * vh + h]);
+      const double b = beta[t * vh + h];
+      for (auto& v : s) v *= decay;
+      std::vector<double> kv_mem(dv, 0.0);
+      for (int d = 0; d < dk; ++d)
+        for (int c = 0; c < dv; ++c) kv_mem[c] += s[d * dv + c] * k[d];
+      for (int d = 0; d < dk; ++d)
+        for (int c = 0; c < dv; ++c) s[d * dv + c] += k[d] * b * (conv[t * conv_width + 2 * kh * dk + h * dv + c] - kv_mem[c]);
+      for (int c = 0; c < dv; ++c) {
+        double expected = 0;
+        for (int d = 0; d < dk; ++d) expected += s[d * dv + c] * q[d];
+        max_error = std::max(max_error,
+                             std::abs(double(got[t * vh * dv + h * dv + c]) - expected));
+      }
+    }
+  }
+  EXPECT_LT(max_error, 3e-2) << "max error " << max_error;
 }
 
 TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {

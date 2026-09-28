@@ -34,12 +34,21 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   mlp_.emplace();
   if (max_moe_experts_ > 0) moe_.emplace();
   if (max_mla_heads_ > 0) mla_.emplace();
+  if (max_gdn_proj_ > 0) gdn_.emplace();
   int64_t query_dim = 0;
   int64_t kv_dim = 0;
   int64_t query_heads = 0;
   bool any_gated = false;
   int64_t packed_width = 0;
   for (const auto& block : config_.blocks) {
+    if (const auto* r = std::get_if<components::GatedDeltaNetConfig>(&block.mixer)) {
+      max_gdn_proj_ = std::max(max_gdn_proj_,
+                               2 * r->key_heads * r->key_dim + 2 * r->value_heads * r->value_dim);
+      max_gdn_conv_ = std::max(max_gdn_conv_,
+                               2 * r->key_heads * r->key_dim + r->value_heads * r->value_dim);
+      max_gdn_value_ = std::max(max_gdn_value_, r->value_heads * r->value_dim);
+      max_gdn_heads_ = std::max(max_gdn_heads_, r->value_heads);
+    }
     if (const auto* m = std::get_if<components::MlaConfig>(&block.mixer)) {
       max_mla_heads_ = std::max(max_mla_heads_, m->query_heads);
       max_mla_head_dim_ = std::max(max_mla_head_dim_, m->head_dim());
@@ -101,6 +110,17 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
     INFERX_ASSIGN_OR_RETURN(mla_->attn_out, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
     INFERX_ASSIGN_OR_RETURN(mla_->plan.plan,
                             Tensor::Empty(DataType::kInt32, Shape({3 * rows + 1}), device));
+  }
+  if (gdn_.has_value()) {
+    INFERX_ASSIGN_OR_RETURN(gdn_->packed, alloc2_at(rows, max_gdn_proj_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->conv_in, alloc2_at(rows, max_gdn_conv_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->z, alloc2_at(rows, max_gdn_value_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->ba, alloc2_at(rows, 2 * max_gdn_heads_));
+    INFERX_ASSIGN_OR_RETURN(
+        gdn_->beta, Tensor::Empty(DataType::kFloat32, Shape({rows * max_gdn_heads_}), device));
+    INFERX_ASSIGN_OR_RETURN(
+        gdn_->g, Tensor::Empty(DataType::kFloat32, Shape({rows * max_gdn_heads_}), device));
+    INFERX_ASSIGN_OR_RETURN(gdn_->y, alloc2_at(rows, max_gdn_value_));
   }
   if (moe_.has_value()) {
     // Slots are (token, selected-expert) pairs; every buffer is indexed by

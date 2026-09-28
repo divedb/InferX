@@ -64,7 +64,7 @@ TEST(FamilyConfigTest, MoETranslatesAndValidatesAsExecutable) {
   EXPECT_TRUE(config->ValidateExecutable().ok());
 }
 
-TEST(FamilyConfigTest, RecurrentLayersAreRejectedAsUnexecutable) {
+TEST(FamilyConfigTest, RecurrentLayersValidateAsExecutable) {
   const auto config = TranslateFamilyConfig(
       Identity("qwen3_next"),
       Config("qwen3_next",
@@ -77,9 +77,7 @@ TEST(FamilyConfigTest, RecurrentLayersAreRejectedAsUnexecutable) {
              "\"shared_expert_intermediate_size\":32"));
   ASSERT_TRUE(config.ok()) << config.status();
   EXPECT_TRUE(std::holds_alternative<components::GatedDeltaNetConfig>(config->blocks[0].mixer));
-  const auto executable = config->ValidateExecutable();
-  ASSERT_FALSE(executable.ok());
-  EXPECT_EQ(executable.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
 }
 
 TEST(FamilyConfigTest, UnknownModelTypeIsRejected) {

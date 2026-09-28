@@ -9,6 +9,7 @@
 #include <variant>
 
 #include "inferx/models/components/attention.h"
+#include "inferx/models/components/gdn.h"
 #include "inferx/models/components/mlp.h"
 #include "inferx/models/components/moe.h"
 #include "inferx/models/components/moe.h"
@@ -49,8 +50,8 @@ struct DecoderLayerWeights {
   /// Output-side norms (Gemma sandwich); absent when residual is kPreNorm.
   std::optional<Tensor> mixer_out_norm;
   std::optional<Tensor> feed_forward_out_norm;
-  /// Attention or MLA projections; recurrent mixers are not loadable yet.
-  std::variant<AttentionWeights, MlaWeights> mixer;
+  /// Attention, MLA, or recurrent projections.
+  std::variant<AttentionWeights, MlaWeights, GdnWeights> mixer;
   std::variant<SwiGluWeights, MoeWeights> feed_forward;
 };
 

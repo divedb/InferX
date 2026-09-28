@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include <optional>
+
 #include "absl/types/span.h"
 #include "inferx/models/state.h"
 #include "inferx/core/device.h"
@@ -29,8 +31,11 @@ struct AttentionBatch {
   Tensor last_page_len;  ///< [num_seqs] tokens in each sequence's last block.
   absl::Span<const int32_t> host_qo_indptr;  ///< Required mirror of qo_indptr for planning; must match device data.
   absl::Span<const int32_t> host_kv_indptr;  ///< Mirror of kv_indptr, host.
-  int num_tokens = 0;                        ///< Total scheduled tokens.
-  int num_seqs = 0;                          ///< Sequences in the batch.
+  int num_tokens = 0;  ///< Total scheduled tokens.
+  int num_seqs = 0;    ///< Sequences in the batch.
+  /// [num_seqs] recurrent-state slot of each sequence; absent when the model
+  /// has no recurrent layers.
+  std::optional<Tensor> recurrent_indices;
 };
 
 /// \brief One step's model execution inputs, prepared by the ModelRunner.

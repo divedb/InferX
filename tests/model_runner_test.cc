@@ -201,22 +201,19 @@ TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   EXPECT_EQ((*runner)->kv_pool()->Layout().dtype, DataType::kFloat32);
 }
 
-TEST(ModelRunnerStateTest, RejectsRecurrentStateBeforeAllocation) {
+TEST(ModelRunnerStateTest, AllocatesMixedLayoutsAndRecurrentState) {
   auto model = std::make_unique<TestModel>();
-  model->requirements = {RecurrentStateSpec{1, 2, 4, 4, 4}};
-  // Default CUDA device deliberately exercises rejection before device setup.
-  auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
-                                   ExecutionConfig{}, std::move(model));
-  EXPECT_EQ(runner.status().code(), absl::StatusCode::kUnimplemented);
-}
-
-TEST(ModelRunnerStateTest, RejectsMixedPagedLayoutsBeforeAllocation) {
-  auto model = std::make_unique<TestModel>();
+  // A hybrid stack: per-layer paged layouts plus a recurrent layer.
   model->config_.num_hidden_layers = 2;
-  model->requirements.push_back(PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kBFloat16}});
-  auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
-                                   ExecutionConfig{}, std::move(model));
-  EXPECT_EQ(runner.status().code(), absl::StatusCode::kUnimplemented);
+  model->requirements = {PagedKvStateSpec{KvLayout{2, 2, 4, DataType::kBFloat16}},
+                         RecurrentStateSpec{1, 2, 4, 4, 4}};
+  ModelConfig mc;
+  mc.device.device_type = "cpu";
+  CacheConfig cc;
+  cc.num_kv_blocks = 2;
+  auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
+  ASSERT_TRUE(runner.ok()) << runner.status();
+  EXPECT_EQ((*runner)->kv_pool()->LayoutFor(0).kv_heads, 2);
 }
 
 TEST(ModelRunnerStateTest, RejectsMissingLayerState) {

@@ -87,6 +87,14 @@ class KvBlockPool {
                                       int64_t block_size, const KvLayout& layout,
                                       DeviceId device);
 
+  /// \brief Same, with one layout per layer.
+  ///
+  /// Hybrid models (Qwen3-Next) and decompressed MLA layers vary per-layer
+  /// geometry; the pool keeps one free list across layers and sizes each
+  /// layer's region from its own layout.
+  static StatusOr<KvBlockPool> Create(int64_t num_blocks, int64_t block_size,
+                                      const std::vector<KvLayout>& layouts, DeviceId device);
+
   /// \brief Takes a free block. The contents are whatever was there before.
   ///
   /// \return A block index, or ResourceExhausted when the pool is full. Callers
@@ -132,6 +140,11 @@ class KvBlockPool {
   /// \brief Returns the per-token geometry of the cache.
   const KvLayout& Layout() const { return layout_; }
 
+  /// \brief Returns layer `layer`'s geometry ( heterogeneous pools vary).
+  const KvLayout& LayoutFor(int64_t layer) const {
+    return layouts_.empty() ? layout_ : layouts_[layer];
+  }
+
   /// \brief Returns the number of blocks currently on the free list.
   int64_t FreeBlocks() const { return static_cast<int64_t>(free_list_.size()); }
   /// \brief Returns the number of blocks currently handed out.
@@ -155,12 +168,16 @@ class KvBlockPool {
 
   DeviceBuffer storage_;
   KvLayout layout_;
+  /// Per-layer layouts for heterogeneous pools; empty when uniform.
+  std::vector<KvLayout> layouts_;
+  /// Per-layer byte offsets (heterogeneous pools).
+  std::vector<int64_t> layer_offsets_;
   int64_t num_layers_ = 0;
   int64_t num_blocks_ = 0;
   int64_t block_size_ = 0;
   /// Bytes from the start of one layer's region to the next.
   int64_t layer_stride_ = 0;
-  /// Bytes from a layer's K region to its V region.
+  /// Bytes from a layer's K region to its V region (uniform pools).
   int64_t entry_stride_ = 0;
   DeviceId device_;
 

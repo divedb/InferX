@@ -5,6 +5,7 @@
 
 #include "inferx/models/causal/model_traits.h"
 #include "inferx/models/components/decoder_layer.h"
+#include "inferx/models/components/gdn.h"
 #include "inferx/models/components/mla.h"
 #include "inferx/models/components/norm.h"
 #include "inferx/models/diagnostic_trace.h"
@@ -40,9 +41,11 @@ class DecoderLayer {
     static_assert(Traits::kNorm == NormPlacement::kPre);
   }
 
+  using LayerState = std::variant<PagedKvState, RecurrentState>;
   Status Forward(bool first, Tensor& hidden, Tensor& normed, Tensor& mixed,
-                 const AttentionBatch& batch, const PagedKvState& state, const KvBlockPool& pool,
-                 components::AttentionWorkspace& attention_ws, components::MlaWorkspace& mla_ws,
+                 const AttentionBatch& batch, const LayerState& state, const KvBlockPool& pool,
+                 const RecurrentStatePool& recurrent, components::AttentionWorkspace& attention_ws,
+                 components::MlaWorkspace& mla_ws, components::GdnWorkspace& gdn_ws,
                  components::MlpWorkspace& mlp_ws, components::MoeWorkspace& moe_ws,
                  Tensor& packed, ops::ExecutionContext& ctx, DiagnosticTrace& trace,
                  const std::string& prefix) const {
@@ -52,17 +55,21 @@ class DecoderLayer {
       INFERX_RETURN_IF_ERROR(input_norm_.AddForward(ctx, mixed, hidden, normed));
     }
     if (trace.enabled()) trace.Write(prefix + "input_norm", normed);
-    if (auto* mla = std::get_if<components::MlaWeights>(&mixer_weights_)) {
+    if (auto* gdn = std::get_if<components::GdnWeights>(&mixer_weights_)) {
+      INFERX_RETURN_IF_ERROR(components::RunGatedDeltaNet(
+          std::get<components::GatedDeltaNetConfig>(mixer_), *gdn, normed, batch,
+          std::get<RecurrentState>(state), recurrent, gdn_ws, ctx, &trace, prefix, mixed));
+    } else if (auto* mla = std::get_if<components::MlaWeights>(&mixer_weights_)) {
       INFERX_RETURN_IF_ERROR(components::RunMlaAttention(
-          std::get<components::MlaConfig>(mixer_), *mla, normed, norm_eps_, batch, state, pool,
-          mla_ws, ctx, &trace, prefix, mixed));
+          std::get<components::MlaConfig>(mixer_), *mla, normed, norm_eps_, batch,
+          std::get<PagedKvState>(state), pool, mla_ws, ctx, &trace, prefix, mixed));
     } else if (const auto* a = std::get_if<components::AttentionConfig>(&mixer_)) {
       INFERX_RETURN_IF_ERROR(
           components::RunAttention(*a, std::get<components::AttentionWeights>(mixer_weights_),
-                                   normed, norm_eps_, batch, state, pool, attention_ws, &packed,
-                                   ctx, &trace, prefix, mixed));
+                                   normed, norm_eps_, batch, std::get<PagedKvState>(state), pool,
+                                   attention_ws, &packed, ctx, &trace, prefix, mixed));
     } else {
-      return UnimplementedError("recurrent mixer execution is not implemented");
+      return InvalidArgumentError("layer mixer has no weights");
     }
     if (output_norm_residual_) {
       // Gemma sandwich: the mixer output is normalized before the residual
@@ -100,7 +107,8 @@ class DecoderLayer {
   std::variant<components::AttentionConfig, components::MlaConfig,
                components::GatedDeltaNetConfig> mixer_;
   std::variant<components::SwiGluConfig, components::MoeConfig> feed_forward_;
-  std::variant<components::AttentionWeights, components::MlaWeights> mixer_weights_;
+  std::variant<components::AttentionWeights, components::MlaWeights,
+               components::GdnWeights> mixer_weights_;
   std::variant<components::SwiGluWeights, components::MoeWeights> feed_forward_weights_;
   float norm_eps_;
   bool output_norm_residual_;

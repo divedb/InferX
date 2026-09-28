@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "absl/strings/str_cat.h"
 #include "inferx/core/logging.h"
 #include "inferx/models/components/qkv_linear.h"
 #include "inferx/models/loading/weight_loader.h"
@@ -93,14 +94,19 @@ StatusOr<PreparedCausalLM> PrepareCausalLM(models::LoadedCheckpoint& checkpoint,
         head_weight, LoadVocabShard(checkpoint.weights, std::string(names.head) + ".weight",
                                     mc.vocab_size, mc.hidden_size, parallel, device));
   }
-  const auto& first_attention =
-      std::get<components::AttentionConfig>(rank_local.blocks.front().mixer);
+  std::string mixer_summary = "recurrent";
+  if (const auto* first_attention =
+          std::get_if<components::AttentionConfig>(&rank_local.blocks.front().mixer)) {
+    mixer_summary = absl::StrCat("q_heads=", first_attention->query_heads,
+                                 " kv_heads=", first_attention->kv_heads,
+                                 " head_dim=", first_attention->head_dim);
+  } else if (const auto* mla =
+                 std::get_if<components::MlaConfig>(&rank_local.blocks.front().mixer)) {
+    mixer_summary = absl::StrCat("mla heads=", mla->query_heads, " head_dim=", mla->head_dim());
+  }
   INFERX_LOG(INFO) << "loaded decoder: layers=" << mc.num_hidden_layers
-                   << " hidden=" << mc.hidden_size << " vocab=" << mc.vocab_size
-                   << " q_heads=" << first_attention.query_heads
-                   << " kv_heads=" << first_attention.kv_heads
-                   << " head_dim=" << first_attention.head_dim
-                   << " tp=" << parallel.tensor_parallel_size;
+                   << " hidden=" << mc.hidden_size << " vocab=" << mc.vocab_size << " "
+                   << mixer_summary << " tp=" << parallel.tensor_parallel_size;
   return PreparedCausalLM{std::move(rank_local), std::move(weights), std::move(*head_weight)};
 }
 

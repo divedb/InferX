@@ -58,6 +58,40 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers, int64_t num_blocks
   return pool;
 }
 
+StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_blocks, int64_t block_size,
+                                          const std::vector<KvLayout>& layouts,
+                                          DeviceId device) {
+  if (layouts.empty()) {
+    return InvalidArgumentError("KV pool needs at least one layer layout");
+  }
+  for (const auto& layout : layouts) {
+    if (layout.kv_heads <= 0 || layout.head_dim <= 0 || layout.entries_per_token <= 0) {
+      return InvalidArgumentError("KV layout is degenerate: entries=", layout.entries_per_token,
+                                  " kv_heads=", layout.kv_heads, " head_dim=", layout.head_dim);
+    }
+    if (DataTypeIsSubByte(layout.dtype)) {
+      return InvalidArgumentError("KV dtype ", DataTypeName(layout.dtype),
+                                  " is not supported by the block pool");
+    }
+  }
+  // First validate through the uniform path for the shared checks, then
+  // rebuild the geometry per layer.
+  INFERX_ASSIGN_OR_RETURN(auto probe, Create(static_cast<int64_t>(layouts.size()), num_blocks,
+                                             block_size, layouts.front(), device));
+  probe.layouts_ = layouts;
+  probe.layer_offsets_.assign(layouts.size() + 1, 0);
+  int64_t offset = 0;
+  for (size_t layer = 0; layer < layouts.size(); ++layer) {
+    probe.layer_offsets_[layer] = offset;
+    const int64_t entry_elems = block_size * layouts[layer].kv_heads * layouts[layer].head_dim;
+    const int64_t entry_bytes = DataTypeByteSize(layouts[layer].dtype, entry_elems);
+    offset += entry_bytes * layouts[layer].entries_per_token * num_blocks;
+  }
+  probe.layer_offsets_[layouts.size()] = offset;
+  INFERX_ASSIGN_OR_RETURN(probe.storage_, DeviceBuffer::Allocate(static_cast<size_t>(offset), device));
+  return probe;
+}
+
 StatusOr<int32_t> KvBlockPool::AllocateBlock() {
   if (free_list_.empty()) {
     return ResourceExhaustedError("KV pool is full: all ", num_blocks_, " blocks are in use");
@@ -106,30 +140,34 @@ StatusOr<Tensor> KvBlockPool::KeyCache(int64_t layer) const {
   if (layer < 0 || layer >= num_layers_) {
     return InvalidArgumentError("layer ", layer, " is outside [0, ", num_layers_, ")");
   }
-
-  return ViewAt(storage_, layer * layer_stride_,
-                Shape({num_blocks_, block_size_, layout_.kv_heads, layout_.head_dim}),
-                layout_.dtype, device_);
+  const KvLayout& layout = LayoutFor(layer);
+  const int64_t offset = layouts_.empty() ? layer * layer_stride_ : layer_offsets_[layer];
+  return ViewAt(storage_, offset,
+                Shape({num_blocks_, block_size_, layout.kv_heads, layout.head_dim}),
+                layout.dtype, device_);
 }
 
 StatusOr<Tensor> KvBlockPool::ValueCache(int64_t layer) const {
   if (layer < 0 || layer >= num_layers_) {
     return InvalidArgumentError("layer ", layer, " is outside [0, ", num_layers_, ")");
   }
-
-  if (layout_.entries_per_token < 2) {
+  const KvLayout& layout = LayoutFor(layer);
+  if (layout.entries_per_token < 2) {
     return FailedPreconditionError(
-        "this KV layout has ", layout_.entries_per_token,
+        "this KV layout has ", layout.entries_per_token,
         " entry per token and therefore no separate value cache; an MLA latent "
         "is read through KeyCache()");
   }
-
+  const int64_t entry_elems = block_size_ * layout.kv_heads * layout.head_dim;
+  const int64_t entry_bytes = DataTypeByteSize(layout.dtype, entry_elems);
+  const int64_t base =
+      layouts_.empty() ? layer * layer_stride_ : layer_offsets_[layer];
   // K and V for a layer are adjacent: [blocks][K|V][...] would interleave them
   // per block, which is worse for the append kernel, so the entry dimension is
   // outermost within a layer.
-  return ViewAt(storage_, layer * layer_stride_ + entry_stride_ * num_blocks_,
-                Shape({num_blocks_, block_size_, layout_.kv_heads, layout_.head_dim}),
-                layout_.dtype, device_);
+  return ViewAt(storage_, base + entry_bytes * num_blocks_,
+                Shape({num_blocks_, block_size_, layout.kv_heads, layout.head_dim}),
+                layout.dtype, device_);
 }
 
 }  // namespace inferx

@@ -28,6 +28,10 @@ class DecoderWorkspace {
   int64_t max_mla_q_lora_ = 0;
   int64_t max_mla_kv_lora_ = 0;
   int64_t max_mla_rope_ = 0;
+  int64_t max_gdn_proj_ = 0;
+  int64_t max_gdn_conv_ = 0;
+  int64_t max_gdn_value_ = 0;
+  int64_t max_gdn_heads_ = 0;
   int64_t max_mla_up_width_ = 0;
   int64_t max_moe_experts_ = 0;
   int64_t max_experts_per_token_ = 0;
@@ -39,6 +43,7 @@ class DecoderWorkspace {
   std::optional<Tensor> hidden_, normed_, mixed_;
   std::optional<components::AttentionWorkspace> attention_;
   std::optional<components::MlaWorkspace> mla_;
+  std::optional<components::GdnWorkspace> gdn_;
   std::optional<components::MlpWorkspace> mlp_;
   std::optional<components::MoeWorkspace> moe_;
 };
@@ -66,11 +71,10 @@ class DecoderStack final : private DecoderWorkspace {
     INFERX_ASSIGN_OR_RETURN(Tensor mixed, mixed_->Slice(0, input.attention.num_tokens));
     for (size_t i = 0; i < layers_.size(); ++i) {
       const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";
-      INFERX_RETURN_IF_ERROR(layers_[i].Forward(i == 0, hidden, normed, mixed, input.attention,
-                                                std::get<PagedKvState>(state.layers[i]),
-                                                *state.paged_kv, *attention_, *mla_, *mlp_,
-                                                *moe_, *packed_projection_, ctx, trace,
-                                                prefix));
+      INFERX_RETURN_IF_ERROR(layers_[i].Forward(
+          i == 0, hidden, normed, mixed, input.attention, state.layers[i], *state.paged_kv,
+          state.recurrent == nullptr ? *gdn_fallback_pool_ : *state.recurrent, *attention_,
+          *mla_, *gdn_, *mlp_, *moe_, *packed_projection_, ctx, trace, prefix));
     }
     INFERX_RETURN_IF_ERROR(final_norm_.AddForward(ctx, mixed, hidden, normed));
     if (trace.enabled()) trace.Write("final_norm", normed);
@@ -78,6 +82,11 @@ class DecoderStack final : private DecoderWorkspace {
   }
 
  private:
+  // Present only for models with no recurrent layers, so the layer's pool
+  // reference is never dangling; recurrent models use the runner's pool.
+  static constexpr RecurrentStatePool* kNoRecurrentPool = nullptr;
+  RecurrentStatePool* gdn_fallback_pool_ = const_cast<RecurrentStatePool*>(
+      static_cast<const RecurrentStatePool*>(kNoRecurrentPool));
   std::vector<DecoderLayer<Traits>> layers_;
   typename Traits::Norm final_norm_;
 };

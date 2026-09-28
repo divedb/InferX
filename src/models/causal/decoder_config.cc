@@ -57,18 +57,21 @@ Status DecoderConfig::Validate() const {
 Status DecoderConfig::ValidateExecutable() const {
   for (const auto& block : blocks) {
     const auto* a = std::get_if<components::AttentionConfig>(&block.mixer);
-    if (a == nullptr && !std::holds_alternative<components::MlaConfig>(block.mixer)) {
-      return UnimplementedError("recurrent mixer execution is not implemented");
+    if (a == nullptr && !std::holds_alternative<components::MlaConfig>(block.mixer) &&
+        !std::holds_alternative<components::GatedDeltaNetConfig>(block.mixer)) {
+      return UnimplementedError("mixer execution is not implemented");
     }
-    ops::AttentionParams params;
-    params.query_heads = a->query_heads;
-    params.kv_heads = a->kv_heads;
-    params.head_dim = a->head_dim;
-    params.scale = a->scale_override > 0.0f ? a->scale_override : 1.0f;
-    params.sliding_window = a->sliding_window;
-    INFERX_RETURN_IF_ERROR(ops::ValidateAttentionGeometry(params));
-    if (a != nullptr && a->head_dim > 8 * 256) {
-      return UnimplementedError("attention head dimension exceeds the generic kernel");
+    if (a != nullptr) {
+      ops::AttentionParams params;
+      params.query_heads = a->query_heads;
+      params.kv_heads = a->kv_heads;
+      params.head_dim = a->head_dim;
+      params.scale = a->scale_override > 0.0f ? a->scale_override : 1.0f;
+      params.sliding_window = a->sliding_window;
+      INFERX_RETURN_IF_ERROR(ops::ValidateAttentionGeometry(params));
+      if (a->head_dim > 8 * 256) {
+        return UnimplementedError("attention head dimension exceeds the generic kernel");
+      }
     }
     if (const auto* moe = std::get_if<components::MoeConfig>(&block.feed_forward)) {
       if (moe->num_experts > 512 || moe->experts_per_token > 64) {

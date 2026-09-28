@@ -107,6 +107,11 @@ class CpuRuntime final : public DeviceRuntime {
     return Copy(dst, src, bytes, kind);
   }
 
+Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
+  std::memset(dst, 0, bytes);
+  return OkStatus();
+}
+
   StatusOr<Stream> CreateStream() override { return Stream(nullptr); }
 
   Status DestroyStream(Stream /*stream*/) override { return OkStatus(); }

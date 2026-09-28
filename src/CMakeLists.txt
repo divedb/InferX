@@ -4,6 +4,7 @@ add_subdirectory(core)
 # scheduler over device-side KV storage.
 add_library(inferx_cache
   cache/kv_block_pool.cc
+  cache/recurrent_state_pool.cc
 )
 add_library(inferx::cache ALIAS inferx_cache)
 target_link_libraries(inferx_cache PUBLIC inferx::core)
@@ -25,11 +26,13 @@ add_library(inferx_ops
   ops/attention.cc
   ops/moe.cc
   ops/mla.cc
+  ops/gdn.cc
   ops/flash_attention.cc
   ops/cuda/flash_attention.cu
   ops/cuda/generic_attention.cu
   ops/cuda/moe.cu
   ops/cuda/mla.cu
+  ops/cuda/gdn.cu
   ops/cuda/sampling.cu
   ops/cuda/gather.cu
   ops/cuda/linear.cu
@@ -84,6 +87,7 @@ add_library(inferx_models
   models/components/mlp.cc
   models/components/moe.cc
   models/components/mla.cc
+  models/components/gdn.cc
   models/components/parallel_linear.cc
   models/components/qkv_linear.cc
   models/causal/causal_lm.cc

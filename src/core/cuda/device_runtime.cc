@@ -89,6 +89,13 @@ class CudaDeviceRuntime final : public DeviceRuntime {
         "cudaMemcpyAsync");
   }
 
+Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
+  const cudaError_t err = cudaMemsetAsync(dst, 0, bytes, static_cast<cudaStream_t>(stream));
+  return err == cudaSuccess
+             ? OkStatus()
+             : InternalError("cudaMemsetAsync failed: ", cudaGetErrorString(err));
+}
+
   StatusOr<Stream> CreateStream() override {
     INFERX_RETURN_IF_ERROR(Activate());
     cudaStream_t stream = nullptr;

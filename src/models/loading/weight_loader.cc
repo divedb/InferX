@@ -199,8 +199,11 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
   INFERX_ASSIGN_OR_RETURN(
       auto post_mixer_norm,
       Weight(checkpoint, prefix + std::string(names.ffn_norm) + ".weight", {hidden}, device));
-  const auto& a = std::get<components::AttentionConfig>(config.mixer);
-  INFERX_ASSIGN_OR_RETURN(auto attn, LoadAttentionWeights(checkpoint, prefix, names, layout, a,
+  const auto* a = std::get_if<components::AttentionConfig>(&config.mixer);
+  if (a == nullptr) {
+    return UnimplementedError("checkpoint mapping for this mixer is not implemented");
+  }
+  INFERX_ASSIGN_OR_RETURN(auto attn, LoadAttentionWeights(checkpoint, prefix, names, layout, *a,
                                                           parallel, hidden, device));
   if (const auto* dense = std::get_if<components::SwiGluConfig>(&config.feed_forward)) {
     INFERX_ASSIGN_OR_RETURN(

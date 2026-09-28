@@ -12,6 +12,8 @@
 
 namespace inferx {
 
+class RecurrentStatePool;  ///< Defined in cache/recurrent_state_pool.h.
+
 /// \brief Paged KV cache requirements declared by one attention layer.
 struct PagedKvStateSpec {
   KvLayout layout;  ///< Per-token geometry the layer caches.
@@ -34,14 +36,19 @@ struct PagedKvState {
   int64_t pool_layer = -1;  ///< Layer index into the pool.
 };
 
-/// \brief Handle to one layer's recurrent state; device buffers pending.
-struct RecurrentState {};
+/// \brief Handle to one layer's region of the runner-owned recurrent pool.
+struct RecurrentState {
+  int64_t pool_layer = -1;  ///< Layer index into the pool.
+};
 
 /// \brief Per-layer execution state owned by the ModelRunner and handed to
 ///        Model::Forward each step.
 struct ModelState {
   /// Pool backing every PagedKvState layer.
   const KvBlockPool* paged_kv = nullptr;
+
+  /// Pool backing every RecurrentState layer; null when the model has none.
+  const RecurrentStatePool* recurrent = nullptr;
 
   /// One entry per decoder layer, matching StateRequirements order.
   std::vector<std::variant<PagedKvState, RecurrentState>> layers;

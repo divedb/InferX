@@ -98,6 +98,9 @@ class DeviceRuntime {
   virtual Status CopyAsync(void* dst, const void* src, size_t bytes, CopyKind kind,
                            Stream stream) = 0;
 
+  /// \brief Fills `bytes` bytes at `dst` with zero, asynchronously on `stream`.
+  virtual Status MemsetAsync(void* dst, size_t bytes, Stream stream) = 0;
+
   /// \brief Creates a stream on the bound device.
   ///
   /// \return       The stream, or an error status.
