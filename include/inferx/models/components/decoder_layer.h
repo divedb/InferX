@@ -11,6 +11,7 @@
 #include "inferx/models/components/attention.h"
 #include "inferx/models/components/mlp.h"
 #include "inferx/models/components/moe.h"
+#include "inferx/models/components/moe.h"
 #include "inferx/models/components/norm.h"
 
 namespace inferx {
@@ -57,8 +58,8 @@ struct DecoderLayerWeights {
 /// Dispatches SwiGLU and MoE; the hot path stays a direct call.
 Status RunFeedForward(const std::variant<SwiGluConfig, MoeConfig>& config,
                       const std::variant<SwiGluWeights, MoeWeights>& weights,
-                      const Tensor& normed, MlpWorkspace& ws, Tensor* packed_buffer,
-                      ops::ExecutionContext& ctx, DiagnosticTrace* trace,
+                      const Tensor& normed, MlpWorkspace& mlp_ws, MoeWorkspace& moe_ws,
+                      Tensor* packed_buffer, ops::ExecutionContext& ctx, DiagnosticTrace* trace,
                       std::string_view prefix, Tensor& mixed_out);
 
 }  // namespace inferx::components

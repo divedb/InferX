@@ -64,8 +64,17 @@ Status DecoderConfig::ValidateExecutable() const {
     if (a->head_dim > 8 * 256) {
       return UnimplementedError("attention head dimension exceeds the generic kernel");
     }
-    if (!std::holds_alternative<components::SwiGluConfig>(block.feed_forward)) {
-      return UnimplementedError("expert feed-forward execution is not implemented");
+    if (const auto* moe = std::get_if<components::MoeConfig>(&block.feed_forward)) {
+      if (moe->num_experts > 512 || moe->experts_per_token > 64) {
+        return UnimplementedError("expert counts exceed the routing kernel");
+      }
+      if (moe->routing.group_count > 1) {
+        const int64_t per_group = moe->num_experts / moe->routing.group_count;
+        if (moe->num_experts % moe->routing.group_count != 0 ||
+            moe->routing.group_topk * per_group < moe->experts_per_token) {
+          return InvalidArgumentError("grouped routing cannot select enough experts");
+        }
+      }
     }
   }
   return OkStatus();

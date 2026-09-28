@@ -53,7 +53,7 @@ TEST(FamilyConfigTest, Qwen3TranslatesQkNorm) {
   EXPECT_TRUE(executable.ok()) << executable.ToString();
 }
 
-TEST(FamilyConfigTest, MoEIsRejectedAtBuildTimeNotForwardTime) {
+TEST(FamilyConfigTest, MoETranslatesAndValidatesAsExecutable) {
   const auto config = TranslateFamilyConfig(
       Identity("qwen3_moe"),
       Config("qwen3_moe",
@@ -61,9 +61,7 @@ TEST(FamilyConfigTest, MoEIsRejectedAtBuildTimeNotForwardTime) {
              "\"shared_expert_intermediate_size\":32,\"norm_topk_prob\":true"));
   ASSERT_TRUE(config.ok()) << config.status();
   EXPECT_TRUE(std::holds_alternative<components::MoeConfig>(config->blocks[0].feed_forward));
-  const auto executable = config->ValidateExecutable();
-  ASSERT_FALSE(executable.ok());
-  EXPECT_EQ(executable.code(), absl::StatusCode::kUnimplemented);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
 }
 
 TEST(FamilyConfigTest, RecurrentLayersAreRejectedAsUnexecutable) {
@@ -149,9 +147,15 @@ TEST(FamilyConfigTest, DenseQwen3RejectsUnknownLayerTypes) {
 }
 
 TEST(FamilyConfigTest, TypedBuilderRejectsUnsupportedBlocksBeforeReadingWeights) {
-  for (const auto& json : {Config("qwen3_moe",
+  for (const auto& json : {Config("qwen3_next",
+                                  "\"layer_types\":[\"linear_attention\",\"full_attention\"],"
+                                  "\"full_attention_interval\":2,"
+                                  "\"linear_num_key_heads\":2,\"linear_num_value_heads\":2,"
+                                  "\"linear_key_head_dim\":64,\"linear_value_head_dim\":64,"
+                                  "\"linear_conv_kernel_dim\":4,"
                                   "\"num_experts\":4,\"num_experts_per_tok\":2,"
-                                  "\"moe_intermediate_size\":32")}) {
+                                  "\"moe_intermediate_size\":32,"
+                                  "\"shared_expert_intermediate_size\":32")}) {
     models::LoadedCheckpoint checkpoint;
     auto identity = CheckpointConfig::FromJson(json);
     ASSERT_TRUE(identity.ok());

@@ -240,8 +240,8 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
                  {1, hidden}, device));
     }
   }
-  components::MoeWeights moe{std::move(router), std::move(experts), std::move(shared_expert),
-                             std::move(shared_expert_gate)};
+  components::MoeWeights moe{std::move(router), std::nullopt, std::nullopt, std::move(experts),
+                             std::move(shared_expert), std::move(shared_expert_gate)};
   return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
                                          std::nullopt, std::nullopt, std::move(attn),
                                          std::move(moe)};

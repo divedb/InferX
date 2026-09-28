@@ -53,7 +53,7 @@ StatusOr<causal::DecoderConfig> TranslateVariant(const nlohmann::json& j) {
     experts.num_experts = j.at("num_experts").get<int64_t>();
     experts.experts_per_token = j.at("num_experts_per_tok").get<int64_t>();
     experts.intermediate_size = j.at("moe_intermediate_size").get<int64_t>();
-    experts.normalize_routing_weights = j.value("norm_topk_prob", true);
+    experts.routing.normalize = j.value("norm_topk_prob", true);
     experts.shared_intermediate_size = j.value("shared_expert_intermediate_size", int64_t{0});
     experts.gate_shared_expert = next && experts.shared_intermediate_size > 0;
   }

@@ -23,9 +23,11 @@ add_library(inferx_ops
   ops/elementwise.cc
   ops/rotary.cc
   ops/attention.cc
+  ops/moe.cc
   ops/flash_attention.cc
   ops/cuda/flash_attention.cu
   ops/cuda/generic_attention.cu
+  ops/cuda/moe.cu
   ops/cuda/sampling.cu
   ops/cuda/gather.cu
   ops/cuda/linear.cu

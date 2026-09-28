@@ -32,6 +32,7 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   const auto& dims = config_.model;
   attention_.emplace();
   mlp_.emplace();
+  if (max_moe_experts_ > 0) moe_.emplace();
   int64_t query_dim = 0;
   int64_t kv_dim = 0;
   int64_t query_heads = 0;
@@ -50,6 +51,13 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
     if (const auto* dense = std::get_if<components::SwiGluConfig>(&block.feed_forward)) {
       max_intermediate_ = std::max(max_intermediate_, dense->intermediate_size);
     }
+    if (const auto* moe = std::get_if<components::MoeConfig>(&block.feed_forward)) {
+      max_moe_experts_ = std::max(max_moe_experts_, moe->num_experts);
+      max_experts_per_token_ = std::max(max_experts_per_token_, moe->experts_per_token);
+      max_moe_intermediate_ = std::max(max_moe_intermediate_, moe->intermediate_size);
+      max_shared_intermediate_ =
+          std::max(max_shared_intermediate_, moe->shared_intermediate_size);
+    }
   }
   const int64_t rows = max_tokens_;
   const auto alloc2 = [&](int64_t cols) {
@@ -57,6 +65,9 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   };
   const auto alloc_flat = [&](int64_t cols) {
     return Tensor::Empty(DataType::kBFloat16, Shape({rows * cols}), device);
+  };
+  const auto alloc2_at = [&](int64_t r, int64_t c) {
+    return Tensor::Empty(DataType::kBFloat16, Shape({r, c}), device);
   };
   INFERX_ASSIGN_OR_RETURN(hidden_, alloc2(dims.hidden_size));
   INFERX_ASSIGN_OR_RETURN(normed_, alloc2(dims.hidden_size));
@@ -69,6 +80,30 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
     INFERX_ASSIGN_OR_RETURN(attention_->gate, alloc_flat(query_dim));
   }
   INFERX_ASSIGN_OR_RETURN(mlp_->gate, alloc_flat(max_intermediate_));
+  if (moe_.has_value()) {
+    // Slots are (token, selected-expert) pairs; every buffer is indexed by
+    // the dispatch slot so gather, expert GEMMs, and scatter agree.
+    const int64_t slots = max_tokens_ * max_experts_per_token_;
+    INFERX_ASSIGN_OR_RETURN(moe_->topk_indices,
+                            Tensor::Empty(DataType::kInt32, Shape({slots}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->topk_weights,
+                            Tensor::Empty(DataType::kFloat32, Shape({slots}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->counts,
+                            Tensor::Empty(DataType::kInt32, Shape({max_moe_experts_}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->offsets,
+                            Tensor::Empty(DataType::kInt32, Shape({max_moe_experts_ + 1}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->cursor,
+                            Tensor::Empty(DataType::kInt32, Shape({max_moe_experts_}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->token_rows,
+                            Tensor::Empty(DataType::kInt32, Shape({slots}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->weights_by_slot,
+                            Tensor::Empty(DataType::kFloat32, Shape({slots}), device));
+    INFERX_ASSIGN_OR_RETURN(moe_->gathered, alloc2_at(slots, dims.hidden_size));
+    INFERX_ASSIGN_OR_RETURN(moe_->activated, alloc2_at(slots, max_moe_intermediate_));
+    INFERX_ASSIGN_OR_RETURN(moe_->expert_rows, alloc2_at(slots, dims.hidden_size));
+    INFERX_ASSIGN_OR_RETURN(moe_->packed_gate_up, alloc2_at(slots, 2 * max_moe_intermediate_));
+    INFERX_ASSIGN_OR_RETURN(moe_->shared_out, alloc2_at(max_tokens_, dims.hidden_size));
+  }
   // Attention runs the fused QKV projection (with a doubled query section
   // when gated), and packed gate/up rows can be wider; one buffer serves
   // both since they never overlap in time.

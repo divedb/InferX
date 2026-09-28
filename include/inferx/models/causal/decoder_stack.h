@@ -23,12 +23,17 @@ class DecoderWorkspace {
   int max_tokens_;
   bool workspace_ready_ = false;
   int64_t max_intermediate_ = 0;
+  int64_t max_moe_experts_ = 0;
+  int64_t max_experts_per_token_ = 0;
+  int64_t max_moe_intermediate_ = 0;
+  int64_t max_shared_intermediate_ = 0;
   bool enable_split_decode_ = false;
   int prefill_tile_rows_ = 64;
   std::optional<Tensor> packed_projection_;
   std::optional<Tensor> hidden_, normed_, mixed_;
   std::optional<components::AttentionWorkspace> attention_;
   std::optional<components::MlpWorkspace> mlp_;
+  std::optional<components::MoeWorkspace> moe_;
 };
 
 template <ModelTraits Traits>
@@ -56,7 +61,7 @@ class DecoderStack final : private DecoderWorkspace {
       const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";
       INFERX_RETURN_IF_ERROR(layers_[i].Forward(i == 0, hidden, normed, mixed, input.attention,
                                                 std::get<PagedKvState>(state.layers[i]),
-                                                *state.paged_kv, *attention_, *mlp_,
+                                                *state.paged_kv, *attention_, *mlp_, *moe_,
                                                 *packed_projection_, ctx, trace, prefix));
     }
     INFERX_RETURN_IF_ERROR(final_norm_.AddForward(ctx, mixed, hidden, normed));

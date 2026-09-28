@@ -18,6 +18,7 @@
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
 #include "inferx/models/components/rope.h"
+#include "inferx/ops/moe.h"
 #include "inferx/ops/rms_norm.h"
 
 namespace inferx {
@@ -454,6 +455,90 @@ TEST_F(OpsTest, BiasAndSigmoidGates) {
   ASSERT_TRUE(ops::MulScalar(ctx, x, 4.0f).ok());
   const auto scaled = Download(x);
   EXPECT_NEAR(scaled[1], 4, 0.02f);
+}
+
+TEST_F(OpsTest, RouteTokensMatchesReferencePolicies) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  // Two tokens, three experts, hidden 4.
+  Tensor hidden = Upload({1, 0.5f, -0.25f, 0.125f, -0.5f, 0.25f, 0.75f, -1},
+                         Shape({2, 4}));
+  Tensor router = Upload({0.1f, -0.2f, 0.3f, 0.4f, 0.5f, -0.6f, 0.7f, -0.8f, 0.9f, 1.0f,
+                          -1.1f, 1.2f},
+                         Shape({3, 4}));
+  Tensor bias = Upload({0.05f, -0.1f, 0.15f}, Shape({3}));
+  const float kBias[3] = {0.05f, -0.1f, 0.15f};
+  const auto logits = [&](int row, int e) {
+    const float h[4] = {row == 0 ? 1.0f : -0.5f, row == 0 ? 0.5f : 0.25f,
+                        row == 0 ? -0.25f : 0.75f, row == 0 ? 0.125f : -1.0f};
+    const float w[3][4] = {{0.1f, -0.2f, 0.3f, 0.4f},
+                           {0.5f, -0.6f, 0.7f, -0.8f},
+                           {0.9f, 1.0f, -1.1f, 1.2f}};
+    float dot = 0;
+    for (int d = 0; d < 4; ++d) dot += h[d] * w[e][d];
+    return dot;
+  };
+  auto indices = [&]() {
+    return Tensor::Empty(DataType::kInt32, Shape({4}), DeviceId::Cuda(0)).value();
+  };
+  auto weights32 = [&]() {
+    return Tensor::Empty(DataType::kFloat32, Shape({4}), DeviceId::Cuda(0)).value();
+  };
+
+  // Softmax top-2 with bias: renormalized softmax over the selected logits.
+  {
+    Tensor idx = indices(), w = weights32();
+    ops::RoutingConfig config;
+    config.topk = 2;
+    ASSERT_TRUE(ops::RouteTokens(ctx, hidden, router, &bias, nullptr, config, idx, w).ok());
+    std::vector<int32_t> got_idx(4);
+    std::vector<float> got_w(4);
+    ASSERT_TRUE(runtime_->Copy(got_idx.data(), idx.Data(), 16, CopyKind::kDeviceToHost).ok());
+    ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+    ASSERT_TRUE(runtime_->Copy(got_w.data(), w.Data(), 16, CopyKind::kDeviceToHost).ok());
+    ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+    for (int row = 0; row < 2; ++row) {
+      std::vector<std::pair<float, int>> ranked;
+      for (int e = 0; e < 3; ++e) ranked.push_back({logits(row, e) + kBias[e], e});
+      std::sort(ranked.begin(), ranked.end(), std::greater<>());
+      const float m = ranked[0].first;
+      const float denom = std::exp(ranked[0].first - m) + std::exp(ranked[1].first - m);
+      EXPECT_EQ(got_idx[row * 2], ranked[0].second);
+      EXPECT_EQ(got_idx[row * 2 + 1], ranked[1].second);
+      EXPECT_NEAR(got_w[row * 2], std::exp(ranked[0].first - m) / denom, 2e-3);
+      EXPECT_NEAR(got_w[row * 2 + 1], std::exp(ranked[1].first - m) / denom, 2e-3);
+    }
+  }
+}
+
+TEST_F(OpsTest, RouteTokensGroupedSigmoidSelection) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  // One token, four experts in two groups, one group kept, top-1.
+  Tensor hidden = Upload({1, 2, 3, 4}, Shape({1, 4}));
+  Tensor router = Upload({10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                         Shape({4, 4}));
+  // Sigmoid scores: e0 = sigmoid(10) ~ 1, e1 = e2 = e3 = sigmoid(0) = 0.5.
+  Tensor correction = Tensor::Empty(DataType::kFloat32, Shape({4}), DeviceId::Cuda(0)).value();
+  ASSERT_TRUE(runtime_->Copy(correction.Data(), std::vector<float>{0, 0, 0, 0}.data(), 16,
+                             CopyKind::kHostToDevice).ok());
+  ops::RoutingConfig config;
+  config.scoring = ops::RouterScoring::kSigmoidGroupTopk;
+  config.topk = 1;
+  config.normalize = false;
+  config.routing_scale = 2.5f;
+  config.group_count = 2;
+  config.group_topk = 1;
+  Tensor idx = Tensor::Empty(DataType::kInt32, Shape({1}), DeviceId::Cuda(0)).value();
+  Tensor w = Tensor::Empty(DataType::kFloat32, Shape({1}), DeviceId::Cuda(0)).value();
+  ASSERT_TRUE(ops::RouteTokens(ctx, hidden, router, nullptr, &correction, config, idx, w).ok());
+  std::vector<int32_t> got_idx(1);
+  std::vector<float> got_w(1);
+  ASSERT_TRUE(runtime_->Copy(got_idx.data(), idx.Data(), 4, CopyKind::kDeviceToHost).ok());
+  ASSERT_TRUE(runtime_->Copy(got_w.data(), w.Data(), 4, CopyKind::kDeviceToHost).ok());
+  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  // Group 0 (experts 0, 1) wins on e0's near-one score; e0 is selected with
+  // its raw sigmoid weight times the routed scale, unnormalized.
+  EXPECT_EQ(got_idx[0], 0);
+  EXPECT_NEAR(got_w[0], 2.5f / (1.0f + std::exp(-10.0f)), 2e-3);
 }
 
 TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {
