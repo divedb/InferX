@@ -1,9 +1,11 @@
-#pragma once
+#ifndef INFERX_CACHE_KV_BLOCK_POOL_H_
+#define INFERX_CACHE_KV_BLOCK_POOL_H_
 
+#include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <vector>
 
+#include "inferx/core/device.h"
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/dtype.h"
 #include "inferx/core/status.h"
@@ -22,11 +24,14 @@ namespace inferx {
 struct KvLayout {
   /// Entries per token per layer. 2 for K and V; 1 for an MLA latent.
   int64_t entries_per_token = 2;
+
   /// KV heads *on this rank*. For GQA this is `num_key_value_heads / tp_size`;
   /// for MLA it does not shard at all, which is why the pool never divides it.
   int64_t kv_heads = 0;
+
   /// Per-head dimension of each K/V entry.
   int64_t head_dim = 0;
+
   /// Element type of the cached entries.
   DataType dtype = DataType::kBFloat16;
 
@@ -72,12 +77,12 @@ class KvBlockPool {
   /// \param num_blocks  Total blocks, shared across all sequences.
   /// \param block_size  Tokens per block. 16 by default (T10).
   /// \param layout      Per-token geometry. \see KvLayout.
-  /// \return            The pool, or ResourceExhausted if it will not fit.
   /// \param device      Where the pool lives. `Cpu()` exists so the scheduler's
-  /// block bookkeeping can be
-  ///                    unit-tested on a machine with no device at all, which
-  ///                    §3.1 calls the highest-leverage testability decision in
-  ///                    the design. The free list is the same code either way.
+  ///                    block bookkeeping can be unit-tested on a machine with
+  ///                    no device at all, which §3.1 calls the
+  ///                    highest-leverage testability decision in the design.
+  ///                    The free list is the same code either way.
+  /// \return            The pool, or ResourceExhausted if it will not fit.
   static StatusOr<KvBlockPool> Create(int64_t num_layers, int64_t num_blocks,
                                       int64_t block_size, const KvLayout& layout,
                                       DeviceId device);
@@ -110,6 +115,7 @@ class KvBlockPool {
   /// \param layer Layer index.
   /// \return      The cache tensor, or an error status for an invalid layer.
   StatusOr<Tensor> KeyCache(int64_t layer) const;
+
   /// \brief The V region for one layer, shaped for the kernels.
   ///
   /// \param layer Layer index.
@@ -118,21 +124,21 @@ class KvBlockPool {
   StatusOr<Tensor> ValueCache(int64_t layer) const;
 
   /// \brief Returns the number of layers the pool caches.
-  int64_t num_layers() const { return num_layers_; }
+  int64_t NumLayers() const { return num_layers_; }
   /// \brief Returns the total number of blocks, shared across all sequences.
-  int64_t num_blocks() const { return num_blocks_; }
+  int64_t NumBlocks() const { return num_blocks_; }
   /// \brief Returns the number of tokens per block.
-  int64_t block_size() const { return block_size_; }
+  int64_t BlockSize() const { return block_size_; }
   /// \brief Returns the per-token geometry of the cache.
-  const KvLayout& layout() const { return layout_; }
+  const KvLayout& Layout() const { return layout_; }
 
   /// \brief Returns the number of blocks currently on the free list.
-  int64_t free_blocks() const { return static_cast<int64_t>(free_list_.size()); }
+  int64_t FreeBlocks() const { return static_cast<int64_t>(free_list_.size()); }
   /// \brief Returns the number of blocks currently handed out.
-  int64_t used_blocks() const { return num_blocks_ - free_blocks(); }
+  int64_t UsedBlocks() const { return num_blocks_ - FreeBlocks(); }
 
   /// \brief Returns the size of the backing allocation in bytes.
-  size_t bytes() const { return storage_.size(); }
+  size_t Bytes() const { return storage_.size(); }
 
   /// \brief Blocks needed to hold `tokens` tokens.
   int64_t BlocksForTokens(int64_t tokens) const {
@@ -195,11 +201,11 @@ class BlockTable {
   }
 
   /// \brief Returns the block indices of the sequence, in logical order.
-  const std::vector<int32_t>& blocks() const { return blocks_; }
+  const std::vector<int32_t>& Blocks() const { return blocks_; }
   /// \brief Returns the number of blocks held by the sequence.
-  int64_t size() const { return static_cast<int64_t>(blocks_.size()); }
+  int64_t Size() const { return static_cast<int64_t>(blocks_.size()); }
   /// \brief Returns the number of tokens the held blocks can store.
-  int64_t capacity_tokens() const { return size() * block_size_; }
+  int64_t CapacityTokens() const { return Size() * block_size_; }
   /// \brief Drops every block from the table.
   void Clear() { blocks_.clear(); }
 
@@ -209,3 +215,5 @@ class BlockTable {
 };
 
 }  // namespace inferx
+
+#endif  // INFERX_CACHE_KV_BLOCK_POOL_H_

@@ -107,7 +107,7 @@ TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
   StatusOr<SchedulerOutput> drain = scheduler_->Schedule();
   ASSERT_TRUE(drain.ok());
   EXPECT_EQ(drain->finished_request_ids, std::vector<RequestId>({1}));
-  EXPECT_EQ(pool_->free_blocks(), pool_->num_blocks());
+  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
 }
 
 TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
@@ -194,11 +194,11 @@ TEST_F(SchedulerTest, AbortFreesBlocksAndFinishesRequest) {
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3})).ok());
   StatusOr<SchedulerOutput> output = scheduler_->Schedule();
   ASSERT_TRUE(output.ok());
-  EXPECT_LT(pool_->free_blocks(), pool_->num_blocks());
+  EXPECT_LT(pool_->FreeBlocks(), pool_->NumBlocks());
 
   EXPECT_EQ(scheduler_->AbortRequests({1}), std::vector<uint64_t>({1}));
   EXPECT_FALSE(scheduler_->HasRequests());
-  EXPECT_EQ(pool_->free_blocks(), pool_->num_blocks());
+  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
   std::optional<Request> aborted = scheduler_->PopFinished();
   ASSERT_TRUE(aborted.has_value());
   EXPECT_EQ(aborted->finish_reason(), FinishReason::kAborted);

@@ -196,9 +196,9 @@ TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   cc.num_kv_blocks = 2;
   auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
   ASSERT_TRUE(runner.ok()) << runner.status();
-  EXPECT_EQ((*runner)->kv_pool()->layout().kv_heads, 2);
-  EXPECT_EQ((*runner)->kv_pool()->layout().head_dim, 4);
-  EXPECT_EQ((*runner)->kv_pool()->layout().dtype, DataType::kFloat32);
+  EXPECT_EQ((*runner)->kv_pool()->Layout().kv_heads, 2);
+  EXPECT_EQ((*runner)->kv_pool()->Layout().head_dim, 4);
+  EXPECT_EQ((*runner)->kv_pool()->Layout().dtype, DataType::kFloat32);
 }
 
 TEST(ModelRunnerStateTest, RejectsRecurrentStateBeforeAllocation) {

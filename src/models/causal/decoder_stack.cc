@@ -197,7 +197,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
     if (std::holds_alternative<PagedKvStateSpec>(specs[i])) {
       const auto* entry = std::get_if<PagedKvState>(&state.layers[i]);
       if (entry == nullptr || state.paged_kv == nullptr || entry->pool_layer < 0 ||
-          entry->pool_layer >= state.paged_kv->num_layers()) {
+          entry->pool_layer >= state.paged_kv->NumLayers()) {
         return InvalidArgumentError("missing paged state for layer ", i);
       }
     } else if (!std::holds_alternative<RecurrentState>(state.layers[i])) {
@@ -230,7 +230,7 @@ StatusOr<Tensor> DecoderStack::Forward(const DecoderInput& input, ModelState& st
       return InvalidArgumentError("attention sequences must have positive query lengths");
   }
   INFERX_RETURN_IF_ERROR(ops::BeginAttentionStep(ctx, attention_batch.kv_indptr,
-      attention_batch.last_page_len, state.paged_kv->block_size(), rows,
+      attention_batch.last_page_len, state.paged_kv->BlockSize(), rows,
       attention_batch.num_seqs, attention_->plan));
   for (size_t i = 0; i < config_.blocks.size(); ++i) {
     const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";

@@ -26,11 +26,11 @@ Status Scheduler::AddRequest(Request request) {
 Status Scheduler::EnsureBlockCapacity(Request* request, int64_t target_tokens,
                                       std::vector<int32_t>* granted) {
   if (!request->has_blocks()) {
-    request->GrantBlocks(BlockTable(pool_->block_size()));
+    request->GrantBlocks(BlockTable(pool_->BlockSize()));
   }
   BlockTable* table = request->mutable_block_table();
   const int64_t needed = pool_->BlocksForTokens(target_tokens);
-  while (table->size() < needed) {
+  while (table->Size() < needed) {
     StatusOr<int32_t> block = pool_->AllocateBlock();
     if (!block.ok()) {
       return block.status();
@@ -171,7 +171,7 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
       continue;
     }
     const size_t index = it->second;
-    pool_->FreeBlocks(request.block_table().blocks());
+    pool_->FreeBlocks(request.block_table().Blocks());
     request.Finish(reason);
     pending_finish_notifications_.push_back(id);
     finished_.push_back(std::move(running_[index]));
@@ -209,7 +209,7 @@ std::vector<uint64_t> Scheduler::AbortRequests(absl::Span<const uint64_t> reques
     }
     const size_t index = it->second;
     Request& request = running_[index];
-    pool_->FreeBlocks(request.block_table().blocks());
+    pool_->FreeBlocks(request.block_table().Blocks());
     request.Finish(FinishReason::kAborted);
     pending_finish_notifications_.push_back(id);
     finished_.push_back(std::move(running_[index]));
@@ -229,9 +229,9 @@ SchedulerStats Scheduler::Stats() const {
   SchedulerStats stats = stats_;
   stats.num_running = static_cast<int>(running_.size());
   stats.num_waiting = static_cast<int>(waiting_.size());
-  if (pool_ != nullptr && pool_->num_blocks() > 0) {
+  if (pool_ != nullptr && pool_->NumBlocks() > 0) {
     stats.kv_cache_usage =
-        static_cast<float>(pool_->used_blocks()) / static_cast<float>(pool_->num_blocks());
+        static_cast<float>(pool_->UsedBlocks()) / static_cast<float>(pool_->NumBlocks());
   }
   return stats;
 }

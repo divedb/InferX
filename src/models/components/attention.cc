@@ -69,7 +69,7 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
   write("k_rope", k);
   INFERX_ASSIGN_OR_RETURN(Tensor key_cache, pool.KeyCache(kv_state.pool_layer));
   INFERX_ASSIGN_OR_RETURN(Tensor value_cache, pool.ValueCache(kv_state.pool_layer));
-  const int64_t block_size = pool.block_size();
+  const int64_t block_size = pool.BlockSize();
   INFERX_RETURN_IF_ERROR(ops::WritePagedKv(ctx, k, v, batch.positions, batch.batch_indices,
                                            batch.kv_indptr, batch.kv_indices, key_cache,
                                            value_cache, block_size));
