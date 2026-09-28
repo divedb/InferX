@@ -5,6 +5,7 @@
 
 #include "inferx/models/causal/model_traits.h"
 #include "inferx/models/components/decoder_layer.h"
+#include "inferx/models/components/mla.h"
 #include "inferx/models/components/norm.h"
 #include "inferx/models/diagnostic_trace.h"
 
@@ -32,7 +33,7 @@ class DecoderLayer {
                                            std::move(weights.feed_forward_out_norm))),
         mixer_(config.mixer),
         feed_forward_(config.feed_forward),
-        attention_weights_(std::move(weights.mixer)),
+        mixer_weights_(std::move(weights.mixer)),
         feed_forward_weights_(std::move(weights.feed_forward)),
         norm_eps_(config.norm.eps),
         output_norm_residual_(config.residual == components::ResidualStyle::kOutputNorm) {
@@ -41,19 +42,25 @@ class DecoderLayer {
 
   Status Forward(bool first, Tensor& hidden, Tensor& normed, Tensor& mixed,
                  const AttentionBatch& batch, const PagedKvState& state, const KvBlockPool& pool,
-                 components::AttentionWorkspace& attention_ws, components::MlpWorkspace& mlp_ws,
-                 components::MoeWorkspace& moe_ws, Tensor& packed, ops::ExecutionContext& ctx,
-                 DiagnosticTrace& trace, const std::string& prefix) const {
+                 components::AttentionWorkspace& attention_ws, components::MlaWorkspace& mla_ws,
+                 components::MlpWorkspace& mlp_ws, components::MoeWorkspace& moe_ws,
+                 Tensor& packed, ops::ExecutionContext& ctx, DiagnosticTrace& trace,
+                 const std::string& prefix) const {
     if (first) {
       INFERX_RETURN_IF_ERROR(input_norm_.Forward(ctx, hidden, normed));
     } else {
       INFERX_RETURN_IF_ERROR(input_norm_.AddForward(ctx, mixed, hidden, normed));
     }
     if (trace.enabled()) trace.Write(prefix + "input_norm", normed);
-    if (const auto* a = std::get_if<components::AttentionConfig>(&mixer_)) {
+    if (auto* mla = std::get_if<components::MlaWeights>(&mixer_weights_)) {
+      INFERX_RETURN_IF_ERROR(components::RunMlaAttention(
+          std::get<components::MlaConfig>(mixer_), *mla, normed, norm_eps_, batch, state, pool,
+          mla_ws, ctx, &trace, prefix, mixed));
+    } else if (const auto* a = std::get_if<components::AttentionConfig>(&mixer_)) {
       INFERX_RETURN_IF_ERROR(
-          components::RunAttention(*a, attention_weights_, normed, norm_eps_, batch, state, pool,
-                                   attention_ws, &packed, ctx, &trace, prefix, mixed));
+          components::RunAttention(*a, std::get<components::AttentionWeights>(mixer_weights_),
+                                   normed, norm_eps_, batch, state, pool, attention_ws, &packed,
+                                   ctx, &trace, prefix, mixed));
     } else {
       return UnimplementedError("recurrent mixer execution is not implemented");
     }
@@ -90,9 +97,10 @@ class DecoderLayer {
   typename Traits::Norm ffn_norm_;
   std::optional<typename Traits::Norm> mixer_out_norm_;
   std::optional<typename Traits::Norm> feed_forward_out_norm_;
-  std::variant<components::AttentionConfig, components::GatedDeltaNetConfig> mixer_;
+  std::variant<components::AttentionConfig, components::MlaConfig,
+               components::GatedDeltaNetConfig> mixer_;
   std::variant<components::SwiGluConfig, components::MoeConfig> feed_forward_;
-  components::AttentionWeights attention_weights_;
+  std::variant<components::AttentionWeights, components::MlaWeights> mixer_weights_;
   std::variant<components::SwiGluWeights, components::MoeWeights> feed_forward_weights_;
   float norm_eps_;
   bool output_norm_residual_;

@@ -33,12 +33,22 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   attention_.emplace();
   mlp_.emplace();
   if (max_moe_experts_ > 0) moe_.emplace();
+  if (max_mla_heads_ > 0) mla_.emplace();
   int64_t query_dim = 0;
   int64_t kv_dim = 0;
   int64_t query_heads = 0;
   bool any_gated = false;
   int64_t packed_width = 0;
   for (const auto& block : config_.blocks) {
+    if (const auto* m = std::get_if<components::MlaConfig>(&block.mixer)) {
+      max_mla_heads_ = std::max(max_mla_heads_, m->query_heads);
+      max_mla_head_dim_ = std::max(max_mla_head_dim_, m->head_dim());
+      max_mla_q_lora_ = std::max(max_mla_q_lora_, m->q_lora_rank);
+      max_mla_rope_ = std::max(max_mla_rope_, m->qk_rope_head_dim);
+      max_mla_kv_lora_ = std::max(max_mla_kv_lora_, m->kv_lora_rank);
+      max_mla_up_width_ =
+          std::max(max_mla_up_width_, m->query_heads * (m->qk_nope_head_dim + m->v_head_dim));
+    }
     if (const auto* a = std::get_if<components::AttentionConfig>(&block.mixer)) {
       query_heads = std::max(query_heads, a->query_heads);
       query_dim = std::max<int64_t>(query_dim, a->query_heads * a->head_dim);
@@ -80,6 +90,18 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
     INFERX_ASSIGN_OR_RETURN(attention_->gate, alloc_flat(query_dim));
   }
   INFERX_ASSIGN_OR_RETURN(mlp_->gate, alloc_flat(max_intermediate_));
+  if (mla_.has_value()) {
+    INFERX_ASSIGN_OR_RETURN(mla_->q_lora, alloc2_at(rows, max_mla_q_lora_));
+    INFERX_ASSIGN_OR_RETURN(mla_->kv_lora, alloc2_at(rows, max_mla_kv_lora_));
+    INFERX_ASSIGN_OR_RETURN(mla_->k_rope, alloc2_at(rows, max_mla_rope_));
+    INFERX_ASSIGN_OR_RETURN(mla_->kv_b, alloc2_at(rows, max_mla_up_width_));
+    INFERX_ASSIGN_OR_RETURN(mla_->query, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->key, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->value, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->attn_out, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->plan.plan,
+                            Tensor::Empty(DataType::kInt32, Shape({3 * rows + 1}), device));
+  }
   if (moe_.has_value()) {
     // Slots are (token, selected-expert) pairs; every buffer is indexed by
     // the dispatch slot so gather, expert GEMMs, and scatter agree.

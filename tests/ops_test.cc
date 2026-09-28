@@ -18,6 +18,7 @@
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
 #include "inferx/models/components/rope.h"
+#include "inferx/ops/mla.h"
 #include "inferx/ops/moe.h"
 #include "inferx/ops/rms_norm.h"
 
@@ -539,6 +540,38 @@ TEST_F(OpsTest, RouteTokensGroupedSigmoidSelection) {
   // its raw sigmoid weight times the routed scale, unnormalized.
   EXPECT_EQ(got_idx[0], 0);
   EXPECT_NEAR(got_w[0], 2.5f / (1.0f + std::exp(-10.0f)), 2e-3);
+}
+
+TEST_F(OpsTest, AssembleMlaCachesLaysOutRotatedAndPaddedSlices) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  // Two heads: nope 4, rope 2, v 3 -> head_dim 6 with a zero-padded V tail.
+  Tensor k_rope = Upload({1, 2, 3, 4}, Shape({2, 2}));
+  Tensor up = Upload({10, 11, 12, 13, 20, 21, 22,   // Row 0, head 0.
+                          30, 31, 32, 33, 40, 41, 42,   // Row 0, head 1.
+                      110, 111, 112, 113, 120, 121, 122,  // Row 1, head 0.
+                      130, 131, 132, 133, 140, 141, 142},  // Row 1, head 1.
+                     Shape({2, 14}));
+  Tensor k = MakeBf16(Shape({2, 2, 6}));
+  Tensor v = MakeBf16(Shape({2, 2, 6}));
+  ASSERT_TRUE(ops::AssembleMlaCaches(ctx, k_rope, up, 2, 4, 2, 3, k, v).ok());
+  const auto got_k = Download(k);
+  const auto got_v = Download(v);
+  // Head 0 of row 0: [rope | nope] = [1, 2, 10, 11, 12, 13].
+  EXPECT_NEAR(got_k[0], 1, 1e-3);
+  EXPECT_NEAR(got_k[1], 2, 1e-3);
+  EXPECT_NEAR(got_k[2], 10, 1e-2);
+  EXPECT_NEAR(got_k[5], 13, 1e-2);
+  // Value head: [v | zeros] = [20, 21, 22, 0, 0, 0].
+  EXPECT_NEAR(got_v[0], 20, 1e-2);
+  EXPECT_NEAR(got_v[2], 22, 1e-2);
+  EXPECT_EQ(got_v[3], 0);
+  EXPECT_EQ(got_v[5], 0);
+  // Row 1, head 1 (offset 12 + 6): shared rope slice, then head-1 nope/v.
+  EXPECT_NEAR(got_k[18 + 0], 3, 1e-3);
+  EXPECT_NEAR(got_k[18 + 1], 4, 1e-3);
+  EXPECT_NEAR(got_k[18 + 2], 130, 1e-2);
+  EXPECT_NEAR(got_k[18 + 5], 133, 1e-2);
+  EXPECT_NEAR(got_v[18 + 0], 140, 1e-2);
 }
 
 TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {

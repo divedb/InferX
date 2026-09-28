@@ -10,6 +10,7 @@
 
 #include "inferx/core/tensor.h"
 #include "inferx/models/components/linear.h"
+#include "inferx/models/components/mla.h"
 #include "inferx/models/components/rope.h"
 #include "inferx/models/state.h"
 #include "inferx/ops/execution_context.h"

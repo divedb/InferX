@@ -18,7 +18,13 @@ Status DecoderConfig::Validate() const {
     if (!std::isfinite(block.norm.eps) || block.norm.eps < 0) {
       return InvalidArgumentError("invalid block normalization epsilon");
     }
-    if (const auto* a = std::get_if<components::AttentionConfig>(&block.mixer)) {
+    if (const auto* m = std::get_if<components::MlaConfig>(&block.mixer)) {
+      if (m->query_heads <= 0 || m->q_lora_rank <= 0 || m->kv_lora_rank <= 0 ||
+          m->qk_nope_head_dim <= 0 || m->qk_rope_head_dim <= 0 || m->v_head_dim <= 0 ||
+          m->v_head_dim > m->head_dim() || m->rotary.dim != m->qk_rope_head_dim) {
+        return InvalidArgumentError("invalid multi-latent attention geometry");
+      }
+    } else if (const auto* a = std::get_if<components::AttentionConfig>(&block.mixer)) {
       if (a->query_heads <= 0 || a->kv_heads <= 0 || a->head_dim <= 0 ||
           a->query_heads % a->kv_heads != 0 || a->rotary.dim <= 0 ||
           a->rotary.dim > a->head_dim || a->rotary.dim % 2 != 0 ||
@@ -51,7 +57,7 @@ Status DecoderConfig::Validate() const {
 Status DecoderConfig::ValidateExecutable() const {
   for (const auto& block : blocks) {
     const auto* a = std::get_if<components::AttentionConfig>(&block.mixer);
-    if (a == nullptr) {
+    if (a == nullptr && !std::holds_alternative<components::MlaConfig>(block.mixer)) {
       return UnimplementedError("recurrent mixer execution is not implemented");
     }
     ops::AttentionParams params;
@@ -61,7 +67,7 @@ Status DecoderConfig::ValidateExecutable() const {
     params.scale = a->scale_override > 0.0f ? a->scale_override : 1.0f;
     params.sliding_window = a->sliding_window;
     INFERX_RETURN_IF_ERROR(ops::ValidateAttentionGeometry(params));
-    if (a->head_dim > 8 * 256) {
+    if (a != nullptr && a->head_dim > 8 * 256) {
       return UnimplementedError("attention head dimension exceeds the generic kernel");
     }
     if (const auto* moe = std::get_if<components::MoeConfig>(&block.feed_forward)) {
@@ -90,6 +96,10 @@ std::vector<LayerStateSpec> DecoderConfig::StateRequirements() const {
       layout.head_dim = a->head_dim;
       layout.dtype = DataType::kBFloat16;
       specs.push_back(PagedKvStateSpec{layout});
+    } else if (const auto* m = std::get_if<components::MlaConfig>(&block.mixer)) {
+      // Decompressed MLA caches per-head K and zero-padded V at head_dim.
+      specs.push_back(PagedKvStateSpec{KvLayout{2, m->query_heads, m->head_dim(),
+                                                 DataType::kBFloat16}});
     } else {
       const auto& g = std::get<components::GatedDeltaNetConfig>(block.mixer);
       specs.push_back(RecurrentStateSpec{g.key_heads, g.value_heads, g.key_dim, g.value_dim,

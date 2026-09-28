@@ -23,6 +23,12 @@ class DecoderWorkspace {
   int max_tokens_;
   bool workspace_ready_ = false;
   int64_t max_intermediate_ = 0;
+  int64_t max_mla_heads_ = 0;
+  int64_t max_mla_head_dim_ = 0;
+  int64_t max_mla_q_lora_ = 0;
+  int64_t max_mla_kv_lora_ = 0;
+  int64_t max_mla_rope_ = 0;
+  int64_t max_mla_up_width_ = 0;
   int64_t max_moe_experts_ = 0;
   int64_t max_experts_per_token_ = 0;
   int64_t max_moe_intermediate_ = 0;
@@ -32,6 +38,7 @@ class DecoderWorkspace {
   std::optional<Tensor> packed_projection_;
   std::optional<Tensor> hidden_, normed_, mixed_;
   std::optional<components::AttentionWorkspace> attention_;
+  std::optional<components::MlaWorkspace> mla_;
   std::optional<components::MlpWorkspace> mlp_;
   std::optional<components::MoeWorkspace> moe_;
 };
@@ -61,8 +68,9 @@ class DecoderStack final : private DecoderWorkspace {
       const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";
       INFERX_RETURN_IF_ERROR(layers_[i].Forward(i == 0, hidden, normed, mixed, input.attention,
                                                 std::get<PagedKvState>(state.layers[i]),
-                                                *state.paged_kv, *attention_, *mlp_, *moe_,
-                                                *packed_projection_, ctx, trace, prefix));
+                                                *state.paged_kv, *attention_, *mla_, *mlp_,
+                                                *moe_, *packed_projection_, ctx, trace,
+                                                prefix));
     }
     INFERX_RETURN_IF_ERROR(final_norm_.AddForward(ctx, mixed, hidden, normed));
     if (trace.enabled()) trace.Write("final_norm", normed);

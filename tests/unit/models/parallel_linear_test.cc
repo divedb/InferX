@@ -241,7 +241,7 @@ class ParallelLoadingTest : public ::testing::Test {
 TEST_F(ParallelLoadingTest, PacksQkvInBlockContiguousOrder) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = weights->blocks[0].mixer;
+  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
   EXPECT_EQ(attn.packed_qkv.GetShape().ToString(),
             Shape({kQueryRows + 2 * kKvRows, kHidden}).ToString());
   for (int64_t row = 0; row < kQueryRows; ++row) {
@@ -265,7 +265,7 @@ TEST_F(ParallelLoadingTest, FusedCheckpointQkvUsesTheSameRankSlices) {
   const auto weights =
       Load(tensors, Parallel(2, 1), names, models::WeightLayout{models::QkvLayout::kFused});
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attention = weights->blocks[0].mixer;
+  const auto& attention = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
   for (int64_t row = 0; row < 8; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attention.packed_qkv, row), 8.0f + row);
   }
@@ -319,7 +319,7 @@ TEST_F(ParallelLoadingTest, FusedLayoutRequiresAnExplicitName) {
 TEST_F(ParallelLoadingTest, PerProjectionWeightsAreViewsIntoThePackedTensor) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = weights->blocks[0].mixer;
+  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
   const auto* base = static_cast<const std::byte*>(attn.packed_qkv.Data());
   EXPECT_EQ(static_cast<const std::byte*>(attn.query.weight.Data()), base);
   EXPECT_EQ(static_cast<const std::byte*>(attn.key.weight.Data()),
@@ -333,7 +333,7 @@ TEST_F(ParallelLoadingTest, ShardsQueryAndKvRowsByRank) {
   // (rows 4..7 of k_proj and v_proj).
   const auto weights = Load(StandardTensors(), Parallel(2, 1));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = weights->blocks[0].mixer;
+  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
   ASSERT_EQ(attn.packed_qkv.Dim(0), 8 + 2 * 4);
   for (int64_t row = 0; row < 8; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, row), 8.0f + row);
@@ -349,7 +349,7 @@ TEST_F(ParallelLoadingTest, ReplicatesKvHeadsBelowRankCount) {
   // k/v rows 4..7; query rows 12..15 (rank * 1 q head * head_dim 4).
   const auto weights = Load(StandardTensors(), Parallel(4, 3));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = weights->blocks[0].mixer;
+  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
   ASSERT_EQ(attn.packed_qkv.Dim(0), 4 + 2 * 4);  // 1 q head, 1 kv head.
   for (int64_t row = 0; row < 4; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, row), 12.0f + row);
@@ -410,10 +410,10 @@ TEST_F(ParallelLoadingTest, ShardsMergedGateUpAndRowParallelProjections) {
     EXPECT_FLOAT_EQ(ElemValue(ffn.down.weight, 3, col, 8), 8.0f + col);
   }
   // o_proj likewise, over the (undoubled) query width.
-  ASSERT_EQ(block.mixer.output.weight.Dim(0), kHidden);
-  ASSERT_EQ(block.mixer.output.weight.Dim(1), 8);
+  ASSERT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(0), kHidden);
+  ASSERT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(1), 8);
   for (int64_t col = 0; col < 8; ++col) {
-    EXPECT_FLOAT_EQ(ElemValue(block.mixer.output.weight, 0, col, 8), 8.0f + col);
+    EXPECT_FLOAT_EQ(ElemValue(std::get<components::AttentionWeights>(block.mixer).output.weight, 0, col, 8), 8.0f + col);
   }
 }
 
@@ -421,8 +421,8 @@ TEST_F(ParallelLoadingTest, SingleRankRowParallelLoadsWholeTensor) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
   const auto& block = weights->blocks[0];
-  EXPECT_EQ(block.mixer.output.weight.Dim(1), kQueryRows);  // Full input width.
-  EXPECT_FLOAT_EQ(ElemValue(block.mixer.output.weight, 0, 15, kQueryRows), 15.0f);
+  EXPECT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(1), kQueryRows);  // Full input width.
+  EXPECT_FLOAT_EQ(ElemValue(std::get<components::AttentionWeights>(block.mixer).output.weight, 0, 15, kQueryRows), 15.0f);
 }
 
 TEST_F(ParallelLoadingTest, ShardsEmbeddingByVocabRows) {

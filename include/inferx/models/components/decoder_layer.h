@@ -38,7 +38,7 @@ struct DecoderLayerConfig {
   NormConfig mixer_out_norm;
   NormConfig feed_forward_out_norm;
   ResidualStyle residual = ResidualStyle::kPreNorm;
-  std::variant<AttentionConfig, GatedDeltaNetConfig> mixer;
+  std::variant<AttentionConfig, MlaConfig, GatedDeltaNetConfig> mixer;
   std::variant<SwiGluConfig, MoeConfig> feed_forward;
 };
 
@@ -49,7 +49,8 @@ struct DecoderLayerWeights {
   /// Output-side norms (Gemma sandwich); absent when residual is kPreNorm.
   std::optional<Tensor> mixer_out_norm;
   std::optional<Tensor> feed_forward_out_norm;
-  AttentionWeights mixer;  ///< Recurrent mixers are not loadable yet.
+  /// Attention or MLA projections; recurrent mixers are not loadable yet.
+  std::variant<AttentionWeights, MlaWeights> mixer;
   std::variant<SwiGluWeights, MoeWeights> feed_forward;
 };
 

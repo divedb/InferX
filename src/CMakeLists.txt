@@ -24,10 +24,12 @@ add_library(inferx_ops
   ops/rotary.cc
   ops/attention.cc
   ops/moe.cc
+  ops/mla.cc
   ops/flash_attention.cc
   ops/cuda/flash_attention.cu
   ops/cuda/generic_attention.cu
   ops/cuda/moe.cu
+  ops/cuda/mla.cu
   ops/cuda/sampling.cu
   ops/cuda/gather.cu
   ops/cuda/linear.cu
@@ -81,6 +83,7 @@ add_library(inferx_models
   models/components/decoder_layer.cc
   models/components/mlp.cc
   models/components/moe.cc
+  models/components/mla.cc
   models/components/parallel_linear.cc
   models/components/qkv_linear.cc
   models/causal/causal_lm.cc
