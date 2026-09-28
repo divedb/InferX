@@ -75,10 +75,10 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
       weights_by_slot.Numel() != total) {
     return InvalidArgumentError("dispatch buffers disagree with the routed batch");
   }
+  // Histogram, sync the counts to the host (expert GEMMs need row counts),
+  // upload the prefix offsets, and only then scatter slots: the scatter
+  // writes through those offsets, so ordering is load-bearing.
   INFERX_RETURN_IF_ERROR(cuda::ExpertHistogram(ctx, topk_indices, num_experts, counts));
-  INFERX_RETURN_IF_ERROR(cuda::ScatterSlots(ctx, topk_indices, topk_weights, offsets, cursor,
-                                            token_rows, weights_by_slot));
-  // One host sync per MoE layer: expert GEMMs need row counts on the host.
   std::vector<int32_t> host(num_experts);
   INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(
       host.data(), counts.Data(), num_experts * sizeof(int32_t), CopyKind::kDeviceToHost,
@@ -99,13 +99,15 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
   INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(offsets.Data(), device_offsets.data(),
                                                  device_offsets.size() * sizeof(int32_t),
                                                  CopyKind::kHostToDevice, ctx.stream()));
+  INFERX_RETURN_IF_ERROR(cuda::ScatterSlots(ctx, topk_indices, topk_weights, offsets, cursor,
+                                            token_rows, weights_by_slot));
   return host_offsets;
 }
 
 Status GatherRoutedTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& token_rows,
                           Tensor& out) {
   if (hidden.Rank() != 2 || token_rows.Rank() != 1 || out.Rank() != 2 ||
-      out.Dim(0) != token_rows.Numel() || out.Dim(1) != hidden.Dim(1) ||
+      out.Dim(0) < token_rows.Numel() || out.Dim(1) != hidden.Dim(1) ||
       hidden.GetDataType() != DataType::kBFloat16 || out.GetDataType() != DataType::kBFloat16) {
     return InvalidArgumentError("gather expects [slots, hidden] output for [slots] rows");
   }

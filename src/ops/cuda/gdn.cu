@@ -120,7 +120,10 @@ __global__ void RecurrentKernel(const __nv_bfloat16* __restrict__ conv,
 
   float* st = state + ((int64_t(slots[seq]) * value_heads + head) * dk) * dv;
   for (int i = tid; i < dk * kDvTile; i += blockDim.x) {
-    s[i] = st[(i / kDvTile) * dv + col0 + (i % kDvTile)];
+    // Columns past dv are padding for this tile; leave shared memory zero
+    // so the update and output loops see real zeros there.
+    const int col = col0 + (i % kDvTile);
+    s[i] = col < dv ? st[(i / kDvTile) * dv + col] : 0.0f;
   }
   __syncthreads();
 
@@ -197,7 +200,8 @@ __global__ void RecurrentKernel(const __nv_bfloat16* __restrict__ conv,
   }
   __syncthreads();
   for (int i = tid; i < dk * kDvTile; i += blockDim.x) {
-    st[(i / kDvTile) * dv + col0 + (i % kDvTile)] = s[i];
+    const int col = col0 + (i % kDvTile);
+    if (col < dv) st[(i / kDvTile) * dv + col] = s[i];
   }
 }
 

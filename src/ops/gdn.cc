@@ -58,7 +58,7 @@ Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
       a_log.GetDataType() != DataType::kFloat32 ||
       dt_bias.GetDataType() != DataType::kFloat32 ||
       beta.GetDataType() != DataType::kFloat32 || g.GetDataType() != DataType::kFloat32 ||
-      beta.Numel() != g.Numel() || a_log.Numel() * 2 != ba.Numel() ||
+      beta.Numel() != g.Numel() || ba.Dim(1) != 2 * a_log.Numel() ||
       dt_bias.Numel() != a_log.Numel()) {
     return InvalidArgumentError("GDN gate shapes or dtypes disagree");
   }

@@ -32,9 +32,6 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   const auto& dims = config_.model;
   attention_.emplace();
   mlp_.emplace();
-  if (max_moe_experts_ > 0) moe_.emplace();
-  if (max_mla_heads_ > 0) mla_.emplace();
-  if (max_gdn_proj_ > 0) gdn_.emplace();
   int64_t query_dim = 0;
   int64_t kv_dim = 0;
   int64_t query_heads = 0;
@@ -76,8 +73,17 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
       max_moe_intermediate_ = std::max(max_moe_intermediate_, moe->intermediate_size);
       max_shared_intermediate_ =
           std::max(max_shared_intermediate_, moe->shared_intermediate_size);
+      // The shared expert runs through the dense SwiGLU path and its
+      // activation buffer is the dense workspace's.
+      max_intermediate_ = std::max(max_intermediate_, moe->shared_intermediate_size);
     }
   }
+  // Variant workspaces are sized by the scan above, so they are created
+  // only after it runs.
+  if (max_moe_experts_ > 0) moe_.emplace();
+  if (max_mla_heads_ > 0) mla_.emplace();
+  if (max_gdn_proj_ > 0) gdn_.emplace();
+
   const int64_t rows = max_tokens_;
   const auto alloc2 = [&](int64_t cols) {
     return Tensor::Empty(DataType::kBFloat16, Shape({rows, cols}), device);
@@ -100,27 +106,33 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
   }
   INFERX_ASSIGN_OR_RETURN(mlp_->gate, alloc_flat(max_intermediate_));
   if (mla_.has_value()) {
-    INFERX_ASSIGN_OR_RETURN(mla_->q_lora, alloc2_at(rows, max_mla_q_lora_));
-    INFERX_ASSIGN_OR_RETURN(mla_->kv_lora, alloc2_at(rows, max_mla_kv_lora_));
-    INFERX_ASSIGN_OR_RETURN(mla_->k_rope, alloc2_at(rows, max_mla_rope_));
-    INFERX_ASSIGN_OR_RETURN(mla_->kv_b, alloc2_at(rows, max_mla_up_width_));
-    INFERX_ASSIGN_OR_RETURN(mla_->query, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
-    INFERX_ASSIGN_OR_RETURN(mla_->key, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
-    INFERX_ASSIGN_OR_RETURN(mla_->value, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
-    INFERX_ASSIGN_OR_RETURN(mla_->attn_out, alloc2_at(rows, max_mla_heads_ * max_mla_head_dim_));
+    const auto alloc_mla_flat = [&](int64_t width) {
+      return Tensor::Empty(DataType::kBFloat16, Shape({rows * width}), device);
+    };
+    INFERX_ASSIGN_OR_RETURN(mla_->q_lora, alloc_mla_flat(max_mla_q_lora_));
+    INFERX_ASSIGN_OR_RETURN(mla_->kv_lora, alloc_mla_flat(max_mla_kv_lora_));
+    INFERX_ASSIGN_OR_RETURN(mla_->k_rope, alloc_mla_flat(max_mla_rope_));
+    INFERX_ASSIGN_OR_RETURN(mla_->kv_b, alloc_mla_flat(max_mla_up_width_));
+    INFERX_ASSIGN_OR_RETURN(mla_->query, alloc_mla_flat(max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->key, alloc_mla_flat(max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->value, alloc_mla_flat(max_mla_heads_ * max_mla_head_dim_));
+    INFERX_ASSIGN_OR_RETURN(mla_->attn_out, alloc_mla_flat(max_mla_heads_ * max_mla_head_dim_));
     INFERX_ASSIGN_OR_RETURN(mla_->plan.plan,
                             Tensor::Empty(DataType::kInt32, Shape({3 * rows + 1}), device));
   }
   if (gdn_.has_value()) {
-    INFERX_ASSIGN_OR_RETURN(gdn_->packed, alloc2_at(rows, max_gdn_proj_));
-    INFERX_ASSIGN_OR_RETURN(gdn_->conv_in, alloc2_at(rows, max_gdn_conv_));
-    INFERX_ASSIGN_OR_RETURN(gdn_->z, alloc2_at(rows, max_gdn_value_));
-    INFERX_ASSIGN_OR_RETURN(gdn_->ba, alloc2_at(rows, 2 * max_gdn_heads_));
+    const auto alloc_gdn_flat = [&](int64_t width) {
+      return Tensor::Empty(DataType::kBFloat16, Shape({rows * width}), device);
+    };
+    INFERX_ASSIGN_OR_RETURN(gdn_->packed, alloc_gdn_flat(max_gdn_proj_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->conv_in, alloc_gdn_flat(max_gdn_conv_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->z, alloc_gdn_flat(max_gdn_value_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->ba, alloc_gdn_flat(2 * max_gdn_heads_));
     INFERX_ASSIGN_OR_RETURN(
         gdn_->beta, Tensor::Empty(DataType::kFloat32, Shape({rows * max_gdn_heads_}), device));
     INFERX_ASSIGN_OR_RETURN(
         gdn_->g, Tensor::Empty(DataType::kFloat32, Shape({rows * max_gdn_heads_}), device));
-    INFERX_ASSIGN_OR_RETURN(gdn_->y, alloc2_at(rows, max_gdn_value_));
+    INFERX_ASSIGN_OR_RETURN(gdn_->y, alloc_gdn_flat(max_gdn_value_));
   }
   if (moe_.has_value()) {
     // Slots are (token, selected-expert) pairs; every buffer is indexed by
@@ -141,10 +153,15 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
     INFERX_ASSIGN_OR_RETURN(moe_->weights_by_slot,
                             Tensor::Empty(DataType::kFloat32, Shape({slots}), device));
     INFERX_ASSIGN_OR_RETURN(moe_->gathered, alloc2_at(slots, dims.hidden_size));
-    INFERX_ASSIGN_OR_RETURN(moe_->activated, alloc2_at(slots, max_moe_intermediate_));
+    INFERX_ASSIGN_OR_RETURN(moe_->activated,
+                            Tensor::Empty(DataType::kBFloat16,
+                                          Shape({slots * max_moe_intermediate_}), device));
     INFERX_ASSIGN_OR_RETURN(moe_->expert_rows, alloc2_at(slots, dims.hidden_size));
-    INFERX_ASSIGN_OR_RETURN(moe_->packed_gate_up, alloc2_at(slots, 2 * max_moe_intermediate_));
+    INFERX_ASSIGN_OR_RETURN(moe_->packed_gate_up,
+                            Tensor::Empty(DataType::kBFloat16,
+                                          Shape({slots * 2 * max_moe_intermediate_}), device));
     INFERX_ASSIGN_OR_RETURN(moe_->shared_out, alloc2_at(max_tokens_, dims.hidden_size));
+    INFERX_ASSIGN_OR_RETURN(moe_->shared_gate, alloc_flat(max_tokens_));
   }
   // Attention runs the fused QKV projection (with a doubled query section
   // when gated), and packed gate/up rows can be wider; one buffer serves

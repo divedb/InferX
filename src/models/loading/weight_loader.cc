@@ -229,8 +229,7 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
     INFERX_ASSIGN_OR_RETURN(auto o_bias,
                             Weight(checkpoint, prefix + std::string(names.o) + ".bias",
                                    {hidden}, device));
-    INFERX_ASSIGN_OR_RETURN(auto o_bias_2d, o_bias.Reshape(Shape({1, hidden})));
-    output_bias = std::move(o_bias_2d);
+    output_bias = std::move(o_bias);
   }
   std::optional<Tensor> sinks;
   if (a.sinks) {

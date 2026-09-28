@@ -27,39 +27,44 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
   INFERX_ASSIGN_OR_RETURN(Tensor indices2d, indices_flat.Reshape(Shape({rows, topk})));
   ops::RoutingConfig routing = config.routing;
   routing.topk = topk;
+  INFERX_ASSIGN_OR_RETURN(Tensor weights2d, ws.topk_weights->Slice(0, rows * topk));
   INFERX_RETURN_IF_ERROR(ops::RouteTokens(
       ctx, normed, weights.router, weights.router_bias.has_value() ? &*weights.router_bias : nullptr,
       weights.correction_bias.has_value() ? &*weights.correction_bias : nullptr, routing,
-      indices2d, *ws.topk_weights));
+      indices_flat, weights2d));
   write("router_weights", *ws.topk_weights);
 
   // Route, then bring the per-expert counts to the host once: expert GEMMs
   // need host-side row counts. A fused MoE kernel removes this sync later.
-  auto dispatch = ops::BuildExpertDispatch(ctx, indices2d, *ws.topk_weights, config.num_experts,
-                                           *ws.counts, *ws.offsets, *ws.cursor, *ws.token_rows,
-                                           *ws.weights_by_slot);
+  INFERX_ASSIGN_OR_RETURN(Tensor token_rows, ws.token_rows->Slice(0, rows * topk));
+  INFERX_ASSIGN_OR_RETURN(Tensor weights_by_slot, ws.weights_by_slot->Slice(0, rows * topk));
+  auto dispatch = ops::BuildExpertDispatch(ctx, indices_flat, weights2d, config.num_experts,
+                                           *ws.counts, *ws.offsets, *ws.cursor, token_rows,
+                                           weights_by_slot);
   INFERX_RETURN_IF_ERROR(dispatch.status());
   const std::vector<int64_t>& offsets = *dispatch;
 
-  INFERX_RETURN_IF_ERROR(ops::GatherRoutedTokens(ctx, normed, *ws.token_rows, *ws.gathered));
+  INFERX_RETURN_IF_ERROR(ops::GatherRoutedTokens(ctx, normed, token_rows, *ws.gathered));
 
   // Every expert runs the same gated-MLP ops over its slice of the gathered
   // tokens; the shared execution below is the only expert loop.
   for (int64_t e = 0; e < config.num_experts; ++e) {
     const int64_t count = offsets[e + 1] - offsets[e];
     if (count == 0) continue;
-    const auto x = ws.gathered->Slice(offsets[e], offsets[e + 1]).value();
-    auto packed_flat = ws.packed_gate_up->Slice(0, count * 2 * config.intermediate_size).value();
-    auto packed = packed_flat.Reshape(Shape({count, 2 * config.intermediate_size})).value();
+    INFERX_ASSIGN_OR_RETURN(auto x, ws.gathered->Slice(offsets[e], offsets[e + 1]));
+    INFERX_ASSIGN_OR_RETURN(auto packed_flat,
+                            ws.packed_gate_up->Slice(0, count * 2 * config.intermediate_size));
+    INFERX_ASSIGN_OR_RETURN(auto packed,
+                            packed_flat.Reshape(Shape({count, 2 * config.intermediate_size})));
     INFERX_RETURN_IF_ERROR(ops::Linear(ctx, x, weights.experts[e].packed_gate_up, packed));
     if (weights.experts[e].packed_bias.has_value()) {
       INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, packed, *weights.experts[e].packed_bias, packed));
     }
-    auto act_flat = ws.activated->Slice(0, count * config.intermediate_size).value();
-    auto act = act_flat.Reshape(Shape({count, config.intermediate_size})).value();
+    INFERX_ASSIGN_OR_RETURN(auto act_flat, ws.activated->Slice(0, count * config.intermediate_size));
+    INFERX_ASSIGN_OR_RETURN(auto act, act_flat.Reshape(Shape({count, config.intermediate_size})));
     INFERX_RETURN_IF_ERROR(ops::PackedGatedActivation(ctx, packed, act, config.activation,
                                                       config.oai_alpha, config.oai_limit));
-    auto out_rows = ws.expert_rows->Slice(offsets[e], offsets[e + 1]).value();
+    INFERX_ASSIGN_OR_RETURN(auto out_rows, ws.expert_rows->Slice(offsets[e], offsets[e + 1]));
     INFERX_RETURN_IF_ERROR(ops::Linear(ctx, act, weights.experts[e].down.weight, out_rows));
     if (weights.experts[e].down_bias.has_value()) {
       INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, out_rows, *weights.experts[e].down_bias, out_rows));
@@ -74,7 +79,11 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
     INFERX_RETURN_IF_ERROR(RunSwiGlu(shared_cfg, *weights.shared_expert, normed, mlp_ws,
                                      packed_buffer, ctx, trace, prefix, mixed_out));
     if (weights.shared_expert_gate.has_value()) {
-      INFERX_RETURN_IF_ERROR(ops::MulSigmoidRowGate(ctx, mixed_out, *weights.shared_expert_gate));
+      // The gate is a per-token scalar: project, then scale sigmoid-wise.
+      INFERX_ASSIGN_OR_RETURN(Tensor gate_rows, ws.shared_gate->Slice(0, rows));
+      INFERX_ASSIGN_OR_RETURN(Tensor gate_2d, gate_rows.Reshape(Shape({rows, 1})));
+      INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, *weights.shared_expert_gate, gate_2d));
+      INFERX_RETURN_IF_ERROR(ops::MulSigmoidRowGate(ctx, mixed_out, gate_2d));
     }
   } else {
     INFERX_RETURN_IF_ERROR(ops::MulScalar(ctx, mixed_out, 0.0f));
@@ -82,8 +91,8 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
   for (int64_t e = 0; e < config.num_experts; ++e) {
     const int64_t count = offsets[e + 1] - offsets[e];
     if (count == 0) continue;
-    INFERX_RETURN_IF_ERROR(ops::ScatterRoutedOutputs(ctx, *ws.expert_rows, *ws.token_rows,
-                                                     *ws.weights_by_slot, offsets[e], count,
+    INFERX_RETURN_IF_ERROR(ops::ScatterRoutedOutputs(ctx, *ws.expert_rows, token_rows,
+                                                     weights_by_slot, offsets[e], count,
                                                      mixed_out));
   }
   write("moe_out", mixed_out);

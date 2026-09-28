@@ -21,6 +21,12 @@ target_link_libraries(inferx_scheduler_test PRIVATE inferx::engine
 target_compile_options(inferx_scheduler_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME scheduler_test COMMAND inferx_scheduler_test)
 
+add_executable(inferx_parity_test unit/models/parity_test.cc)
+target_link_libraries(inferx_parity_test PRIVATE inferx::models GTest::gtest_main)
+target_compile_options(inferx_parity_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME parity_test COMMAND inferx_parity_test
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
 add_executable(inferx_model_test model_test.cc)
 target_link_libraries(inferx_model_test PRIVATE inferx::models GTest::gtest_main)
 target_compile_options(inferx_model_test PRIVATE -Wall -Wextra -Wpedantic)
@@ -44,7 +50,7 @@ target_compile_options(inferx_ops_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME ops_test COMMAND inferx_ops_test)
 if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   # WSL2 ships two libcuda copies; only the WSL one can see the GPU.
-  set_tests_properties(rms_norm_test model_test ops_test PROPERTIES ENVIRONMENT
+  set_tests_properties(rms_norm_test model_test ops_test parity_test PROPERTIES ENVIRONMENT
                        "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()
 

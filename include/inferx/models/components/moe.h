@@ -72,6 +72,7 @@ struct MoeWorkspace {
   std::optional<Tensor> expert_rows;    ///< [max_tokens * topk, hidden] bf16.
   std::optional<Tensor> packed_gate_up; ///< [max_tokens * topk, 2*inter] bf16.
   std::optional<Tensor> shared_out;     ///< [max_tokens, hidden] bf16.
+  std::optional<Tensor> shared_gate;    ///< [max_tokens, 1] bf16 gate logits.
 };
 
 /// \brief Runs the routed expert feed-forward into `mixed_out`.
