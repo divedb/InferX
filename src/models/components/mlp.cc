@@ -24,8 +24,15 @@ Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights,
   INFERX_ASSIGN_OR_RETURN(auto flat, packed_buffer->Slice(0, rows * width));
   INFERX_ASSIGN_OR_RETURN(auto packed, flat.Reshape(Shape({rows, width})));
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, normed, weights.packed_gate_up, packed));
-  INFERX_RETURN_IF_ERROR(ops::PackedSiluAndMul(ctx, packed, gate));
+  if (weights.packed_bias.has_value()) {
+    INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, packed, *weights.packed_bias, packed));
+  }
+  INFERX_RETURN_IF_ERROR(ops::PackedGatedActivation(ctx, packed, gate, config.activation,
+                                                    config.oai_alpha, config.oai_limit));
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, gate, weights.down.weight, mixed_out));
+  if (weights.down_bias.has_value()) {
+    INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, mixed_out, *weights.down_bias, mixed_out));
+  }
   write("silu", gate);
   write("down_proj", mixed_out);
   return OkStatus();

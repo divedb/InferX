@@ -14,23 +14,31 @@ StatusOr<nlohmann::json> ParseConfigJson(std::string_view text) {
   }
 }
 
-StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j, bool qk_norm,
-                                               bool plus_one_norm) {
+StatusOr<ops::Activation> ParseActivation(const nlohmann::json& j) {
+  const std::string act = j.value("hidden_act", std::string("silu"));
+  // gpt-oss states "silu" but clamps and shifts via swiglu_limit.
+  if (j.value("swiglu_limit", 0.0) > 0.0) return ops::Activation::kSiluOai;
+  if (act == "silu" || act == "swish") return ops::Activation::kSilu;
+  if (act == "gelu_pytorch_tanh" || act == "geglu") return ops::Activation::kGeluTanh;
+  return UnimplementedError("unsupported feed-forward activation: ", act);
+}
+
+StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
+                                               const DecoderDefaults& defaults) {
   INFERX_ASSIGN_OR_RETURN(auto model, CheckpointConfig::FromJson(j.dump()));
   if (j.contains("text_config")) {
     return UnimplementedError("multimodal wrappers require their own model builder");
   }
-  if (j.contains("quantization_config") && !j.at("quantization_config").is_null()) {
-    return UnimplementedError("quantized checkpoint mapping is not implemented");
+  if (j.value("mlp_bias", false)) {
+    return UnimplementedError("dense feed-forward biases are not implemented");
   }
-  if (model.hidden_act != "silu" || j.value("mlp_bias", false)) {
-    return UnimplementedError("decoder requires bias-free SwiGLU feed-forward layers");
-  }
+  INFERX_ASSIGN_OR_RETURN(auto activation, ParseActivation(j));
   components::AttentionConfig attention;
   attention.query_heads = model.num_attention_heads;
   attention.kv_heads = model.num_key_value_heads;
   attention.head_dim = model.head_dim;
-  attention.qk_norm = qk_norm;
+  attention.qk_norm = defaults.qk_norm;
+  attention.qk_norm_plus_one = defaults.qk_norm_plus_one;
   attention.qkv_bias = j.value("attention_bias", false);
   attention.output_bias = j.value("attention_bias", false);
   attention.rotary.theta = model.rope_theta;
@@ -73,12 +81,12 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j, bool qk_
   }
   DecoderConfig config;
   config.model = model;
-  config.final_norm = components::NormConfig{model.rms_norm_eps, plus_one_norm};
+  config.final_norm = components::NormConfig{model.rms_norm_eps, defaults.plus_one_norm};
   config.blocks.resize(model.num_hidden_layers);
   for (auto& block : config.blocks) {
     block.norm = config.final_norm;
     block.mixer = attention;
-    block.feed_forward = components::SwiGluConfig{model.intermediate_size};
+    block.feed_forward = components::SwiGluConfig{model.intermediate_size, activation};
   }
   return config;
 }

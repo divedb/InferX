@@ -1,16 +1,20 @@
 #pragma once
 
+#include <optional>
 #include <utility>
 
 #include "inferx/models/causal/model_traits.h"
 #include "inferx/models/components/decoder_layer.h"
+#include "inferx/models/components/norm.h"
 #include "inferx/models/diagnostic_trace.h"
 
 namespace inferx::causal {
 
 /// Owns one layer's weights. The stack lends activation workspace and the
-/// runner lends persistent state. The final residual addition is fused into
-/// the following layer's normalization (or the stack's final normalization).
+/// runner lends persistent state. Under kPreNorm the final residual addition
+/// is fused into the following layer's normalization (or the stack's final
+/// normalization); under kOutputNorm each sublayer output is normalized
+/// before joining the residual stream, so the same fusion still holds.
 template <ModelTraits Traits>
 class DecoderLayer {
  public:
@@ -18,11 +22,16 @@ class DecoderLayer {
                components::DecoderLayerWeights weights)
       : input_norm_(config.norm, std::move(weights.input_norm)),
         ffn_norm_(config.norm, std::move(weights.post_mixer_norm)),
+        mixer_out_norm_(MakeOutNorm(config.residual, config.mixer_out_norm,
+                                    std::move(weights.mixer_out_norm))),
+        feed_forward_out_norm_(MakeOutNorm(config.residual, config.feed_forward_out_norm,
+                                           std::move(weights.feed_forward_out_norm))),
         attention_(std::get<typename Traits::Attn::Config>(config.mixer),
                    std::move(weights.mixer)),
         mlp_(std::get<typename Traits::Mlp::Config>(config.feed_forward),
              std::get<typename Traits::Mlp::Weights>(std::move(weights.feed_forward))),
-        norm_eps_(config.norm.eps) {
+        norm_eps_(config.norm.eps),
+        output_norm_residual_(config.residual == components::ResidualStyle::kOutputNorm) {
     static_assert(Traits::kNorm == NormPlacement::kPre);
   }
 
@@ -40,18 +49,41 @@ class DecoderLayer {
     INFERX_RETURN_IF_ERROR(attention_.Forward(normed, norm_eps_, batch, state, pool,
                                               attention_ws, &packed, ctx, &trace, prefix,
                                               mixed));
+    if (output_norm_residual_) {
+      // Gemma sandwich: the mixer output is normalized before the residual
+      // add, which the feed-forward-side norm then fuses.
+      INFERX_RETURN_IF_ERROR(mixer_out_norm_->Forward(ctx, mixed, mixed));
+      if (trace.enabled()) trace.Write(prefix + "mixer_out_norm", mixed);
+    }
     INFERX_RETURN_IF_ERROR(ffn_norm_.AddForward(ctx, mixed, hidden, normed));
     if (trace.enabled()) trace.Write(prefix + "post_norm", normed);
     if (trace.enabled()) trace.Write(prefix + "residual", hidden);
-    return mlp_.Forward(normed, mlp_ws, &packed, ctx, &trace, prefix, mixed);
+    INFERX_RETURN_IF_ERROR(mlp_.Forward(normed, mlp_ws, &packed, ctx, &trace, prefix, mixed));
+    if (output_norm_residual_) {
+      INFERX_RETURN_IF_ERROR(feed_forward_out_norm_->Forward(ctx, mixed, mixed));
+      if (trace.enabled()) trace.Write(prefix + "feed_forward_out_norm", mixed);
+    }
+    return OkStatus();
   }
 
  private:
+  static std::optional<typename Traits::Norm> MakeOutNorm(
+      components::ResidualStyle residual, const components::NormConfig& config,
+      std::optional<Tensor> weight) {
+    if (residual != components::ResidualStyle::kOutputNorm || !weight.has_value()) {
+      return std::nullopt;
+    }
+    return typename Traits::Norm(config, std::move(*weight));
+  }
+
   typename Traits::Norm input_norm_;
   typename Traits::Norm ffn_norm_;
+  std::optional<typename Traits::Norm> mixer_out_norm_;
+  std::optional<typename Traits::Norm> feed_forward_out_norm_;
   typename Traits::Attn attention_;
   typename Traits::Mlp mlp_;
   float norm_eps_;
+  bool output_norm_residual_;
 };
 
 }  // namespace inferx::causal

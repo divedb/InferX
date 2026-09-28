@@ -208,7 +208,8 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
                          prefix + std::string(names.up), prefix + std::string(names.down),
                          hidden, dense->intermediate_size, parallel, device));
     return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
-                                           std::move(attn), std::move(ffn)};
+                                           std::nullopt, std::nullopt, std::move(attn),
+                                           std::move(ffn)};
   }
   const auto& m = std::get<components::MoeConfig>(config.feed_forward);
   INFERX_ASSIGN_OR_RETURN(auto router,
@@ -242,7 +243,8 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
   components::MoeWeights moe{std::move(router), std::move(experts), std::move(shared_expert),
                              std::move(shared_expert_gate)};
   return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
-                                         std::move(attn), std::move(moe)};
+                                         std::nullopt, std::nullopt, std::move(attn),
+                                         std::move(moe)};
 }
 
 }  // namespace

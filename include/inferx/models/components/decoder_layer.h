@@ -19,17 +19,35 @@ class DiagnosticTrace;
 
 namespace components {
 
-/// \brief Configuration for one pre-norm decoder layer.
+/// \brief Where a layer's normalization sits relative to its residual adds.
+enum class ResidualStyle {
+  /// Llama lineage: normalize the residual stream before each sublayer,
+  /// add the sublayer output raw (fused into the next AddForward).
+  kPreNorm,
+  /// Gemma lineage: normalize each sublayer OUTPUT before it joins the
+  /// residual stream (post_attention/pre_feedforward/post_feedforward norms).
+  kOutputNorm,
+};
+
+/// \brief Configuration for one decoder layer.
 struct DecoderLayerConfig {
   NormConfig norm;  ///< Applied before the mixer and before the feed-forward.
+  /// Output-side norms applied to the mixer and feed-forward results; read
+  /// only when `residual` is kOutputNorm.
+  NormConfig mixer_out_norm;
+  NormConfig feed_forward_out_norm;
+  ResidualStyle residual = ResidualStyle::kPreNorm;
   std::variant<AttentionConfig, GatedDeltaNetConfig> mixer;
   std::variant<SwiGluConfig, MoeConfig> feed_forward;
 };
 
-/// \brief Weights for one pre-norm decoder layer.
+/// \brief Weights for one decoder layer.
 struct DecoderLayerWeights {
   Tensor input_norm;       ///< [hidden] mixer-side norm.
   Tensor post_mixer_norm;  ///< [hidden] feed-forward-side norm.
+  /// Output-side norms (Gemma sandwich); absent when residual is kPreNorm.
+  std::optional<Tensor> mixer_out_norm;
+  std::optional<Tensor> feed_forward_out_norm;
   AttentionWeights mixer;  ///< Recurrent mixers are not loadable yet.
   std::variant<SwiGluWeights, MoeWeights> feed_forward;
 };

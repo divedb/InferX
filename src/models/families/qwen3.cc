@@ -23,7 +23,7 @@ struct Qwen3Traits {
   using Attn =
       components::GqaAttention<components::QkvBias::kDisabled, components::QkNorm::kRmsNorm,
                                components::RopeStyle::kNeox>;
-  using Mlp = components::GatedMlp<components::Activation::kSilu>;
+  using Mlp = components::GatedMlp<ops::Activation::kSilu>;
 };
 
 static_assert(causal::ModelTraits<Qwen3Traits>);
@@ -36,9 +36,10 @@ template <Variant Kind>
 StatusOr<causal::DecoderConfig> TranslateVariant(const nlohmann::json& j) {
   constexpr bool next = Kind == Variant::kNext;
   constexpr bool moe = Kind != Variant::kDense;
-  INFERX_ASSIGN_OR_RETURN(auto config,
-                          causal::AttentionDecoderConfig(j, Qwen3Traits::Attn::kQkNorm,
-                                                         /*plus_one_norm=*/next));
+  INFERX_ASSIGN_OR_RETURN(auto config, causal::AttentionDecoderConfig(
+                                            j, {/*qk_norm=*/Qwen3Traits::Attn::kQkNorm,
+                                                /*plus_one_norm=*/next,
+                                                /*qk_norm_plus_one=*/next}));
   const int64_t sparse_step = j.value("decoder_sparse_step", int64_t{1});
   if (sparse_step <= 0) return InvalidArgumentError("decoder_sparse_step must be positive");
   const auto dense_layers = j.value("mlp_only_layers", std::vector<int64_t>{});

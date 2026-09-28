@@ -52,6 +52,85 @@ Status PackedSiluAndMul(ExecutionContext& ctx, const Tensor& packed, Tensor& out
   return cuda::PackedSiluAndMul(ctx, packed, out);
 }
 
+Status SplitProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& q, Tensor* gate,
+                       Tensor& k, Tensor& v) {
+  const Tensor* parts[] = {&packed, &q, &k, &v};
+  for (const Tensor* t : parts) {
+    if (t->Rank() != 2 || t->GetDataType() != DataType::kBFloat16 ||
+        t->Device() != ctx.device() || t->Dim(0) != packed.Dim(0))
+      return InvalidArgumentError("SplitProjection requires compatible BF16 matrices");
+  }
+  const int64_t gate_width = gate == nullptr ? 0 : gate->Dim(1);
+  if (gate != nullptr &&
+      (gate->Rank() != 2 || gate->GetDataType() != DataType::kBFloat16 ||
+       gate->Device() != ctx.device() || gate->Dim(0) != packed.Dim(0)))
+    return InvalidArgumentError("SplitProjection gate must match the packed rows");
+  if (packed.Dim(1) != q.Dim(1) + gate_width + k.Dim(1) + v.Dim(1))
+    return InvalidArgumentError("SplitProjection column counts disagree");
+  if (!ctx.device().IsCuda()) return UnimplementedError("SplitProjection requires CUDA");
+  if (packed.IsEmpty()) return OkStatus();
+  return cuda::SplitProjection(ctx, packed, q, gate, k, v);
+}
+
+Status PackedGatedActivation(ExecutionContext& ctx, const Tensor& packed, Tensor& out,
+                             Activation act, float oai_alpha, float oai_limit) {
+  if (packed.Rank() != 2 || out.Rank() != 2 ||
+      packed.GetDataType() != DataType::kBFloat16 || out.GetDataType() != DataType::kBFloat16 ||
+      packed.Device() != ctx.device() || out.Device() != ctx.device() ||
+      packed.Dim(0) != out.Dim(0) || packed.Dim(1) != 2 * out.Dim(1))
+    return InvalidArgumentError("PackedGatedActivation requires compatible BF16 matrices");
+  if (!ctx.device().IsCuda()) return UnimplementedError("PackedGatedActivation requires CUDA");
+  if (packed.IsEmpty()) return OkStatus();
+  return cuda::PackedGatedActivation(ctx, packed, out, act, oai_alpha, oai_limit);
+}
+
+Status AddBias(ExecutionContext& ctx, const Tensor& x, const Tensor& bias, Tensor& out) {
+  if (x.Rank() != 2 || bias.Rank() != 1 || out.Rank() != 2 ||
+      x.GetDataType() != DataType::kBFloat16 || bias.GetDataType() != DataType::kBFloat16 ||
+      out.GetDataType() != DataType::kBFloat16 || bias.Dim(0) != x.Dim(1) ||
+      out.Dim(0) != x.Dim(0) || out.Dim(1) != x.Dim(1))
+    return InvalidArgumentError("AddBias requires a [rows, width] matrix and [width] bias");
+  if (x.Device() != ctx.device() || bias.Device() != ctx.device() ||
+      out.Device() != ctx.device())
+    return InvalidArgumentError("AddBias tensors must live on the context's device ",
+                                ctx.device().ToString());
+  if (!ctx.device().IsCuda()) return UnimplementedError("AddBias requires CUDA");
+  if (x.IsEmpty()) return OkStatus();
+  return cuda::AddBias(ctx, x, bias, out);
+}
+
+Status MulSigmoidGate(ExecutionContext& ctx, Tensor& x, const Tensor& gate) {
+  if (x.Rank() != gate.Rank() || x.GetDataType() != DataType::kBFloat16 ||
+      gate.GetDataType() != DataType::kBFloat16 || x.Device() != ctx.device() ||
+      gate.Device() != ctx.device())
+    return InvalidArgumentError("MulSigmoidGate requires same-shape BF16 tensors");
+  for (int i = 0; i < x.Rank(); ++i) {
+    if (x.Dim(i) != gate.Dim(i))
+      return InvalidArgumentError("MulSigmoidGate requires same-shape BF16 tensors");
+  }
+  if (!ctx.device().IsCuda()) return UnimplementedError("MulSigmoidGate requires CUDA");
+  if (x.IsEmpty()) return OkStatus();
+  return cuda::MulSigmoidGate(ctx, x, gate);
+}
+
+Status MulSigmoidRowGate(ExecutionContext& ctx, Tensor& x, const Tensor& gate) {
+  if (x.Rank() != 2 || gate.Rank() != 2 || gate.Dim(1) != 1 || gate.Dim(0) != x.Dim(0) ||
+      x.GetDataType() != DataType::kBFloat16 || gate.GetDataType() != DataType::kBFloat16 ||
+      x.Device() != ctx.device() || gate.Device() != ctx.device())
+    return InvalidArgumentError("MulSigmoidRowGate requires [rows, width] and [rows, 1] BF16");
+  if (!ctx.device().IsCuda()) return UnimplementedError("MulSigmoidRowGate requires CUDA");
+  if (x.IsEmpty()) return OkStatus();
+  return cuda::MulSigmoidRowGate(ctx, x, gate);
+}
+
+Status MulScalar(ExecutionContext& ctx, Tensor& x, float scalar) {
+  if (x.GetDataType() != DataType::kBFloat16 || x.Device() != ctx.device())
+    return InvalidArgumentError("MulScalar requires a BF16 tensor on the context device");
+  if (!ctx.device().IsCuda()) return UnimplementedError("MulScalar requires CUDA");
+  if (x.IsEmpty()) return OkStatus();
+  return cuda::MulScalar(ctx, x, scalar);
+}
+
 Status Add(ExecutionContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
   INFERX_RETURN_IF_ERROR(CheckElementwise("Add", a, b, out));
   const DeviceId device = ctx.device();

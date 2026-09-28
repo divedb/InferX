@@ -128,6 +128,10 @@ StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, Model
                                                    ctx.stream()));
   } else {
     INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, embedding_, input.token_ids, hidden));
+    if (config_.embedding_scale != 1.0f) {
+      // Gemma scales token embeddings by sqrt(hidden) in activation dtype.
+      INFERX_RETURN_IF_ERROR(ops::MulScalar(ctx, hidden, config_.embedding_scale));
+    }
   }
 
   const auto& attention_batch = input.attention;

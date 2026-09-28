@@ -25,6 +25,8 @@ namespace inferx::causal {
 struct DecoderConfig {
   CheckpointConfig model;                              ///< Family-agnostic dimensions.
   components::NormConfig final_norm;                   ///< Closing norm after the last layer.
+  /// Embedding multiplier applied after the gather (Gemma: sqrt(hidden)).
+  float embedding_scale = 1.0f;
   std::vector<components::DecoderLayerConfig> blocks;  ///< One entry per layer.
 
   /// \brief Checks internal consistency of dimensions, geometry, and variants.

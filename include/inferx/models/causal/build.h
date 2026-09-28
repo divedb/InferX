@@ -12,8 +12,9 @@ template <ModelTraits Traits>
 StatusOr<DecoderConfig> TranslateDenseConfig(const nlohmann::json& json) {
   static_assert(Traits::kNorm == NormPlacement::kPre);
   static_assert(Traits::Attn::kRope == components::RopeStyle::kNeox);
-  INFERX_ASSIGN_OR_RETURN(auto config, AttentionDecoderConfig(json, Traits::Attn::kQkNorm,
-                                                              /*plus_one_norm=*/false));
+  INFERX_ASSIGN_OR_RETURN(auto config,
+                          AttentionDecoderConfig(
+                              json, {/*qk_norm=*/Traits::Attn::kQkNorm}));
   if constexpr (Traits::Attn::kQkvBias) {
     for (auto& block : config.blocks) {
       std::get<components::AttentionConfig>(block.mixer).qkv_bias = true;

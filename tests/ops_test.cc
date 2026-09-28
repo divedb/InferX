@@ -397,6 +397,65 @@ TEST_F(OpsTest, AddAndSiluAndMulMatchReferences) {
   }
 }
 
+TEST_F(OpsTest, PackedGatedActivationFlavors) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  // gate = [2, -0.5, 10], up = [0.5, 2, -3]; headroom around the clamps.
+  Tensor packed = Upload({2, -0.5, 10, 0.5, 2, -3}, Shape({1, 6}));
+  Tensor out = MakeBf16(Shape({1, 3}));
+
+  ASSERT_TRUE(ops::PackedGatedActivation(ctx, packed, out, ops::Activation::kSilu).ok());
+  auto got = Download(out);
+  const auto silu = [](float g) { return g / (1.0f + std::exp(-g)); };
+  EXPECT_NEAR(got[0], silu(2) * 0.5f, 0.01f);
+  EXPECT_NEAR(got[1], silu(-0.5f) * 2, 0.01f);
+  EXPECT_NEAR(got[2], silu(10) * -3, 0.01f);
+
+  ASSERT_TRUE(ops::PackedGatedActivation(ctx, packed, out, ops::Activation::kGeluTanh).ok());
+  got = Download(out);
+  const auto gelu = [](float g) {
+    return 0.5f * g * (1.0f + std::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g)));
+  };
+  EXPECT_NEAR(got[0], gelu(2) * 0.5f, 0.01f);
+  EXPECT_NEAR(got[1], gelu(-0.5f) * 2, 0.01f);
+
+  // gpt-oss: gate clamps only from above, up clamps both ways and gains +1.
+  ASSERT_TRUE(ops::PackedGatedActivation(ctx, packed, out, ops::Activation::kSiluOai).ok());
+  got = Download(out);
+  EXPECT_NEAR(got[0], (2 / (1.0f + std::exp(-1.702f * 2))) * 1.5f, 0.01f);
+  EXPECT_NEAR(got[2], (7 / (1.0f + std::exp(-1.702f * 7))) * (-3.0f + 1.0f), 0.01f);
+}
+
+TEST_F(OpsTest, BiasAndSigmoidGates) {
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  Tensor x = Upload({1, 2, 3, 4}, Shape({2, 2}));
+  Tensor bias = Upload({10, -1}, Shape({2}));
+  Tensor out = MakeBf16(Shape({2, 2}));
+  ASSERT_TRUE(ops::AddBias(ctx, x, bias, out).ok());
+  const auto biased = Download(out);
+  EXPECT_NEAR(biased[0], 11, 0.01f);
+  EXPECT_NEAR(biased[1], 1, 0.01f);
+  EXPECT_NEAR(biased[2], 13, 0.01f);
+  EXPECT_NEAR(biased[3], 3, 0.01f);
+
+  Tensor gate = Upload({0, 1, 2, -2}, Shape({2, 2}));
+  ASSERT_TRUE(ops::MulSigmoidGate(ctx, out, gate).ok());
+  const auto gated = Download(out);
+  EXPECT_NEAR(gated[0], 11 * 0.5f, 0.02f);
+  EXPECT_NEAR(gated[1], 1 / (1.0f + std::exp(-1)), 0.02f);
+
+  Tensor row_gate = Upload({0, 2}, Shape({2, 1}));
+  ASSERT_TRUE(ops::MulSigmoidRowGate(ctx, x, row_gate).ok());
+  const auto row_gated = Download(x);
+  EXPECT_NEAR(row_gated[0], 0.5f, 0.01f);
+  EXPECT_NEAR(row_gated[1], 1, 0.01f);
+  EXPECT_NEAR(row_gated[2], 3 / (1.0f + std::exp(-2)), 0.02f);
+  EXPECT_NEAR(row_gated[3], 4 / (1.0f + std::exp(-2)), 0.02f);
+
+  ASSERT_TRUE(ops::MulScalar(ctx, x, 4.0f).ok());
+  const auto scaled = Download(x);
+  EXPECT_NEAR(scaled[1], 4, 0.02f);
+}
+
 TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {
   using ops::RopeFlavor;
   // Default: theta^(-2i/dim).

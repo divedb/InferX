@@ -14,7 +14,7 @@ struct LlamaTraits {
   using Attn =
       components::GqaAttention<components::QkvBias::kDisabled, components::QkNorm::kNone,
                                components::RopeStyle::kNeox>;
-  using Mlp = components::GatedMlp<components::Activation::kSilu>;
+  using Mlp = components::GatedMlp<ops::Activation::kSilu>;
 };
 
 static_assert(causal::ModelTraits<LlamaTraits>);
