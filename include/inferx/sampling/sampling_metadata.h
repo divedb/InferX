@@ -5,6 +5,9 @@
 #include <optional>
 #include <vector>
 
+#include <cstring>
+#include <map>
+
 #include "absl/types/span.h"
 #include "inferx/sampling/sampling_params.h"
 
@@ -43,6 +46,8 @@ struct SamplingMetadata {
   struct PerRequest {
     const SamplingParams* params = nullptr;  ///< Borrowed for the Build call.
     std::uint64_t rng_offset = 0;            ///< Generated tokens so far.
+    /// Prompt plus generated tokens, for penalties; borrowed for Build.
+    const std::vector<std::int32_t>* history = nullptr;
   };
 
   int batch = 0;
@@ -50,12 +55,37 @@ struct SamplingMetadata {
   bool all_greedy = true;
   std::vector<RequestSamplingParams> requests;  ///< Batch order.
 
-  /// \brief Resolves `batch` (params + RNG positions) against a vocabulary.
+  /// \brief Device-mirror payloads, built by Build(): CSR entries packed
+  ///        alongside the per-row knobs so one async upload serves the batch.
+  ///
+  /// Bias entries pack (token, float bits) into uint64; history entries pack
+  /// (token, occurrence count) the same way. The engine seed stands in for
+  /// requests that did not set one.
+  struct DevicePayload {
+    std::vector<float> temperature, top_p, min_p, penalties;
+    std::vector<int32_t> top_k, greedy;
+    std::vector<uint64_t> seeds, rng_offsets;
+    std::vector<int32_t> bias_ptr{0}, allow_ptr{0}, hist_ptr{0};
+    std::vector<uint64_t> bias_entries, hist_entries;
+    std::vector<int32_t> allow_entries;
+  };
+  DevicePayload device;
+  uint64_t engine_seed = 0;
+
+  /// \brief Resolves `batch` (params + RNG positions + histories) against a
+  ///        vocabulary, also packing the device-mirror CSR payloads.
   static SamplingMetadata Build(std::int64_t vocab_size,
-                                absl::Span<const PerRequest> batch) {
+                                absl::Span<const PerRequest> batch,
+                                uint64_t engine_seed = 0) {
     SamplingMetadata metadata;
     metadata.vocab_size = vocab_size;
+    metadata.engine_seed = engine_seed;
     metadata.requests.reserve(batch.size());
+    auto& d = metadata.device;
+    d.temperature.reserve(batch.size());
+    d.top_k.reserve(batch.size());
+    d.greedy.reserve(batch.size());
+    d.seeds.reserve(batch.size());
     for (const PerRequest& per : batch) {
       const SamplingParams& p = *per.params;
       RequestSamplingParams r;
@@ -75,6 +105,35 @@ struct SamplingMetadata {
       r.rng_offset = per.rng_offset;
       metadata.all_greedy = metadata.all_greedy && r.greedy;
       metadata.requests.push_back(r);
+
+      d.temperature.push_back(p.temperature);
+      d.top_k.push_back(static_cast<int32_t>(p.top_k));
+      d.top_p.push_back(p.top_p);
+      d.min_p.push_back(p.min_p);
+      d.penalties.push_back(p.repetition_penalty);
+      d.penalties.push_back(p.presence_penalty);
+      d.penalties.push_back(p.frequency_penalty);
+      d.greedy.push_back(r.greedy ? 1 : 0);
+      d.seeds.push_back(p.seed.value_or(engine_seed));
+      d.rng_offsets.push_back(per.rng_offset);
+      for (const auto& [token, bias] : p.logit_bias) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &bias, sizeof(bits));
+        d.bias_entries.push_back((uint64_t(static_cast<uint32_t>(token)) << 32) | bits);
+      }
+      d.bias_ptr.push_back(static_cast<int32_t>(d.bias_entries.size()));
+      for (int32_t token : p.allowed_token_ids) d.allow_entries.push_back(token);
+      d.allow_ptr.push_back(static_cast<int32_t>(d.allow_entries.size()));
+      if (per.history != nullptr) {
+        // Deduplicate with counts: presence fires once, frequency scales.
+        std::map<int32_t, int32_t> counts;
+        for (int32_t token : *per.history) counts[token]++;
+        for (const auto& [token, count] : counts) {
+          d.hist_entries.push_back((uint64_t(static_cast<uint32_t>(token)) << 32) |
+                                   uint32_t(count));
+        }
+      }
+      d.hist_ptr.push_back(static_cast<int32_t>(d.hist_entries.size()));
     }
     metadata.batch = static_cast<int>(batch.size());
     return metadata;

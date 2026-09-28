@@ -63,6 +63,7 @@ target_compile_options(inferx_ops PRIVATE
 add_library(inferx_sampling
   sampling/sampling_params.cc
   sampling/sampler.cc
+  sampling/sampling_kernels.cu
 )
 add_library(inferx::sampling ALIAS inferx_sampling)
 target_link_libraries(inferx_sampling PUBLIC inferx::ops absl::status absl::span)
