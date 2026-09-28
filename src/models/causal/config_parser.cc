@@ -1,4 +1,4 @@
-#include "models/causal/config_parser.h"
+#include "inferx/models/causal/config_parser.h"
 
 #include <cmath>
 
@@ -6,14 +6,16 @@ namespace inferx::causal {
 
 StatusOr<nlohmann::json> ParseConfigJson(std::string_view text) {
   try {
-    return nlohmann::json::parse(text);
+    auto json = nlohmann::json::parse(text);
+    if (!json.is_object()) return InvalidArgumentError("config.json must be an object");
+    return json;
   } catch (const nlohmann::json::exception& e) {
     return InvalidArgumentError("invalid config.json: ", e.what());
   }
 }
 
-StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
-                                               bool qk_norm, bool plus_one_norm) {
+StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j, bool qk_norm,
+                                               bool plus_one_norm) {
   INFERX_ASSIGN_OR_RETURN(auto model, CheckpointConfig::FromJson(j.dump()));
   if (j.contains("text_config")) {
     return UnimplementedError("multimodal wrappers require their own model builder");
@@ -29,7 +31,8 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
   attention.kv_heads = model.num_key_value_heads;
   attention.head_dim = model.head_dim;
   attention.qk_norm = qk_norm;
-  attention.projection_bias = j.value("attention_bias", false);
+  attention.qkv_bias = j.value("attention_bias", false);
+  attention.output_bias = j.value("attention_bias", false);
   attention.rotary.theta = model.rope_theta;
   nlohmann::json rope = nlohmann::json::object();
   for (const char* key : {"rope_scaling", "rope_parameters"}) {
@@ -39,7 +42,8 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
   attention.rotary.theta = rope.value("rope_theta", attention.rotary.theta);
   attention.rotary.factor = rope.value("factor", 1.0);
   attention.rotary.parameters_json = rope.dump();
-  const double partial = rope.value("partial_rotary_factor", j.value("partial_rotary_factor", 1.0));
+  const double partial =
+      rope.value("partial_rotary_factor", j.value("partial_rotary_factor", 1.0));
   if (!std::isfinite(partial) || partial <= 0 || partial > 1) {
     return InvalidArgumentError("partial_rotary_factor must be in (0, 1]");
   }

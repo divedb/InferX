@@ -1,6 +1,6 @@
 #include "inferx/ops/elementwise.h"
 
-#include "ops/cuda/elementwise.h"
+#include "inferx/ops/cuda/elementwise.h"
 
 namespace inferx::ops {
 namespace {

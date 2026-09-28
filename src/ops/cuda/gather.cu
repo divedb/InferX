@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 
 #include "inferx/core/dtype.h"
-#include "ops/cuda/gather.h"
+#include "inferx/ops/cuda/gather.h"
 
 namespace inferx::ops::cuda {
 namespace {

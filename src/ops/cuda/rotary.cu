@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include "flashinfer/norm.cuh"
 
-#include "ops/cuda/rotary.h"
+#include "inferx/ops/cuda/rotary.h"
 
 namespace inferx::ops::cuda {
 namespace {

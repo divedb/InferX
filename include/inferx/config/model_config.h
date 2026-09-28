@@ -9,6 +9,10 @@
 namespace inferx {
 
 struct ModelConfig {
+  /// Device placement for the model; the engine executes on its primary device.
+  /// EXAMPLE: --device cuda
+  DeviceConfig device;
+
   /// Directory holding the model checkpoint.
   /// EXAMPLE: --model /path/to/checkpoint
   std::string model_dir;

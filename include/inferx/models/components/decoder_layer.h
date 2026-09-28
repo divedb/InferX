@@ -1,8 +1,7 @@
 /// \file
-/// \brief The decoder layer: the one place transformer topology lives. A
-/// layer is a pre-norm residual unit — norm -> mixer -> add, norm ->
-/// feed-forward -> add — with the mixer and feed-forward chosen per layer
-/// from variants.
+/// \brief Per-layer configuration and canonical weights for checkpoint
+/// translation. Execution topology lives in causal::DecoderLayer<Traits>;
+/// variants also describe families whose execution is not implemented yet.
 
 #ifndef INFERX_MODELS_COMPONENTS_DECODER_LAYER_H_
 #define INFERX_MODELS_COMPONENTS_DECODER_LAYER_H_

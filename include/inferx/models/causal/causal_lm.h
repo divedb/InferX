@@ -7,13 +7,13 @@
 
 #include <memory>
 
+#include "inferx/config/parallel_config.h"
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/config/parallel_config.h"
 #include "inferx/models/causal/decoder_stack.h"
-#include "inferx/models/causal/weight_mapping.h"
 #include "inferx/models/checkpoint.h"
+#include "inferx/models/loading/weight_loader.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/execution_context.h"
 
@@ -26,7 +26,7 @@ struct LanguageModelHead {
   explicit LanguageModelHead(Tensor w) : weight(std::move(w)) {}
 
   int capacity = 0;  ///< Stable row capacity for graph replay.
-  Tensor weight;  ///< [vocab, hidden]; may alias the token embedding.
+  Tensor weight;     ///< [vocab, hidden]; may alias the token embedding.
 
   /// \brief Gathers `rows`, then projects them to [rows, vocab] logits.
   /// The row buffer and logits borrow workspace allocated on first use.
@@ -38,10 +38,31 @@ struct LanguageModelHead {
   std::optional<Tensor> rows_, logits_;
 };
 
-/// \brief Causal language model over the shared dense decoder stack.
+/// Validated and loaded common state, before selecting a typed executor.
+struct PreparedCausalLM {
+  DecoderConfig config;
+  DecoderWeights weights;
+  Tensor head;
+};
+
+StatusOr<PreparedCausalLM> PrepareCausalLM(models::LoadedCheckpoint& checkpoint,
+                                           DecoderConfig config,
+                                           const models::WeightNames& names,
+                                           const models::WeightLayout& layout, DeviceId device,
+                                           int max_tokens, int max_seqs,
+                                           const ParallelConfig& parallel);
+
+/// The only virtual execution boundary is Model. Layers and components are
+/// concrete types selected by Traits.
+template <ModelTraits Traits>
 class CausalLM final : public Model {
  public:
-  CausalLM(DecoderStack decoder, LanguageModelHead head, int max_seqs);
+  CausalLM(PreparedCausalLM prepared, int max_tokens, int max_seqs)
+      : decoder_(std::move(prepared.config), std::move(prepared.weights), max_tokens),
+        head_(std::move(prepared.head)),
+        max_seqs_(max_seqs) {
+    head_.capacity = max_seqs;
+  }
 
   bool SupportsCudaGraphs() const override { return true; }
   const CheckpointConfig& config() const override { return decoder_.config(); }
@@ -49,26 +70,23 @@ class CausalLM final : public Model {
     return decoder_.StateRequirements();
   }
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx) override;
+                           ops::ExecutionContext& ctx) override {
+    if (input.attention.num_seqs <= 0 || input.attention.num_seqs > max_seqs_ ||
+        input.logit_rows.Rank() != 1 || input.logit_rows.Numel() != input.attention.num_seqs ||
+        input.logit_rows.GetDataType() != DataType::kInt32 ||
+        input.logit_rows.Device() != ctx.device()) {
+      return InvalidArgumentError("invalid requested language-model output rows");
+    }
+    DecoderInput decoder_input{input.token_ids, {}, input.attention};
+    INFERX_ASSIGN_OR_RETURN(Tensor hidden, decoder_.Forward(decoder_input, state, ctx));
+    return head_.Forward(hidden, input.logit_rows, ctx);
+  }
 
  private:
-  DecoderStack decoder_;
+  DecoderStack<Traits> decoder_;
   LanguageModelHead head_;
   int max_seqs_;
 };
-
-/// \brief Validates, maps, and assembles a CausalLM from an opened
-///        checkpoint: the single build entry the families call.
-///
-/// Rejects configurations with no executable implementation (MoE, recurrent
-/// mixers, gated or biased projections) before loading any weight. `config`
-/// carries TOTAL head counts; `parallel` both shards the executed stack to
-/// this rank's heads and selects its row slices of the packed QKV weights.
-StatusOr<std::unique_ptr<Model>> BuildCausalLM(models::LoadedCheckpoint& checkpoint,
-                                               DecoderConfig config,
-                                               const CheckpointLayout& layout, DeviceId device,
-                                               int max_tokens, int max_seqs,
-                                               const ParallelConfig& parallel = {});
 
 }  // namespace inferx::causal
 

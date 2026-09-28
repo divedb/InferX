@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <string_view>
 
-#include "ops/cuda/cublas.h"
-#include "ops/cuda/linear.h"
+#include "inferx/ops/cuda/cublas.h"
+#include "inferx/ops/cuda/linear.h"
 
 namespace inferx::ops::cuda {
 namespace {

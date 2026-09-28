@@ -67,7 +67,7 @@ HWY_AFTER_NAMESPACE();
 
 #if HWY_ONCE
 
-#include "ops/cpu/rms_norm.h"
+#include "inferx/ops/cpu/rms_norm.h"
 
 namespace inferx {
 namespace ops {

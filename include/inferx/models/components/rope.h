@@ -9,6 +9,8 @@
 
 namespace inferx::components {
 
+enum class RopeStyle { kNeox };
+
 /// \brief Rotary position embedding applied inside an attention layer.
 struct RotaryConfig {
   int64_t dim = 0;               ///< Rotated columns per head; even, <= head_dim.

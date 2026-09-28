@@ -1,7 +1,7 @@
-#include "inferx/ops/profile.h"
 #include "inferx/ops/linear.h"
 
-#include "ops/cuda/linear.h"
+#include "inferx/ops/cuda/linear.h"
+#include "inferx/ops/profile.h"
 
 namespace inferx::ops {
 

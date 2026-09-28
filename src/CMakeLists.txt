@@ -35,10 +35,14 @@ add_library(inferx_ops
 )
 set_source_files_properties(ops/cuda/flash_attention.cu PROPERTIES
   COMPILE_OPTIONS "--expt-relaxed-constexpr")
+# Highway re-includes rms_norm.cc once per SIMD target through
+# HWY_TARGET_INCLUDE, which resolves against the include path.
+set_source_files_properties(ops/cpu/rms_norm.cc PROPERTIES
+  COMPILE_OPTIONS "-I${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(inferx::ops ALIAS inferx_ops)
 target_link_libraries(inferx_ops PUBLIC inferx::core
                       PRIVATE CUDA::cudart CUDA::cublas hwy)
-target_include_directories(inferx_ops PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+target_include_directories(inferx_ops PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/flashinfer/include
   ${PROJECT_SOURCE_DIR}/third_party/flashinfer/3rdparty/cccl/libcudacxx/include
   ${PROJECT_SOURCE_DIR}/third_party/flashinfer/3rdparty/cutlass/include)
@@ -56,35 +60,17 @@ add_library(inferx::sampling ALIAS inferx_sampling)
 target_link_libraries(inferx_sampling PUBLIC inferx::ops absl::status absl::span)
 target_compile_options(inferx_sampling PRIVATE -Wall -Wextra -Wpedantic)
 
-# inferx_model_families -- architecture families that self-register from
-# their own translation units, plus the config-translation closure those
-# families build on. The archive is whole-archived (see inferx_models), so
-# registration always runs even though its TUs export no referenced symbols.
-# CONSTRAINT: members must reference nothing from inferx_models -- only each
-# other, headers, and libraries later on the link line -- or links that never
-# pull those models members fail. RegisterFamily is header-inline for the
-# same reason. Adding a translate/build-tier family = one .cc listed here;
-# tier-1 families are just rows in model_registry.cc.
-add_library(inferx_model_families STATIC
-  models/qwen3.cc
-  models/causal/config_parser.cc
-  models/checkpoint_config.cc
-)
-add_library(inferx::model_families ALIAS inferx_model_families)
-target_link_libraries(inferx_model_families PUBLIC inferx::core inferx::boost
-                      PRIVATE nlohmann_json::nlohmann_json absl::status
-                              absl::statusor absl::strings)
-target_include_directories(inferx_model_families PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_options(inferx_model_families PRIVATE -Wall -Wextra -Wpedantic)
-
 # inferx_models -- reusable transformer components under models/components
-# (config + weights + execution, paired), the shared dense causal decoder
-# under models/causal (stack, LM head, fused-QKV weight mapping), the mmap'd
-# checkpoint reader those loaders use, and the tiered registry selecting a
-# family by checkpoint identity.
+# (config + weights + execution), typed decoder composition under models/causal,
+# checkpoint mapping under models/loading, and family factories selected by
+# checkpoint identity. Explicit factory references retain families in static links.
 add_library(inferx_models
   models/model.cc
   models/model_registry.cc
+  models/families/llama.cc
+  models/families/qwen3.cc
+  models/causal/config_parser.cc
+  models/checkpoint_config.cc
   models/checkpoint.cc
   models/safe_tensors_reader.cc
   models/safe_tensors_view.cc
@@ -96,7 +82,8 @@ add_library(inferx_models
   models/components/qkv_linear.cc
   models/causal/causal_lm.cc
   models/causal/decoder_stack.cc
-  models/causal/weight_mapping.cc
+  models/causal/decoder_config.cc
+  models/loading/weight_loader.cc
 )
 add_library(inferx::models ALIAS inferx_models)
 target_link_libraries(inferx_models
@@ -104,14 +91,6 @@ target_link_libraries(inferx_models
          nlohmann_json::nlohmann_json
   PRIVATE absl::flat_hash_map absl::span
           absl::status absl::statusor absl::strings)
-# The family archive rides in the interface, whole-archived: registration
-# TUs export no referenced symbols, so plain archive selection would drop
-# them and their families would never enter the registry. Order on the
-# final link line does not matter -- see the CONSTRAINT on
-# inferx_model_families.
-set_property(TARGET inferx_models APPEND PROPERTY INTERFACE_LINK_LIBRARIES
-  "$<LINK_LIBRARY:WHOLE_ARCHIVE,inferx_model_families>")
-target_include_directories(inferx_models PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(inferx_models PRIVATE -Wall -Wextra -Wpedantic)
 
 # Architecture, scheduling, and orchestration are ordinary C++.

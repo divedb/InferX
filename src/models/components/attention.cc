@@ -4,14 +4,14 @@
 #include <string_view>
 
 #include "inferx/core/shape.h"
+#include "inferx/models/diagnostic_trace.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/attention.h"
 #include "inferx/ops/elementwise.h"
 #include "inferx/ops/flash_attention.h"
 #include "inferx/ops/linear.h"
-#include "inferx/ops/rotary.h"
 #include "inferx/ops/rms_norm.h"
-#include "models/diagnostic_trace.h"
+#include "inferx/ops/rotary.h"
 
 namespace inferx::components {
 

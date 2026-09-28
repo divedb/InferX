@@ -24,8 +24,10 @@ class ExecutionContext {
 
   /// \brief Returns the runtime of the execution device.
   DeviceRuntime& runtime() const { return runtime_; }
+
   /// \brief Returns the stream ops enqueue their work on.
   Stream stream() const { return stream_; }
+
   /// \brief Returns the device ops execute on.
   DeviceId device() const { return runtime_.device(); }
 

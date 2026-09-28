@@ -3,7 +3,7 @@
 #include <cstdlib>
 #include <string_view>
 
-#include "ops/cuda/attention.h"
+#include "inferx/ops/cuda/attention.h"
 
 namespace inferx::ops::cuda {
 namespace {

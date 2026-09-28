@@ -1,82 +1,26 @@
-/// \file
-/// \brief The generic causal decoder stack: embedding -> pre-norm layers ->
-/// final norm. Phase-agnostic; prefill and decode are expressed entirely in
-/// DecoderInput's ragged batch geometry.
-
-#ifndef INFERX_MODELS_CAUSAL_DECODER_STACK_H_
-#define INFERX_MODELS_CAUSAL_DECODER_STACK_H_
+#pragma once
 
 #include <optional>
+#include <utility>
 #include <vector>
 
-#include "inferx/core/status.h"
-#include "inferx/core/tensor.h"
-#include "inferx/models/components/attention.h"
-#include "inferx/models/components/decoder_layer.h"
-#include "inferx/models/components/mlp.h"
-#include "inferx/models/components/norm.h"
-#include "inferx/models/model.h"
-#include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/models/causal/decoder_config.h"
+#include "inferx/models/causal/decoder_layer.h"
 
 namespace inferx::causal {
 
-/// \brief Everything needed to build a decoder stack.
-struct DecoderConfig {
-  CheckpointConfig model;                        ///< Family-agnostic dimensions.
-  components::NormConfig final_norm;             ///< Closing norm after the last layer.
-  std::vector<components::DecoderLayerConfig> blocks;  ///< One entry per layer.
-
-  /// \brief Checks internal consistency of dimensions, geometry, and variants.
-  Status Validate() const;
-
-  /// \brief Checks that every configured variant has an executable
-  ///        implementation -- run at build time so an unexecutable model is
-  ///        rejected before any weight is loaded, never at first Forward.
-  Status ValidateExecutable() const;
-
-  /// \brief Persistent state each layer needs, one entry per layer.
-  std::vector<LayerStateSpec> StateRequirements() const;
-};
-
-/// \brief All stack weights, on the model's device.
-struct DecoderWeights {
-  Tensor token_embedding;  ///< [vocab, hidden]
-  Tensor final_norm;       ///< [hidden]
-  std::vector<components::DecoderLayerWeights> blocks;
-};
-
-/// \brief One step's stack input; prepared embeddings may replace token ids.
-struct DecoderInput {
-  Tensor token_ids;  ///< [num_tokens] int32, unless embeddings is set.
-  std::optional<Tensor> embeddings;  ///< [num_tokens, hidden] prepared embeddings.
-  AttentionBatch attention;  ///< Ragged batch and KV geometry.
-};
-
-/// \brief Executes a DecoderConfig over DecoderWeights. One concrete class:
-/// topology is data, computation lives in the components it calls.
-class DecoderStack final {
- public:
-  DecoderStack(DecoderConfig config, DecoderWeights weights, int max_tokens);
-
-  const CheckpointConfig& config() const { return config_.model; }
-  std::vector<LayerStateSpec> StateRequirements() const {
-    return config_.StateRequirements();
-  }
-  StatusOr<Tensor> Forward(const DecoderInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx);
-
- private:
-  /// \brief Allocates the reusable activation workspace on first use.
+/// Shared allocation, input validation, and attention planning. Keeping this
+/// outside the template avoids duplicating workspace machinery per family.
+class DecoderWorkspace {
+ protected:
+  DecoderWorkspace(DecoderConfig config, Tensor embedding, int max_tokens);
   Status InitWorkspace(DeviceId device);
+  StatusOr<Tensor> BeginForward(const DecoderInput& input, ModelState& state,
+                                ops::ExecutionContext& ctx, DiagnosticTrace& trace);
 
   DecoderConfig config_;
-  DecoderWeights weights_;
+  Tensor embedding_;
   int max_tokens_;
-
-  /// \brief Persistent activation workspace, sized by max_tokens_ and the
-  /// widest per-layer geometry, allocated on first use. Forward returns views
-  /// into these buffers; they stay valid until the next Forward call.
   bool workspace_ready_ = false;
   int64_t max_intermediate_ = 0;
   bool enable_split_decode_ = false;
@@ -87,6 +31,42 @@ class DecoderStack final {
   std::optional<components::MlpWorkspace> mlp_;
 };
 
-}  // namespace inferx::causal
+template <ModelTraits Traits>
+class DecoderStack final : private DecoderWorkspace {
+ public:
+  DecoderStack(DecoderConfig config, DecoderWeights weights, int max_tokens)
+      : DecoderWorkspace(std::move(config), std::move(weights.token_embedding), max_tokens),
+        final_norm_(config_.final_norm, std::move(weights.final_norm)) {
+    layers_.reserve(config_.blocks.size());
+    for (size_t i = 0; i < config_.blocks.size(); ++i) {
+      layers_.emplace_back(config_.blocks[i], std::move(weights.blocks[i]));
+    }
+  }
 
-#endif  // INFERX_MODELS_CAUSAL_DECODER_STACK_H_
+  const CheckpointConfig& config() const { return config_.model; }
+  std::vector<LayerStateSpec> StateRequirements() const { return config_.StateRequirements(); }
+
+  StatusOr<Tensor> Forward(const DecoderInput& input, ModelState& state,
+                           ops::ExecutionContext& ctx) {
+    DiagnosticTrace trace(ctx);
+    INFERX_ASSIGN_OR_RETURN(Tensor hidden, BeginForward(input, state, ctx, trace));
+    INFERX_ASSIGN_OR_RETURN(Tensor normed, normed_->Slice(0, input.attention.num_tokens));
+    INFERX_ASSIGN_OR_RETURN(Tensor mixed, mixed_->Slice(0, input.attention.num_tokens));
+    for (size_t i = 0; i < layers_.size(); ++i) {
+      const std::string prefix = trace.enabled() ? "layer_" + std::to_string(i) + "." : "";
+      INFERX_RETURN_IF_ERROR(layers_[i].Forward(i == 0, hidden, normed, mixed, input.attention,
+                                                std::get<PagedKvState>(state.layers[i]),
+                                                *state.paged_kv, *attention_, *mlp_,
+                                                *packed_projection_, ctx, trace, prefix));
+    }
+    INFERX_RETURN_IF_ERROR(final_norm_.AddForward(ctx, mixed, hidden, normed));
+    if (trace.enabled()) trace.Write("final_norm", normed);
+    return normed;
+  }
+
+ private:
+  std::vector<DecoderLayer<Traits>> layers_;
+  typename Traits::Norm final_norm_;
+};
+
+}  // namespace inferx::causal

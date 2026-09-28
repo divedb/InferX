@@ -14,10 +14,10 @@
 #include <unistd.h>
 #endif
 
-#include "../device_runtime_internal.h"
 #include "absl/status/status.h"
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
+#include "inferx/core/device_runtime_internal.h"
 
 namespace inferx::internal {
 namespace {

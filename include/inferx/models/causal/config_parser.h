@@ -2,7 +2,7 @@
 
 #include <string_view>
 
-#include "inferx/models/causal/decoder_stack.h"
+#include "inferx/models/causal/decoder_config.h"
 #include "nlohmann/json.hpp"
 
 namespace inferx::causal {
@@ -15,7 +15,7 @@ StatusOr<nlohmann::json> ParseConfigJson(std::string_view text);
 
 // Common GQA + SwiGLU defaults. Families translate their config.json on top
 // of this and select the actual per-layer block types.
-StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& json,
-                                               bool qk_norm, bool plus_one_norm);
+StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& json, bool qk_norm,
+                                               bool plus_one_norm);
 
 }  // namespace inferx::causal

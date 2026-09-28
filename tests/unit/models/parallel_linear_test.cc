@@ -1,22 +1,24 @@
+#include "inferx/models/components/parallel_linear.h"
+
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <span>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/core/device.h"
 #include "inferx/core/tensor.h"
-#include "inferx/config/parallel_config.h"
-#include "inferx/models/causal/decoder_stack.h"
-#include "inferx/models/causal/weight_mapping.h"
+#include "inferx/models/causal/decoder_config.h"
 #include "inferx/models/checkpoint.h"
 #include "inferx/models/components/attention.h"
-#include "inferx/models/components/parallel_linear.h"
 #include "inferx/models/components/qkv_linear.h"
+#include "inferx/models/loading/weight_loader.h"
 #include "inferx/models/model_registry.h"
 
 namespace inferx {
@@ -161,11 +163,11 @@ class ParallelLoadingTest : public ::testing::Test {
       const int64_t end = static_cast<int64_t>(blob.size());
       if (!first) header += ",";
       first = false;
-      header += "\"" + t.name + "\":{\"dtype\":\"F32\",\"shape\":[" +
-                std::to_string(t.shape[0]);
+      header +=
+          "\"" + t.name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(t.shape[0]);
       for (size_t d = 1; d < t.shape.size(); ++d) header += "," + std::to_string(t.shape[d]);
-      header += "],\"data_offsets\":[" + std::to_string(begin) + "," + std::to_string(end) +
-                "]}";
+      header +=
+          "],\"data_offsets\":[" + std::to_string(begin) + "," + std::to_string(end) + "]}";
     }
     header += "}";
 
@@ -213,12 +215,14 @@ class ParallelLoadingTest : public ::testing::Test {
   }
 
   StatusOr<causal::DecoderWeights> Load(const std::vector<TensorSpec>& tensors,
-                                        const ParallelConfig& parallel) {
+                                        const ParallelConfig& parallel,
+                                        const models::WeightNames& names = {},
+                                        const models::WeightLayout& layout = {}) {
     WriteCheckpoint(tensors);
     INFERX_ASSIGN_OR_RETURN(auto checkpoint, models::Checkpoint::Open(dir_.string()));
     INFERX_ASSIGN_OR_RETURN(auto config, Config());
-    return causal::LoadDecoderWeights(checkpoint, config, causal::CheckpointLayout{},
-                                      parallel, DeviceId::Cpu());
+    return causal::LoadDecoderWeights(checkpoint, config, names, layout, parallel,
+                                      DeviceId::Cpu());
   }
 
   float RowValue(const Tensor& packed, int64_t row, int64_t width = kHidden) {
@@ -247,6 +251,69 @@ TEST_F(ParallelLoadingTest, PacksQkvInBlockContiguousOrder) {
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, kQueryRows + row), 100.0f + row);
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, kQueryRows + kKvRows + row), 200.0f + row);
   }
+}
+
+TEST_F(ParallelLoadingTest, FusedCheckpointQkvUsesTheSameRankSlices) {
+  auto tensors = StandardTensors();
+  // One source tensor with row values 0..31: Q occupies [0,16), K [16,24),
+  // V [24,32). Rank 1 selects Q [8,16), K [20,24), V [28,32).
+  tensors.erase(tensors.begin() + 4, tensors.begin() + 7);
+  tensors.push_back(
+      {"model.layers.0.self_attn.qkv.weight", {kQueryRows + 2 * kKvRows, kHidden}, 0.0f});
+  models::WeightNames names;
+  names.qkv = "self_attn.qkv";
+  const auto weights =
+      Load(tensors, Parallel(2, 1), names, models::WeightLayout{models::QkvLayout::kFused});
+  ASSERT_TRUE(weights.ok()) << weights.status();
+  const auto& attention = weights->blocks[0].mixer;
+  for (int64_t row = 0; row < 8; ++row) {
+    EXPECT_FLOAT_EQ(RowValue(attention.packed_qkv, row), 8.0f + row);
+  }
+  for (int64_t row = 0; row < 4; ++row) {
+    EXPECT_FLOAT_EQ(RowValue(attention.packed_qkv, 8 + row), 20.0f + row);
+    EXPECT_FLOAT_EQ(RowValue(attention.packed_qkv, 12 + row), 28.0f + row);
+  }
+  EXPECT_EQ(attention.query.weight.Data(), attention.packed_qkv.Data());
+}
+
+TEST_F(ParallelLoadingTest, CompleteNameMappingPreservesGateAndUpRoles) {
+  auto tensors = StandardTensors();
+  const std::vector<std::string> renamed = {"transformer.wte",
+                                            "transformer.ln_f",
+                                            "transformer.h.0.ln_1",
+                                            "transformer.h.0.ln_2",
+                                            "transformer.h.0.attn.query",
+                                            "transformer.h.0.attn.key",
+                                            "transformer.h.0.attn.value",
+                                            "transformer.h.0.attn.c_proj",
+                                            "transformer.h.0.mlp.w2",
+                                            "transformer.h.0.mlp.w1",
+                                            "transformer.h.0.mlp.c_proj"};
+  ASSERT_EQ(tensors.size(), renamed.size());
+  for (size_t i = 0; i < tensors.size(); ++i) tensors[i].name = renamed[i] + ".weight";
+  const models::WeightNames names{.embed = "transformer.wte",
+                                  .layers = "transformer.h",
+                                  .final_norm = "transformer.ln_f",
+                                  .attn_norm = "ln_1",
+                                  .ffn_norm = "ln_2",
+                                  .q = "attn.query",
+                                  .k = "attn.key",
+                                  .v = "attn.value",
+                                  .o = "attn.c_proj",
+                                  .gate = "mlp.w2",
+                                  .up = "mlp.w1",
+                                  .down = "mlp.c_proj"};
+  const auto weights = Load(tensors, Parallel(1, 0), names);
+  ASSERT_TRUE(weights.ok()) << weights.status();
+  const auto& mlp = std::get<components::SwiGluWeights>(weights->blocks[0].feed_forward);
+  EXPECT_FLOAT_EQ(RowValue(mlp.gate.weight, 3), 3.0f);
+  EXPECT_FLOAT_EQ(RowValue(mlp.up.weight, 3), 103.0f);
+}
+
+TEST_F(ParallelLoadingTest, FusedLayoutRequiresAnExplicitName) {
+  const auto weights = Load(StandardTensors(), Parallel(1, 0), {},
+                            models::WeightLayout{models::QkvLayout::kFused});
+  EXPECT_EQ(weights.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST_F(ParallelLoadingTest, PerProjectionWeightsAreViewsIntoThePackedTensor) {

@@ -1,10 +1,10 @@
 #include "inferx/ops/rms_norm.h"
-#include "inferx/ops/elementwise.h"
 
 #include <limits>
 
-#include "ops/cpu/rms_norm.h"
-#include "ops/cuda/rms_norm.h"
+#include "inferx/ops/cpu/rms_norm.h"
+#include "inferx/ops/cuda/rms_norm.h"
+#include "inferx/ops/elementwise.h"
 
 namespace inferx::ops {
 

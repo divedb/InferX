@@ -1,7 +1,7 @@
 #include "inferx/ops/rotary.h"
 #include <cmath>
 
-#include "ops/cuda/rotary.h"
+#include "inferx/ops/cuda/rotary.h"
 
 namespace inferx::ops {
 

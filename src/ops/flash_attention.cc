@@ -2,8 +2,8 @@
 
 #include <limits>
 
+#include "inferx/ops/cuda/flash_attention.h"
 #include "inferx/ops/profile.h"
-#include "ops/cuda/flash_attention.h"
 
 namespace inferx::ops {
 namespace {

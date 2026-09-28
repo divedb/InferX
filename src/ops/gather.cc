@@ -2,7 +2,7 @@
 
 #include <limits>
 
-#include "ops/cuda/gather.h"
+#include "inferx/ops/cuda/gather.h"
 
 namespace inferx::ops {
 

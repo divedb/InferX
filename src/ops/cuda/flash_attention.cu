@@ -7,7 +7,7 @@
 #include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/variants.cuh>
 
-#include "ops/cuda/flash_attention.h"
+#include "inferx/ops/cuda/flash_attention.h"
 namespace inferx::ops::cuda {
 namespace {
 __global__ void DecodePlan(const int* kv, const int* last, int batch, int page, int* plan) {

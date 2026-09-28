@@ -1,6 +1,3 @@
-/// \file
-/// \brief Parallel execution topology (vLLM ParallelConfig analogue).
-
 #ifndef INFERX_CONFIG_PARALLEL_CONFIG_H_
 #define INFERX_CONFIG_PARALLEL_CONFIG_H_
 
@@ -34,6 +31,7 @@ struct ParallelConfig {
       return InvalidArgumentError("invalid tensor-parallel topology: size ",
                                   tensor_parallel_size, ", rank ", tensor_parallel_rank);
     }
+
     return OkStatus();
   }
 };

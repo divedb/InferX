@@ -1,6 +1,6 @@
 #include "inferx/core/device_runtime.h"
 
-#include "device_runtime_internal.h"
+#include "inferx/core/device_runtime_internal.h"
 
 namespace inferx {
 

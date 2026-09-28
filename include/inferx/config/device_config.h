@@ -37,6 +37,21 @@ struct DeviceConfig {
   /// EXAMPLE: --device-ids 0,1,2
   std::vector<int> device_ids;
 
+  /// \brief The device the engine executes on.
+  ///
+  /// The first requested ordinal, or ordinal 0 when none is given. Only valid
+  /// after Validate() has accepted the type; unbuilt backends still resolve
+  /// here so the error stays with Validate().
+  ///
+  /// \return The primary DeviceId for this configuration.
+  DeviceId PrimaryDevice() const {
+    const int8_t ordinal = static_cast<int8_t>(device_ids.empty() ? 0 : device_ids.front());
+    if (device_type == "cuda") return DeviceId::Cuda(ordinal);
+    if (device_type == "rocm") return DeviceId::Rocm(ordinal);
+    if (device_type == "ascend") return DeviceId::Ascend(ordinal);
+    return DeviceId::Cpu();
+  }
+
   /// \brief Structural validation: known type, backend compiled in,
   ///        non-negative unique ids.
   ///

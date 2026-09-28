@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "ops/cuda/elementwise.h"
+#include "inferx/ops/cuda/elementwise.h"
 
 namespace inferx::ops::cuda {
 namespace {

@@ -1,6 +1,3 @@
-/// \file
-/// \brief KV cache pool sizing (vLLM CacheConfig analogue).
-
 #ifndef INFERX_CACHE_CACHE_CONFIG_H_
 #define INFERX_CACHE_CACHE_CONFIG_H_
 
@@ -14,9 +11,11 @@ struct CacheConfig {
   /// Total KV blocks to allocate across all layers.
   /// EXAMPLE: --num-kv-blocks 4096
   std::int64_t num_kv_blocks = 2048;
+
   /// Tokens per KV block.
   /// EXAMPLE: --block-size 16
   std::int64_t block_size = 16;
+
   /// Exact KV cache pool size in bytes; 0 derives the pool from num_kv_blocks
   /// instead.
   /// EXAMPLE: --kv-cache-memory-bytes 8589934592

@@ -13,7 +13,7 @@ ModelRunner::Run(...)
 Model::Forward(...)
     |
     v
-causal::CausalLM (shared dense decoder stack)
+causal::CausalLM<Traits> (typed dense decoder stack)
     |
     v
 components (attention, mlp, qkv_linear, ...)  --  ops
@@ -36,41 +36,44 @@ components (attention, mlp, qkv_linear, ...)  --  ops
   state, ctx)` returns `[num_seqs, vocab]` logits for the requested rows.
   `Model::Load` resolves the checkpoint's `model_type` / `architectures`
   through the family registry.
-- **Family registry** (`models/model_registry.{h,cc}`) maps checkpoint
-  identity to an implementation at the lowest of three escalating tiers:
-  *tier 1* — a `Family` row of knobs (`qk_norm`, `plus_one_norm`, checkpoint
-  name layout) describing a standard dense causal decoder; llama is one such
-  row. *tier 2* — a `translate` function producing a `DecoderConfig` for
-  families whose configs differ beyond knobs (MoE fields, layer types;
-  `models/qwen3.cc`, one flat file registering three identities). *tier 3* —
-  a `build` function owning everything, for architectures no `DecoderConfig`
-  can express (encoder-decoder, multimodal towers, native SSM). Tier-2/3
-  families self-register from their own translation units into the
-  `inferx_model_families` archive (whole-archived; see the CONSTRAINT in
-  `src/CMakeLists.txt`); adding one never edits `model_registry.cc`. The
-  composition — parse, translate, validate, shard, `BuildCausalLM` — lives
-  once in `BuildFamily`, so no family repeats it.
-- **`causal/`** is the generic dense decoder: `DecoderStack` (embedding ->
-  pre-norm layers -> final norm) plus `CausalLM`, the served `Model`, and the
-  weight mapping that loads any Llama-style checkpoint layout into it.
-  `BuildCausalLM` validates the total config, rewrites each attention block's
-  head counts rank-local under the `ParallelConfig` seam
-  (`engine/parallel_config.h`, vLLM ParallelConfig analogue; defaults shard
-  nothing), and loads weights with this rank's row slices.
-- **`components/`** holds the reusable transformer pieces (attention, mlp,
-  moe, norm, rope, linear, qkv_linear, parallel_linear): config + weights +
-  execution as concrete, non-virtual pieces the stack composes. The
-  parallel-linear family mirrors vLLM's: `qkv_linear` is QKVParallelLinear
-  (`ShardQkv` derives one rank's head geometry — query heads divided, KV
-  heads divided or replicated below the rank count — and attention always
-  projects through one fused `[q | k | v]` GEMM whose per-projection weights
-  are views into the packed allocation); `parallel_linear`'s `ShardDim`
-  serves MergedColumnParallelLinear (fused gate|up, same view invariant),
-  RowParallelLinear (o_proj/down_proj input-column shards; partial sums
-  await collectives), and VocabParallelEmbedding (embedding and lm_head
-  vocab-row shards). `BuildCausalLM` rejects `tensor_parallel_size > 1`
-  until cross-rank collectives exist; at size 1 every shard is the whole
-  tensor and execution is unchanged.
+- **Family registry** (`models/model_registry.{h,cc}`) maps checkpoint identity
+  to factories in `src/models/families/`. Each dense family declares its
+  architecture, checkpoint names/layout, normalization placement/type, attention
+  type, and MLP type in a traits struct. `causal::MakeFamily<Traits>` generates
+  the factory and its configuration translator. Families with additional config
+  fields supply a translator; structurally different models can supply a custom
+  `Family::build` function returning `Model`. Built-in factory references are
+  explicit, so static linking needs neither registration initializers nor a
+  whole-archive family library. Conflicting known model type/architecture
+  identities are rejected.
+- **`causal/`** contains `CausalLM<Traits>`, `DecoderStack<Traits>`, and
+  `DecoderLayer<Traits>` as private implementation templates. The public
+  `causal/decoder_config.h` holds runtime dimensions, per-layer configuration,
+  and the loader's weight bundle. `PrepareCausalLM` shares validation, sharding,
+  loading, and head weight tying. It rejects unsupported execution before
+  reading tensors. `DecoderWorkspace` shares input validation, buffer allocation,
+  and attention planning across template instantiations.
+- **Ownership and execution:** each concrete decoder layer owns its norms,
+  attention, MLP, and their weights. The stack owns the embedding, final norm,
+  and reusable activation workspace. The runner supplies persistent layer state.
+  The layer retains the fused residual/RMSNorm schedule: the MLP residual is
+  added during the following layer's input norm or the stack's final norm.
+  `Model::Forward` remains the serving boundary, including its borrowed-output
+  lifetime and CUDA graph contract.
+- **`loading/`** separates checkpoint names (`WeightNames`) from source storage
+  (`WeightLayout`). Paths omit `.weight`/`.bias`; layer-local names are relative
+  to `layers.<index>.`. Separate Q/K/V tensors and fused `[Q | K | V]` row-major
+  `[out, in]` tensors both load into the same packed rank-local representation.
+  Gate/up names identify semantic roles independently of checkpoint spelling.
+  Loading checks full shapes before slicing, replicates KV heads when needed,
+  and preserves projection views into packed allocations.
+- **`components/`** contains concrete `GqaAttention`, `GatedMlp`, and `RmsNorm`
+  components over shared execution functions. Traits select structural choices;
+  dimensions, epsilon, RoPE parameters, and weight tying remain runtime data.
+  QKV and output bias are represented separately. Backend kernels remain in ops.
+  Tensor-parallel geometry and loading are supported, but execution with more
+  than one rank remains rejected until collectives are implemented.
+
 - **ops** holds the reusable, backend-portable operations the forwards call.
   Each op is a free function: a public header with the agnostic API and
   config, one common source that validates arguments and dispatches on the
@@ -80,12 +83,24 @@ components (attention, mlp, qkv_linear, ...)  --  ops
   kernels and dtype support on CUDA, Highway vectorization and multi-target
   dispatch on CPU — stay inside their backend directories.
 
+
+The executable families remain Llama and dense Qwen3. Qwen3 MoE and Next keep
+configuration translation and early rejection of unsupported execution. Fused
+checkpoint mapping is available for future families; it does not by itself add
+Qwen1/Qwen2 execution, bias kernels, dynamic NTK, or LogN attention scaling.
+
+To add a dense family, declare traits in `src/models/families/<name>.cc`, return
+`MakeFamily<Traits>()` (or supply a config translator), and add its factory to
+`families.h`, the registry, and `src/CMakeLists.txt`. Components never inspect
+architecture strings or checkpoint tensor names.
+
+
 Weight loading is covered end to end: `tests/model_test.cc` runs the real
-Qwen3-0.6B checkpoint through forward, `tests/unit/models/qkv_linear_test.cc`
+Qwen3-0.6B checkpoint through forward, `tests/unit/models/parallel_linear_test.cc`
 pins the shard math and the packed QKV row layout (block order, view
 aliasing, rank slices, KV replication) against synthetic safetensors, and
-`tests/unit/models/family_config_test.cc` covers tier translation plus the
-registry canary that fails loudly if a family's registration ever drops out
-of the link. `tests/model_runner_test.cc` pins the runner contract with a
-fake model: the batch the model receives, the tokens fed back after sampling,
+`tests/unit/models/family_config_test.cc` covers traits-driven translation,
+architecture aliases, malformed configuration, and early rejection of unsupported
+execution. Loader tests also cover fused QKV source rows and custom gate/up name
+mappings. `tests/model_runner_test.cc` pins the runner contract with a fake model: the batch the model receives, the tokens fed back after sampling,
 and that failures surface before Forward runs.

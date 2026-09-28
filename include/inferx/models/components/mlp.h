@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 
 #include "inferx/core/tensor.h"
 #include "inferx/models/components/linear.h"
@@ -51,12 +52,35 @@ struct MlpWorkspace {
 /// One fused GEMM over the packed gate/up weight into `packed_buffer` (the
 /// shared packed-projection workspace the stack always provides), then
 /// PackedSiluAndMul, then the down projection.
-Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights,
-                 const Tensor& normed, MlpWorkspace& ws, Tensor* packed_buffer,
-                 ops::ExecutionContext& ctx, DiagnosticTrace* trace,
-                 std::string_view prefix, Tensor& mixed_out);
+Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights, const Tensor& normed,
+                 MlpWorkspace& ws, Tensor* packed_buffer, ops::ExecutionContext& ctx,
+                 DiagnosticTrace* trace, std::string_view prefix, Tensor& mixed_out);
 
-}  // namespace inferx::components
+enum class Activation { kSilu };
+
+template <Activation Act>
+class GatedMlp {
+ public:
+  using Config = SwiGluConfig;
+  using Weights = SwiGluWeights;
+  static constexpr Activation kActivation = Act;
+
+  GatedMlp(Config config, Weights weights)
+      : config_(std::move(config)), weights_(std::move(weights)) {}
+
+  Status Forward(const Tensor& input, MlpWorkspace& workspace, Tensor* packed,
+                 ops::ExecutionContext& ctx, DiagnosticTrace* trace, std::string_view prefix,
+                 Tensor& output) const {
+    static_assert(Act == Activation::kSilu);
+    return RunSwiGlu(config_, weights_, input, workspace, packed, ctx, trace, prefix, output);
+  }
+
+ private:
+  Config config_;
+  Weights weights_;
+};
+
+}  // namespace components
 }  // namespace inferx
 
 #endif  // INFERX_MODELS_COMPONENTS_MLP_H_

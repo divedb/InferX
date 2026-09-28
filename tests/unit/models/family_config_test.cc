@@ -2,7 +2,7 @@
 
 #include "gtest/gtest.h"
 #include "inferx/core/status.h"
-#include "inferx/models/causal/decoder_stack.h"
+#include "inferx/models/causal/decoder_config.h"
 #include "inferx/models/components/decoder_layer.h"
 #include "inferx/models/model_registry.h"
 
@@ -39,8 +39,7 @@ TEST(FamilyConfigTest, LlamaTranslatesDenseConfig) {
   EXPECT_FALSE(a.qk_norm);
   EXPECT_EQ(a.query_heads, 4);
   EXPECT_EQ(a.kv_heads, 2);
-  EXPECT_TRUE(std::holds_alternative<components::SwiGluConfig>(
-      config->blocks[0].feed_forward));
+  EXPECT_TRUE(std::holds_alternative<components::SwiGluConfig>(config->blocks[0].feed_forward));
   const auto executable = config->ValidateExecutable();
   EXPECT_TRUE(executable.ok()) << executable.ToString();
 }
@@ -55,31 +54,31 @@ TEST(FamilyConfigTest, Qwen3TranslatesQkNorm) {
 }
 
 TEST(FamilyConfigTest, MoEIsRejectedAtBuildTimeNotForwardTime) {
-  const auto config = TranslateFamilyConfig(Identity("qwen3_moe"), Config(
-      "qwen3_moe",
-      "\"num_experts\":4,\"num_experts_per_tok\":2,\"moe_intermediate_size\":32,"
-      "\"shared_expert_intermediate_size\":32,\"norm_topk_prob\":true"));
+  const auto config = TranslateFamilyConfig(
+      Identity("qwen3_moe"),
+      Config("qwen3_moe",
+             "\"num_experts\":4,\"num_experts_per_tok\":2,\"moe_intermediate_size\":32,"
+             "\"shared_expert_intermediate_size\":32,\"norm_topk_prob\":true"));
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_TRUE(std::holds_alternative<components::MoeConfig>(
-      config->blocks[0].feed_forward));
+  EXPECT_TRUE(std::holds_alternative<components::MoeConfig>(config->blocks[0].feed_forward));
   const auto executable = config->ValidateExecutable();
   ASSERT_FALSE(executable.ok());
   EXPECT_EQ(executable.code(), absl::StatusCode::kUnimplemented);
 }
 
 TEST(FamilyConfigTest, RecurrentLayersAreRejectedAsUnexecutable) {
-  const auto config = TranslateFamilyConfig(Identity("qwen3_next"), Config(
-      "qwen3_next",
-      "\"layer_types\":[\"linear_attention\",\"full_attention\"],"
-      "\"full_attention_interval\":2,"
-      "\"linear_num_key_heads\":2,\"linear_num_value_heads\":2,"
-      "\"linear_key_head_dim\":64,\"linear_value_head_dim\":64,"
-      "\"linear_conv_kernel_dim\":4,"
-      "\"num_experts\":4,\"num_experts_per_tok\":2,\"moe_intermediate_size\":32,"
-      "\"shared_expert_intermediate_size\":32"));
+  const auto config = TranslateFamilyConfig(
+      Identity("qwen3_next"),
+      Config("qwen3_next",
+             "\"layer_types\":[\"linear_attention\",\"full_attention\"],"
+             "\"full_attention_interval\":2,"
+             "\"linear_num_key_heads\":2,\"linear_num_value_heads\":2,"
+             "\"linear_key_head_dim\":64,\"linear_value_head_dim\":64,"
+             "\"linear_conv_kernel_dim\":4,"
+             "\"num_experts\":4,\"num_experts_per_tok\":2,\"moe_intermediate_size\":32,"
+             "\"shared_expert_intermediate_size\":32"));
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_TRUE(std::holds_alternative<components::GatedDeltaNetConfig>(
-      config->blocks[0].mixer));
+  EXPECT_TRUE(std::holds_alternative<components::GatedDeltaNetConfig>(config->blocks[0].mixer));
   const auto executable = config->ValidateExecutable();
   ASSERT_FALSE(executable.ok());
   EXPECT_EQ(executable.code(), absl::StatusCode::kUnimplemented);
@@ -95,19 +94,75 @@ TEST(FamilyConfigTest, InvalidJsonIsRejected) {
   EXPECT_FALSE(config.ok());
 }
 
-/// The registry canary: qwen3 registers from its own translation unit at
-/// static init. If the OBJECT-library link of inferx_model_families ever
-/// regresses to archive selection, the registering TU is dropped and these
-/// lookups fail -- loudly, instead of serving a "qwen3 is unsupported"
-/// surprise at model-load time.
-TEST(FamilyConfigTest, SelfRegisteredFamiliesResolve) {
+/// Factories must remain reachable through the registry in static builds.
+TEST(FamilyConfigTest, BuiltinFamiliesResolve) {
   for (const char* type : {"llama", "qwen3", "qwen3_moe", "qwen3_next"}) {
     const auto family = ResolveFamily(Identity(type));
     EXPECT_TRUE(family.ok()) << type << ": " << family.status();
   }
-  const auto by_architecture = ResolveFamily(Identity("llama"));
-  ASSERT_TRUE(by_architecture.ok());
-  EXPECT_EQ((*by_architecture)->model_type, "llama");
+}
+
+TEST(FamilyConfigTest, ArchitectureAliasesSelectTheSameFactory) {
+  for (const char* type : {"llama", "qwen3", "qwen3_moe", "qwen3_next"}) {
+    const auto by_type = ResolveFamily(Identity(type));
+    ASSERT_TRUE(by_type.ok());
+    CheckpointConfig identity;
+    identity.architectures = std::string((*by_type)->architecture);
+    const auto by_arch = ResolveFamily(identity);
+    ASSERT_TRUE(by_arch.ok()) << by_arch.status();
+    EXPECT_EQ(*by_arch, *by_type);
+    EXPECT_NE((*by_arch)->build, nullptr);
+  }
+}
+
+TEST(FamilyConfigTest, ConflictingIdentitiesAreRejected) {
+  auto identity = Identity("llama");
+  identity.architectures = "Qwen3ForCausalLM";
+  EXPECT_EQ(ResolveFamily(identity).status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST(FamilyConfigTest, Qwen3MoeTranslatesThroughArchitectureAlias) {
+  CheckpointConfig identity;
+  identity.architectures = "Qwen3MoeForCausalLM";
+  const auto config = TranslateFamilyConfig(
+      identity,
+      std::string("{") + kBaseDims +
+          ",\"num_experts\":4,\"num_experts_per_tok\":2,\"moe_intermediate_size\":32}");
+  ASSERT_TRUE(config.ok()) << config.status();
+  EXPECT_TRUE(std::holds_alternative<components::MoeConfig>(config->blocks[0].feed_forward));
+}
+
+TEST(FamilyConfigTest, MalformedFieldsReturnStatusInsteadOfThrowing) {
+  for (const std::string json :
+       {std::string("[]"), Config("llama", "\"attention_bias\":\"invalid\""),
+        Config("qwen3_moe")}) {
+    EXPECT_EQ(TranslateFamilyConfig(Identity("qwen3_moe"), json).status().code(),
+              absl::StatusCode::kInvalidArgument);
+  }
+}
+
+TEST(FamilyConfigTest, DenseQwen3RejectsUnknownLayerTypes) {
+  const auto config = TranslateFamilyConfig(
+      Identity("qwen3"),
+      Config("qwen3", "\"layer_types\":[\"linear_attention\",\"full_attention\"]"));
+  EXPECT_EQ(config.status().code(), absl::StatusCode::kUnimplemented);
+}
+
+TEST(FamilyConfigTest, TypedBuilderRejectsUnsupportedBlocksBeforeReadingWeights) {
+  for (const auto& json : {Config("qwen3", "\"attention_bias\":true"),
+                           Config("qwen3_moe",
+                                  "\"num_experts\":4,\"num_experts_per_tok\":2,"
+                                  "\"moe_intermediate_size\":32")}) {
+    models::LoadedCheckpoint checkpoint;
+    auto identity = CheckpointConfig::FromJson(json);
+    ASSERT_TRUE(identity.ok());
+    checkpoint.config = *identity;
+    checkpoint.config_json = json;
+    // No weight files are opened. A failed weight lookup would report a
+    // different status than the expected unsupported-execution rejection.
+    const auto model = BuildModel(checkpoint, DeviceId::Cpu(), 8, 2);
+    EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
+  }
 }
 
 }  // namespace

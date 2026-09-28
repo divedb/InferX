@@ -1,7 +1,8 @@
-#include <cmath>
 #include "inferx/ops/attention.h"
 
-#include "ops/cuda/attention.h"
+#include <cmath>
+
+#include "inferx/ops/cuda/attention.h"
 
 namespace inferx::ops {
 Status ValidateAttentionGeometry(const AttentionParams& p) {

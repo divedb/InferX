@@ -1,9 +1,9 @@
 #include "inferx/models/components/mlp.h"
 
 #include "inferx/core/shape.h"
+#include "inferx/models/diagnostic_trace.h"
 #include "inferx/ops/elementwise.h"
 #include "inferx/ops/linear.h"
-#include "models/diagnostic_trace.h"
 
 namespace inferx::components {
 

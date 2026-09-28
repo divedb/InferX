@@ -1,28 +1,19 @@
 /// \file
-/// \brief Checkpoint tensor-name mapping for the shared Llama-style layout.
+/// \brief Maps checkpoint tensors into canonical decoder weights.
 
-#ifndef INFERX_MODELS_CAUSAL_WEIGHT_MAPPING_H_
-#define INFERX_MODELS_CAUSAL_WEIGHT_MAPPING_H_
+#ifndef INFERX_MODELS_LOADING_WEIGHT_LOADER_H_
+#define INFERX_MODELS_LOADING_WEIGHT_LOADER_H_
 
 #include <string_view>
 
+#include "inferx/config/parallel_config.h"
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
-#include "inferx/config/parallel_config.h"
-#include "inferx/models/causal/decoder_stack.h"
+#include "inferx/models/causal/decoder_config.h"
 #include "inferx/models/checkpoint.h"
+#include "inferx/models/loading/weight_names.h"
 
 namespace inferx::causal {
-
-/// \brief Checkpoint names belong to the architecture family, not the
-///        components. This is the Llama-style convention shared by llama,
-///        qwen, mistral, phi, internlm, and friends.
-struct CheckpointLayout {
-  std::string backbone_prefix = "model.";
-  std::string head_name = "lm_head.weight";
-  std::string attention_name = "self_attn.";
-  std::string feed_forward_name = "mlp.";
-};
 
 /// \brief Uploads one named checkpoint tensor to `device` as bfloat16,
 ///        checking it against `expected`. The mapping workhorse families
@@ -40,7 +31,7 @@ StatusOr<Tensor> LoadVocabShard(const models::Checkpoint& checkpoint, std::strin
                                 DeviceId device);
 
 /// \brief Maps every decoder tensor (embedding, final norm, all layers) of
-/// `checkpoint` through `layout`, with shape checks before upload.
+/// `checkpoint` through `names` and `layout`, with shape checks before upload.
 ///
 /// `config` carries TOTAL head counts; `parallel` selects this rank's row
 /// slices of the QKV projections.
@@ -49,9 +40,10 @@ StatusOr<Tensor> LoadVocabShard(const models::Checkpoint& checkpoint, std::strin
 /// unsupported.
 StatusOr<DecoderWeights> LoadDecoderWeights(const models::Checkpoint& checkpoint,
                                             const DecoderConfig& config,
-                                            const CheckpointLayout& layout,
+                                            const models::WeightNames& names,
+                                            const models::WeightLayout& layout,
                                             const ParallelConfig& parallel, DeviceId device);
 
 }  // namespace inferx::causal
 
-#endif  // INFERX_MODELS_CAUSAL_WEIGHT_MAPPING_H_
+#endif  // INFERX_MODELS_LOADING_WEIGHT_LOADER_H_

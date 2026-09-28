@@ -4,7 +4,7 @@
 
 #include "flashinfer/norm.cuh"
 #include "inferx/core/dtype.h"
-#include "ops/cuda/rms_norm.h"
+#include "inferx/ops/cuda/rms_norm.h"
 
 namespace inferx::ops::cuda {
 namespace {
