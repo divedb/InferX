@@ -9,8 +9,11 @@ namespace inferx {
 namespace {
 
 const auto& BuiltinFamilies() {
-  static const std::array families = {families::Llama(), families::Qwen3(),
-                                      families::Qwen3Moe(), families::Qwen3Next()};
+  static const std::array families = {
+      families::Llama(),    families::Qwen2(),       families::Qwen3(),
+      families::Mistral(),  families::Gemma3(),      families::Mixtral(),
+      families::Qwen3Moe(), families::Qwen3Next(),   families::GptOss(),
+      families::DeepseekV3()};
   return families;
 }
 

@@ -131,6 +131,117 @@ TEST_F(ModelTest, ForwardReturnsLogits) {
   EXPECT_EQ(logits->GetDataType(), DataType::kBFloat16);
 }
 
+namespace {
+
+/// Writes a tiny synthetic Qwen2.5 checkpoint and loads it end to end: the
+/// biased QKV projections, the packed-bias execution path, and the family
+/// registry selection all have to agree for forward to produce logits.
+struct TempDir {
+  std::filesystem::path path = std::filesystem::temp_directory_path() /
+                               ("inferx_qwen2_smoke_" + std::to_string(::getpid()));
+  TempDir() { std::filesystem::create_directories(path); }
+  ~TempDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+};
+
+void WriteF32(const std::filesystem::path& file,
+              const std::vector<std::pair<std::string, std::pair<std::vector<int64_t>, float>>>&
+                  tensors) {
+  std::string header = "{";
+  std::vector<std::byte> blob;
+  bool first = true;
+  for (const auto& [name, spec] : tensors) {
+    int64_t numel = 1;
+    for (auto d : spec.first) numel *= d;
+    const int64_t begin = static_cast<int64_t>(blob.size());
+    for (int64_t i = 0; i < numel; ++i) {
+      const float value = spec.second + static_cast<float>(i % 97) * 0.01f;
+      std::byte raw[4];
+      std::memcpy(raw, &value, sizeof(raw));
+      for (auto b : raw) blob.push_back(b);
+    }
+    const int64_t end = static_cast<int64_t>(blob.size());
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(spec.first[0]);
+    for (size_t d = 1; d < spec.first.size(); ++d) header += "," + std::to_string(spec.first[d]);
+    header += "],\"data_offsets\":[" + std::to_string(begin) + "," + std::to_string(end) + "]}";
+  }
+  header += "}";
+  uint64_t hlen = header.size();
+  std::vector<std::byte> bytes(8 + hlen + blob.size(), std::byte{0});
+  std::memcpy(bytes.data(), &hlen, 8);
+  std::memcpy(bytes.data() + 8, header.data(), hlen);
+  std::memcpy(bytes.data() + 8 + hlen, blob.data(), blob.size());
+  std::ofstream out(file.string(), std::ios::binary);
+  out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+}  // namespace
+
+TEST_F(ModelTest, LoadsSyntheticQwen2AndRunsBiasedAttention) {
+  constexpr int64_t kHidden = 16, kHeads = 4, kKv = 2, kDim = 8, kInter = 32, kVocab = 50;
+  constexpr int64_t kQ = kHeads * kDim, kKV = kKv * kDim;
+  TempDir dir;
+  const std::string config =
+      "{\"model_type\":\"qwen2\",\"architectures\":[\"Qwen2ForCausalLM\"],"
+      "\"hidden_size\":16,\"intermediate_size\":32,\"num_hidden_layers\":2,"
+      "\"num_attention_heads\":4,\"num_key_value_heads\":2,\"head_dim\":8,"
+      "\"vocab_size\":50,\"max_position_embeddings\":128,\"rms_norm_eps\":1e-5,"
+      "\"rope_theta\":10000,\"attention_bias\":true,\"tie_word_embeddings\":false}";
+  std::ofstream(dir.path / "config.json") << config;
+  std::vector<std::pair<std::string, std::pair<std::vector<int64_t>, float>>> tensors{
+      {"model.embed_tokens.weight", {{kVocab, kHidden}, 0.02f}},
+      {"model.norm.weight", {{kHidden}, 0.5f}},
+      {"lm_head.weight", {{kVocab, kHidden}, 0.01f}}};
+  for (int layer = 0; layer < 2; ++layer) {
+    const auto p = "model.layers." + std::to_string(layer) + ".";
+    tensors.push_back({p + "input_layernorm.weight", {{kHidden}, 0.5f}});
+    tensors.push_back({p + "post_attention_layernorm.weight", {{kHidden}, 0.5f}});
+    tensors.push_back({p + "self_attn.q_proj.weight", {{kQ, kHidden}, 0.03f}});
+    tensors.push_back({p + "self_attn.q_proj.bias", {{kQ}, 0.01f}});
+    tensors.push_back({p + "self_attn.k_proj.weight", {{kKV, kHidden}, 0.03f}});
+    tensors.push_back({p + "self_attn.k_proj.bias", {{kKV}, 0.01f}});
+    tensors.push_back({p + "self_attn.v_proj.weight", {{kKV, kHidden}, 0.03f}});
+    tensors.push_back({p + "self_attn.v_proj.bias", {{kKV}, 0.01f}});
+    tensors.push_back({p + "self_attn.o_proj.weight", {{kHidden, kQ}, 0.03f}});
+    tensors.push_back({p + "mlp.gate_proj.weight", {{kInter, kHidden}, 0.03f}});
+    tensors.push_back({p + "mlp.up_proj.weight", {{kInter, kHidden}, 0.03f}});
+    tensors.push_back({p + "mlp.down_proj.weight", {{kHidden, kInter}, 0.03f}});
+  }
+  WriteF32(dir.path / "model.safetensors", tensors);
+
+  auto model = Model::Load(dir.path.string(), DeviceId::Cuda(0), /*max_tokens=*/8,
+                           /*max_seqs=*/2);
+  ASSERT_TRUE(model.ok()) << model.status();
+  const CheckpointConfig& cfg = (*model)->config();
+  KvLayout layout{2, cfg.num_key_value_heads, cfg.head_dim, DataType::kBFloat16};
+  auto pool = KvBlockPool::Create(cfg.num_hidden_layers, 4, 2, layout, DeviceId::Cuda(0));
+  ASSERT_TRUE(pool.ok());
+  auto input = MakeInput(2);
+  ASSERT_TRUE(input.ok());
+  ops::ExecutionContext ctx(*runtime_, stream_);
+  ModelState state;
+  state.paged_kv = &*pool;
+  for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
+  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx);
+  ASSERT_TRUE(logits.ok()) << logits.status();
+  ASSERT_EQ(logits->Dim(1), kVocab);
+  // F32 weights round to small nonzero values; every logit must be finite.
+  std::vector<uint16_t> raw(logits->Numel());
+  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Copy(raw.data(), logits->Data(), raw.size() * 2,
+                             CopyKind::kDeviceToHost).ok());
+  for (uint16_t bits : raw) {
+    const uint32_t wide = static_cast<uint32_t>(bits) << 16;
+    float value = 0;
+    std::memcpy(&value, &wide, 4);
+    EXPECT_TRUE(std::isfinite(value));
+  }
+}
+
 TEST_F(ModelTest, RejectsUnsupportedArchitecture) {
   const std::string dir = ::testing::TempDir() + "inferx-unsupported-arch";
   std::filesystem::create_directories(dir);

@@ -1,6 +1,10 @@
+#include <cmath>
+#include <cstring>
+
 #include "inferx/models/checkpoint.h"
 
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +76,9 @@ StatusOr<SafeTensorReader> OpenShard(const std::filesystem::path& path) {
 }
 
 }  // namespace
+
+/// E2M1 nibble magnitudes (OCP MX FP4): bit 3 is the sign.
+constexpr float kMxNibbleMagnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
 StatusOr<Tensor> Checkpoint::AsHostBf16(const Tensor& host) {
   if (host.GetDataType() == DataType::kBFloat16) return host;
@@ -160,6 +167,55 @@ std::optional<Tensor> Checkpoint::Find(std::string_view name) const {
     }
   }
   return std::nullopt;
+}
+
+StatusOr<Tensor> Checkpoint::UploadF32(std::string_view name, const Shape& expected,
+                                     DeviceId device) const {
+  auto host = Find(name);
+  if (!host.has_value()) {
+    return NotFoundError("checkpoint tensor not found: ", name);
+  }
+  if (host->GetShape() != expected) {
+    return InvalidArgumentError("tensor ", name, " has shape ", host->GetShape().ToString(),
+                                ", expected ", expected.ToString());
+  }
+  if (host->GetDataType() == DataType::kFloat32) return host->To(device);
+  if (host->GetDataType() != DataType::kBFloat16) {
+    return UnimplementedError("cannot load ", DataTypeName(host->GetDataType()),
+                              " tensor as float32: ", name);
+  }
+  INFERX_ASSIGN_OR_RETURN(auto converted,
+                          Tensor::Empty(DataType::kFloat32, expected, DeviceId::Cpu()));
+  const auto* in = static_cast<const uint16_t*>(host->Data());
+  auto* out = static_cast<float*>(converted.Data());
+  for (int64_t i = 0; i < host->Numel(); ++i) {
+    const uint32_t bits = static_cast<uint32_t>(in[i]) << 16;
+    std::memcpy(&out[i], &bits, sizeof(float));
+  }
+  return converted.To(device);
+}
+
+StatusOr<Tensor> Checkpoint::DequantMxToBf16(const Tensor& blocks, const Tensor& scales,
+                                             const Shape& logical) const {
+  if (blocks.GetDataType() != DataType::kUInt8 || scales.GetDataType() != DataType::kUInt8 ||
+      blocks.Numel() * 2 != logical.Numel() || scales.Numel() * 32 != logical.Numel()) {
+    return InvalidArgumentError("MXFP4 blocks and scales disagree with ", logical.ToString());
+  }
+  const auto* packed = static_cast<const uint8_t*>(blocks.Data());
+  const auto* e8m0 = static_cast<const uint8_t*>(scales.Data());
+  INFERX_ASSIGN_OR_RETURN(auto out, Tensor::Empty(DataType::kBFloat16, logical, DeviceId::Cpu()));
+  auto* values = static_cast<uint16_t*>(out.Data());
+  const int64_t n = logical.Numel();
+  for (int64_t i = 0; i < n; ++i) {
+    // Element 0 of a byte is the high nibble; one E8M0 byte scales 32 values.
+    const uint8_t byte = packed[i / 2];
+    const uint8_t nibble = (i % 2 == 0) ? (byte >> 4) : (byte & 0xF);
+    const float magnitude = kMxNibbleMagnitude[nibble & 0x7];
+    const float sign = (nibble & 0x8) ? -1.0f : 1.0f;
+    const float value = sign * magnitude * exp2f(static_cast<float>(e8m0[i / 32]) - 127.0f);
+    values[i] = FloatToBf16Bits(value);
+  }
+  return out;
 }
 
 StatusOr<Tensor> Checkpoint::UploadBf16(std::string_view name, const Shape& expected,

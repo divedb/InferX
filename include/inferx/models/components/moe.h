@@ -36,6 +36,9 @@ struct MoeConfig {
   ops::RoutingConfig routing;            ///< Selection and weighting policy.
   bool has_router_bias = false;          ///< gpt-oss router carries a bias.
   bool has_correction_bias = false;      ///< DeepSeek e_score_correction_bias.
+  /// gpt-oss stores all experts fused and MXFP4-quantized with interleaved
+  /// gate/up rows; dequantized and de-interleaved at load.
+  bool fused_mxfp4_experts = false;
   int64_t shared_intermediate_size = 0;  ///< 0 disables the shared expert.
   bool gate_shared_expert = false;
 };

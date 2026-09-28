@@ -76,9 +76,6 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j,
     return InvalidArgumentError("partial_rotary_factor must be in (0, 1]");
   }
   rotary.dim = static_cast<int64_t>(model.head_dim * partial);
-  if (j.value("use_sliding_window", false)) {
-    return UnimplementedError("sliding-window layer mapping is not implemented");
-  }
   DecoderConfig config;
   config.model = model;
   config.final_norm = components::NormConfig{model.rms_norm_eps, defaults.plus_one_norm};

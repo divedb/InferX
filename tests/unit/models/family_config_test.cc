@@ -4,7 +4,12 @@
 #include "inferx/core/status.h"
 #include "inferx/models/causal/decoder_config.h"
 #include "inferx/models/components/decoder_layer.h"
+#include <cmath>
+#include <fstream>
+
 #include "inferx/models/model_registry.h"
+#include "inferx/ops/elementwise.h"
+#include "inferx/ops/moe.h"
 
 namespace inferx {
 namespace {
@@ -144,7 +149,128 @@ TEST(FamilyConfigTest, DenseQwen3RejectsUnknownLayerTypes) {
   EXPECT_EQ(config.status().code(), absl::StatusCode::kUnimplemented);
 }
 
-TEST(FamilyConfigTest, TypedBuilderRejectsUnsupportedBlocksBeforeReadingWeights) {
+TEST(FamilyConfigTest, Qwen25TranslatesBiasedAttention) {
+  const auto config = TranslateFamilyConfig(
+      Identity("qwen2"), Config("qwen2", "\"attention_bias\":true,\"hidden_act\":\"silu\""));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto& a = std::get<components::AttentionConfig>(config->blocks[0].mixer);
+  EXPECT_TRUE(a.qkv_bias);
+  EXPECT_FALSE(a.output_bias);  // Qwen2 biases QKV only, not o_proj.
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, MistralTranslatesSlidingWindow) {
+  const auto config =
+      TranslateFamilyConfig(Identity("mistral"),
+                            Config("mistral", "\"sliding_window\":4096,\"use_sliding_window\":true"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto& a = std::get<components::AttentionConfig>(config->blocks[0].mixer);
+  EXPECT_EQ(a.sliding_window, 4096);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, Gemma3TranslatesSandwichNormsAndWindows) {
+  const auto config = TranslateFamilyConfig(
+      Identity("gemma3_text"),
+      Config("gemma3_text",
+             "\"hidden_act\":\"gelu_pytorch_tanh\",\"attention_bias\":true,"
+             "\"query_pre_attn_scalar\":256,\"sliding_window\":1024,"
+             "\"sliding_window_pattern\":2,\"rope_scaling\":{\"rope_type\":\"linear\",\"factor\":8.0},"
+             "\"rope_local_base_freq\":10000"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  EXPECT_NEAR(config->embedding_scale, std::sqrt(32.0f), 1e-4f);
+  const auto& first = std::get<components::AttentionConfig>(config->blocks[0].mixer);
+  const auto& second = std::get<components::AttentionConfig>(config->blocks[1].mixer);
+  EXPECT_EQ(first.sliding_window, 1024);      // (0 + 1) % 2 != 0 -> local.
+  EXPECT_EQ(second.sliding_window, 0);        // (1 + 1) % 2 == 0 -> global.
+  EXPECT_NEAR(first.scale_override, 1.0f / std::sqrt(256.0f), 1e-6f);
+  EXPECT_EQ(first.rotary.type, "default");    // Local layers use the local base.
+  EXPECT_EQ(second.rotary.type, "linear");    // Global layers scale by 8.
+  const auto& ffn = std::get<components::SwiGluConfig>(config->blocks[0].feed_forward);
+  EXPECT_EQ(ffn.activation, ops::Activation::kGeluTanh);
+  EXPECT_EQ(config->blocks[0].residual, components::ResidualStyle::kOutputNorm);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, MixtralTranslatesSoftmaxRoutedExperts) {
+  const auto config =
+      TranslateFamilyConfig(Identity("mixtral"),
+                            Config("mixtral", "\"num_local_experts\":8,"
+                                              "\"num_experts_per_tok\":2,\"norm_topk_prob\":true,"
+                                              "\"sliding_window\":4096,\"use_sliding_window\":true"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto& moe = std::get<components::MoeConfig>(config->blocks[0].feed_forward);
+  EXPECT_EQ(moe.num_experts, 8);
+  EXPECT_EQ(moe.experts_per_token, 2);
+  EXPECT_EQ(moe.routing.scoring, ops::RouterScoring::kSoftmaxTopkRenorm);
+  EXPECT_TRUE(moe.routing.normalize);
+  EXPECT_EQ(moe.shared_intermediate_size, 0);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, GptOssTranslatesSinksAndFusedExperts) {
+  const auto config = TranslateFamilyConfig(
+      Identity("gpt_oss"),
+      Config("gpt_oss",
+             "\"num_local_experts\":32,\"num_experts_per_tok\":4,\"swiglu_limit\":7.0,"
+             "\"attention_bias\":true,\"sliding_window\":128,\"rms_norm_eps\":0.00001,"
+             "\"layer_types\":[\"sliding_attention\",\"full_attention\"]"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto& first = std::get<components::AttentionConfig>(config->blocks[0].mixer);
+  EXPECT_TRUE(first.sinks);
+  EXPECT_EQ(first.sliding_window, 128);
+  const auto& moe = std::get<components::MoeConfig>(config->blocks[0].feed_forward);
+  EXPECT_TRUE(moe.has_router_bias);
+  EXPECT_TRUE(moe.fused_mxfp4_experts);
+  EXPECT_EQ(moe.activation, ops::Activation::kSiluOai);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, DeepseekV3TranslatesMlaAndGroupedRouting) {
+  const auto config = TranslateFamilyConfig(
+      Identity("deepseek_v3"),
+      Config("deepseek_v3",
+             "\"q_lora_rank\":64,\"kv_lora_rank\":32,\"qk_nope_head_dim\":32,"
+             "\"qk_rope_head_dim\":16,\"v_head_dim\":24,\"first_k_dense_replace\":1,"
+             "\"n_routed_experts\":16,\"num_experts_per_tok\":4,\"n_group\":4,"
+             "\"topk_group\":2,\"norm_topk_prob\":true,\"routed_scaling_factor\":2.5,"
+             "\"moe_intermediate_size\":48"));
+  ASSERT_TRUE(config.ok()) << config.status();
+  const auto& mla = std::get<components::MlaConfig>(config->blocks[0].mixer);
+  EXPECT_EQ(mla.head_dim(), 48);
+  EXPECT_EQ(mla.rotary.dim, 16);
+  EXPECT_TRUE(std::holds_alternative<components::SwiGluConfig>(
+      config->blocks[0].feed_forward));  // Dense prefix.
+  const auto& moe = std::get<components::MoeConfig>(config->blocks[1].feed_forward);
+  EXPECT_EQ(moe.routing.scoring, ops::RouterScoring::kSigmoidGroupTopk);
+  EXPECT_EQ(moe.routing.group_count, 4);
+  EXPECT_EQ(moe.routing.group_topk, 2);
+  EXPECT_NEAR(moe.routing.routing_scale, 2.5f, 1e-6f);
+  EXPECT_TRUE(moe.has_correction_bias);
+  EXPECT_TRUE(config->ValidateExecutable().ok());
+}
+
+TEST(FamilyConfigTest, RealGptOssConfigTranslatesWhenPresent) {
+  std::ifstream config_file("models/gpt-oss-20b/config.json");
+  if (!config_file.good()) GTEST_SKIP() << "local gpt-oss checkpoint not present";
+  std::string json((std::istreambuf_iterator<char>(config_file)),
+                   std::istreambuf_iterator<char>());
+  const auto config = TranslateFamilyConfig(Identity("gpt_oss"), json);
+  ASSERT_TRUE(config.ok()) << config.status();
+  EXPECT_EQ(config->model.num_hidden_layers, 24);
+  const auto& moe = std::get<components::MoeConfig>(config->blocks[0].feed_forward);
+  EXPECT_EQ(moe.num_experts, 32);
+  EXPECT_EQ(moe.experts_per_token, 4);
+  EXPECT_EQ(moe.oai_limit, 7.0f);
+  const auto& a = std::get<components::AttentionConfig>(config->blocks[0].mixer);
+  EXPECT_TRUE(a.sinks);
+  EXPECT_EQ(a.sliding_window, 128);  // Layer 0 is sliding_attention.
+  EXPECT_EQ(a.rotary.type, "yarn");
+  EXPECT_NEAR(a.rotary.factor, 32.0, 1e-6);
+  EXPECT_TRUE(config->ValidateExecutable().ok()) << config->ValidateExecutable().ToString();
+}
+
+TEST(FamilyConfigTest, TypedBuilderValidatesThenFailsAtMissingWeights) {
   for (const auto& json : {Config("qwen3_next",
                                   "\"layer_types\":[\"linear_attention\",\"full_attention\"],"
                                   "\"full_attention_interval\":2,"
@@ -159,10 +285,10 @@ TEST(FamilyConfigTest, TypedBuilderRejectsUnsupportedBlocksBeforeReadingWeights)
     ASSERT_TRUE(identity.ok());
     checkpoint.config = *identity;
     checkpoint.config_json = json;
-    // No weight files are opened. A failed weight lookup would report a
-    // different status than the expected unsupported-execution rejection.
+    // No weight files are opened: with every block now executable, the
+    // build must pass validation and fail at the (absent) weights instead.
     const auto model = BuildModel(checkpoint, DeviceId::Cpu(), 8, 2);
-    EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
+    EXPECT_EQ(model.status().code(), absl::StatusCode::kNotFound);
   }
 }
 

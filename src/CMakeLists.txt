@@ -77,6 +77,8 @@ add_library(inferx_models
   models/model_registry.cc
   models/families/llama.cc
   models/families/qwen3.cc
+  models/families/dense_families.cc
+  models/families/moe_families.cc
   models/causal/config_parser.cc
   models/checkpoint_config.cc
   models/checkpoint.cc

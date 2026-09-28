@@ -84,12 +84,35 @@ components (attention, mlp, qkv_linear, ...)  --  ops
   dispatch on CPU — stay inside their backend directories.
 
 
-The executable families remain Llama and dense Qwen3. Qwen3 MoE and Next keep
-configuration translation and early rejection of unsupported execution. Fused
-checkpoint mapping is available for future families; it does not by itself add
-Qwen1/Qwen2 execution, bias kernels, dynamic NTK, or LogN attention scaling.
+The executable families are Llama 3.x, Qwen2.5, Qwen3 (dense, MoE, and Next),
+Mistral, Gemma 3, Mixtral, DeepSeek-V3, and gpt-oss. Each is a thin identity
+(traits plus a config translator over the shared `AttentionDecoderConfig`);
+every capability they use is implemented once as a shared component:
 
-To add a dense family, declare traits in `src/models/families/<name>.cc`, return
+- **Attention** — GQA with optional Q/K norms (plain or plus-one), biased
+  projections, per-layer sliding windows, attention sinks, scale overrides,
+  gated outputs, and RoPE scaling (linear, llama3, yarn with its softmax
+  temperature). FlashInfer runs the fast path; a generic kernel covers sinks
+  and geometries outside its template set.
+- **Feed-forward** — one gated-MLP execution with runtime activation flavor
+  (silu, Gemma's gelu-tanh, gpt-oss's clamped SwiGLU-oai) and optional packed
+  biases; MoE layers route through one kernel covering renormalized softmax
+  (Mixtral, Qwen3, gpt-oss) and DeepSeek's sigmoid/grouped scheme, dispatch
+  experts through the same gated-MLP ops, and reuse the dense path for shared
+  experts.
+- **MLA** — DeepSeek's latent attention runs decompressed through the same
+  paged pool and kernels as GQA; the compressed latent cache remains a future
+  `KvLayout` mode.
+- **Recurrent layers** — Qwen3-Next's Gated DeltaNet executes the reference
+  recurrence sequentially with per-slot state in a `RecurrentStatePool`; the
+  KV pool carries one layout per layer so hybrid stacks allocate both.
+- **Residual styles** — pre-norm (most families) and Gemma's
+  output-normalized sandwich share the same fused AddForward seam.
+- **Quantized checkpoints** — gpt-oss's MXFP4 experts dequantize at load
+  (E8M0 block scales, interleaved gate/up rows and biases); gpt-oss therefore
+  needs device memory for its dequantized experts. GPTQ/AWQ remain unsupported.
+
+To add a family, declare traits in `src/models/families/<name>.cc`, return
 `MakeFamily<Traits>()` (or supply a config translator), and add its factory to
 `families.h`, the registry, and `src/CMakeLists.txt`. Components never inspect
 architecture strings or checkpoint tensor names.

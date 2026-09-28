@@ -58,6 +58,14 @@ class Checkpoint {
   /// \return             The host bf16 tensor, or an error status.
   StatusOr<Tensor> FindHostBf16(std::string_view name, const Shape& expected_full) const;
 
+  /// \brief Uploads `name` to `device` as float32 (A_log/dt_bias style).
+  StatusOr<Tensor> UploadF32(std::string_view name, const Shape& expected,
+                             DeviceId device) const;
+
+  /// \brief Dequantizes MXFP4-packed nibbles with E8M0 block scales to bf16.
+  StatusOr<Tensor> DequantMxToBf16(const Tensor& blocks, const Tensor& scales,
+                                   const Shape& logical) const;
+
   /// \brief Uploads `name` to `device` as bfloat16.
   ///
   /// \param name     Tensor name.
