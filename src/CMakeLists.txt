@@ -131,6 +131,22 @@ if(INFERX_ENABLE_TOKENIZERS)
 endif()
 target_compile_options(inferx_engine PRIVATE -Wall -Wextra -Wpedantic)
 
+# inferx_dist -- tensor-parallel worker topology: the controller-side
+# process pool (posix_spawn, one worker per device), the IPC wire protocol
+# over Boost.InterProcess message queues, and the worker-side engine loop.
+# Collectives sit behind dist/comm.h; SingleRankComm (identity) is the only
+# backend until NCCL lands with multi-GPU support.
+add_library(inferx_dist
+  dist/worker_ipc.cc
+  dist/worker_launch.cc
+  dist/worker_main.cc
+)
+add_library(inferx::dist ALIAS inferx_dist)
+target_link_libraries(inferx_dist
+  PUBLIC inferx::engine inferx::boost
+          absl::status absl::statusor absl::strings)
+target_compile_options(inferx_dist PRIVATE -Wall -Wextra -Wpedantic)
+
 # inferx_bench -- CLI-independent benchmark entry points (`inferx bench *`).
 # Business libraries never include anything from apps/.
 add_library(inferx_bench

@@ -148,3 +148,18 @@ add_executable(inferx_device_config_test unit/config/device_config_test.cc)
 target_link_libraries(inferx_device_config_test PRIVATE inferx::core GTest::gtest_main)
 target_compile_options(inferx_device_config_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME device_config_test COMMAND inferx_device_config_test)
+
+# Real multi-process round trip: spawns the inferx binary as a world-of-one
+# worker, so it needs the GPU, the local checkpoint, and the repo root.
+add_executable(inferx_dist_worker_test dist_worker_test.cc)
+target_link_libraries(inferx_dist_worker_test PRIVATE inferx::dist GTest::gtest_main)
+target_compile_options(inferx_dist_worker_test PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(inferx_dist_worker_test PRIVATE
+                           INFERX_BIN="$<TARGET_FILE:inferx>")
+add_test(NAME dist_worker_test COMMAND inferx_dist_worker_test
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(dist_worker_test PROPERTIES TIMEOUT 120)
+if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+  set_tests_properties(dist_worker_test PROPERTIES ENVIRONMENT
+                       "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+endif()

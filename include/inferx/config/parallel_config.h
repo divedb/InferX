@@ -18,8 +18,14 @@ namespace inferx {
 /// shards -- flow through model build; the defaults make every derived value
 /// identical to the unsharded model.
 struct ParallelConfig {
-  int tensor_parallel_size = 1;  ///< Ranks the model weights are sharded across.
-  int tensor_parallel_rank = 0;  ///< This instance's rank, in [0, tensor_parallel_size).
+  /// Ranks the model weights are sharded across; one worker process per
+  /// device when greater than 1.
+  /// EXAMPLE: --tensor-parallel-size 2
+  int tensor_parallel_size = 1;
+
+  /// This instance's rank, in [0, tensor_parallel_size); the controller
+  /// assigns each spawned worker its rank, so it is never set from the CLI.
+  int tensor_parallel_rank = 0;
 
   /// \brief Checks rank/size sanity.
   Status Validate() const {

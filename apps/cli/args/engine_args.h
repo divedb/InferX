@@ -8,6 +8,7 @@
 #include "cli/app.h"
 #include "inferx/config/cache_config.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 
 namespace inferx::cli {
@@ -27,6 +28,8 @@ struct EngineArgs {
   bool chunked_prefill = true;          // vLLM: --enable-chunked-prefill
   std::vector<int> cudagraph_capture_sizes;   // vLLM: --cudagraph-capture-sizes
   int max_cudagraph_capture_size = 0;         // vLLM: --max-cudagraph-capture-size
+  int tensor_parallel_size = 1;               // vLLM: --tensor-parallel-size; one
+                                              // worker process per device when > 1
 
   /// Binds this group's options to `sub`. The struct instance must outlive
   /// the App: commands keep it inside their args struct, which the callback
@@ -71,6 +74,11 @@ struct EngineArgs {
                   "automatically")
         ->capture_default_str()
         ->check(CLI::Range(0, 4096));
+    g->add_option("--tensor-parallel-size", tensor_parallel_size,
+                  "Worker processes to shard the model across, one per "
+                  "device id; 1 keeps the in-process engine")
+        ->capture_default_str()
+        ->check(CLI::Range(1, 255));
   }
 
   /// \brief KV cache pool sizing (vLLM CacheConfig analogue).
@@ -98,6 +106,15 @@ struct EngineArgs {
     cfg.max_num_seqs = max_num_seqs;
     cfg.max_num_batched_tokens = max_num_batched_tokens;
     cfg.chunked_prefill = chunked_prefill;
+    return cfg;
+  }
+
+  /// \brief The controller's view of the tensor-parallel topology (vLLM
+  ///        --tensor-parallel-size; rank 0). Each spawned worker overrides
+  ///        the rank with its own.
+  ParallelConfig BuildParallelConfig() const {
+    ParallelConfig cfg;
+    cfg.tensor_parallel_size = tensor_parallel_size;
     return cfg;
   }
 };

@@ -8,15 +8,25 @@
 
 namespace inferx {
 
-/// \brief Whether this build carries the CUDA runtime.
+/// \brief Which backends this build links (compile-time capability).
 ///
-/// Compile-time capability only: it constrains device-type choices (a
-/// CPU-only build rejects "cuda" up front). Whether a GPU is actually
-/// attached is a runtime question answered at device activation.
+/// These constrain device-type choices -- a build without a runtime cannot
+/// honor its type, so the option is not offered. Whether hardware is
+/// actually attached is a runtime question answered at device activation.
 #ifdef INFERX_WITH_CUDA
 inline constexpr bool kCudaBuilt = true;
 #else
 inline constexpr bool kCudaBuilt = false;
+#endif
+#ifdef INFERX_WITH_ROCM
+inline constexpr bool kRocmBuilt = true;
+#else
+inline constexpr bool kRocmBuilt = false;
+#endif
+#ifdef INFERX_WITH_ASCEND
+inline constexpr bool kAscendBuilt = true;
+#else
+inline constexpr bool kAscendBuilt = false;
 #endif
 
 /// \brief The alignment of anything a kernel reads.

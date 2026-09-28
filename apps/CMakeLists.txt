@@ -17,14 +17,16 @@ add_library(inferx_cli
   cli/diagnostic/replay_logits.cc
   cli/launch/launch.cc 
   cli/launch/render.cc
-  cli/run_batch.cc 
+  cli/run_batch.cc
   cli/serve.cc
+  cli/worker.cc
 )
 
 add_library(inferx::cli ALIAS inferx_cli)
 target_include_directories(inferx_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(inferx_cli
-  PUBLIC inferx::cli_presentation inferx::bench inferx::diagnostic inferx::server)
+  PUBLIC inferx::cli_presentation inferx::bench inferx::diagnostic inferx::dist
+         inferx::server)
 target_compile_options(inferx_cli PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(inferx main.cc)

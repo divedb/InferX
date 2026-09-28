@@ -19,6 +19,7 @@ void InferxCli::RegisterCommands() {
   RegisterLaunch(app_);
   RegisterDiagnostic(app_);
   RegisterBench(app_);
+  RegisterWorker(app_);
 }
 
 int InferxCli::Run(int argc, char** argv) {

@@ -8,15 +8,19 @@ namespace inferx {
 
 /// \brief Tuning knobs of the scheduling policy.
 struct SchedulerConfig {
-  /// \brief Token budget per step, across all scheduled requests.
+  /// Token budget per step, across all scheduled requests.
+  /// EXAMPLE: --max-num-batched-tokens 8192
   int max_num_batched_tokens = 4096;
-  /// \brief Upper bound on concurrently running requests.
+  /// Upper bound on concurrently running requests.
+  /// EXAMPLE: --max-num-seqs 64
   int max_num_seqs = 32;
-  /// \brief Bound on the waiting queue; admissions beyond it are rejected.
+  /// Bound on the waiting queue; admissions beyond it are rejected. Not
+  /// exposed as a CLI flag yet.
   int queue_capacity = 64;
-  /// \brief Whether a long prompt may be split across steps within the token
-  ///        budget (the scheduler's native mode; CLI contract for vLLM's
-  ///        --enable-chunked-prefill).
+  /// Whether a long prompt may be split across steps within the token budget
+  /// (the scheduler's native mode; CLI contract for vLLM's
+  /// --enable-chunked-prefill).
+  /// EXAMPLE: --no-enable-chunked-prefill
   bool chunked_prefill = true;
 };
 

@@ -1,7 +1,10 @@
 #ifndef INFERX_CONFIG_DEVICE_CONFIG_H_
 #define INFERX_CONFIG_DEVICE_CONFIG_H_
 
+#include <algorithm>
+#include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "inferx/core/device.h"
@@ -33,12 +36,6 @@ struct DeviceConfig {
   /// Empty means "default" (the first ordinal).
   /// EXAMPLE: --device-ids 0,1,2
   std::vector<int> device_ids;
-
-  /// \brief The device this process executes on.
-  DeviceId PrimaryDevice() const {
-    if (device_type == "cpu") return DeviceId::Cpu();
-    return DeviceId::Cuda(device_ids.empty() ? 0 : device_ids.front());
-  }
 
   /// \brief Structural validation: known type, backend compiled in,
   ///        non-negative unique ids.

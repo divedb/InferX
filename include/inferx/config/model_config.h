@@ -17,37 +17,46 @@ struct ModelConfig {
   /// EXAMPLE: --tokenizer /path/to/tokenizer
   std::string tokenizer_dir;
 
-  DeviceConfig device;  ///< Placement (vLLM DeviceConfig).
-
-  /// Data type for weights and activations; "auto" (the default) uses the checkpoint's dtype,
-  /// or falls back to float32 if the checkpoint is ambiguous.
-  ///
+  /// Data type for weights and activations; "auto" (the default) uses the checkpoint's dtype.
+  /// EXAMPLE: --dtype bfloat16
   std::string dtype = "auto";
 
-  /// \brief Random seed for reproducible sampling.
+  /// Random seed for reproducible sampling.
+  /// EXAMPLE: --seed 42
   std::int64_t seed = 0;
-  /// \brief Maximum sequence length (prompt plus output); 0 keeps the
-  ///        checkpoint's context limit.
+
+  /// Maximum sequence length (prompt plus output); 0 keeps the checkpoint's
+  /// context limit.
+  /// EXAMPLE: --max-model-len 8192
   std::int64_t max_model_len = 0;
-  /// \brief Name the API reports for this model; empty falls back to
-  ///        model_dir through ServedName() (vLLM: --served-model-name,
-  ///        single name; vLLM also accepts a list).
+
+  /// Name the API reports for this model; empty falls back to model_dir
+  /// through ServedName().
+  /// EXAMPLE: --served-model-name inferx-8b
   std::string served_model_name;
-  /// \brief vLLM --generation-config: "auto" (the default) loads
-  ///        generation_config.json from the model directory, "vllm" keeps
-  ///        engine defaults, any other value is a directory to load it from.
-  /// The mode string, not the parsed type -- that is models::GenerationConfig.
+
+  /// Generation config to use; "auto" (the default) uses the checkpoint's generation config,
+  /// e.g. generation_config.json.
+  /// EXAMPLE: --generation-config /path/to/generation_config.json
   std::string generation_config = "auto";
-  /// \brief vLLM --override-generation-config: JSON merged over the
-  ///        resolved generation config, e.g. `{"temperature": 0.5}`.
+
+  /// Generation config to override the checkpoint's generation config; empty uses the
+  /// checkpoint's generation config.
+  /// EXAMPLE: --override-generation-config '{"temperature": 0.5}'
   std::string override_generation_config;
 
-  /// \brief The name the API reports; --served-model-name or model_dir.
+  /// \brief The name the API reports for this model; falls back to model_dir if
+  ///        served_model_name is empty.
+  ///
+  /// \return The name the API reports for this model.
   std::string ServedName() const {
     return served_model_name.empty() ? model_dir : served_model_name;
   }
 
-  /// \brief The directory holding tokenizer.json; --tokenizer or model_dir.
+  /// \brief The directory holding tokenizer.json; falls back to model_dir if tokenizer_dir is
+  ///        empty.
+  ///
+  /// \return The directory holding tokenizer.json.
   std::string ResolvedTokenizerDir() const {
     return tokenizer_dir.empty() ? model_dir : tokenizer_dir;
   }
