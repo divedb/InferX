@@ -45,24 +45,23 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
   write("q_proj", q);
   write("k_proj", k);
   write("v_proj", v);
-  const bool fused_norm_rope = a.qk_norm && a.head_dim == 128 && ctx.device().IsCuda();
+  const bool fused_norm_rope =
+      a.qk_norm && !a.qk_norm_plus_one && a.head_dim == 128 && ctx.device().IsCuda();
   if (a.qk_norm && !fused_norm_rope) {
+    const ops::RMSNormConfig head_norm{norm_eps, a.qk_norm_plus_one, !a.qk_norm_plus_one};
     INFERX_ASSIGN_OR_RETURN(Tensor q_heads, q.Reshape(Shape({rows * a.query_heads, a.head_dim})));
-    INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, q_heads, *w.query_norm, q_heads,
-                                        ops::RMSNormConfig{norm_eps, false, true}));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, q_heads, *w.query_norm, q_heads, head_norm));
     INFERX_ASSIGN_OR_RETURN(Tensor k_heads, k.Reshape(Shape({rows * a.kv_heads, a.head_dim})));
-    INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, k_heads, *w.key_norm, k_heads,
-                                        ops::RMSNormConfig{norm_eps, false, true}));
+    INFERX_RETURN_IF_ERROR(ops::RmsNorm(ctx, k_heads, *w.key_norm, k_heads, head_norm));
   }
   INFERX_ASSIGN_OR_RETURN(Tensor q3, q.Reshape(Shape({rows, a.query_heads, a.head_dim})));
   INFERX_ASSIGN_OR_RETURN(Tensor k3, k.Reshape(Shape({rows, a.kv_heads, a.head_dim})));
+  const ops::RotaryParams rotary = a.rotary.Params();
   if (fused_norm_rope) {
     INFERX_RETURN_IF_ERROR(ops::NormalizeAndApplyRope(ctx, q3, k3, *w.query_norm, *w.key_norm,
-                                                      batch.positions, norm_eps,
-                                                      ops::RotaryParams{a.rotary.dim, a.rotary.theta}));
+                                                      batch.positions, norm_eps, rotary));
   } else {
-    INFERX_RETURN_IF_ERROR(
-        ops::ApplyRope(ctx, q3, k3, batch.positions, ops::RotaryParams{a.rotary.dim, a.rotary.theta}));
+    INFERX_RETURN_IF_ERROR(ops::ApplyRope(ctx, q3, k3, batch.positions, rotary));
   }
 
   write("q_rope", q);

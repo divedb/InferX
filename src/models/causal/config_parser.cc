@@ -38,16 +38,36 @@ StatusOr<DecoderConfig> AttentionDecoderConfig(const nlohmann::json& j, bool qk_
   for (const char* key : {"rope_scaling", "rope_parameters"}) {
     if (j.contains(key) && !j.at(key).is_null()) rope = j.at(key);
   }
-  attention.rotary.type = rope.value("rope_type", rope.value("type", std::string("default")));
-  attention.rotary.theta = rope.value("rope_theta", attention.rotary.theta);
-  attention.rotary.factor = rope.value("factor", 1.0);
-  attention.rotary.parameters_json = rope.dump();
+  components::RotaryConfig& rotary = attention.rotary;
+  rotary.type = rope.value("rope_type", rope.value("type", std::string("default")));
+  rotary.theta = rope.value("rope_theta", rotary.theta);
+  rotary.factor = rope.value("factor", 1.0);
+  rotary.parameters_json = rope.dump();
+  if (rotary.type == "llama3") {
+    rotary.low_freq_factor = rope.value("low_freq_factor", 1.0);
+    rotary.high_freq_factor = rope.value("high_freq_factor", 4.0);
+    rotary.original_max_position =
+        rope.value("original_max_position_embeddings", model.max_position_embeddings);
+  } else if (rotary.type == "yarn") {
+    rotary.beta_fast = rope.value("beta_fast", 32.0);
+    rotary.beta_slow = rope.value("beta_slow", 1.0);
+    rotary.truncate = rope.value("truncate", true);
+    const int64_t original =
+        rope.value("original_max_position_embeddings", int64_t{0});
+    if (original > 0) {
+      rotary.original_max_position = original;
+      // The effective factor is the context ratio once the original training
+      // length is known (reference rule; matches the config's own factor).
+      rotary.factor =
+          static_cast<double>(model.max_position_embeddings) / static_cast<double>(original);
+    }
+  }
   const double partial =
       rope.value("partial_rotary_factor", j.value("partial_rotary_factor", 1.0));
   if (!std::isfinite(partial) || partial <= 0 || partial > 1) {
     return InvalidArgumentError("partial_rotary_factor must be in (0, 1]");
   }
-  attention.rotary.dim = static_cast<int64_t>(model.head_dim * partial);
+  rotary.dim = static_cast<int64_t>(model.head_dim * partial);
   if (j.value("use_sliding_window", false)) {
     return UnimplementedError("sliding-window layer mapping is not implemented");
   }

@@ -33,12 +33,17 @@ struct AttentionConfig {
   int64_t query_heads = 0;  ///< Total query heads, before any sharding.
   int64_t kv_heads = 0;     ///< Key/value heads; divides query_heads.
   int64_t head_dim = 0;
-  bool qk_norm = false;      ///< Per-head RMSNorm on q and k.
-  bool qkv_bias = false;     ///< Biases on the q/k/v projections.
-  bool output_bias = false;  ///< Bias on the output projection.
+  bool qk_norm = false;           ///< Per-head RMSNorm on q and k.
+  bool qk_norm_plus_one = false;  ///< Q/K head norms scale by (1 + w) (Gemma, Qwen3-Next).
+  bool qkv_bias = false;          ///< Biases on the q/k/v projections.
+  bool output_bias = false;       ///< Bias on the output projection.
+  /// Attention logit scale; 0 selects 1/sqrt(head_dim). Gemma derives it from
+  /// query_pre_attn_scalar, MLA from its combined head dimension.
+  float scale_override = 0.0f;
   RotaryConfig rotary;
   int64_t sliding_window = 0;  ///< Tokens; 0 disables windowing.
   OutputGate output_gate = OutputGate::kNone;
+  bool sinks = false;  ///< Per-head attention sink added to the denominator.
 };
 
 /// \brief Gated DeltaNet linear attention (Qwen3-Next recurrent layers).

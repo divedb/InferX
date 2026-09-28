@@ -17,6 +17,7 @@
 #include "inferx/ops/gather.h"
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
+#include "inferx/models/components/rope.h"
 #include "inferx/ops/rms_norm.h"
 
 namespace inferx {
@@ -394,6 +395,83 @@ TEST_F(OpsTest, AddAndSiluAndMulMatchReferences) {
     const float silu = gate[i] / (1.0f + std::exp(-gate[i]));
     EXPECT_NEAR(got_act[i], silu * up[i], 0.05f) << "element " << i;
   }
+}
+
+TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {
+  using ops::RopeFlavor;
+  // Default: theta^(-2i/dim).
+  ops::RotaryParams def;
+  def.rotary_dim = 8;
+  def.theta = 10000.0f;
+  EXPECT_NEAR(ops::InverseFrequency(0, def), 1.0f, 1e-6f);
+  EXPECT_NEAR(ops::InverseFrequency(3, def), std::pow(10000.0f, -0.75f), 1e-6f);
+
+  // Linear: every frequency divided by the factor.
+  ops::RotaryParams lin;
+  lin.rotary_dim = 8;
+  lin.theta = 10000.0f;
+  lin.scaling.flavor = RopeFlavor::kLinear;
+  lin.scaling.factor = 8.0f;
+  EXPECT_NEAR(ops::InverseFrequency(3, lin), std::pow(10000.0f, -0.75f) / 8.0f, 1e-7f);
+
+  // Llama3 (8k original context, factors 1/4, scale 8): a wavelength shorter
+  // than high_freq_wavelen stays extrapolated, one longer than
+  // low_freq_wavelen interpolates fully, one between blends.
+  ops::RotaryParams llama3;
+  llama3.rotary_dim = 8;
+  llama3.theta = 500000.0f;
+  llama3.scaling.flavor = RopeFlavor::kLlama3;
+  llama3.scaling.factor = 8.0f;
+  llama3.scaling.low_freq_factor = 1.0f;
+  llama3.scaling.high_freq_factor = 4.0f;
+  llama3.scaling.original_max_position = 8192.0f;
+  const float pi2 = 6.28318530717958647692f;
+  for (int i = 0; i < 4; ++i) {
+    const float base = std::pow(500000.0f, -2.0f * i / 8.0f);
+    const float wavelen = pi2 / base;
+    const float low = 8192.0f, high = 8192.0f / 4.0f;
+    float expected = base;
+    if (wavelen > low) {
+      expected = base / 8.0f;
+    } else if (!(wavelen < high)) {
+      const float t = (8192.0f / wavelen - 1.0f) / (4.0f - 1.0f);
+      expected = (1.0f - t) * base / 8.0f + t * base;
+    }
+    EXPECT_NEAR(ops::InverseFrequency(i, llama3), expected, 1e-7f) << "freq " << i;
+  }
+
+  // YaRN: ramped blend between interpolation and extrapolation.
+  ops::RotaryParams yarn;
+  yarn.rotary_dim = 8;
+  yarn.theta = 10000.0f;
+  yarn.scaling.flavor = RopeFlavor::kYarn;
+  yarn.scaling.factor = 32.0f;
+  yarn.scaling.ramp_low = 1.0f;
+  yarn.scaling.ramp_high = 3.0f;
+  for (int i = 0; i < 4; ++i) {
+    const float base = std::pow(10000.0f, -2.0f * i / 8.0f);
+    const float ramp = std::min(std::max((i - 1.0f) / 2.0f, 0.0f), 1.0f);
+    EXPECT_NEAR(ops::InverseFrequency(i, yarn), (base / 32.0f) * ramp + base * (1.0f - ramp), 1e-7f)
+        << "freq " << i;
+  }
+}
+
+TEST(RopeScaling, YarnAttentionTemperatureFollowsFactor) {
+  components::RotaryConfig config;
+  config.dim = 64;
+  config.theta = 150000.0f;
+  config.type = "yarn";
+  config.factor = 32.0f;
+  config.beta_fast = 32.0f;
+  config.beta_slow = 1.0f;
+  config.original_max_position = 4096;
+  const ops::RotaryParams params = config.Params();
+  EXPECT_EQ(params.scaling.flavor, ops::RopeFlavor::kYarn);
+  EXPECT_NEAR(params.scaling.attention_scale, 0.1f * std::log(32.0f) + 1.0f, 1e-6f);
+  // gpt-oss: beta 32/1 over 4096 positions must clamp inside [0, dim-1].
+  EXPECT_GE(params.scaling.ramp_low, 0.0f);
+  EXPECT_LE(params.scaling.ramp_high, 63.0f);
+  EXPECT_LE(params.scaling.ramp_low, params.scaling.ramp_high);
 }
 
 TEST_F(OpsTest, ApplyRopeRotatesHalfPairs) {

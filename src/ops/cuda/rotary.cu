@@ -10,7 +10,7 @@ namespace {
 __global__ void NormRopeKernel(__nv_bfloat16* q, __nv_bfloat16* k,
                                const __nv_bfloat16* qw, const __nv_bfloat16* kw,
                                const int32_t* positions, int qheads, int kheads,
-                               int rotary, float theta, float eps) {
+                               int rotary, ops::RotaryParams params, float eps) {
   __shared__ __nv_bfloat16 normalized[128];
   __shared__ float inv_rms;
   const int token = blockIdx.x, head = blockIdx.y;
@@ -30,9 +30,10 @@ __global__ void NormRopeKernel(__nv_bfloat16* q, __nv_bfloat16* k,
   __syncthreads();
   const int half = rotary / 2;
   if (i < half) {
-    const float inv_freq = 1.0f / powf(theta, (2.0f / float(rotary)) * float(i));
-    const float angle = float(positions[token]) * inv_freq;
-    const auto c = __float2bfloat16(cosf(angle)), s = __float2bfloat16(sinf(angle));
+    const float angle = float(positions[token]) * ops::InverseFrequency(i, params);
+    // The YaRN temperature rides on cos/sin, as in the reference embeddings.
+    const auto c = __float2bfloat16(cosf(angle) * params.scaling.attention_scale);
+    const auto s = __float2bfloat16(sinf(angle) * params.scaling.attention_scale);
     const auto x1 = normalized[i], x2 = normalized[i + half];
     row[i] = __hsub_rn(__hmul_rn(x1, c), __hmul_rn(x2, s));
     row[i + half] = __hadd_rn(__hmul_rn(x2, c), __hmul_rn(x1, s));
@@ -50,24 +51,25 @@ Status CudaError(cudaError_t err, const char* what) {
 
 /// Neox-style rotate-half RoPE. Thread `j` owns the complex pair (i, i + r/2)
 /// of one head, where i = j % (r/2); every head of q and k is covered by the
-/// grid-stride loop. Frequencies are derived on device: theta^(-2i/r).
+/// grid-stride loop. Frequencies come from the shared InverseFrequency
+/// formula, which carries every scaling flavor, and the YaRN temperature
+/// multiplies cos/sin in fp32 before the activation-dtype rounding.
 __global__ void ApplyRopeKernel(__nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k,
                                 const int32_t* __restrict__ positions, int query_heads,
-                                int kv_heads, int head_dim, int rotary_dim, float theta) {
+                                int kv_heads, int head_dim, int rotary_dim,
+                                ops::RotaryParams params) {
   const int token = blockIdx.x;
   const float pos = static_cast<float>(positions[token]);
   const int half = rotary_dim / 2;
-  const float exponent_scale = 2.0f / static_cast<float>(rotary_dim);
   const int pairs = max(query_heads, kv_heads) * half;
   for (int j = threadIdx.x; j < pairs; j += blockDim.x) {
     const int head = j / half;
     const int i = j - head * half;
-    const float inv_freq = 1.0f / powf(theta, exponent_scale * static_cast<float>(i));
-    const float angle = pos * inv_freq;
+    const float angle = pos * ops::InverseFrequency(i, params);
     // Both the reference cache and its elementwise products use BF16.
     // Preserve those rounding boundaries instead of fusing the rotation in FP32.
-    const __nv_bfloat16 c = __float2bfloat16(cosf(angle));
-    const __nv_bfloat16 s = __float2bfloat16(sinf(angle));
+    const __nv_bfloat16 c = __float2bfloat16(cosf(angle) * params.scaling.attention_scale);
+    const __nv_bfloat16 s = __float2bfloat16(sinf(angle) * params.scaling.attention_scale);
     if (head < query_heads) {
       __nv_bfloat16* qp = q + (static_cast<int64_t>(token) * query_heads + head) * head_dim;
       const __nv_bfloat16 x1 = qp[i], x2 = qp[i + half];
@@ -94,7 +96,7 @@ Status NormalizeAndApplyRope(ExecutionContext& ctx, const Tensor& q, const Tenso
       const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(k.Data())),
       static_cast<const __nv_bfloat16*>(q_weight.Data()),
       static_cast<const __nv_bfloat16*>(k_weight.Data()), positions.DataAs<int32_t>(),
-      q.Dim(1), k.Dim(1), params.rotary_dim, params.theta, eps);
+      q.Dim(1), k.Dim(1), params.rotary_dim, params, eps);
   return CudaError(cudaGetLastError(), "normalize and apply rope");
 }
 
@@ -108,7 +110,7 @@ Status ApplyRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
                     static_cast<cudaStream_t>(ctx.stream())>>>(
       q_ptr, k_ptr, static_cast<const int32_t*>(positions.Data()),
       static_cast<int>(q.Dim(1)), static_cast<int>(k.Dim(1)), static_cast<int>(q.Dim(2)),
-      static_cast<int>(params.rotary_dim), params.theta);
+      static_cast<int>(params.rotary_dim), params);
   return CudaError(cudaGetLastError(), "apply rope launch");
 }
 
