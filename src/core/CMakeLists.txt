@@ -4,17 +4,29 @@
 # API include <cuda_runtime_api.h>, which is plain C; only files containing
 # __global__ kernels need nvcc, and there are none at M0.
 
-add_library(inferx_core
-  cpu/device_runtime.cc
-  allocator.cc
-  arena.cc
-  caching_allocator.cc
-  device_buffer.cc
-  device_runtime.cc
-  logging.cc
-  shape.cc
-  storage.cc
-  tensor.cc
+inferx_add_library(
+  NAME core
+  SRCS
+    cpu/device_runtime.cc
+    allocator.cc
+    arena.cc
+    caching_allocator.cc
+    device_buffer.cc
+    device_runtime.cc
+    logging.cc
+    shape.cc
+    storage.cc
+    tensor.cc
+  INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/include
+  DEPS
+    absl::log
+    absl::status
+    absl::statusor
+    absl::flat_hash_map
+    absl::inlined_vector
+    absl::span
+    absl::strings
+  PRIVATE_DEPS absl::log_initialize mimalloc-static
 )
 
 if(INFERX_ENABLE_CUDA)
@@ -26,24 +38,3 @@ if(INFERX_ENABLE_CUDA)
 else()
   target_sources(inferx_core PRIVATE accelerator_runtime_stub.cc)
 endif()
-add_library(inferx::core ALIAS inferx_core)
-target_compile_features(inferx_core PUBLIC cxx_std_23)
-
-target_include_directories(inferx_core PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
-
-target_link_libraries(inferx_core
-  PUBLIC
-    absl::log
-    absl::status
-    absl::statusor
-    absl::flat_hash_map
-    absl::inlined_vector
-    absl::span
-    absl::strings
-  PRIVATE
-    absl::log_initialize
-    mimalloc-static
-)
-
-target_compile_options(inferx_core PRIVATE -Wall -Wextra -Wpedantic)
