@@ -33,6 +33,10 @@ if(INFERX_BUILD_TESTS)
   enable_testing()
 endif()
 
+# Target-declaration helpers (inferx_add_library), available to every
+# subdirectory including the engine-independent ones below.
+include(cmake/InferxHelpers.cmake)
+
 # The public provider SDK and host provider need no engine dependencies.
 add_subdirectory(src/kvc)
 if(INFERX_BUILD_KVCACHE_PLUGINS)

@@ -50,14 +50,18 @@ void RegisterBenchWorkload(CLI::App& parent) {
       "workload", "Benchmark the fixed workload through the real scheduler and model runner");
   args->model.AddOptions(*sub);
   args->engine.AddOptions(*sub);
-  sub->add_option("--suite", args->suite, "Workload JSON")->capture_default_str();
+  sub->add_option("--suite", args->suite, "Workload JSON")
+      ->type_name("PATH")
+      ->capture_default_str();
   sub->add_option("--repeats", args->repeats, "Timed trials per case after one warmup")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   // Diagnostic-only profiling range after a full warmup; normal timing is
   // unchanged.
   sub->add_option("--profile-step", args->profile_step,
                   "CUDA profiler range during repeat 0; -1 disables")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::Range(-1, 1 << 20));
   sub->add_flag("--step-timings", args->step_timings,

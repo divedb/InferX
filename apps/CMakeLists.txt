@@ -1,34 +1,43 @@
-add_library(inferx_cli_presentation cli/presentation.cc cli/terminal.cc)
-add_library(inferx::cli_presentation ALIAS inferx_cli_presentation)
-target_include_directories(inferx_cli_presentation PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(inferx_cli_presentation PUBLIC CLI11::CLI11 fmt::fmt)
-target_compile_features(inferx_cli_presentation PUBLIC cxx_std_23)
-
-add_library(inferx_cli
-  cli/app.cc
-  cli/bench/bench.cc 
-  cli/bench/latency.cc 
-  cli/bench/throughput.cc
-  cli/bench/workload.cc
-  cli/chat.cc 
-  cli/collect_env.cc 
-  cli/complete.cc
-  cli/diagnostic/diagnostic.cc 
-  cli/diagnostic/replay_logits.cc
-  cli/launch/launch.cc 
-  cli/launch/render.cc
-  cli/run_batch.cc
-  cli/serve.cc
-  cli/version.cc
-  cli/worker.cc
+# Shared CLI console: help rendering, error translation, styled output.
+inferx_add_library(
+  NAME cli_presentation
+  HDRS
+    cli/console.h
+    cli/terminal.h
+  SRCS
+    cli/console.cc
+    cli/terminal.cc
+  INCLUDE_DIRS
+    .
+  DEPS CLI11::CLI11 fmt::fmt rapidfuzz::rapidfuzz
 )
 
-add_library(inferx::cli ALIAS inferx_cli)
-target_include_directories(inferx_cli PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(inferx_cli
-  PUBLIC inferx::cli_presentation inferx::bench inferx::diagnostic inferx::dist
-         inferx::server)
-target_compile_options(inferx_cli PRIVATE -Wall -Wextra -Wpedantic)
+# Every subcommand registrar plus the app shell. Business errors and command
+# execution stay out of the presentation layer.
+inferx_add_library(
+  NAME cli
+  HDRS
+    cli/app.h
+    cli/commands.h
+  SRCS
+    cli/app.cc
+    cli/bench/bench.cc
+    cli/bench/latency.cc
+    cli/bench/throughput.cc
+    cli/bench/workload.cc
+    cli/chat.cc
+    cli/collect_env.cc
+    cli/complete.cc
+    cli/diagnostic/diagnostic.cc
+    cli/diagnostic/replay_logits.cc
+    cli/help.cc
+    cli/launch/launch.cc
+    cli/launch/render.cc
+    cli/run_batch.cc
+    cli/serve.cc
+    cli/version.cc
+  DEPS inferx::cli_presentation inferx::bench inferx::diagnostic inferx::server
+)
 
 add_executable(inferx main.cc)
 target_compile_definitions(inferx PRIVATE INFERX_VERSION="${PROJECT_VERSION}")

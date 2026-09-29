@@ -36,46 +36,63 @@ struct EngineArgs {
   /// owns via shared_ptr.
   void AddOptions(CLI::App& sub) {
     CLI::Option_group* g = sub.add_option_group("Engine", "execution capacity");
+    // Deep-tuning knobs live in the "Advanced" group: excluded from normal
+    // help, shown by --help=all. Everything here keeps parsing identically.
     g->add_option("--max-num-seqs", max_num_seqs, "Maximum number of sequences per iteration")
+        ->type_name("N")
         ->capture_default_str()
         ->check(CLI::PositiveNumber);
     g->add_option("--max-num-batched-tokens", max_num_batched_tokens,
                   "Maximum number of tokens per batch")
+        ->type_name("N")
         ->capture_default_str()
         ->check(CLI::Range(16, 1 << 20));
     g->add_option("--num-kv-blocks", num_kv_blocks,
                   "InferX: total KV cache blocks preallocated across all layers")
+        ->type_name("N")
+        ->group("Advanced")
         ->capture_default_str()
         ->check(CLI::PositiveNumber);
     g->add_option("--block-size", block_size, "Token capacity of one KV cache block")
+        ->type_name("N")
+        ->group("Advanced")
         ->capture_default_str()
         ->check(CLI::IsMember({int64_t{16}, int64_t{32}, int64_t{64}}));
     g->add_flag("--cuda-graphs", cuda_graphs,
-                "Capture and replay decode CUDA graphs (vLLM: --enforce-eager, inverted)");
+                "Capture and replay decode CUDA graphs (vLLM: --enforce-eager, inverted)")
+        ->group("Advanced");
     g->add_option("--kv-cache-memory-bytes", kv_cache_memory_bytes,
                   "Exact KV cache size in bytes; 0 derives it from "
                   "--num-kv-blocks")
+        ->type_name("BYTES")
         ->capture_default_str()
         ->check(CLI::Range(int64_t{0}, int64_t{1} << 40));
     CLI::Option* chunked = g->add_flag("--enable-chunked-prefill", chunked_prefill,
                                        "Allow splitting long prompts across scheduler steps "
                                        "(default)");
+    chunked->group("Advanced");
     CLI::Option* whole = g->add_flag(
         "--no-enable-chunked-prefill", [this](std::int64_t) { chunked_prefill = false; },
         "Require whole prompts to prefill in one step");
-    whole->excludes(chunked);
+    whole->excludes(chunked)->group("Advanced");
     g->add_option("--cudagraph-capture-sizes", cudagraph_capture_sizes,
                   "Decode batch sizes to capture graphs for; empty selects "
                   "automatically")
+        ->type_name("SIZES")
+        ->group("Advanced")
         ->delimiter(',')
         ->check(CLI::Range(1, 4096));
     g->add_option("--max-cudagraph-capture-size", max_cudagraph_capture_size,
                   "Largest decode batch size to capture; 0 selects "
                   "automatically")
+        ->type_name("N")
+        ->group("Advanced")
         ->capture_default_str()
         ->check(CLI::Range(0, 4096));
     g->add_option("--tensor-parallel-size", tensor_parallel_size,
                   "Tensor-parallel GPU ranks, one per device id; requires NCCL and eager execution")
+        ->type_name("N")
+        ->group("Advanced")
         ->capture_default_str()
         ->check(CLI::Range(1, 255));
   }

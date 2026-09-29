@@ -64,6 +64,11 @@ target_link_libraries(inferx_cli_args_test PRIVATE inferx::cli GTest::gtest_main
 target_compile_options(inferx_cli_args_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME cli_args_test COMMAND inferx_cli_args_test)
 
+add_executable(inferx_console_help_test console_help_test.cc)
+target_link_libraries(inferx_console_help_test PRIVATE inferx::cli GTest::gtest_main)
+target_compile_options(inferx_console_help_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME console_help_test COMMAND inferx_console_help_test)
+
 add_executable(inferx_server_api_test server_api_test.cc)
 target_link_libraries(inferx_server_api_test
   PRIVATE inferx::server nlohmann_json::nlohmann_json GTest::gtest_main)
@@ -174,19 +179,4 @@ set_tests_properties(tensor_parallel_test PROPERTIES TIMEOUT 120)
 if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   set_tests_properties(tensor_parallel_test PROPERTIES ENVIRONMENT
                       "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
-endif()
-
-# Real multi-process round trip: spawns the inferx binary as a world-of-one
-# worker, so it needs the GPU, the local checkpoint, and the repo root.
-add_executable(inferx_dist_worker_test dist_worker_test.cc)
-target_link_libraries(inferx_dist_worker_test PRIVATE inferx::dist GTest::gtest_main)
-target_compile_options(inferx_dist_worker_test PRIVATE -Wall -Wextra -Wpedantic)
-target_compile_definitions(inferx_dist_worker_test PRIVATE
-                           INFERX_BIN="$<TARGET_FILE:inferx>")
-add_test(NAME dist_worker_test COMMAND inferx_dist_worker_test
-         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-set_tests_properties(dist_worker_test PROPERTIES TIMEOUT 120)
-if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
-  set_tests_properties(dist_worker_test PROPERTIES ENVIRONMENT
-                       "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()

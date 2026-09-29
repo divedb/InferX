@@ -14,7 +14,8 @@ struct BenchOutputArgs {
   void AddOptions(CLI::App& sub) {
     CLI::Option_group* g = sub.add_option_group("Output", "results and logging");
     g->add_option("--output-json", output_json,
-                  "Path to save benchmark results in JSON format");
+                  "Path to save benchmark results in JSON format")
+        ->type_name("PATH");
     g->add_flag("--disable-log-stats", disable_log_stats,
                 "Disable logging statistics");
   }

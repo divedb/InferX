@@ -62,6 +62,11 @@ set(FMT_WERROR OFF CACHE BOOL "")
 add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/fmt"
                  "${PROJECT_BINARY_DIR}/third_party/fmt" EXCLUDE_FROM_ALL)
 
+# rapidfuzz-cpp: Levenshtein distances for CLI "Did you mean" suggestions
+# (header-only; the `rapidfuzz::rapidfuzz` target carries its include dir).
+add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/rapidfuzz"
+                 "${PROJECT_BINARY_DIR}/third_party/rapidfuzz" EXCLUDE_FROM_ALL)
+
 # Boost.Asio subset + Beast: coroutine-based HTTP for the serving layer
 # (`inferx serve`). Header-only interface targets; the Boost subset's
 # provenance is pinned in third_party/boost/fetch.sh.

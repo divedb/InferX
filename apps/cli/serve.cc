@@ -80,30 +80,43 @@ void RegisterServe(CLI::App& root) {
   args->model.AddOptions(*sub);
   args->engine.AddOptions(*sub);
   args->sampling.AddOptions(*sub);
-  sub->add_option("--host", args->host, "Host address")->capture_default_str();
+  sub->add_option("--host", args->host, "Host address")
+      ->type_name("HOST")
+      ->capture_default_str();
   sub->add_option("--port", args->port, "Port number")
+      ->type_name("PORT")
       ->capture_default_str()
       ->check(CLI::Range(1, 65535));
   // Prompt-preparation worker pool (docs/tokenizer_process_pool.md): the
-  // exposed surface is worker count, queue bounds, and deadlines.
+  // exposed surface is worker count, queue bounds, and deadlines. The bounds
+  // and deadlines are deep tuning; --help=all shows them.
   sub->add_option("--tokenizer-workers", args->tokenizer_workers,
                   "CPU tokenizer worker processes (no inline fallback)")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::Range(1, 1024));
   sub->add_option("--tokenizer-queue-max-requests", args->tokenizer_queue_max_requests,
                   "Max pending+running tokenizer requests")
+      ->type_name("N")
+      ->group("Advanced")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--tokenizer-queue-max-mb", args->tokenizer_queue_max_mb,
                   "Max pending tokenizer input in MiB")
+      ->type_name("MB")
+      ->group("Advanced")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--tokenizer-request-timeout-ms", args->tokenizer_request_timeout_ms,
                   "Per-request prompt preprocessing budget incl. queueing")
+      ->type_name("MS")
+      ->group("Advanced")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--tokenizer-startup-timeout-ms", args->tokenizer_startup_timeout_ms,
                   "Worker startup handshake timeout")
+      ->type_name("MS")
+      ->group("Advanced")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->callback([args] { ThrowIfError(server::RunServe(args->Build())); });

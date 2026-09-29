@@ -30,13 +30,16 @@ struct SamplingArgs {
 
     options_["temperature"] =
         g->add_option("--temperature", params.temperature, "Sampling temperature")
+            ->type_name("FLOAT")
             ->capture_default_str()
             ->check(CLI::Range(0.0f, 10.0f));
     options_["top-p"] = g->add_option("--top-p", params.top_p, "Top-p sampling")
+                            ->type_name("FLOAT")
                             ->capture_default_str()
                             ->check(CLI::Range(0.0f, 1.0f));
     options_["max-tokens"] =
         g->add_option("--max-tokens", params.max_tokens, "Maximum tokens per request")
+            ->type_name("N")
             ->capture_default_str()
             ->check(CLI::PositiveNumber);
     g->add_flag("--ignore-eos", params.ignore_eos, "Never stop on EOS");

@@ -55,14 +55,17 @@ void RegisterBenchThroughput(CLI::App& parent) {
   args->engine.AddOptions(*sub);
   args->dataset.AddOptions(*sub);
   sub->add_option("--num-prompts", args->num_prompts, "Number of prompts to run")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--num-iters", args->num_iters,
                   "Number of timed trials to run after warmup")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--num-iters-warmup", args->num_iters_warmup,
                   "Number of trials to run for warmup")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::Range(0, 1 << 20));
   args->output.AddOptions(*sub);

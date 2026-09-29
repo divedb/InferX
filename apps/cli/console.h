@@ -14,11 +14,11 @@ namespace inferx::cli {
 /// e.g. "inferx bench latency".
 std::string CommandPath(const CLI::App& app);
 
-class Presentation {
+class Console {
  public:
-  /// `out_is_terminal` / `err_is_terminal` drive per-stream auto color.
-  Presentation(CLI::App& app, std::ostream& out, std::ostream& err, bool out_is_terminal,
-               bool err_is_terminal);
+  /// Color is decided once, from the environment and each standard stream's
+  /// tty state (see cli::ShouldUseColor).
+  Console(CLI::App& app, std::ostream& out, std::ostream& err);
 
   /// Parses `argv` (argv[0] is the program name). Translates CLI11 parse
   /// errors into the project's message style while preserving CLI11's exit
@@ -38,8 +38,9 @@ class Presentation {
   /// so the parse prepass can reject `--opt --other-flag` as a missing value.
   void CollectValueOptions(CLI::App* app);
 
-  /// Renders `app`'s help into the out stream; returns the exit code (0).
-  int PrintHelp(const CLI::App* app);
+  /// Renders `app`'s help into the out stream; `all` includes the advanced
+  /// options. Returns the exit code (0).
+  int PrintHelp(const CLI::App* app, bool all = false);
 
   /// Reports a translated parse error; returns `code` as the exit code.
   int ReportParseError(const CLI::ParseError& error, const CLI::App* target,
@@ -48,8 +49,6 @@ class Presentation {
   CLI::App& app_;
   std::ostream& out_;
   std::ostream& err_;
-  bool out_is_terminal_;
-  bool err_is_terminal_;
   std::map<std::string, bool> value_options_;  // name -> takes a value
   // Color is decided once from the environment and each stream's tty state.
   cli::TextStyler out_style_;

@@ -50,19 +50,24 @@ void RegisterBenchLatency(CLI::App& parent) {
   args->model.AddOptions(*sub);
   args->engine.AddOptions(*sub);
   sub->add_option("--batch-size", args->batch_size, "Number of requests in the batch")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--output-len", args->output_len, "Tokens generated per request")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--input-len", args->input_len, "Input length of the synthetic prompts")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--num-iters", args->num_iters, "Number of iterations to run")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   sub->add_option("--num-iters-warmup", args->num_iters_warmup,
                   "Number of iterations to run for warmup")
+      ->type_name("N")
       ->capture_default_str()
       ->check(CLI::Range(0, 1 << 20));
   args->output.AddOptions(*sub);

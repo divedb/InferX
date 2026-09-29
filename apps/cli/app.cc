@@ -1,12 +1,11 @@
 #include "cli/app.h"
 
-#include <cstdio>
 #include <exception>
 #include <string>
 
 #include "cli/commands.h"
+#include "cli/console.h"
 #include "cli/error.h"
-#include "cli/presentation.h"
 
 namespace inferx::cli {
 
@@ -19,22 +18,21 @@ void InferxCli::RegisterCommands() {
   RegisterLaunch(app_);
   RegisterDiagnostic(app_);
   RegisterBench(app_);
-  RegisterWorker(app_);
+  RegisterHelp(app_);
   RegisterVersion(app_);
 }
 
 int InferxCli::ParseCommandLine(int argc, const char* const argv[]) { return 0; }
 
 int InferxCli::Run(int argc, char** argv) {
-  Presentation presentation(app_, std::cout, std::cerr, cli::IsInteractiveTerminal(stdout),
-                            cli::IsInteractiveTerminal(stderr));
+  Console console(app_, std::cout, std::cerr);
   try {
-    return presentation.Parse(argc, argv);
+    return console.Parse(argc, argv);
   } catch (const CommandError& e) {
-    presentation.Error(e.what());
+    console.Error(e.what());
     return 1;
   } catch (const std::exception& e) {
-    presentation.Error(std::string("internal error: ") + e.what());
+    console.Error(std::string("internal error: ") + e.what());
     return 1;
   }
 }

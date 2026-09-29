@@ -1,6 +1,6 @@
-// `inferx version` — prints the build version and exits.
+#include <fmt/format.h>
+
 #include <CLI/CLI.hpp>
-#include <iostream>
 
 #include "cli/app.h"
 #include "cli/commands.h"
@@ -8,8 +8,10 @@
 namespace inferx::cli {
 
 void RegisterVersion(CLI::App& root) {
-  CLI::App* sub = root.add_subcommand("version", "Display program version information and exit.");
-  sub->callback([] { std::cout << INFERX_VERSION << "\n"; });
+  std::string subcmd_name = "version";
+  std::string subcmd_desc = "Display program version information and exit.";
+  CLI::App* sub = root.add_subcommand(std::move(subcmd_name), std::move(subcmd_desc));
+  sub->callback([] { fmt::print("{}\n", INFERX_VERSION); });
 }
 
 }  // namespace inferx::cli

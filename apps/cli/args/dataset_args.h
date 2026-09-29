@@ -23,15 +23,18 @@ struct DatasetArgs {
   void AddOptions(CLI::App& sub) {
     CLI::Option_group* g = sub.add_option_group("Dataset", "prompt source");
     g->add_option("--dataset-name", name, "Dataset name")
+        ->type_name("NAME")
         ->capture_default_str()
         ->check(CLI::IsMember(bench::DatasetNameValues()));
-    g->add_option("--dataset-path", path, "Path to the dataset");
+    g->add_option("--dataset-path", path, "Path to the dataset")->type_name("PATH");
     g->add_option("--input-len", input_len,
                   "Input length of prompts for the random dataset")
+        ->type_name("N")
         ->capture_default_str()
         ->check(CLI::PositiveNumber);
     g->add_option("--output-len", output_len,
                   "Output length of responses for the random dataset")
+        ->type_name("N")
         ->capture_default_str()
         ->check(CLI::PositiveNumber);
   }

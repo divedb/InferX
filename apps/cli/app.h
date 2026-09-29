@@ -25,6 +25,9 @@ class InferxCli {
     // Set the default behavior for subcommands: allow 0 or 1 subcommand to be
     // specified.
     app_.require_subcommand(0, 1);
+    // Registered before the commands so subcommands inherit the flag; the
+    // console normalizes the friendlier "--help=all" spelling onto it.
+    app_.set_help_all_flag("--help-all", "Show all options, including advanced ones");
     RegisterCommands();
   }
 
@@ -35,6 +38,9 @@ class InferxCli {
   /// \param argv The command-line arguments.
   /// \return     The process exit code.
   int Run(int argc, char** argv);
+
+  /// \brief The command tree, for in-process rendering (tests, tooling).
+  CLI::App& app() { return app_; }
 
  private:
   void RegisterCommands();
