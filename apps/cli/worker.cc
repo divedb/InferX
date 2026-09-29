@@ -1,7 +1,3 @@
-// `inferx worker` -- one tensor-parallel rank. Spawned by the controller
-// (WorkerPool) with rank, world, device, and channel names on the command
-// line; the model/engine flag groups are the same ones every other command
-// uses, so a worker is configured exactly like the in-process engine.
 #include <CLI/CLI.hpp>
 #include <string>
 

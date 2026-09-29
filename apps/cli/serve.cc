@@ -38,14 +38,10 @@ struct ServeArgs {
     p.host = host;
     p.port = port;
     p.tokenizer.workers = tokenizer_workers;
-    p.tokenizer.queue_max_requests =
-        static_cast<std::size_t>(tokenizer_queue_max_requests);
-    p.tokenizer.queue_max_bytes =
-        static_cast<std::size_t>(tokenizer_queue_max_mb) << 20;
-    p.tokenizer.request_timeout =
-        std::chrono::milliseconds(tokenizer_request_timeout_ms);
-    p.tokenizer.startup_timeout =
-        std::chrono::milliseconds(tokenizer_startup_timeout_ms);
+    p.tokenizer.queue_max_requests = static_cast<std::size_t>(tokenizer_queue_max_requests);
+    p.tokenizer.queue_max_bytes = static_cast<std::size_t>(tokenizer_queue_max_mb) << 20;
+    p.tokenizer.request_timeout = std::chrono::milliseconds(tokenizer_request_timeout_ms);
+    p.tokenizer.startup_timeout = std::chrono::milliseconds(tokenizer_startup_timeout_ms);
     return p;
   }
 
@@ -55,8 +51,8 @@ struct ServeArgs {
   ///        explicitly win over it, and --override-generation-config merges
   ///        last regardless.
   void ApplyGenerationConfig(sampling::SamplingParams* defaults) const {
-    auto resolved = GenerationConfig::Resolve(model.config.model_dir,
-                                              model.config.generation_config);
+    auto resolved =
+        GenerationConfig::Resolve(model.config.model_dir, model.config.generation_config);
     if (!resolved.ok()) throw CommandError(resolved.status());
     if (resolved->has_value()) {
       server::MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
@@ -94,8 +90,7 @@ void RegisterServe(CLI::App& root) {
                   "CPU tokenizer worker processes (no inline fallback)")
       ->capture_default_str()
       ->check(CLI::Range(1, 1024));
-  sub->add_option("--tokenizer-queue-max-requests",
-                  args->tokenizer_queue_max_requests,
+  sub->add_option("--tokenizer-queue-max-requests", args->tokenizer_queue_max_requests,
                   "Max pending+running tokenizer requests")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
@@ -103,13 +98,11 @@ void RegisterServe(CLI::App& root) {
                   "Max pending tokenizer input in MiB")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  sub->add_option("--tokenizer-request-timeout-ms",
-                  args->tokenizer_request_timeout_ms,
+  sub->add_option("--tokenizer-request-timeout-ms", args->tokenizer_request_timeout_ms,
                   "Per-request prompt preprocessing budget incl. queueing")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  sub->add_option("--tokenizer-startup-timeout-ms",
-                  args->tokenizer_startup_timeout_ms,
+  sub->add_option("--tokenizer-startup-timeout-ms", args->tokenizer_startup_timeout_ms,
                   "Worker startup handshake timeout")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);

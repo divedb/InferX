@@ -1,9 +1,3 @@
-// CUDA DeviceRuntime: allocation, copies, streams, events, and graph capture.
-//
-// Compiled only when the CUDA toolkit is available. The runtime exposes the
-// same mechanical services as the CPU runtime so the ops and tensor layers
-// remain device-agnostic.
-
 #include "inferx/core/device_runtime.h"
 
 #include <cuda_runtime.h>
@@ -16,7 +10,6 @@
 
 #include "absl/status/status.h"
 #include "inferx/core/device.h"
-#include "inferx/core/device_runtime_internal.h"
 
 namespace inferx::internal {
 namespace {
@@ -89,12 +82,12 @@ class CudaDeviceRuntime final : public DeviceRuntime {
         "cudaMemcpyAsync");
   }
 
-Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
-  const cudaError_t err = cudaMemsetAsync(dst, 0, bytes, static_cast<cudaStream_t>(stream));
-  return err == cudaSuccess
-             ? OkStatus()
-             : InternalError("cudaMemsetAsync failed: ", cudaGetErrorString(err));
-}
+  Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
+    const cudaError_t err = cudaMemsetAsync(dst, 0, bytes, static_cast<cudaStream_t>(stream));
+    return err == cudaSuccess
+               ? OkStatus()
+               : InternalError("cudaMemsetAsync failed: ", cudaGetErrorString(err));
+  }
 
   StatusOr<Stream> CreateStream() override {
     INFERX_RETURN_IF_ERROR(Activate());

@@ -23,8 +23,8 @@ void InferxCli::RegisterCommands() {
 }
 
 int InferxCli::Run(int argc, char** argv) {
-  Presentation presentation(app_, std::cout, std::cerr,
-                            term::IsTerminal(stdout), term::IsTerminal(stderr));
+  Presentation presentation(app_, std::cout, std::cerr, term::IsTerminal(stdout),
+                            term::IsTerminal(stderr));
   try {
     return presentation.Parse(argc, argv);
   } catch (const CommandError& e) {

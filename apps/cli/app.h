@@ -13,9 +13,10 @@ namespace inferx::cli {
 /// Default checkpoint directory pre-filled into model options.
 inline constexpr std::string_view kDefaultModelDir = "models/Qwen3-0.6B";
 
+/// \brief Command-line interface for InferX.
 class InferxCli {
  public:
-  /// \brief
+  /// \brief Constructs a CLI application with the given description and name.
   ///
   /// \param description The description of the CLI application.
   /// \param name        The name of the CLI application.
@@ -29,11 +30,14 @@ class InferxCli {
   }
 
   /// \brief Parses argv and runs the selected command. Returns the process
-  /// exit code (parse errors preserve CLI11's codes).
+  ///        exit code (parse errors preserve CLI11's codes).
+  ///
+  /// \param argc The number of arguments in argv.
+  /// \param argv The command-line arguments.
+  /// \return     The process exit code.
   int Run(int argc, char** argv);
 
  private:
-  /// \brief Register all subcommands and their options into the CLI application.
   void RegisterCommands();
 
   CLI::App app_;

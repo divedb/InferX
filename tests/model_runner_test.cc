@@ -38,7 +38,8 @@ class TestModel final : public Model {
   const CheckpointConfig& config() const override { return config_; }
 
   std::vector<LayerStateSpec> StateRequirements() const override { return requirements; }
-  std::vector<LayerStateSpec> requirements = {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
+  std::vector<LayerStateSpec> requirements = {
+      PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
 
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
                            ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
@@ -100,8 +101,8 @@ class ModelRunnerTest : public ::testing::Test {
     cc.block_size = 2;
     auto model = std::make_unique<TestModel>();
     model_ = model.get();
-    auto runner = ModelRunner::Create(mc, cc, sc, ExecutionConfig{}, std::move(model),
-                                       std::move(comm));
+    auto runner =
+        ModelRunner::Create(mc, cc, sc, ExecutionConfig{}, std::move(model), std::move(comm));
     ASSERT_TRUE(runner.ok()) << runner.status();
     runner_ = std::move(*runner);
     scheduler_ = std::make_unique<Scheduler>(sc, runner_->kv_pool(), 127);
@@ -150,8 +151,8 @@ TEST_F(ModelRunnerTest, PassesTheSuppliedCommunicatorToTheModel) {
 TEST(ModelRunnerStateTest, RejectsTensorParallelDeviceCountMismatch) {
   ModelConfig model;
   model.device.device_ids = {0};
-  auto runner = ModelRunner::Create(model, CacheConfig{}, SchedulerConfig{},
-                                    ExecutionConfig{}, ParallelConfig{2, 0});
+  auto runner = ModelRunner::Create(model, CacheConfig{}, SchedulerConfig{}, ExecutionConfig{},
+                                    ParallelConfig{2, 0});
   EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
@@ -177,14 +178,15 @@ class RankGroupTest : public ::testing::Test {
       model->expected_rank = rank;
       model->token_offset = rank * 50;  // Peer logits must never choose the next token.
       model->use_collective = true;
-      if (rank == 1 && fail_peer) model->injected_failure = InternalError("injected rank failure");
+      if (rank == 1 && fail_peer)
+        model->injected_failure = InternalError("injected rank failure");
       auto runner = ModelRunner::Create(model_config, cache, scheduling, ExecutionConfig{},
-                                         std::move(model), world->TakeRank(rank));
+                                        std::move(model), world->TakeRank(rank));
       ASSERT_TRUE(runner.ok()) << runner.status();
       ranks.push_back(*std::move(runner));
     }
-    auto group = ModelRunner::CreateGroup(std::move(ranks),
-        [world](const Status& status) { world->Abort(status); });
+    auto group = ModelRunner::CreateGroup(
+        std::move(ranks), [world](const Status& status) { world->Abort(status); });
     ASSERT_TRUE(group.ok()) << group.status();
     group_ = *std::move(group);
     scheduler_ = std::make_unique<Scheduler>(scheduling, group_->kv_pool(), 127);
@@ -327,7 +329,8 @@ TEST(ModelRunnerStateTest, UsesDeclaredLayoutInsteadOfLegacyDimensions) {
   mc.device.device_type = "cpu";
   CacheConfig cc;
   cc.num_kv_blocks = 2;
-  auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
+  auto runner =
+      ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
   ASSERT_TRUE(runner.ok()) << runner.status();
   EXPECT_EQ((*runner)->kv_pool()->Layout().kv_heads, 2);
   EXPECT_EQ((*runner)->kv_pool()->Layout().head_dim, 4);
@@ -344,7 +347,8 @@ TEST(ModelRunnerStateTest, AllocatesMixedLayoutsAndRecurrentState) {
   mc.device.device_type = "cpu";
   CacheConfig cc;
   cc.num_kv_blocks = 2;
-  auto runner = ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
+  auto runner =
+      ModelRunner::Create(mc, cc, SchedulerConfig{}, ExecutionConfig{}, std::move(model));
   ASSERT_TRUE(runner.ok()) << runner.status();
   EXPECT_EQ((*runner)->kv_pool()->LayoutFor(0).kv_heads, 2);
 }
@@ -353,7 +357,7 @@ TEST(ModelRunnerStateTest, RejectsMissingLayerState) {
   auto model = std::make_unique<TestModel>();
   model->requirements.clear();
   auto runner = ModelRunner::Create(ModelConfig{}, CacheConfig{}, SchedulerConfig{},
-                                   ExecutionConfig{}, std::move(model));
+                                    ExecutionConfig{}, std::move(model));
   EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
@@ -369,22 +373,25 @@ class PositionModel final : public Model {
   }
   Status Init() {
     const auto device = DeviceId::Cuda(0);
-    INFERX_ASSIGN_OR_RETURN(table_, Tensor::Empty(DataType::kBFloat16, Shape({64, 128}), device));
-    INFERX_ASSIGN_OR_RETURN(hidden_, Tensor::Empty(DataType::kBFloat16, Shape({8, 128}), device));
-    INFERX_ASSIGN_OR_RETURN(logits_, Tensor::Empty(DataType::kBFloat16, Shape({4, 128}), device));
+    INFERX_ASSIGN_OR_RETURN(table_,
+                            Tensor::Empty(DataType::kBFloat16, Shape({64, 128}), device));
+    INFERX_ASSIGN_OR_RETURN(hidden_,
+                            Tensor::Empty(DataType::kBFloat16, Shape({8, 128}), device));
+    INFERX_ASSIGN_OR_RETURN(logits_,
+                            Tensor::Empty(DataType::kBFloat16, Shape({4, 128}), device));
     std::vector<uint16_t> table(64 * 128, 0);
     for (int p = 0; p < 64; ++p) table[p * 128 + p + 10] = 0x3f80;
     INFERX_ASSIGN_OR_RETURN(auto runtime, RuntimeFor(device));
     return runtime->Copy(table_->Data(), table.data(), table.size() * sizeof(uint16_t),
                          CopyKind::kHostToDevice);
   }
-  bool SupportsCudaGraphs() const override { return true; }
+
   const CheckpointConfig& config() const override { return config_; }
   std::vector<LayerStateSpec> StateRequirements() const override {
     return {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
   }
-  StatusOr<Tensor> Forward(const ModelInput& input, ModelState&,
-                           ops::ExecutionContext& ctx, dist::CommBackend&) override {
+  StatusOr<Tensor> Forward(const ModelInput& input, ModelState&, ops::ExecutionContext& ctx,
+                           dist::CommBackend&) override {
     ++calls;
     INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_->Slice(0, input.attention.num_tokens));
     INFERX_ASSIGN_OR_RETURN(auto logits, logits_->Slice(0, input.attention.num_seqs));
@@ -393,11 +400,11 @@ class PositionModel final : public Model {
     return logits;
   }
   int calls = 0;
+
  private:
   CheckpointConfig config_;
   std::optional<Tensor> table_, hidden_, logits_;
 };
-
 
 TEST(ModelRunnerCudaTest, GraphSamplingTracksBatchTurnoverAndPageTransitions) {
   ModelConfig mc;
@@ -423,8 +430,8 @@ TEST(ModelRunnerCudaTest, GraphSamplingTracksBatchTurnoverAndPageTransitions) {
       params.temperature = 0;
       params.ignore_eos = true;
       params.max_tokens = 8 + 3 * i;
-      ASSERT_TRUE(scheduler.AddRequest(Request(wave * 4 + i,
-          std::vector<int>(3 + i, 1), params)).ok());
+      ASSERT_TRUE(
+          scheduler.AddRequest(Request(wave * 4 + i, std::vector<int>(3 + i, 1), params)).ok());
     }
     while (scheduler.HasRequests()) {
       auto plan = scheduler.Schedule();

@@ -1,4 +1,3 @@
-// `inferx run-batch` — offline batch runner; not implemented yet.
 #include <CLI/CLI.hpp>
 
 #include "cli/commands.h"
@@ -7,7 +6,10 @@
 namespace inferx::cli {
 
 void RegisterRunBatch(CLI::App& root) {
-  CLI::App* sub = root.add_subcommand("run-batch", "Run batch prompts and write results to file.");
+  std::string subcmd_name = "run-batch";
+  std::string subcmd_description = "Run batch prompts and write results to file.";
+  CLI::App* sub = root.add_subcommand(std::move(subcmd_name), std::move(subcmd_description));
+
   sub->callback([] { ThrowIfError(UnimplementedError("run-batch is not implemented yet")); });
 }
 

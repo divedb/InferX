@@ -34,8 +34,8 @@ struct LanguageModelHead {
 
   /// \brief Gathers `rows`, then projects them to [rows, vocab] logits.
   /// The row buffer and logits borrow workspace allocated on first use.
-  StatusOr<Tensor> Forward(const Tensor& hidden, const Tensor& rows,
-                           ops::ExecutionContext& ctx, dist::CommBackend& comm);
+  StatusOr<Tensor> Forward(const Tensor& hidden, const Tensor& rows, ops::ExecutionContext& ctx,
+                           dist::CommBackend& comm);
 
  private:
   bool workspace_ready_ = false;
@@ -69,7 +69,6 @@ class CausalLM final : public Model {
     head_.vocab_total = decoder_.config().vocab_size;
   }
 
-  bool SupportsCudaGraphs() const override { return true; }
   const CheckpointConfig& config() const override { return decoder_.config(); }
   std::vector<LayerStateSpec> StateRequirements() const override {
     return decoder_.StateRequirements();

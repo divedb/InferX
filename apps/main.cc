@@ -9,7 +9,8 @@ int main(int argc, char** argv) {
   if (!inferx::core::InitializeLogging(inferx::core::LoggingConfigFromEnv()).ok()) {
     std::fprintf(stderr, "inferx: logging left at Abseil defaults\n");
   }
-  inferx::cli::InferxCli cli{"InferX — High-performance LLM inference engine",
-                             "inferx"};
+
+  inferx::cli::InferxCli cli{"InferX — High-performance LLM inference engine", "inferx"};
+
   return cli.Run(argc, argv);
 }

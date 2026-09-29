@@ -43,16 +43,20 @@ class DeviceRuntime {
 
   /// \brief Returns the device this runtime is permanently bound to.
   DeviceId device() const { return device_; }
+
   /// \brief Returns the kind of the bound device.
   DeviceKind kind() const { return device_.kind; }
+
   /// \brief Returns the number of devices of this runtime's kind.
   virtual int DeviceCount() const = 0;
+
   /// \brief Makes the bound device current on the calling thread.
   ///
   /// Used before compute or vendor calls outside this interface. Runtime
   /// operations activate their device themselves when needed.
   /// \return       OK, or an error status.
   virtual Status Activate() = 0;
+
   /// \brief Returns the free/total memory of the bound device.
   ///
   /// \return       The memory info, or an error status.
@@ -63,16 +67,19 @@ class DeviceRuntime {
   /// \param bytes  Number of bytes to allocate.
   /// \return       The allocation, or an error status.
   virtual StatusOr<void*> Allocate(size_t bytes) = 0;
+
   /// \brief Frees device memory returned by Allocate().
   ///
   /// \param ptr    The block to free.
   /// \return       OK, or an error status.
   virtual Status Free(void* ptr) = 0;
+
   /// \brief Allocates page-locked host memory of `bytes`.
   ///
   /// \param bytes Number of bytes to allocate.
   /// \return      The allocation, or an error status.
   virtual StatusOr<void*> AllocatePinnedHost(size_t bytes) = 0;
+
   /// \brief Frees page-locked host memory.
   ///
   /// \param ptr The block to free.
@@ -87,6 +94,7 @@ class DeviceRuntime {
   /// \param kind  Direction of the copy.
   /// \return      OK, or an error status.
   virtual Status Copy(void* dst, const void* src, size_t bytes, CopyKind kind) = 0;
+
   /// \brief Copies `bytes` asynchronously on `stream`.
   ///
   /// \param dst    Destination address.
@@ -105,52 +113,61 @@ class DeviceRuntime {
   ///
   /// \return       The stream, or an error status.
   virtual StatusOr<Stream> CreateStream() = 0;
+
   /// \brief Destroys a stream.
   ///
   /// \param stream The stream to destroy.
   /// \return       OK, or an error status.
   virtual Status DestroyStream(Stream stream) = 0;
+
   /// \brief Blocks until all work enqueued on `stream` completes.
   ///
   /// \param stream The stream to wait on.
   /// \return       OK, or an error status.
   virtual Status SynchronizeStream(Stream stream) = 0;
+
   /// \brief Creates an event, optionally enabled for timing.
   ///
   /// \param timing True to record elapsed time between events.
   /// \return       The event, or an error status.
   virtual StatusOr<DeviceEvent> CreateEvent(bool timing) = 0;
+
   /// \brief Destroys an event.
   ///
   /// \param event The event to destroy.
   /// \return      OK, or an error status.
   virtual Status DestroyEvent(DeviceEvent event) = 0;
+
   /// \brief Records `event` on `stream`.
   ///
   /// \param event  The event to record.
   /// \param stream The stream to record it on.
   /// \return       OK, or an error status.
   virtual Status RecordEvent(DeviceEvent event, Stream stream) = 0;
+
   /// \brief Blocks the host until `event` completes.
   ///
   /// \param event The event to wait on.
   /// \return      OK, or an error status.
   virtual Status SynchronizeEvent(DeviceEvent event) = 0;
+
   /// \brief Checks whether `event` has completed.
   ///
   /// \param event The event to query.
   /// \return      True when complete, or an error status.
   virtual StatusOr<bool> QueryEvent(DeviceEvent event) = 0;
+
   /// \brief Returns the elapsed time between two recorded events.
   ///
   /// \param start The earlier event; both must be timing events.
   /// \param end   The later event.
   /// \return      Elapsed milliseconds, or an error status.
   virtual StatusOr<float> ElapsedMs(DeviceEvent start, DeviceEvent end) = 0;
+
   /// \brief Checks whether `stream` is currently capturing a graph.
   ///
   /// \param stream The stream to query.
-  /// \return      True when capturing, or an error status.
+  /// \return       True when capturing, or an error status.
   virtual StatusOr<bool> IsCapturing(Stream stream) = 0;
 
   /// \brief Begins graph capture on `stream`.
@@ -158,17 +175,20 @@ class DeviceRuntime {
   /// \param stream The stream to capture.
   /// \return       OK, or an error status.
   virtual Status BeginCapture(Stream stream) = 0;
+
   /// \brief Ends capture and instantiates the captured graph.
   ///
   /// \param stream The stream whose capture ends.
   /// \return       The instantiated graph, or an error status.
   virtual StatusOr<GraphExec> EndCaptureAndInstantiate(Stream stream) = 0;
+
   /// \brief Enqueues the instantiated graph on `stream`.
   ///
   /// \param graph  The graph to launch.
   /// \param stream The stream to launch it on.
   /// \return       OK, or an error status.
   virtual Status LaunchGraph(GraphExec graph, Stream stream) = 0;
+
   /// \brief Destroys an instantiated graph.
   ///
   /// \param graph The graph to destroy.

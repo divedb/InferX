@@ -1,10 +1,3 @@
-// CPU DeviceRuntime: host allocation, memcpy, and no-op synchronization.
-//
-// The CPU runtime exists so that the scheduler, KV-cache bookkeeping, and the
-// tensor layer are unit-testable with no device attached. Its streams and
-// events are dummies -- host execution is synchronous -- and graph capture is
-// unsupported, which `capabilities()` reports.
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -17,7 +10,6 @@
 #include "absl/status/status.h"
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/core/device_runtime_internal.h"
 
 namespace inferx::internal {
 namespace {
@@ -107,10 +99,10 @@ class CpuRuntime final : public DeviceRuntime {
     return Copy(dst, src, bytes, kind);
   }
 
-Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
-  std::memset(dst, 0, bytes);
-  return OkStatus();
-}
+  Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
+    std::memset(dst, 0, bytes);
+    return OkStatus();
+  }
 
   StatusOr<Stream> CreateStream() override { return Stream(nullptr); }
 
@@ -157,10 +149,5 @@ Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
 };
 
 }  // namespace
-
-DeviceRuntime* CpuDeviceRuntime() {
-  static CpuRuntime runtime;
-  return &runtime;
-}
 
 }  // namespace inferx::internal

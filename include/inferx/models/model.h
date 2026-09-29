@@ -61,10 +61,6 @@ class Model {
  public:
   virtual ~Model() = default;
 
-  // Opt in only when Forward uses stable capacity buffers and device metadata
-  // for changing decode positions/block tables. Custom models default to eager.
-  virtual bool SupportsCudaGraphs() const { return false; }
-
   /// \brief Loads a checkpoint, selecting the implementation by architecture.
   ///
   /// Attention kernels are chosen by the runtime from execution geometry;

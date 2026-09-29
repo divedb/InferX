@@ -12,7 +12,6 @@ enum class Style { kError, kWarning, kSuccess, kCommand, kHeading, kDim, kPlaceh
 bool IsTerminal(FILE* stream);
 bool UseColor(ColorMode mode, bool terminal);
 
-// All terminal escape sequences live here. Callers choose semantic styles.
 class StyleSheet {
  public:
   explicit StyleSheet(bool color) : color_(color) {}

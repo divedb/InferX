@@ -517,8 +517,8 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   }
   const sampling::SamplingMetadata metadata =
       sampling::SamplingMetadata::Build(mc.vocab_size, absl::MakeConstSpan(per));
-  if (pure_decode && execution.enable_cuda_graphs && device.IsCuda() &&
-      model->SupportsCudaGraphs()) {
+
+  if (pure_decode && execution.enable_cuda_graphs && device.IsCuda()) {
     auto& graph = decode_graphs[batch];
     if (!graph.warmed) {
       // Let cuBLAS initialize algorithms/workspace for this exact shape before capture.
