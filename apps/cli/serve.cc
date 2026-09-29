@@ -32,6 +32,7 @@ struct ServeArgs {
     p.cache = engine.BuildCacheConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.execution = engine.BuildExecutionConfig();
+    p.parallel = engine.BuildParallelConfig();
     p.default_sampling = sampling.Build();
     ApplyGenerationConfig(&p.default_sampling);
     p.host = host;

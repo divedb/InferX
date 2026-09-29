@@ -3,6 +3,7 @@
 #include <utility>
 #include <variant>
 
+#include "inferx/dist/comm.h"
 #include "inferx/models/causal/model_traits.h"
 #include "inferx/models/components/decoder_layer.h"
 #include "inferx/models/components/gdn.h"
@@ -47,8 +48,8 @@ class DecoderLayer {
                  const RecurrentStatePool& recurrent, components::AttentionWorkspace& attention_ws,
                  components::MlaWorkspace& mla_ws, components::GdnWorkspace& gdn_ws,
                  components::MlpWorkspace& mlp_ws, components::MoeWorkspace& moe_ws,
-                 Tensor& packed, ops::ExecutionContext& ctx, DiagnosticTrace& trace,
-                 const std::string& prefix) const {
+                 Tensor& packed, ops::ExecutionContext& ctx, dist::CommBackend& comm,
+                 DiagnosticTrace& trace, const std::string& prefix) const {
     if (first) {
       INFERX_RETURN_IF_ERROR(input_norm_.Forward(ctx, hidden, normed));
     } else {
@@ -71,6 +72,10 @@ class DecoderLayer {
     } else {
       return InvalidArgumentError("layer mixer has no weights");
     }
+    // The mixer's output projection is row-parallel: fold the ranks'
+    // partial sums before the result joins the residual stream (and
+    // before Gemma's output-side norm, which applies to the full sum).
+    INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, mixed));
     if (output_norm_residual_) {
       // Gemma sandwich: the mixer output is normalized before the residual
       // add, which the feed-forward-side norm then fuses.
@@ -83,6 +88,9 @@ class DecoderLayer {
     INFERX_RETURN_IF_ERROR(components::RunFeedForward(feed_forward_, feed_forward_weights_,
                                                       normed, mlp_ws, moe_ws, &packed, ctx, &trace,
                                                       prefix, mixed));
+    // Same folding for the feed-forward: down projections (dense, expert,
+    // and shared) sum rank-local partials over the sharded input.
+    INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, mixed));
     if (output_norm_residual_) {
       INFERX_RETURN_IF_ERROR(feed_forward_out_norm_->Forward(ctx, mixed, mixed));
       if (trace.enabled()) trace.Write(prefix + "feed_forward_out_norm", mixed);

@@ -4,7 +4,6 @@
 
 namespace inferx::families {
 
-// Explicit references keep factories reachable in static-library builds.
 Family Llama();
 Family Qwen2();
 Family Qwen3();

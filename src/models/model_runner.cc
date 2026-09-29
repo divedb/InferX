@@ -1,19 +1,22 @@
-#include "inferx/cache/recurrent_state_pool.h"
 #include "inferx/models/model_runner.h"
-#include "inferx/ops/execution_context.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
+#include "inferx/cache/recurrent_state_pool.h"
 #include "inferx/core/logging.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
+#include "inferx/dist/nccl_comm.h"
 #include "inferx/ops/execution_context.h"
 #include "inferx/sampling/sampler.h"
 
@@ -34,6 +37,13 @@ struct RunnerRequestState {
 }  // namespace
 
 struct ModelRunnerImpl {
+  struct DecodeGraph {
+    GraphExec exec;
+    std::optional<Tensor> logits;
+    std::optional<sampling::SamplerOutput> output;
+    bool warmed = false;
+  };
+
   ModelConfig config;
   CacheConfig cache;
   SchedulerConfig scheduler;
@@ -42,6 +52,7 @@ struct ModelRunnerImpl {
   DeviceRuntime* runtime = nullptr;
   Stream stream;
   std::unique_ptr<Model> model;
+  std::unique_ptr<dist::CommBackend> comm;
   std::unique_ptr<KvBlockPool> pool;
   std::unique_ptr<RecurrentStatePool> recurrent_pool;
   /// Free recurrent slots, LIFO; empty when the model has no recurrent layers.
@@ -54,25 +65,43 @@ struct ModelRunnerImpl {
   int32_t* host_inputs = nullptr;
   std::unique_ptr<sampling::Sampler> sampler;
   int32_t* host_samples = nullptr;
-  struct DecodeGraph {
-    GraphExec exec;
-    std::optional<Tensor> logits;
-    std::optional<sampling::SamplerOutput> output;
-    bool warmed = false;
-  };
   absl::flat_hash_map<int, DecodeGraph> decode_graphs;
   Status failure;
+  bool sample_output = true;
+  std::function<void(const Status&)> abort;
+  std::function<Status()> check_health;
+  DeviceEvent completion;
+  std::vector<std::unique_ptr<ModelRunner>> peers;
+
+  Status WaitForStream() {
+    if (!check_health) return runtime->SynchronizeStream(stream);
+    INFERX_RETURN_IF_ERROR(runtime->RecordEvent(completion, stream));
+
+    while (true) {
+      INFERX_RETURN_IF_ERROR(check_health());
+      INFERX_ASSIGN_OR_RETURN(bool done, runtime->QueryEvent(completion));
+
+      if (done) return OkStatus();
+
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  }
 
   ~ModelRunnerImpl() {
     if (runtime == nullptr) return;
+
     (void)runtime->Activate();
+
     // Drain queued work even after an operation failed before the runner's sync.
     if (stream.handle != nullptr) (void)runtime->SynchronizeStream(stream);
+
     for (auto& [batch, graph] : decode_graphs) {
       if (graph.exec.handle != nullptr) (void)runtime->DestroyGraph(graph.exec);
     }
+
     if (host_samples != nullptr) (void)runtime->FreePinnedHost(host_samples);
     if (host_inputs != nullptr) (void)runtime->FreePinnedHost(host_inputs);
+    if (completion.handle != nullptr) (void)runtime->DestroyEvent(completion);
     if (stream.handle != nullptr) (void)runtime->DestroyStream(stream);
   }
 
@@ -87,21 +116,92 @@ const CheckpointConfig& ModelRunner::checkpoint_config() const {
 }
 
 StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
-    const ModelConfig& model, const CacheConfig& cache,
-    const SchedulerConfig& scheduler, const ExecutionConfig& execution,
-    const ParallelConfig& parallel) {
+    const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
+    const ExecutionConfig& execution, const ParallelConfig& parallel,
+    std::unique_ptr<dist::CommBackend> comm) {
+  INFERX_RETURN_IF_ERROR(parallel.Validate());
+  INFERX_RETURN_IF_ERROR(model.device.Validate());
+  if (!comm && parallel.tensor_parallel_size > 1) {
+    if (parallel.tensor_parallel_rank != 0) {
+      return InvalidArgumentError("the tensor-parallel coordinator must have rank zero");
+    }
+    if (model.device.device_type != "cuda") {
+      return InvalidArgumentError("multi-GPU tensor parallelism requires CUDA");
+    }
+    if (execution.enable_cuda_graphs) {
+      return UnimplementedError("tensor-parallel serving currently requires eager execution");
+    }
+    std::vector<int> ids = model.device.device_ids;
+    if (ids.empty()) {
+      for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) ids.push_back(rank);
+    }
+    if (ids.size() != static_cast<size_t>(parallel.tensor_parallel_size)) {
+      return InvalidArgumentError(
+          "device-ids must contain one device per tensor-parallel rank");
+    }
+    std::vector<DeviceId> devices;
+    for (const int id : ids) {
+      if (id > std::numeric_limits<int8_t>::max()) {
+        return InvalidArgumentError("CUDA device ordinal is out of range");
+      }
+      devices.push_back(DeviceId::Cuda(static_cast<int8_t>(id)));
+    }
+    INFERX_ASSIGN_OR_RETURN(auto checkpoint,
+                            CheckpointConfig::FromFile(model.model_dir + "/config.json"));
+    if (checkpoint.model_type != "qwen3" || checkpoint.architectures != "Qwen3ForCausalLM") {
+      return UnimplementedError("multi-GPU serving currently supports dense Qwen3 checkpoints");
+    }
+    const int size = parallel.tensor_parallel_size;
+    if (checkpoint.num_attention_heads <= 0 || checkpoint.num_key_value_heads <= 0 ||
+        checkpoint.intermediate_size <= 0 || checkpoint.vocab_size <= 0 ||
+        checkpoint.num_attention_heads % size != 0 ||
+        checkpoint.intermediate_size % size != 0 || checkpoint.vocab_size % size != 0 ||
+        (checkpoint.num_key_value_heads >= size ? checkpoint.num_key_value_heads % size != 0
+                                                : size % checkpoint.num_key_value_heads != 0)) {
+      return InvalidArgumentError("Qwen3 dimensions do not support this tensor-parallel size");
+    }
+    INFERX_ASSIGN_OR_RETURN(auto world, dist::NcclWorld::Create(devices));
+    std::vector<std::unique_ptr<ModelRunner>> ranks;
+    for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) {
+      ModelConfig local = model;
+      local.device.device_ids = {ids[rank]};
+      auto made =
+          Create(local, cache, scheduler, execution,
+                 ParallelConfig{parallel.tensor_parallel_size, rank}, world->MakeRank(rank));
+      if (!made.ok()) {
+        world->Abort(made.status());
+        return made.status();
+      }
+      ranks.push_back(*std::move(made));
+    }
+    return CreateGroup(
+        std::move(ranks), [world](const Status& status) { world->Abort(status); },
+        [world] { return world->CheckHealth(); });
+  }
+  if (!comm) comm = std::make_unique<dist::SingleRankComm>();
+  if (comm->size() != parallel.tensor_parallel_size ||
+      comm->rank() != parallel.tensor_parallel_rank) {
+    return InvalidArgumentError("runner communicator must match the model's parallel topology");
+  }
   if (scheduler.max_num_batched_tokens <= 0 || scheduler.max_num_seqs <= 0) {
     return InvalidArgumentError("runner requires positive token and sequence capacities");
   }
   INFERX_ASSIGN_OR_RETURN(
-      auto loaded, Model::Load(model.model_dir, model.device.PrimaryDevice(),
-                               scheduler.max_num_batched_tokens, scheduler.max_num_seqs, parallel));
-  return Create(model, cache, scheduler, execution, std::move(loaded));
+      auto loaded,
+      Model::Load(model.model_dir, model.device.PrimaryDevice(),
+                  scheduler.max_num_batched_tokens, scheduler.max_num_seqs, parallel));
+
+  return Create(model, cache, scheduler, execution, std::move(loaded), std::move(comm));
 }
 
 StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
-    const ExecutionConfig& execution, std::unique_ptr<Model> loaded) {
+    const ExecutionConfig& execution, std::unique_ptr<Model> loaded,
+    std::unique_ptr<dist::CommBackend> comm) {
+  if (!comm) comm = std::make_unique<dist::SingleRankComm>();
+  if (comm->size() <= 0 || comm->rank() < 0 || comm->rank() >= comm->size()) {
+    return InvalidArgumentError("runner requires a valid communicator topology");
+  }
   if (!loaded || scheduler.max_num_batched_tokens <= 0 || scheduler.max_num_seqs <= 0 ||
       cache.num_kv_blocks <= 0 || cache.num_kv_blocks > std::numeric_limits<int32_t>::max() ||
       cache.block_size <= 0 || cache.block_size > std::numeric_limits<int32_t>::max()) {
@@ -110,8 +210,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_RETURN_IF_ERROR(model.device.Validate());
   const DeviceId device = model.device.PrimaryDevice();
   const auto requirements = loaded->StateRequirements();
-  if (requirements.empty() || requirements.size() !=
-                                  static_cast<size_t>(loaded->config().num_hidden_layers)) {
+  if (requirements.empty() ||
+      requirements.size() != static_cast<size_t>(loaded->config().num_hidden_layers)) {
     return InvalidArgumentError("model must declare state for each decoder layer");
   }
   std::vector<KvLayout> layouts;
@@ -129,18 +229,19 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   impl->scheduler = scheduler;
   impl->execution = execution;
   impl->model = std::move(loaded);
+  impl->comm = std::move(comm);
   impl->device = device;
   INFERX_ASSIGN_OR_RETURN(impl->runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(impl->runtime->Activate());
   INFERX_ASSIGN_OR_RETURN(impl->stream, impl->runtime->CreateStream());
   const auto& mc = impl->model->config();
-  INFERX_ASSIGN_OR_RETURN(auto pool,
-                          KvBlockPool::Create(cache.num_kv_blocks, cache.block_size, layouts,
-                                              device));
+  INFERX_ASSIGN_OR_RETURN(
+      auto pool, KvBlockPool::Create(cache.num_kv_blocks, cache.block_size, layouts, device));
   impl->pool = std::make_unique<KvBlockPool>(std::move(pool));
   if (!recurrent_specs.empty()) {
-    INFERX_ASSIGN_OR_RETURN(auto recurrent, RecurrentStatePool::Create(
-                                                 recurrent_specs, scheduler.max_num_seqs, device));
+    INFERX_ASSIGN_OR_RETURN(
+        auto recurrent,
+        RecurrentStatePool::Create(recurrent_specs, scheduler.max_num_seqs, device));
     impl->recurrent_pool = std::make_unique<RecurrentStatePool>(std::move(recurrent));
     impl->free_recurrent_slots.resize(scheduler.max_num_seqs);
     for (int64_t slot = 0; slot < scheduler.max_num_seqs; ++slot) {
@@ -148,8 +249,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
           static_cast<int32_t>(scheduler.max_num_seqs - 1 - slot);
     }
   }
-  INFERX_LOG(INFO) << "runner ready: device=" << device.ToString() << " model="
-                   << model.model_dir << " kv_blocks=" << cache.num_kv_blocks
+  INFERX_LOG(INFO) << "runner ready: device=" << device.ToString()
+                   << " model=" << model.model_dir << " kv_blocks=" << cache.num_kv_blocks
                    << " block_size=" << cache.block_size
                    << " max_tokens=" << scheduler.max_num_batched_tokens
                    << " max_seqs=" << scheduler.max_num_seqs;
@@ -171,8 +272,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   const int64_t S = scheduler.max_num_seqs;
   // Fixed offsets keep graph pointers stable. One pinned upload replaces eight
   // synchronous copies; Run drains the stream before this staging area is reused.
-  INFERX_ASSIGN_OR_RETURN(impl->input_storage,
-                          alloc(3 * T + 5 * S + 2 + cache.num_kv_blocks));
+  INFERX_ASSIGN_OR_RETURN(impl->input_storage, alloc(3 * T + 5 * S + 2 + cache.num_kv_blocks));
   int64_t offset = 0;
   auto input_view = [&](int64_t size) -> StatusOr<Tensor> {
     INFERX_ASSIGN_OR_RETURN(auto view, impl->input_storage->Slice(offset, offset + size));
@@ -190,15 +290,60 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
   INFERX_ASSIGN_OR_RETURN(impl->recurrent_indices, input_view(S));
   if (device.IsCuda()) {
     INFERX_ASSIGN_OR_RETURN(void* inputs,
-        impl->runtime->AllocatePinnedHost(impl->input_storage->NBytes()));
+                            impl->runtime->AllocatePinnedHost(impl->input_storage->NBytes()));
     impl->host_inputs = static_cast<int32_t*>(inputs);
     std::memset(inputs, 0, impl->input_storage->NBytes());
     INFERX_ASSIGN_OR_RETURN(void* host, impl->runtime->AllocatePinnedHost(S * sizeof(int32_t)));
     impl->host_samples = static_cast<int32_t*>(host);
   }
-  INFERX_ASSIGN_OR_RETURN(impl->sampler,
-                          sampling::Sampler::Create(scheduler.max_num_seqs, mc.vocab_size, device));
+  INFERX_ASSIGN_OR_RETURN(
+      impl->sampler, sampling::Sampler::Create(scheduler.max_num_seqs, mc.vocab_size, device));
   return std::unique_ptr<ModelRunner>(new ModelRunner(std::move(impl)));
+}
+
+StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::CreateGroup(
+    std::vector<std::unique_ptr<ModelRunner>> ranks, std::function<void(const Status&)> abort,
+    std::function<Status()> check_health) {
+  if (ranks.empty() || !abort)
+    return InvalidArgumentError("rank group needs runners and abort");
+  for (size_t rank = 0; rank < ranks.size(); ++rank) {
+    if (!ranks[rank]) return InvalidArgumentError("rank group contains a null runner");
+    auto& local = *ranks[rank]->impl_;
+    const auto& first = *ranks.front()->impl_;
+    if (!local.peers.empty() || local.comm->rank() != static_cast<int>(rank) ||
+        local.comm->size() != static_cast<int>(ranks.size()) ||
+        local.scheduler.max_num_seqs != first.scheduler.max_num_seqs ||
+        local.scheduler.max_num_batched_tokens != first.scheduler.max_num_batched_tokens ||
+        local.cache.num_kv_blocks != first.cache.num_kv_blocks ||
+        local.cache.block_size != first.cache.block_size ||
+        local.model->config().vocab_size != first.model->config().vocab_size) {
+      const auto status = InvalidArgumentError("rank group topology or capacities disagree");
+      abort(status);
+      return status;
+    }
+    if (local.execution.enable_cuda_graphs) {
+      const auto status = UnimplementedError("rank groups currently require eager execution");
+      abort(status);
+      return status;
+    }
+    local.abort = abort;
+    local.check_health = check_health;
+    if (check_health) {
+      auto event = local.runtime->CreateEvent(false);
+      if (!event.ok()) {
+        abort(event.status());
+        return event.status();
+      }
+      local.completion = *event;
+    }
+    local.sample_output = rank == 0;
+    if (rank != 0) local.sampler.reset();
+  }
+  auto coordinator = std::move(ranks.front());
+  for (size_t rank = 1; rank < ranks.size(); ++rank) {
+    coordinator->impl_->peers.push_back(std::move(ranks[rank]));
+  }
+  return coordinator;
 }
 
 StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& output) {
@@ -226,8 +371,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
       free_recurrent_slots.pop_back();
       // A fresh sequence starts from zero state; stream-ordered so the
       // step's kernels (and captured graphs) read zeros first.
-      INFERX_RETURN_IF_ERROR(
-          recurrent_pool->ResetSlot(lifecycle_ctx, state.recurrent_slot));
+      INFERX_RETURN_IF_ERROR(recurrent_pool->ResetSlot(lifecycle_ctx, state.recurrent_slot));
     }
     if (!states.emplace(nr.request_id, std::move(state)).second) {
       return InvalidArgumentError("duplicate runner request ", nr.request_id);
@@ -335,7 +479,8 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   }
   if (host_inputs != nullptr) {
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(input_storage->Data(), host_inputs,
-        input_storage->NBytes(), CopyKind::kHostToDevice, stream));
+                                              input_storage->NBytes(), CopyKind::kHostToDevice,
+                                              stream));
   }
   // ModelInput carries exact-size views of the capacity buffers; the padded
   // tails of the upload buffers are never visible to the model.
@@ -351,18 +496,13 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   if (recurrent_pool != nullptr) {
     INFERX_ASSIGN_OR_RETURN(recurrent_v, recurrent_indices->Slice(0, batch));
   }
-  ModelInput input{std::move(token_ids_v),
-                   AttentionBatch{std::move(positions_v),
-                                  std::move(batch_indices_v),
-                                  std::move(qo_indptr_v),
-                                  std::move(kv_indptr_v),
-                                  std::move(kv_indices_v),
-                                  std::move(last_page_len_v),
-                                  absl::MakeConstSpan(qo),
-                                  absl::MakeConstSpan(kv),
-                                  static_cast<int>(tokens.size()),
-                                  batch},
-                   std::move(logit_rows_v)};
+  ModelInput input{
+      std::move(token_ids_v),
+      AttentionBatch{std::move(positions_v), std::move(batch_indices_v), std::move(qo_indptr_v),
+                     std::move(kv_indptr_v), std::move(kv_indices_v),
+                     std::move(last_page_len_v), absl::MakeConstSpan(qo),
+                     absl::MakeConstSpan(kv), static_cast<int>(tokens.size()), batch},
+      std::move(logit_rows_v)};
   input.attention.recurrent_indices = std::move(recurrent_v);
   ops::ExecutionContext ctx(*runtime, stream);
   std::optional<Tensor> logits;
@@ -382,13 +522,13 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
     auto& graph = decode_graphs[batch];
     if (!graph.warmed) {
       // Let cuBLAS initialize algorithms/workspace for this exact shape before capture.
-      INFERX_ASSIGN_OR_RETURN(logits, model->Forward(input, model_state, ctx));
+      INFERX_ASSIGN_OR_RETURN(logits, model->Forward(input, model_state, ctx, *comm));
       graph.warmed = true;
     } else {
       if (graph.exec.handle == nullptr) {
         INFERX_VLOG(1) << "capturing decode graph for batch " << batch;
         INFERX_RETURN_IF_ERROR(runtime->BeginCapture(stream));
-        auto captured = model->Forward(input, model_state, ctx);
+        auto captured = model->Forward(input, model_state, ctx, *comm);
         absl::StatusOr<sampling::SamplerOutput> samples =
             captured.ok() ? sampler->Sample(ctx, *captured, metadata)
                           : absl::StatusOr<sampling::SamplerOutput>(captured.status());
@@ -407,8 +547,19 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
       sampled = graph.output;  // Graph replay already produced the samples.
     }
   } else {
-    INFERX_ASSIGN_OR_RETURN(logits, model->Forward(input, model_state, ctx));
-    INFERX_ASSIGN_OR_RETURN(sampled, sampler->Sample(ctx, *logits, metadata));
+    INFERX_ASSIGN_OR_RETURN(logits, model->Forward(input, model_state, ctx, *comm));
+    if (sample_output) {
+      INFERX_ASSIGN_OR_RETURN(sampled, sampler->Sample(ctx, *logits, metadata));
+    }
+  }
+  if (!sample_output) {
+    INFERX_RETURN_IF_ERROR(WaitForStream());
+    for (const auto& sr : output.scheduled) {
+      auto& state = states.at(sr.request_id);
+      state.num_computed += sr.num_new_tokens;
+      ++state.generated;
+    }
+    return result;
   }
   // The graph warm-up iteration runs Forward eagerly without capture; sample
   // its logits through the normal path.
@@ -426,12 +577,13 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
   std::vector<int32_t> samples;
   if (host_samples != nullptr) {
     INFERX_RETURN_IF_ERROR(runtime->CopyAsync(host_samples, sampled->sampled_token_ids.Data(),
-        batch * sizeof(int32_t), CopyKind::kDeviceToHost, stream));
-    INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
+                                              batch * sizeof(int32_t), CopyKind::kDeviceToHost,
+                                              stream));
+    INFERX_RETURN_IF_ERROR(WaitForStream());
     samples.assign(host_samples, host_samples + batch);
   } else {
     // CPU device: tensors are host-accessible once the stream has drained.
-    INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
+    INFERX_RETURN_IF_ERROR(WaitForStream());
     const int32_t* ids = sampled->sampled_token_ids.DataAs<int32_t>();
     samples.assign(ids, ids + batch);
   }
@@ -447,11 +599,55 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
 }
 
 StatusOr<ModelRunnerOutput> ModelRunner::Run(const SchedulerOutput& output) {
+  if (impl_->peers.empty()) return RunLocal(output);
+  if (!impl_->failure.ok()) return FailedPreconditionError(impl_->failure.message());
+  std::vector<std::future<StatusOr<ModelRunnerOutput>>> pending;
+  try {
+    for (const auto& peer : impl_->peers) {
+      pending.push_back(std::async(
+          std::launch::async, [rank = peer.get(), &output] { return rank->RunLocal(output); }));
+    }
+  } catch (const std::exception& error) {
+    impl_->failure = InternalError("could not start rank execution: ", error.what());
+    impl_->abort(impl_->failure);
+    return impl_->failure;  // Futures join before the borrowed output expires.
+  }
+  auto result = RunLocal(output);
+  Status failure = result.status();
+  for (auto& future : pending) {
+    auto peer_result = future.get();
+    if (failure.ok() && !peer_result.ok()) failure = peer_result.status();
+  }
+  if (!failure.ok()) {
+    impl_->failure = failure;
+    impl_->abort(failure);
+    return failure;
+  }
+  // Only rank zero draws a token. Share those exact ids with every rank,
+  // including stochastic sampling, before admitting the next scheduler step.
+  for (const auto& sample : result->samples) {
+    for (auto& peer : impl_->peers) {
+      peer->impl_->states.at(sample.request_id).last_sampled = sample.token_ids.back();
+    }
+  }
+  return result;
+}
+
+StatusOr<ModelRunnerOutput> ModelRunner::RunLocal(const SchedulerOutput& output) {
   if (!impl_->failure.ok()) {
     return FailedPreconditionError("runner failed previously: ", impl_->failure.message());
   }
-  auto result = impl_->Execute(output);
+  auto result = [&]() -> StatusOr<ModelRunnerOutput> {
+    try {
+      return impl_->Execute(output);
+    } catch (const std::exception& error) {
+      return InternalError("rank execution failed: ", error.what());
+    } catch (...) {
+      return InternalError("rank execution failed with an unknown exception");
+    }
+  }();
   if (!result.ok()) {
+    if (impl_->abort) impl_->abort(result.status());
     // A scheduler step and cache writes cannot be rolled back safely. Drain
     // queued work and require reconstruction instead of retrying partial state.
     (void)impl_->runtime->SynchronizeStream(impl_->stream);

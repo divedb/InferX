@@ -7,6 +7,7 @@
 #include "inferx/config/cache_config.h"
 #include "inferx/core/status.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
 #include "inferx/models/checkpoint_config.h"
@@ -27,6 +28,7 @@ struct ServeParams {
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
+  ParallelConfig parallel;
   sampling::SamplingParams default_sampling;  ///< Defaults for requests that omit them.
   TokenizerPoolConfig tokenizer;              ///< Prompt-preparation worker pool.
   std::string host = "127.0.0.1";

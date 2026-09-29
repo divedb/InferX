@@ -3,24 +3,34 @@
 ///
 /// Collectives sit behind this interface so the model path can express
 /// "reduce my partial" without knowing whether the world is one process
-/// (identity), one node (in-memory or NCCL), or many. SingleRankComm is the
-/// only backend today: with a world of one every collective is the identity
-/// function, which is exactly correct -- and it is the only backend this
-/// build can honor, since no NCCL library is present. The NCCL backend for
-/// multi-GPU worlds arrives with the tensor-parallel milestone: same
-/// interface, worker-per-device processes, one communicator per rank.
+/// (identity), one process hosting several virtual ranks (LoopbackComm,
+/// the reference backend for sharded-execution tests), or a set of
+/// worker processes (NcclComm over NCCL, one rank per device).
 
 #ifndef INFERX_DIST_COMM_H_
 #define INFERX_DIST_COMM_H_
 
-#include "inferx/config/parallel_config.h"
+#include <cstdint>
+#include <limits>
+
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
+#include "inferx/ops/execution_context.h"
 
 namespace inferx {
 namespace dist {
 
 /// \brief Collectives over the worker world, from one worker's view.
+///
+/// Collectives use the context's stream. Success means work was submitted;
+/// results are ready for subsequent work on that stream. Tensors and their
+/// storage must remain alive until the stream completes. Submission may block
+/// waiting for peers, so ranks must be driven concurrently.
+///
+/// Calls on each rank must be serialized, and all ranks must issue the same
+/// collective sequence with matching input shapes and dtypes. Only BF16 is
+/// supported today. All tensors must live on the context's device. A failed
+/// collective invalidates the current forward; callers must not retry it.
 class CommBackend {
  public:
   virtual ~CommBackend() = default;
@@ -34,52 +44,75 @@ class CommBackend {
   ///
   /// Backed by all-reduce; row-parallel projections (o_proj, down_proj)
   /// produce rank-local partial sums that this folds into the full result.
-  virtual Status AllReduceSumBf16(Tensor& partial) = 0;
+  /// Also folds the masked partials of a vocab-parallel embedding lookup.
+  /// Accepts any tensor rank, including scalars and empty tensors.
+  virtual Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) = 0;
 
   /// \brief Concatenates rank shards along the last dimension: each rank
   ///        contributes `partial` [rows, shard] and receives `full`
-  ///        [rows, size * shard]. Vocab-parallel logits before sampling.
-  virtual Status AllGatherLastDim(const Tensor& partial, Tensor& full) = 0;
+  ///        [rows, size * shard], in rank order. Both tensors must be BF16.
+  /// Buffers must not overlap, except exact aliasing is allowed at size 1.
+  virtual Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+                                  Tensor& full) = 0;
 
-  /// \brief Orders every rank past this point.
-  virtual Status Barrier() = 0;
+ protected:
+  static Status ValidateTensor(const ops::ExecutionContext& ctx, const Tensor& tensor) {
+    if (tensor.GetDataType() != DataType::kBFloat16) {
+      return InvalidArgumentError("collectives carry bfloat16, got ",
+                                  DataTypeName(tensor.GetDataType()));
+    }
+    if (tensor.Device() != ctx.device()) {
+      return InvalidArgumentError("collective tensors must live on the context's device");
+    }
+    return OkStatus();
+  }
+
+  Status ValidateGather(const ops::ExecutionContext& ctx, const Tensor& partial,
+                        const Tensor& full) const {
+    INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, partial));
+    INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, full));
+    if (size() <= 0 || partial.Rank() != 2 || full.Rank() != 2 ||
+        partial.Dim(0) != full.Dim(0) ||
+        partial.Dim(1) > std::numeric_limits<int64_t>::max() / size() ||
+        full.Dim(1) != size() * partial.Dim(1)) {
+      return InvalidArgumentError("all-gather shapes disagree: partial ",
+                                  partial.GetShape().ToString(), " vs full ",
+                                  full.GetShape().ToString(), " for world ", size());
+    }
+    if (partial.IsEmpty() || (size() == 1 && partial.Data() == full.Data())) {
+      return OkStatus();
+    }
+    const auto input = reinterpret_cast<uintptr_t>(partial.Data());
+    const auto output = reinterpret_cast<uintptr_t>(full.Data());
+    const bool overlaps = input <= output
+                              ? output - input < static_cast<uintptr_t>(partial.NBytes())
+                              : input - output < static_cast<uintptr_t>(full.NBytes());
+    if (overlaps) return InvalidArgumentError("all-gather buffers must not overlap");
+    return OkStatus();
+  }
 };
 
 /// \brief The world-of-one backend: every collective is the identity,
 ///        which is mathematically exact for tensor_parallel_size == 1.
 class SingleRankComm final : public CommBackend {
  public:
-  explicit SingleRankComm(const ParallelConfig& parallel)
-      : size_(parallel.tensor_parallel_size), rank_(parallel.tensor_parallel_rank) {}
+  int size() const override { return 1; }
+  int rank() const override { return 0; }
 
-  int size() const override { return size_; }
-  int rank() const override { return rank_; }
-
-  Status AllReduceSumBf16(Tensor& partial) override {
-    return ValidateAndCopy(partial, partial);
+  Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) override {
+    return ValidateTensor(ctx, partial);
   }
 
-  Status AllGatherLastDim(const Tensor& partial, Tensor& full) override {
-    return ValidateAndCopy(partial, full);
+  Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+                          Tensor& full) override {
+    INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
+    if (full.Data() == partial.Data() || partial.IsEmpty()) return OkStatus();
+    return ctx.runtime().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
+                                   CopyKind::kDeviceToDevice, ctx.stream());
   }
-
-  Status Barrier() override { return OkStatus(); }
-
- private:
-  static Status ValidateAndCopy(const Tensor& partial, Tensor& out) {
-    if (partial.GetDataType() != DataType::kBFloat16) {
-      return InvalidArgumentError("collectives carry bfloat16, got ",
-                                  DataTypeName(partial.GetDataType()));
-    }
-    if (out.Data() != partial.Data()) return partial.CopyTo(out);
-    return OkStatus();
-  }
-
-  int size_;
-  int rank_;
 };
 
-}  // namespace inferx::dist
+}  // namespace dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_COMM_H_

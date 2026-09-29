@@ -71,8 +71,9 @@ components (attention, mlp, qkv_linear, ...)  --  ops
   components over shared execution functions. Traits select structural choices;
   dimensions, epsilon, RoPE parameters, and weight tying remain runtime data.
   QKV and output bias are represented separately. Backend kernels remain in ops.
-  Tensor-parallel geometry and loading are supported, but execution with more
-  than one rank remains rejected until collectives are implemented.
+  Tensor-parallel geometry, loading, and multi-rank execution are supported
+  for dense Qwen3; see tensor_parallel.md for the collective layout and
+  serving constraints.
 
 - **ops** holds the reusable, backend-portable operations the forwards call.
   Each op is a free function: a public header with the agnostic API and

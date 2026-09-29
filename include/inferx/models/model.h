@@ -1,20 +1,23 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
-#include <optional>
-
 #include "absl/types/span.h"
-#include "inferx/models/state.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/config/parallel_config.h"
 #include "inferx/models/checkpoint_config.h"
+#include "inferx/models/state.h"
 #include "inferx/ops/execution_context.h"
 
 namespace inferx {
+
+namespace dist {
+class CommBackend;
+}
 
 /// \brief Logical batch metadata for one flat token batch.
 ///
@@ -29,10 +32,11 @@ struct AttentionBatch {
   Tensor kv_indptr;      ///< [num_seqs + 1] cumulative KV block counts.
   Tensor kv_indices;     ///< Flattened block tables of all sequences.
   Tensor last_page_len;  ///< [num_seqs] tokens in each sequence's last block.
-  absl::Span<const int32_t> host_qo_indptr;  ///< Required mirror of qo_indptr for planning; must match device data.
+  absl::Span<const int32_t>
+      host_qo_indptr;  ///< Required mirror of qo_indptr for planning; must match device data.
   absl::Span<const int32_t> host_kv_indptr;  ///< Mirror of kv_indptr, host.
-  int num_tokens = 0;  ///< Total scheduled tokens.
-  int num_seqs = 0;    ///< Sequences in the batch.
+  int num_tokens = 0;                        ///< Total scheduled tokens.
+  int num_seqs = 0;                          ///< Sequences in the batch.
   /// [num_seqs] recurrent-state slot of each sequence; absent when the model
   /// has no recurrent layers.
   std::optional<Tensor> recurrent_indices;
@@ -85,15 +89,16 @@ class Model {
 
   /// \brief Runs one forward pass over the prepared batch.
   ///
-  /// Reads tokens and attention metadata from `input`, updates the supplied model state, and returns [num_seqs, vocab] logits for
-  /// input.logit_rows, enqueued on the context's stream.
+  /// Reads tokens and attention metadata from `input`, updates the supplied model state, and
+  /// returns [num_seqs, vocab] logits for input.logit_rows, enqueued on the context's stream.
   ///
   /// \param input  Execution inputs from the model runner.
   /// \param state  Per-layer execution state owned by the runner.
   /// \param ctx    Execution context ordering the work.
+  /// \param comm   This rank's communicator, matching the loaded model topology.
   /// \return       [num_seqs, vocab] logits, or an error status.
   virtual StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                                   ops::ExecutionContext& ctx) = 0;
+                                   ops::ExecutionContext& ctx, dist::CommBackend& comm) = 0;
 };
 
 }  // namespace inferx

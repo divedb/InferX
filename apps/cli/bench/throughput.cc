@@ -33,6 +33,7 @@ struct ThroughputArgs {
     p.cache = engine.BuildCacheConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.execution = engine.BuildExecutionConfig();
+    p.parallel = engine.BuildParallelConfig();
     p.dataset = dataset.Build();
     p.dataset.seed = model.config.seed;  // vLLM folds --seed into the model args
     p.num_prompts = num_prompts;

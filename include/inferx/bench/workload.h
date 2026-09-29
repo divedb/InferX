@@ -6,6 +6,7 @@
 #include "inferx/core/status.h"
 #include "inferx/config/cache_config.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
 
@@ -23,6 +24,7 @@ struct WorkloadParams {
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
+  ParallelConfig parallel;
   std::string suite = "benchmarks/qwen3/workload.json";
   int repeats = 3;         ///< Timed trials per case after one warmup.
   int profile_step = -1;   ///< CUDA profiler range during repeat 0; -1 disables.

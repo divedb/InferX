@@ -20,4 +20,22 @@ namespace inferx::ops {
 Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indices,
                   Tensor& out);
 
+/// \brief Gathers rows of a shard of `src`, zeroing out-of-shard indices:
+///        out[i, :] <- (0 <= indices[i] - row_begin < src rows) ?
+///                     src[indices[i] - row_begin, :] : 0.
+///
+/// The vocab-parallel embedding lookup: every rank holds one row range of
+/// the table, so token ids outside the range gather as zero rows and the
+/// following all-reduce completes the embedding.
+Status GatherRowsRange(ExecutionContext& ctx, const Tensor& src, const Tensor& indices,
+                       Tensor& out, int64_t row_begin);
+
+/// \brief Copies a rank-2 block into a column range of a wider rank-2
+///        tensor: dst[i, col_begin + j] <- src[i, j].
+///
+/// The assembly step of an all-gather along the last dimension: each rank
+/// writes its shard into its column block of the shared result.
+Status CopyColumnBlock(ExecutionContext& ctx, const Tensor& src, Tensor& dst,
+                       int64_t col_begin);
+
 }  // namespace inferx::ops

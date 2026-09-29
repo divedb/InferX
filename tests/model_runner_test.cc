@@ -6,6 +6,7 @@
 
 #include "gtest/gtest.h"
 #include "inferx/cache/kv_block_pool.h"
+#include "inferx/dist/loopback_comm.h"
 #include "inferx/engine/scheduler.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/execution_context.h"
@@ -40,7 +41,16 @@ class TestModel final : public Model {
   std::vector<LayerStateSpec> requirements = {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
 
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& /*ctx*/) override {
+                           ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
+    observed_comm = &comm;
+    EXPECT_EQ(comm.size(), expected_world);
+    EXPECT_EQ(comm.rank(), expected_rank);
+    INFERX_RETURN_IF_ERROR(injected_failure);
+    if (use_collective) {
+      INFERX_ASSIGN_OR_RETURN(auto empty,
+                              Tensor::Empty(DataType::kBFloat16, Shape{0}, ctx.device()));
+      INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, empty));
+    }
     EXPECT_NE(state.paged_kv, nullptr);
     EXPECT_EQ(state.layers.size(), requirements.size());
     auto read = [](const Tensor& t, int size) {
@@ -58,7 +68,7 @@ class TestModel final : public Model {
     for (int i = 0; i < num_seqs; ++i) {
       float* row = rows + static_cast<int64_t>(i) * config_.vocab_size;
       for (int64_t j = 0; j < config_.vocab_size; ++j) row[j] = -1.0f;
-      row[next_token_] = 1.0f;
+      row[next_token_ + token_offset] = 1.0f;
     }
     ++next_token_;
     return logits;
@@ -66,6 +76,12 @@ class TestModel final : public Model {
 
   CheckpointConfig config_;
   std::vector<ObservedBatch> batches;
+  dist::CommBackend* observed_comm = nullptr;
+  int expected_world = 1;
+  int expected_rank = 0;
+  int token_offset = 0;
+  bool use_collective = false;
+  Status injected_failure;
 
  private:
   int next_token_ = 10;
@@ -73,7 +89,7 @@ class TestModel final : public Model {
 
 class ModelRunnerTest : public ::testing::Test {
  protected:
-  void MakeRunner(int budget) {
+  void MakeRunner(int budget, std::unique_ptr<dist::CommBackend> comm = nullptr) {
     ModelConfig mc;
     mc.device.device_type = "cpu";
     SchedulerConfig sc;
@@ -84,7 +100,8 @@ class ModelRunnerTest : public ::testing::Test {
     cc.block_size = 2;
     auto model = std::make_unique<TestModel>();
     model_ = model.get();
-    auto runner = ModelRunner::Create(mc, cc, sc, ExecutionConfig{}, std::move(model));
+    auto runner = ModelRunner::Create(mc, cc, sc, ExecutionConfig{}, std::move(model),
+                                       std::move(comm));
     ASSERT_TRUE(runner.ok()) << runner.status();
     runner_ = std::move(*runner);
     scheduler_ = std::make_unique<Scheduler>(sc, runner_->kv_pool(), 127);
@@ -116,6 +133,122 @@ TEST_F(ModelRunnerTest, RepeatedDecodeUsesLastSampleAndAdvancesPositions) {
   auto finished = scheduler_->PopFinished();
   ASSERT_TRUE(finished.has_value());
   EXPECT_EQ(finished->output(), (std::vector<int>{10, 11, 12, 13}));
+}
+
+TEST_F(ModelRunnerTest, PassesTheSuppliedCommunicatorToTheModel) {
+  auto comm = std::make_unique<dist::SingleRankComm>();
+  auto* expected = comm.get();
+  MakeRunner(8, std::move(comm));
+  sampling::SamplingParams params;
+  params.temperature = 0;
+  params.max_tokens = 1;
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
+  ASSERT_TRUE(Step().ok());
+  EXPECT_EQ(model_->observed_comm, expected);
+}
+
+TEST(ModelRunnerStateTest, RejectsTensorParallelDeviceCountMismatch) {
+  ModelConfig model;
+  model.device.device_ids = {0};
+  auto runner = ModelRunner::Create(model, CacheConfig{}, SchedulerConfig{},
+                                    ExecutionConfig{}, ParallelConfig{2, 0});
+  EXPECT_EQ(runner.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+class RankGroupTest : public ::testing::Test {
+ protected:
+  void MakeGroup(bool fail_peer = false) {
+    auto created = dist::LoopbackWorld::Create(2);
+    ASSERT_TRUE(created.ok());
+    std::shared_ptr<dist::LoopbackWorld> world = *std::move(created);
+    ModelConfig model_config;
+    model_config.device.device_type = "cpu";
+    CacheConfig cache;
+    cache.num_kv_blocks = 32;
+    cache.block_size = 2;
+    SchedulerConfig scheduling;
+    scheduling.max_num_seqs = 2;
+    scheduling.max_num_batched_tokens = 4;
+    std::vector<std::unique_ptr<ModelRunner>> ranks;
+    for (int rank = 0; rank < 2; ++rank) {
+      auto model = std::make_unique<TestModel>();
+      models_[rank] = model.get();
+      model->expected_world = 2;
+      model->expected_rank = rank;
+      model->token_offset = rank * 50;  // Peer logits must never choose the next token.
+      model->use_collective = true;
+      if (rank == 1 && fail_peer) model->injected_failure = InternalError("injected rank failure");
+      auto runner = ModelRunner::Create(model_config, cache, scheduling, ExecutionConfig{},
+                                         std::move(model), world->TakeRank(rank));
+      ASSERT_TRUE(runner.ok()) << runner.status();
+      ranks.push_back(*std::move(runner));
+    }
+    auto group = ModelRunner::CreateGroup(std::move(ranks),
+        [world](const Status& status) { world->Abort(status); });
+    ASSERT_TRUE(group.ok()) << group.status();
+    group_ = *std::move(group);
+    scheduler_ = std::make_unique<Scheduler>(scheduling, group_->kv_pool(), 127);
+  }
+  std::unique_ptr<ModelRunner> group_;
+  std::unique_ptr<Scheduler> scheduler_;
+  TestModel* models_[2]{};
+};
+
+TEST_F(RankGroupTest, SharesRankZeroSamplesAndRequestLifecycle) {
+  MakeGroup();
+  sampling::SamplingParams params;
+  params.temperature = 0;
+  params.ignore_eos = true;
+  params.max_tokens = 4;
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
+  int steps = 0;
+  while (scheduler_->HasRequests() && ++steps < 10) {
+    auto plan = scheduler_->Schedule();
+    ASSERT_TRUE(plan.ok());
+    auto result = group_->Run(*plan);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_TRUE(scheduler_->UpdateFromOutput(*plan, *result).ok());
+  }
+  ASSERT_FALSE(scheduler_->HasRequests());
+  auto finished = scheduler_->PopFinished();
+  ASSERT_TRUE(finished.has_value());
+  EXPECT_EQ(finished->output(), (std::vector<int>{10, 11, 12, 13}));
+  ASSERT_EQ(models_[0]->batches.size(), models_[1]->batches.size());
+  for (size_t step = 0; step < models_[0]->batches.size(); ++step) {
+    EXPECT_EQ(models_[0]->batches[step].tokens, models_[1]->batches[step].tokens);
+    EXPECT_EQ(models_[0]->batches[step].positions, models_[1]->batches[step].positions);
+  }
+  auto removals = scheduler_->Schedule();
+  ASSERT_TRUE(removals.ok());
+  ASSERT_TRUE(group_->Run(*removals).ok());
+  // Reuse the request id after every rank has processed the finish notification.
+  params.temperature = 0.8f;
+  params.seed = 123;
+  params.max_tokens = 2;
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {7}, params)).ok());
+  for (int step = 0; step < 2; ++step) {
+    auto plan = scheduler_->Schedule();
+    ASSERT_TRUE(plan.ok());
+    auto result = group_->Run(*plan);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_TRUE(scheduler_->UpdateFromOutput(*plan, *result).ok());
+    EXPECT_EQ(models_[0]->batches.back().tokens, models_[1]->batches.back().tokens);
+  }
+  EXPECT_FALSE(scheduler_->HasRequests());
+}
+
+TEST_F(RankGroupTest, RankFailureReleasesPeerBlockedInCollective) {
+  MakeGroup(true);
+  sampling::SamplingParams params;
+  params.temperature = 0;
+  params.max_tokens = 2;
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1}, params)).ok());
+  auto plan = scheduler_->Schedule();
+  ASSERT_TRUE(plan.ok());
+  const auto result = group_->Run(*plan);
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kInternal);
+  EXPECT_EQ(result.status().message(), "injected rank failure");
+  EXPECT_EQ(group_->Run(*plan).status().code(), absl::StatusCode::kFailedPrecondition);
 }
 
 TEST_F(ModelRunnerTest, ChunkedPrefillDoesNotSkipPromptTokens) {
@@ -251,7 +384,7 @@ class PositionModel final : public Model {
     return {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
   }
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState&,
-                           ops::ExecutionContext& ctx) override {
+                           ops::ExecutionContext& ctx, dist::CommBackend&) override {
     ++calls;
     INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_->Slice(0, input.attention.num_tokens));
     INFERX_ASSIGN_OR_RETURN(auto logits, logits_->Slice(0, input.attention.num_seqs));

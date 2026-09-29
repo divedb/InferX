@@ -1,5 +1,6 @@
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 
 #include "inferx/ops/cuda/cublas.h"
 
@@ -18,14 +19,17 @@ Status CublasError(cublasStatus_t status, const char* what) {
 StatusOr<cublasHandle_t> AcquireCublas(ExecutionContext& ctx) {
   INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
   static std::mutex mutex;
-  static std::unordered_map<int, cublasHandle_t> handles;
+  // One handle per (device, stream): a handle shared across streams would
+  // let one thread's cublasSetStream reroute another's pending GEMM, which
+  // concurrent tensor-parallel ranks on one device would hit immediately.
+  static std::map<std::pair<int, void*>, cublasHandle_t> handles;
   const std::lock_guard<std::mutex> lock(mutex);
-  const int ordinal = ctx.device().index;
-  auto it = handles.find(ordinal);
+  const auto key = std::make_pair(ctx.device().index, static_cast<void*>(ctx.stream()));
+  auto it = handles.find(key);
   if (it == handles.end()) {
     cublasHandle_t handle = nullptr;
     INFERX_RETURN_IF_ERROR(CublasError(cublasCreate(&handle), "cublasCreate"));
-    it = handles.emplace(ordinal, handle).first;
+    it = handles.emplace(key, handle).first;
   }
   INFERX_RETURN_IF_ERROR(
       CublasError(cublasSetStream(it->second, static_cast<cudaStream_t>(ctx.stream())),

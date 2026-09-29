@@ -26,16 +26,20 @@ struct LanguageModelHead {
   explicit LanguageModelHead(Tensor w) : weight(std::move(w)) {}
 
   int capacity = 0;  ///< Stable row capacity for graph replay.
-  Tensor weight;     ///< [vocab, hidden]; may alias the token embedding.
+  Tensor weight;     ///< [rows of vocab shard, hidden]; may alias the embedding.
+  /// \brief Full vocabulary width. Equals the shard width on a single rank;
+  ///        under tensor parallelism the ranks' logits all-gather into this
+  ///        width before sampling.
+  int64_t vocab_total = 0;
 
   /// \brief Gathers `rows`, then projects them to [rows, vocab] logits.
   /// The row buffer and logits borrow workspace allocated on first use.
   StatusOr<Tensor> Forward(const Tensor& hidden, const Tensor& rows,
-                           ops::ExecutionContext& ctx);
+                           ops::ExecutionContext& ctx, dist::CommBackend& comm);
 
  private:
   bool workspace_ready_ = false;
-  std::optional<Tensor> rows_, logits_;
+  std::optional<Tensor> rows_, logits_, full_logits_;
 };
 
 /// Validated and loaded common state, before selecting a typed executor.
@@ -62,6 +66,7 @@ class CausalLM final : public Model {
         head_(std::move(prepared.head)),
         max_seqs_(max_seqs) {
     head_.capacity = max_seqs;
+    head_.vocab_total = decoder_.config().vocab_size;
   }
 
   bool SupportsCudaGraphs() const override { return true; }
@@ -70,7 +75,7 @@ class CausalLM final : public Model {
     return decoder_.StateRequirements();
   }
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx) override {
+                           ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
     if (input.attention.num_seqs <= 0 || input.attention.num_seqs > max_seqs_ ||
         input.logit_rows.Rank() != 1 || input.logit_rows.Numel() != input.attention.num_seqs ||
         input.logit_rows.GetDataType() != DataType::kInt32 ||
@@ -78,8 +83,8 @@ class CausalLM final : public Model {
       return InvalidArgumentError("invalid requested language-model output rows");
     }
     DecoderInput decoder_input{input.token_ids, {}, input.attention};
-    INFERX_ASSIGN_OR_RETURN(Tensor hidden, decoder_.Forward(decoder_input, state, ctx));
-    return head_.Forward(hidden, input.logit_rows, ctx);
+    INFERX_ASSIGN_OR_RETURN(Tensor hidden, decoder_.Forward(decoder_input, state, ctx, comm));
+    return head_.Forward(hidden, input.logit_rows, ctx, comm);
   }
 
  private:

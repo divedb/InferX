@@ -124,7 +124,8 @@ class EngineGateway {
   EngineGateway(boost::asio::io_context& io, ModelConfig model_config,
                 CacheConfig cache_config, SchedulerConfig scheduler_config,
                 ExecutionConfig execution_config,
-                std::shared_ptr<Tokenizer> tokenizer);
+                std::shared_ptr<Tokenizer> tokenizer,
+                ParallelConfig parallel_config = {});
   ~EngineGateway();
 
   EngineGateway(const EngineGateway&) = delete;

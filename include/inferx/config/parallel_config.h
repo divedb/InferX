@@ -7,21 +7,18 @@ namespace inferx {
 
 /// \brief How one engine instance shards a model across ranks.
 ///
-/// Mirrors vLLM's ParallelConfig field names so the correspondence reads
-/// directly; SGLang keeps the same values flat in ServerArgs. Only tensor
-/// parallelism exists today, and only its geometry: collectives (all-reduce,
-/// NCCL process groups) arrive with the tensor-parallel milestone. Rank-local
-/// values derived from it -- per-rank attention heads, packed-projection row
-/// shards -- flow through model build; the defaults make every derived value
-/// identical to the unsharded model.
+/// The model loader shards weights and persistent state using this geometry.
+/// Multi-GPU serving drives one rank per distinct CUDA device in one process,
+/// with one scheduler and NCCL collectives. Explicit rank-local callers supply
+/// a matching CommBackend to the model runner.
 struct ParallelConfig {
-  /// Ranks the model weights are sharded across; one worker process per
-  /// device when greater than 1.
+  /// Ranks the model weights are sharded across; one CUDA device per rank
+  /// in multi-GPU serving.
   /// EXAMPLE: --tensor-parallel-size 2
   int tensor_parallel_size = 1;
 
-  /// This instance's rank, in [0, tensor_parallel_size); the controller
-  /// assigns each spawned worker its rank, so it is never set from the CLI.
+  /// This instance's rank, in [0, tensor_parallel_size). The serving coordinator
+  /// starts at rank zero and assigns ranks to its GPU execution lanes.
   int tensor_parallel_rank = 0;
 
   /// \brief Checks rank/size sanity.

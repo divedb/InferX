@@ -12,6 +12,7 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
+#include "inferx/dist/comm.h"
 #include "inferx/ops/execution_context.h"
 
 namespace inferx {
@@ -122,10 +123,11 @@ TEST_F(ModelTest, ForwardReturnsLogits) {
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
   ops::ExecutionContext ctx(*runtime_, stream_);
+  dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &*pool;
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx);
+  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx, comm);
   ASSERT_TRUE(logits.ok()) << logits.status();
   EXPECT_EQ(logits->Rank(), 2);
   EXPECT_EQ(logits->Dim(0), 1);
@@ -141,10 +143,11 @@ StatusOr<std::vector<float>> ForwardLogits(Model& model, const CheckpointConfig&
                                            DeviceRuntime& runtime, Stream stream,
                                            const ModelInput& input, KvBlockPool& pool) {
   ops::ExecutionContext ctx(runtime, stream);
+  dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &pool;
   for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  INFERX_ASSIGN_OR_RETURN(auto logits, model.Forward(input, state, ctx));
+  INFERX_ASSIGN_OR_RETURN(auto logits, model.Forward(input, state, ctx, comm));
   INFERX_RETURN_IF_ERROR(runtime.SynchronizeStream(stream));
   std::vector<uint16_t> raw(logits.Numel());
   INFERX_RETURN_IF_ERROR(runtime.Copy(raw.data(), logits.Data(), raw.size() * 2,
@@ -304,10 +307,11 @@ TEST_F(ModelTest, LoadsSyntheticQwen2AndRunsBiasedAttention) {
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
   ops::ExecutionContext ctx(*runtime_, stream_);
+  dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &*pool;
   for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx);
+  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx, comm);
   ASSERT_TRUE(logits.ok()) << logits.status();
   ASSERT_EQ(logits->Dim(1), kVocab);
   // F32 weights round to small nonzero values; every logit must be finite.

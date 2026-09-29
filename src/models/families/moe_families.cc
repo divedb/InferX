@@ -1,7 +1,3 @@
-/// \file
-/// \brief Mixture-of-experts families: Mixtral, gpt-oss, and DeepSeek-V3.
-///        Routing policy differs; expert execution is shared.
-
 #include <string>
 #include <vector>
 
@@ -92,10 +88,9 @@ StatusOr<causal::DecoderConfig> TranslateGptOss(const nlohmann::json& j) {
   for (size_t i = 0; i < config.blocks.size(); ++i) {
     auto& a = std::get<components::AttentionConfig>(config.blocks[i].mixer);
     a.sinks = true;
-    a.sliding_window =
-        (!layer_types.empty() && layer_types[i] == "sliding_attention")
-            ? j.value("sliding_window", int64_t{0})
-            : 0;
+    a.sliding_window = (!layer_types.empty() && layer_types[i] == "sliding_attention")
+                           ? j.value("sliding_window", int64_t{0})
+                           : 0;
     config.blocks[i].feed_forward = experts;
   }
   return config;

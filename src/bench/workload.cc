@@ -29,7 +29,7 @@ void Run(const WorkloadParams& params) {
   cc.num_kv_blocks = suite_json.value("kv_blocks", cc.num_kv_blocks);
   cc.block_size = suite_json.value("block_size", cc.block_size);
   const int batch = sc.max_num_seqs;
-  auto runner = Take(ModelRunner::Create(params.model, cc, sc, params.execution));
+  auto runner = Take(ModelRunner::Create(params.model, cc, sc, params.execution, params.parallel));
   Scheduler scheduler(sc, runner->kv_pool(), 151645);
   uint64_t next_id = 1;
   for (const auto& c : suite_json.at("cases")) {

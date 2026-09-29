@@ -29,7 +29,7 @@ struct EngineArgs {
   std::vector<int> cudagraph_capture_sizes;   // vLLM: --cudagraph-capture-sizes
   int max_cudagraph_capture_size = 0;         // vLLM: --max-cudagraph-capture-size
   int tensor_parallel_size = 1;               // vLLM: --tensor-parallel-size; one
-                                              // worker process per device when > 1
+                                              // rank per GPU when > 1
 
   /// Binds this group's options to `sub`. The struct instance must outlive
   /// the App: commands keep it inside their args struct, which the callback
@@ -75,8 +75,7 @@ struct EngineArgs {
         ->capture_default_str()
         ->check(CLI::Range(0, 4096));
     g->add_option("--tensor-parallel-size", tensor_parallel_size,
-                  "Worker processes to shard the model across, one per "
-                  "device id; 1 keeps the in-process engine")
+                  "Tensor-parallel GPU ranks, one per device id; requires NCCL and eager execution")
         ->capture_default_str()
         ->check(CLI::Range(1, 255));
   }
@@ -110,8 +109,7 @@ struct EngineArgs {
   }
 
   /// \brief The controller's view of the tensor-parallel topology (vLLM
-  ///        --tensor-parallel-size; rank 0). Each spawned worker overrides
-  ///        the rank with its own.
+  ///        --tensor-parallel-size; rank 0). The runner assigns each GPU its rank.
   ParallelConfig BuildParallelConfig() const {
     ParallelConfig cfg;
     cfg.tensor_parallel_size = tensor_parallel_size;

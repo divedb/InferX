@@ -7,6 +7,7 @@
 #include "inferx/core/status.h"
 #include "inferx/config/cache_config.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
 
@@ -20,6 +21,7 @@ struct ThroughputParams {
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
+  ParallelConfig parallel;
   DatasetParams dataset;
   int num_prompts = 64;
   int num_iters = 3;         ///< Timed trials after warmup (workload default).

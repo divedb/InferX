@@ -6,6 +6,7 @@
 #include "inferx/core/status.h"
 #include "inferx/config/cache_config.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
 
@@ -17,6 +18,7 @@ struct LatencyParams {
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
+  ParallelConfig parallel;
   int batch_size = 8;    ///< Requests submitted as one batch.
   int output_len = 256;  ///< Tokens generated per request.
   int input_len = 32;         ///< Length of the synthetic prompts.

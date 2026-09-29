@@ -27,6 +27,11 @@ struct DecoderConfig {
   components::NormConfig final_norm;                   ///< Closing norm after the last layer.
   /// Embedding multiplier applied after the gather (Gemma: sqrt(hidden)).
   float embedding_scale = 1.0f;
+  /// \brief First global row of this rank's embedding shard. The token-id
+  ///        gather masks ids outside [offset, offset + shard) to zero; the
+  ///        embedding all-reduce then completes the lookup. Zero when the
+  ///        vocabulary is not sharded.
+  int64_t embedding_row_offset = 0;
   std::vector<components::DecoderLayerConfig> blocks;  ///< One entry per layer.
 
   /// \brief Checks internal consistency of dimensions, geometry, and variants.

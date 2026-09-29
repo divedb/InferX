@@ -349,7 +349,7 @@ Status RunServe(const ServeParams& params) {
 
     try {
       EngineGateway gateway(io, params.model, params.cache, params.scheduler,
-                            params.execution, decode_tokenizer);
+                            params.execution, decode_tokenizer, params.parallel);
       // Startup gate: refuse to serve rather than fall back to encoding on
       // an I/O thread (docs/tokenizer_process_pool.md).
       const Status ready = pool.WaitUntilReady(pool_config.startup_timeout);

@@ -38,10 +38,11 @@ constexpr std::size_t kSlowConsumerEvents = 4096;
 struct EngineGateway::Impl {
   Impl(boost::asio::io_context& io_arg, ModelConfig model_config,
        CacheConfig cache_config, SchedulerConfig scheduler_config,
-       ExecutionConfig execution_config, std::shared_ptr<Tokenizer> tokenizer_arg)
+       ExecutionConfig execution_config, std::shared_ptr<Tokenizer> tokenizer_arg,
+       ParallelConfig parallel_config)
       : io(io_arg), tokenizer(std::move(tokenizer_arg)) {
     runner = Take(ModelRunner::Create(model_config, cache_config, scheduler_config,
-                                      execution_config));
+                                      execution_config, parallel_config));
     const int64_t eos = runner->checkpoint_config().eos_token_id;
     if (eos < 0) {
       throw std::runtime_error("model config has no eos_token_id");
@@ -293,9 +294,9 @@ EngineGateway::EngineGateway(boost::asio::io_context& io, ModelConfig model_conf
                              CacheConfig cache_config,
                              SchedulerConfig scheduler_config,
                              ExecutionConfig execution_config,
-                             std::shared_ptr<Tokenizer> tokenizer)
+                             std::shared_ptr<Tokenizer> tokenizer, ParallelConfig parallel_config)
     : impl_(std::make_unique<Impl>(io, model_config, cache_config, scheduler_config,
-                                   execution_config, std::move(tokenizer))) {
+                                   execution_config, std::move(tokenizer), parallel_config)) {
   impl_->engine = std::thread([this] { impl_->EngineLoop(); });
 }
 

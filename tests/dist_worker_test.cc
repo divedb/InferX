@@ -17,6 +17,7 @@
 #include "inferx/dist/comm.h"
 #include "inferx/dist/worker_ipc.h"
 #include "inferx/dist/worker_launch.h"
+#include "inferx/ops/execution_context.h"
 #include "inferx/tokenizer/id.h"
 
 #ifndef INFERX_BIN
@@ -28,10 +29,16 @@ namespace dist {
 namespace {
 
 TEST(SingleRankCommTest, CollectivesAreIdentity) {
-  SingleRankComm comm(ParallelConfig{});
+  SingleRankComm comm;
   EXPECT_EQ(comm.size(), 1);
   EXPECT_EQ(comm.rank(), 0);
-  ASSERT_TRUE(comm.Barrier().ok());
+
+  auto runtime = RuntimeFor(DeviceId::Cpu());
+  ASSERT_TRUE(runtime.ok()) << runtime.status();
+  ASSERT_TRUE((*runtime)->Activate().ok());
+  auto stream = (*runtime)->CreateStream();
+  ASSERT_TRUE(stream.ok()) << stream.status();
+  ops::ExecutionContext ctx(**runtime, *stream);
 
   // A world of one: reduce and gather return their input unchanged.
   constexpr int64_t kRows = 2, kCols = 3;
@@ -39,15 +46,18 @@ TEST(SingleRankCommTest, CollectivesAreIdentity) {
   auto partial = Tensor::FromBlob(const_cast<uint16_t*>(bits.data()), DataType::kBFloat16,
                                   Shape({kRows, kCols}), DeviceId::Cpu());
   ASSERT_TRUE(partial.ok());
-  EXPECT_TRUE(comm.AllReduceSumBf16(*partial).ok());
+  EXPECT_TRUE(comm.AllReduceSum(ctx, *partial).ok());
 
   auto gathered = Tensor::Empty(DataType::kBFloat16, Shape({kRows, kCols}), DeviceId::Cpu());
   ASSERT_TRUE(gathered.ok());
-  ASSERT_TRUE(comm.AllGatherLastDim(*partial, *gathered).ok());
+  ASSERT_TRUE(comm.AllGatherLastDim(ctx, *partial, *gathered).ok());
+  ASSERT_TRUE((*runtime)->SynchronizeStream(*stream).ok());
   const auto* out = static_cast<const uint16_t*>(gathered->Data());
   for (size_t i = 0; i < bits.size(); ++i) {
     EXPECT_EQ(out[i], bits[i]) << "element " << i;
   }
+  EXPECT_TRUE(comm.AllGatherLastDim(ctx, *partial, *partial).ok());
+  EXPECT_TRUE((*runtime)->DestroyStream(*stream).ok());
 }
 
 /// \brief One real worker process at rank 0 of world 1. The worker loads

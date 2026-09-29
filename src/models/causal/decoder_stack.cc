@@ -189,7 +189,12 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
 
 StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, ModelState& state,
                                                 ops::ExecutionContext& ctx,
-                                                DiagnosticTrace& trace) {
+                                                dist::CommBackend& comm, DiagnosticTrace& trace) {
+  if (comm.size() <= 0 || comm.rank() < 0 || comm.rank() >= comm.size() ||
+      config_.model.vocab_size != comm.size() * embedding_.Dim(0) ||
+      config_.embedding_row_offset != comm.rank() * embedding_.Dim(0)) {
+    return InvalidArgumentError("decoder weights and communicator topology disagree");
+  }
   const int rows = input.attention.num_tokens;
   if (rows <= 0 || rows > max_tokens_) {
     return InvalidArgumentError("decoder token count exceeds workspace capacity");
@@ -231,7 +236,17 @@ StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, Model
                                                    hidden.NBytes(), CopyKind::kDeviceToDevice,
                                                    ctx.stream()));
   } else {
-    INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, embedding_, input.token_ids, hidden));
+    const bool sharded = comm.size() > 1;
+    if (sharded) {
+      // Vocab-parallel lookup: ids outside this rank's shard gather as
+      // zeros; the all-reduce folds the ranks' masked partials.
+      INFERX_RETURN_IF_ERROR(
+          ops::GatherRowsRange(ctx, embedding_, input.token_ids, hidden,
+                               config_.embedding_row_offset));
+    } else {
+      INFERX_RETURN_IF_ERROR(ops::GatherRows(ctx, embedding_, input.token_ids, hidden));
+    }
+    INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, hidden));
     if (config_.embedding_scale != 1.0f) {
       // Gemma scales token embeddings by sqrt(hidden) in activation dtype.
       INFERX_RETURN_IF_ERROR(ops::MulScalar(ctx, hidden, config_.embedding_scale));

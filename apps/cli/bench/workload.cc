@@ -30,6 +30,7 @@ struct WorkloadArgs {
     p.cache = engine.BuildCacheConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.execution = engine.BuildExecutionConfig();
+    p.parallel = engine.BuildParallelConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.suite = suite;
     p.repeats = repeats;

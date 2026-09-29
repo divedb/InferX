@@ -31,6 +31,7 @@
 #include "inferx/models/causal/decoder_config.h"
 #include "inferx/models/model.h"
 #include "inferx/models/model_registry.h"
+#include "inferx/dist/comm.h"
 #include "inferx/ops/execution_context.h"
 #include "inferx/ops/moe.h"
 
@@ -154,6 +155,7 @@ class Engine {
       }
     }
     ops::ExecutionContext ctx(*runtime_, stream_);
+    dist::SingleRankComm comm;
     if (rpool.has_value()) rpool->ResetSlot(ctx, 0).ok();
 
     const int64_t n = tokens.size();
@@ -190,7 +192,7 @@ class Engine {
                                     static_cast<int>(n), 1},
                      logit_rows};
     input.attention.recurrent_indices = std::move(slots);
-    auto logits = (*model)->Forward(input, state, ctx);
+    auto logits = (*model)->Forward(input, state, ctx, comm);
     EXPECT_TRUE(logits.ok()) << logits.status();
     if (!logits.ok()) return {};
     std::vector<uint16_t> raw(logits->Numel());

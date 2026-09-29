@@ -16,7 +16,8 @@ class DecoderWorkspace {
   DecoderWorkspace(DecoderConfig config, Tensor embedding, int max_tokens);
   Status InitWorkspace(DeviceId device);
   StatusOr<Tensor> BeginForward(const DecoderInput& input, ModelState& state,
-                                ops::ExecutionContext& ctx, DiagnosticTrace& trace);
+                                ops::ExecutionContext& ctx, dist::CommBackend& comm,
+                                DiagnosticTrace& trace);
 
   DecoderConfig config_;
   Tensor embedding_;
@@ -64,9 +65,9 @@ class DecoderStack final : private DecoderWorkspace {
   std::vector<LayerStateSpec> StateRequirements() const { return config_.StateRequirements(); }
 
   StatusOr<Tensor> Forward(const DecoderInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx) {
+                           ops::ExecutionContext& ctx, dist::CommBackend& comm) {
     DiagnosticTrace trace(ctx);
-    INFERX_ASSIGN_OR_RETURN(Tensor hidden, BeginForward(input, state, ctx, trace));
+    INFERX_ASSIGN_OR_RETURN(Tensor hidden, BeginForward(input, state, ctx, comm, trace));
     INFERX_ASSIGN_OR_RETURN(Tensor normed, normed_->Slice(0, input.attention.num_tokens));
     INFERX_ASSIGN_OR_RETURN(Tensor mixed, mixed_->Slice(0, input.attention.num_tokens));
     for (size_t i = 0; i < layers_.size(); ++i) {
@@ -74,7 +75,7 @@ class DecoderStack final : private DecoderWorkspace {
       INFERX_RETURN_IF_ERROR(layers_[i].Forward(
           i == 0, hidden, normed, mixed, input.attention, state.layers[i], *state.paged_kv,
           state.recurrent == nullptr ? *gdn_fallback_pool_ : *state.recurrent, *attention_,
-          *mla_, *gdn_, *mlp_, *moe_, *packed_projection_, ctx, trace, prefix));
+          *mla_, *gdn_, *mlp_, *moe_, *packed_projection_, ctx, comm, trace, prefix));
     }
     INFERX_RETURN_IF_ERROR(final_norm_.AddForward(ctx, mixed, hidden, normed));
     if (trace.enabled()) trace.Write("final_norm", normed);

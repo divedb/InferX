@@ -57,6 +57,19 @@ TEST(EngineArgsTest, BuildsConsistentConfigs) {
   EXPECT_EQ(scheduler.max_num_batched_tokens, args.max_num_batched_tokens);
 }
 
+TEST(EngineArgsTest, ParsesTensorParallelDevicesAndTopology) {
+  inferx::cli::ModelConfigArgs model;
+  inferx::cli::EngineArgs engine;
+  CLI::App app{"test"};
+  model.AddOptions(app);
+  engine.AddOptions(app);
+  Parse(app, {"--tensor-parallel-size", "2", "--device-ids", "0,1"});
+  EXPECT_EQ(engine.BuildParallelConfig().tensor_parallel_size, 2);
+  EXPECT_EQ(engine.BuildParallelConfig().tensor_parallel_rank, 0);
+  EXPECT_EQ(model.Build().device.device_ids, (std::vector<int>{0, 1}));
+  EXPECT_FALSE(engine.BuildExecutionConfig().enable_cuda_graphs);
+}
+
 TEST(EngineArgsTest, ParsesVllmParityOptions) {
   inferx::cli::ModelConfigArgs model;
   inferx::cli::EngineArgs args;

@@ -28,6 +28,7 @@ struct LatencyArgs {
     p.cache = engine.BuildCacheConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.execution = engine.BuildExecutionConfig();
+    p.parallel = engine.BuildParallelConfig();
     p.scheduler = engine.BuildSchedulerConfig();
     p.batch_size = batch_size;
     p.output_len = output_len;

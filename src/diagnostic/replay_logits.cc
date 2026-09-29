@@ -14,6 +14,7 @@
 
 #include "inferx/core/status_util.h"
 #include "inferx/diagnostic/replay_logits.h"
+#include "inferx/dist/comm.h"
 #include "inferx/models/model.h"
 #include "nlohmann/json.hpp"
 
@@ -67,6 +68,7 @@ void Replay(const ReplayLogitsParams& params) {
   state.paged_kv = &pool;
   for (int i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
   ops::ExecutionContext ctx(*runtime, stream);
+  dist::SingleRankComm comm;
   const auto upload = [&](const std::vector<int32_t>& values) {
     auto tensor = Take(Tensor::Empty(DataType::kInt32,
         Shape({static_cast<int64_t>(values.size())}), device));
@@ -96,7 +98,7 @@ void Replay(const ReplayLogitsParams& params) {
                         upload(qo), upload(kv), upload(pages),
                         upload({(end - 1) % page_size + 1}), qo, kv, count, 1},
                        logit_rows};
-      logits = Take(model->Forward(input, state, ctx));
+      logits = Take(model->Forward(input, state, ctx, comm));
       // Keep all input allocations alive until the forward has finished.
       Check(runtime->SynchronizeStream(stream));
       start = end;

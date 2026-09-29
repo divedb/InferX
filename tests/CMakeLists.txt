@@ -160,6 +160,27 @@ target_link_libraries(inferx_device_config_test PRIVATE inferx::core GTest::gtes
 target_compile_options(inferx_device_config_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME device_config_test COMMAND inferx_device_config_test)
 
+# Collective contracts, single-rank copies, and concurrent loopback ranks.
+add_executable(inferx_comm_test comm_test.cc)
+target_link_libraries(inferx_comm_test PRIVATE inferx::dist GTest::gtest_main)
+target_compile_options(inferx_comm_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME comm_test COMMAND inferx_comm_test)
+set_tests_properties(comm_test PROPERTIES TIMEOUT 30)
+if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+  set_tests_properties(comm_test PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+endif()
+
+add_executable(inferx_tensor_parallel_test tensor_parallel_test.cc)
+target_link_libraries(inferx_tensor_parallel_test PRIVATE inferx::engine GTest::gtest_main)
+target_compile_options(inferx_tensor_parallel_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME tensor_parallel_test COMMAND inferx_tensor_parallel_test
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(tensor_parallel_test PROPERTIES TIMEOUT 120)
+if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+  set_tests_properties(tensor_parallel_test PROPERTIES ENVIRONMENT
+                      "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+endif()
+
 # Real multi-process round trip: spawns the inferx binary as a world-of-one
 # worker, so it needs the GPU, the local checkpoint, and the repo root.
 add_executable(inferx_dist_worker_test dist_worker_test.cc)

@@ -60,6 +60,13 @@ target_compile_options(inferx_ops PRIVATE
 # inferx_sampling -- request-level sampling configuration, the batched
 # runtime metadata, and the sampling pipeline (greedy fast path today; the
 # fused bias/penalty/filter/sample kernels land in sampling/sampling_kernels.cu).
+# Collective implementations depend on ops, and are usable by the runner
+# without pulling in the worker-process engine layer.
+add_library(inferx_comm dist/loopback_comm.cc dist/nccl_comm.cc)
+add_library(inferx::comm ALIAS inferx_comm)
+target_link_libraries(inferx_comm PUBLIC inferx::ops PRIVATE ${CMAKE_DL_LIBS})
+target_compile_options(inferx_comm PRIVATE -Wall -Wextra -Wpedantic)
+
 add_library(inferx_sampling
   sampling/sampling_params.cc
   sampling/sampler.cc
@@ -122,12 +129,14 @@ if(INFERX_ENABLE_TOKENIZERS)
   target_link_libraries(inferx_engine PUBLIC inferx::tokenizers)
 endif()
 target_compile_options(inferx_engine PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(inferx_engine PUBLIC inferx::comm)
 
 # inferx_dist -- tensor-parallel worker topology: the controller-side
 # process pool (posix_spawn, one worker per device), the IPC wire protocol
 # over Boost.InterProcess message queues, and the worker-side engine loop.
-# Collectives sit behind dist/comm.h; SingleRankComm (identity) is the only
-# backend until NCCL lands with multi-GPU support.
+# Collectives sit behind dist/comm.h: SingleRankComm (identity), LoopbackComm
+# (in-process virtual ranks, the sharded-execution reference), and NcclComm
+# (dlopen'd libnccl for multi-process worlds).
 add_library(inferx_dist
   dist/worker_ipc.cc
   dist/worker_launch.cc
@@ -136,7 +145,8 @@ add_library(inferx_dist
 add_library(inferx::dist ALIAS inferx_dist)
 target_link_libraries(inferx_dist
   PUBLIC inferx::engine inferx::boost
-          absl::status absl::statusor absl::strings)
+          absl::status absl::statusor absl::strings
+  PRIVATE ${CMAKE_DL_LIBS})
 target_compile_options(inferx_dist PRIVATE -Wall -Wextra -Wpedantic)
 
 # inferx_bench -- CLI-independent benchmark entry points (`inferx bench *`).
