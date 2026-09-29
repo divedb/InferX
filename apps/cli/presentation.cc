@@ -1,6 +1,6 @@
-// Presentation: shared help formatting, --color handling, parse-error
-// translation, and styled status messages. tests/cli_output_test.py and
-// tests/cli_presentation_test.cc pin the process-level contract.
+// Presentation: shared help formatting, parse-error translation, and styled
+// status messages (color is configured via the environment). 
+// tests/cli_output_test.py pins the process-level contract.
 #include "cli/presentation.h"
 
 #include <algorithm>
@@ -120,7 +120,7 @@ std::string UsageSuffix(const CLI::App& app) {
 
 /// Wraps every simple <placeholder> token in the placeholder style. A no-op
 /// in plain mode, so message text stays byte-identical when color is off.
-std::string StylePlaceholders(const std::string& text, const term::StyleSheet& style) {
+std::string StylePlaceholders(const std::string& text, const cli::TextStyler& style) {
   std::string out;
   std::size_t i = 0;
   while (i < text.size()) {
@@ -137,7 +137,7 @@ std::string StylePlaceholders(const std::string& text, const term::StyleSheet& s
   return out;
 }
 
-std::string UsageLine(const CLI::App& app, const term::StyleSheet& style) {
+std::string UsageLine(const CLI::App& app, const cli::TextStyler& style) {
   return style.Heading("Usage:") + "\n  " + style.Command(CommandPath(app)) +
          StylePlaceholders(UsageSuffix(app), style);
 }
@@ -150,9 +150,9 @@ std::string LongName(const CLI::Option& option) {
 }
 
 std::vector<std::string> OptionCandidates(const CLI::App& app) {
-  std::vector<std::string> candidates{"--help", "--color"};
+  std::vector<std::string> candidates{"--help"};
   for (const CLI::Option* option : AllOptions(app)) {
-    if (option == app.get_help_ptr() || option == app.get_version_ptr()) continue;
+    if (option == app.get_help_ptr()) continue;
     std::string name = LongName(*option);
     if (!name.empty()) candidates.push_back(name);
   }
@@ -173,8 +173,7 @@ struct HelpEntry {
   bool command = false;  // Style the left column as a command name.
 };
 
-std::string RenderEntries(const std::vector<HelpEntry>& entries,
-                          const term::StyleSheet& style) {
+std::string RenderEntries(const std::vector<HelpEntry>& entries, const cli::TextStyler& style) {
   std::size_t column = 0;
   for (const HelpEntry& entry : entries) {
     if (entry.left.size() <= static_cast<std::size_t>(kMaxLeftWidth))
@@ -183,12 +182,10 @@ std::string RenderEntries(const std::vector<HelpEntry>& entries,
   column = std::max<std::size_t>(column, 4);
   std::string out;
   for (const HelpEntry& entry : entries) {
-    const std::string left = entry.command
-                                 ? style.Command(entry.left)
-                                 : StylePlaceholders(entry.left, style);
+    const std::string left =
+        entry.command ? style.Command(entry.left) : StylePlaceholders(entry.left, style);
     std::vector<std::string> lines =
-        WrapText(entry.right, static_cast<int>(std::max<std::size_t>(
-                                  1, kWrapWidth - column)));
+        WrapText(entry.right, static_cast<int>(std::max<std::size_t>(1, kWrapWidth - column)));
     const std::string first = lines.empty() ? std::string() : lines.front();
     if (entry.left.size() > static_cast<std::size_t>(kMaxLeftWidth)) {
       out += "  " + left + "\n" + std::string(column, ' ') + first + "\n";
@@ -215,7 +212,7 @@ std::string OptionRight(const CLI::Option& option) {
   return description;
 }
 
-std::string MakeHelp(const CLI::App* app, const term::StyleSheet& style) {
+std::string MakeHelp(const CLI::App* app, const cli::TextStyler& style) {
   std::string out;
   if (!app->get_description().empty()) out += app->get_description() + "\n\n";
   out += UsageLine(*app, style) + "\n";
@@ -228,13 +225,12 @@ std::string MakeHelp(const CLI::App* app, const term::StyleSheet& style) {
     out += "\n" + style.Heading("Commands:") + "\n" + RenderEntries(entries, style);
   }
 
-  // Options: the built-in flags always lead the ungrouped section and never
-  // show value placeholders; option groups follow in declaration order.
+  // Options: the built-in help flag always leads the ungrouped section; option
+  // groups follow in declaration order.
   std::vector<HelpEntry> options;
   options.push_back({"-h, --help", "Print this help message and exit"});
-  options.push_back({"-v, --version", "Display program version information and exit"});
   for (const CLI::Option* option : app->get_options()) {
-    if (option == app->get_help_ptr() || option == app->get_version_ptr()) continue;
+    if (option == app->get_help_ptr()) continue;
     std::string group = option->get_group();
     if (!group.empty() && group != "OPTIONS") continue;  // Owned by a group.
     options.push_back({OptionLeft(*option), OptionRight(*option)});
@@ -250,15 +246,11 @@ std::string MakeHelp(const CLI::App* app, const term::StyleSheet& style) {
            RenderEntries(entries, style);
   }
 
-  out += "\n" + style.Heading("Global options:") + "\n" +
-         RenderEntries({{"--color <color>",
-                         "Color output: auto, always, never [default: auto]"}},
-                       style);
-
   if (app->get_parent() == nullptr) {
-    out += "\nExamples:\n  $ inferx serve --model models/Qwen3-0.6B\n"
-           "  $ inferx bench latency --help\n  $ inferx bench throughput --help\n\n"
-           "Run 'inferx <command> --help' for more information.\n";
+    out +=
+        "\nExamples:\n  $ inferx serve --model models/Qwen3-0.6B\n"
+        "  $ inferx bench latency --help\n  $ inferx bench throughput --help\n\n"
+        "Run 'inferx <command> --help' for more information.\n";
   } else {
     out += "\nRun '" + CommandPath(*app) + " --help' for more information.\n";
   }
@@ -267,17 +259,16 @@ std::string MakeHelp(const CLI::App* app, const term::StyleSheet& style) {
 
 // --- Parse-error reports ---------------------------------------------------
 
-void WriteTryLine(std::ostream& err, const term::StyleSheet& style,
-                  const CLI::App* target) {
-  err << "\nFor more information, try '"
-      << style.Command(CommandPath(*target) + " --help") << "'.\n";
+void WriteTryLine(std::ostream& err, const cli::TextStyler& style, const CLI::App* target) {
+  err << "\nFor more information, try '" << style.Command(CommandPath(*target) + " --help")
+      << "'.\n";
 }
 
 std::string PlaceholderFor(const CLI::App&, const std::string& option_name) {
   return "<" + std::string(StripDashes(option_name)) + ">";
 }
 
-void ReportUnknownOption(std::ostream& err, const term::StyleSheet& style,
+void ReportUnknownOption(std::ostream& err, const cli::TextStyler& style,
                          const CLI::App* target, const std::string& name) {
   err << style.Error("error:") << " unknown option '" << style.Command(name) << "'\n";
   const std::string best = Suggest(name, OptionCandidates(*target));
@@ -285,7 +276,7 @@ void ReportUnknownOption(std::ostream& err, const term::StyleSheet& style,
   WriteTryLine(err, style, target);
 }
 
-void ReportUnknownCommand(std::ostream& err, const term::StyleSheet& style,
+void ReportUnknownCommand(std::ostream& err, const cli::TextStyler& style,
                           const CLI::App* target, const std::string& name) {
   err << style.Error("error:") << " unknown command '" << style.Command(name) << "'\n";
   const std::string best = Suggest(name, CommandCandidates(*target));
@@ -295,16 +286,17 @@ void ReportUnknownCommand(std::ostream& err, const term::StyleSheet& style,
     std::vector<HelpEntry> entries;
     for (const CLI::App* sub : children)
       entries.push_back({sub->get_name(), sub->get_description(), true});
-    err << "\n" << style.Heading("Available commands:") << "\n"
+    err << "\n"
+        << style.Heading("Available commands:") << "\n"
         << RenderEntries(entries, style);
   }
   WriteTryLine(err, style, target);
 }
 
-void ReportMissingSubcommand(std::ostream& err, const term::StyleSheet& style,
+void ReportMissingSubcommand(std::ostream& err, const cli::TextStyler& style,
                              const CLI::App* target) {
-  err << style.Error("error:") << " missing required command "
-      << style.Placeholder("<command>") << "\n\n"
+  err << style.Error("error:") << " missing required command " << style.Placeholder("<command>")
+      << "\n\n"
       << UsageLine(*target, style) << "\n\n"
       << style.Heading("Available commands:") << "\n";
   std::vector<HelpEntry> entries;
@@ -314,31 +306,29 @@ void ReportMissingSubcommand(std::ostream& err, const term::StyleSheet& style,
   WriteTryLine(err, style, target);
 }
 
-void ReportMissingOptions(std::ostream& err, const term::StyleSheet& style,
-                          const CLI::App* target,
-                          const std::vector<std::string>& names) {
+void ReportMissingOptions(std::ostream& err, const cli::TextStyler& style,
+                          const CLI::App* target, const std::vector<std::string>& names) {
   err << style.Error("error:");
   bool first = true;
   for (const std::string& name : names) {
-    err << (first ? " " : "\n") << "missing required option '" << style.Command(name)
-        << "' " << style.Placeholder(PlaceholderFor(*target, name));
+    err << (first ? " " : "\n") << "missing required option '" << style.Command(name) << "' "
+        << style.Placeholder(PlaceholderFor(*target, name));
     first = false;
   }
   err << "\n\n" << UsageLine(*target, style) << "\n";
   WriteTryLine(err, style, target);
 }
 
-void ReportMissingValue(std::ostream& err, const term::StyleSheet& style,
-                        const CLI::App* target, const std::string& option_name) {
+void ReportMissingValue(std::ostream& err, const cli::TextStyler& style, const CLI::App* target,
+                        const std::string& option_name) {
   err << style.Error("error:") << " missing value "
       << style.Placeholder(PlaceholderFor(*target, option_name)) << " for '"
       << style.Command(option_name) << "'\n";
   WriteTryLine(err, style, target);
 }
 
-void ReportInvalidValue(std::ostream& err, const term::StyleSheet& style,
-                        const CLI::App* target, const std::string& value,
-                        const std::string& option_name,
+void ReportInvalidValue(std::ostream& err, const cli::TextStyler& style, const CLI::App* target,
+                        const std::string& value, const std::string& option_name,
                         const std::string& detail) {
   err << style.Error("error:") << " invalid value '" << value << "' for '"
       << style.Command(option_name) << "'";
@@ -347,8 +337,8 @@ void ReportInvalidValue(std::ostream& err, const term::StyleSheet& style,
   WriteTryLine(err, style, target);
 }
 
-void ReportGeneric(std::ostream& err, const term::StyleSheet& style,
-                   const CLI::App* target, const std::string& what) {
+void ReportGeneric(std::ostream& err, const cli::TextStyler& style, const CLI::App* target,
+                   const std::string& what) {
   err << style.Error("error:") << " " << what << "\n";
   WriteTryLine(err, style, target);
 }
@@ -375,16 +365,16 @@ Presentation::Presentation(CLI::App& app, std::ostream& out, std::ostream& err,
       out_(out),
       err_(err),
       out_is_terminal_(out_is_terminal),
-      err_is_terminal_(err_is_terminal) {
+      err_is_terminal_(err_is_terminal),
+      out_style_(cli::ShouldUseColor(out_is_terminal)),
+      err_style_(cli::ShouldUseColor(err_is_terminal)) {
   // CLI11 copies the formatter into subcommands when they are created, and
   // the tree already exists by now, so walk it.
   std::function<void(CLI::App*)> install = [&](CLI::App* app) {
-    app->formatter_fn([this](const CLI::App* help_app, std::string,
-                            CLI::AppFormatMode) {
+    app->formatter_fn([this](const CLI::App* help_app, std::string, CLI::AppFormatMode) {
       return MakeHelp(help_app, out_style_);
     });
-    for (CLI::App* sub : app->get_subcommands([](CLI::App*) { return true; }))
-      install(sub);
+    for (CLI::App* sub : app->get_subcommands([](CLI::App*) { return true; })) install(sub);
   };
   install(&app_);
   CollectValueOptions(&app_);
@@ -400,11 +390,6 @@ void Presentation::CollectValueOptions(CLI::App* app) {
   }
   for (CLI::App* sub : app->get_subcommands([](CLI::App*) { return true; }))
     CollectValueOptions(sub);
-}
-
-void Presentation::SetStyles(term::ColorMode mode) {
-  out_style_ = term::StyleSheet(term::UseColor(mode, out_is_terminal_));
-  err_style_ = term::StyleSheet(term::UseColor(mode, err_is_terminal_));
 }
 
 void Presentation::Error(std::string_view message) const {
@@ -425,40 +410,7 @@ int Presentation::PrintHelp(const CLI::App* app) {
 }
 
 int Presentation::Parse(int argc, const char* const argv[]) {
-  // --color and --version are engine-level: they are recognized anywhere
-  // before "--", the last --color wins, and --version short-circuits the
-  // parse. Everything else goes to CLI11 unchanged.
-  std::vector<std::string> args;
-  bool past_dashdash = false;
-  bool have_color = false;
-  bool color_missing_value = false;
-  bool want_version = false;
-  std::string color_value;
-  for (int i = 1; i < argc; ++i) {
-    std::string token = argv[i];
-    if (!past_dashdash) {
-      if (token == "--") {
-        past_dashdash = true;
-      } else if (token == "--color") {
-        if (i + 1 < argc && argv[i + 1][0] != '-') {
-          color_value = argv[++i];
-          have_color = true;
-          continue;
-        }
-        color_missing_value = true;
-        continue;
-      } else if (StartsWith(token, "--color=")) {
-        color_value = token.substr(8);
-        have_color = true;
-        continue;
-      } else if (token == "-v" || token == "--version") {
-        want_version = true;
-        continue;
-      }
-    }
-    args.push_back(std::move(token));
-  }
-  if (want_version) args.insert(args.begin(), "--version");
+  std::vector<std::string> args(argv + 1, argv + argc);
 
   // Deepest subcommand named on the command line: the help target and the
   // context for error hints. Tokens naming no subcommand feed unknown-
@@ -481,26 +433,6 @@ int Presentation::Parse(int argc, const char* const argv[]) {
       unmatched = token;
     }
   }
-
-  term::ColorMode mode = term::ColorMode::kAuto;
-  if (have_color) {
-    if (color_value == "always") {
-      mode = term::ColorMode::kAlways;
-    } else if (color_value == "never") {
-      mode = term::ColorMode::kNever;
-    } else if (color_value != "auto") {
-      SetStyles(term::ColorMode::kNever);
-      ReportInvalidValue(err_, err_style_, target, color_value, "--color",
-                         color_value + " not in {auto,always,never}");
-      return 105;  // CLI11 ValidationError exit code.
-    }
-  }
-  if (color_missing_value) {
-    SetStyles(mode);
-    ReportMissingValue(err_, err_style_, target, "--color");
-    return 114;  // CLI11 ArgumentMismatch exit code.
-  }
-  SetStyles(mode);
 
   // A value option followed by another option (or "--") never takes that
   // token as its value; report the missing value instead of letting CLI11
@@ -533,17 +465,13 @@ int Presentation::Parse(int argc, const char* const argv[]) {
     return PrintHelp(target);
   } catch (const CLI::CallForAllHelp&) {
     return PrintHelp(target);
-  } catch (const CLI::CallForVersion& e) {
-    out_ << e.what() << "\n";
-    return 0;
   } catch (CLI::ParseError& e) {
     return ReportParseError(e, target, unmatched, e.get_exit_code());
   }
   return 0;
 }
 
-int Presentation::ReportParseError(const CLI::ParseError& error,
-                                   const CLI::App* target,
+int Presentation::ReportParseError(const CLI::ParseError& error, const CLI::App* target,
                                    const std::string& unmatched, int code) {
   const std::string name = error.get_name();
   const std::string what = error.what();

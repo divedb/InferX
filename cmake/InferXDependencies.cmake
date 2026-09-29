@@ -53,6 +53,15 @@ set(CLI11_SINGLE_FILE_TESTS OFF CACHE BOOL "")
 add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/cli11"
                  "${PROJECT_BINARY_DIR}/third_party/cli11" EXCLUDE_FROM_ALL)
 
+# fmt: text styling and formatting for the CLI's terminal presentation.
+set(FMT_DOC OFF CACHE BOOL "")
+set(FMT_INSTALL OFF CACHE BOOL "")
+set(FMT_TEST OFF CACHE BOOL "")
+set(FMT_PEDANTIC OFF CACHE BOOL "")
+set(FMT_WERROR OFF CACHE BOOL "")
+add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/fmt"
+                 "${PROJECT_BINARY_DIR}/third_party/fmt" EXCLUDE_FROM_ALL)
+
 # Boost.Asio subset + Beast: coroutine-based HTTP for the serving layer
 # (`inferx serve`). Header-only interface targets; the Boost subset's
 # provenance is pinned in third_party/boost/fetch.sh.

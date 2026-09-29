@@ -1,13 +1,5 @@
-// Presentation owns everything user-facing around CLI11: the shared help
-// formatter, --color handling, parse-error translation, and styled status
-// messages. Construct it after registering the command tree and call Parse
-// at the entry point; business errors still use CommandError and are
-// rendered through Presentation::Error in main.
-//
-// Help and success messages go to stdout; errors and warnings go to stderr.
-// ANSI codes belong only in terminal.cc; this layer picks semantic styles
-// through term::StyleSheet.
 #pragma once
+
 #include <CLI/CLI.hpp>
 #include <map>
 #include <ostream>
@@ -25,8 +17,8 @@ std::string CommandPath(const CLI::App& app);
 class Presentation {
  public:
   /// `out_is_terminal` / `err_is_terminal` drive per-stream auto color.
-  Presentation(CLI::App& app, std::ostream& out, std::ostream& err,
-               bool out_is_terminal, bool err_is_terminal);
+  Presentation(CLI::App& app, std::ostream& out, std::ostream& err, bool out_is_terminal,
+               bool err_is_terminal);
 
   /// Parses `argv` (argv[0] is the program name). Translates CLI11 parse
   /// errors into the project's message style while preserving CLI11's exit
@@ -46,9 +38,6 @@ class Presentation {
   /// so the parse prepass can reject `--opt --other-flag` as a missing value.
   void CollectValueOptions(CLI::App* app);
 
-  /// Rebuilds both stream styles from `mode` and each stream's tty state.
-  void SetStyles(term::ColorMode mode);
-
   /// Renders `app`'s help into the out stream; returns the exit code (0).
   int PrintHelp(const CLI::App* app);
 
@@ -62,8 +51,9 @@ class Presentation {
   bool out_is_terminal_;
   bool err_is_terminal_;
   std::map<std::string, bool> value_options_;  // name -> takes a value
-  term::StyleSheet out_style_{false};
-  term::StyleSheet err_style_{false};
+  // Color is decided once from the environment and each stream's tty state.
+  cli::TextStyler out_style_;
+  cli::TextStyler err_style_;
 };
 
 }  // namespace inferx::cli

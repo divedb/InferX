@@ -20,11 +20,14 @@ void InferxCli::RegisterCommands() {
   RegisterDiagnostic(app_);
   RegisterBench(app_);
   RegisterWorker(app_);
+  RegisterVersion(app_);
 }
 
+int InferxCli::ParseCommandLine(int argc, const char* const argv[]) { return 0; }
+
 int InferxCli::Run(int argc, char** argv) {
-  Presentation presentation(app_, std::cout, std::cerr, term::IsTerminal(stdout),
-                            term::IsTerminal(stderr));
+  Presentation presentation(app_, std::cout, std::cerr, cli::IsInteractiveTerminal(stdout),
+                            cli::IsInteractiveTerminal(stderr));
   try {
     return presentation.Parse(argc, argv);
   } catch (const CommandError& e) {

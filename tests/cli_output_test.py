@@ -43,7 +43,7 @@ class CliOutputTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 self.assertEqual(result.stderr, "")
                 for text in ["InferX", "Usage:\n  inferx <command> [options]",
-                             "Commands:", "Options:", "Examples:", "--color",
+                             "Commands:", "Options:", "Examples:", "version",
                              "serve", "bench", "diagnostic"]:
                     self.assertIn(text, result.stdout)
                 self.assertNotIn("<help>", result.stdout)
@@ -58,8 +58,8 @@ class CliOutputTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, "")
                 self.assertIn("Usage:\n  inferx " + path, result.stdout)
-                self.assertIn("--color", result.stdout)
-                self.assertEqual(result.stdout.count("--color"), 1)
+                self.assertIn("-h, --help", result.stdout)
+                self.assertNotIn("--color", result.stdout)
 
     def test_option_groups_and_defaults(self):
         text = self.run_cli("serve", "--help").stdout
@@ -96,11 +96,13 @@ class CliOutputTest(unittest.TestCase):
                           "--enable-chunked-prefill", "--no-enable-chunked-prefill")
 
     def test_version(self):
+        result = self.run_cli("version")
+        self.assertEqual(result.returncode, 0)
+        self.assertRegex(result.stdout, r"^\d+\.\d+\.\d+")
+        self.assertEqual(result.stderr, "")
+        # The former flags are gone.
         for args in [("--version",), ("-v",), ("serve", "--version")]:
-            result = self.run_cli(*args)
-            self.assertEqual(result.returncode, 0)
-            self.assertRegex(result.stdout, r"^\d+\.\d+\.\d+")
-            self.assertEqual(result.stderr, "")
+            self.assert_error(list(args), "unknown option")
 
     def test_missing_subcommands(self):
         for group in ["bench", "launch", "diagnostic"]:
@@ -131,7 +133,7 @@ class CliOutputTest(unittest.TestCase):
                           "missing required option '--output'")
 
     def test_missing_values(self):
-        for option in ["--model", "--port", "--color"]:
+        for option in ["--model", "--port"]:
             self.assert_error(["serve", option], "missing value", f"for '{option}'")
         self.assert_error(["serve", "--model", "--port", "8000"], "missing value", "--model")
 
@@ -139,7 +141,6 @@ class CliOutputTest(unittest.TestCase):
         for value in ["0", "70000", "abc"]:
             self.assert_error(["serve", "--port", value], "invalid value", "--port")
         self.assert_error(["serve", "--device", "tpu"], "invalid value 'tpu'", "--device", "cuda")
-        self.assert_error(["--color=rainbow"], "invalid value 'rainbow'", "auto,always,never")
         # An option without a validator exercises CLI11's ConversionError.
         self.assert_error(["bench", "workload", "--repeats", "oops"], "invalid value")
 
@@ -150,52 +151,50 @@ class CliOutputTest(unittest.TestCase):
 
     def test_plain_and_colored_layouts_match(self):
         for args in [["--help"], ["serve", "--help"], ["bench"], ["serve", "--modle"]]:
-            plain = self.run_cli("--color=never", *args)
-            color = self.run_cli("--color=always", *args)
+            plain = self.run_cli(*args, env={"NO_COLOR": "1"})
+            color = self.run_cli(*args, env={"CLICOLOR_FORCE": "1"})
             self.assertEqual(plain.returncode, color.returncode)
             self.assertRegex(color.stdout + color.stderr, ANSI)
             self.assertEqual(ANSI.sub("", color.stdout), plain.stdout)
             self.assertEqual(ANSI.sub("", color.stderr), plain.stderr)
 
-    def test_color_anywhere_and_repeated(self):
-        for args in [["--color=always", "bench", "--help"],
-                     ["bench", "--color", "always", "latency", "--help"],
-                     ["bench", "latency", "--help", "--color=always"]]:
-            result = self.run_cli(*args)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertRegex(result.stdout, ANSI)
-        result = self.run_cli("--color=always", "serve", "--color=never", "--help")
+    def test_color_environment_control(self):
+        # CLICOLOR_FORCE colors redirected output; NO_COLOR disables it and
+        # wins over CLICOLOR_FORCE.
+        result = self.run_cli("--help", env={"NO_COLOR": "1"})
         self.assertNotRegex(result.stdout, ANSI)
-
-    def test_no_color_and_explicit_override(self):
-        for mode, colored in [("auto", False), ("never", False), ("always", True)]:
-            result = self.run_cli(f"--color={mode}", "--help", env={"NO_COLOR": "1"})
-            self.assertEqual(bool(ANSI.search(result.stdout)), colored)
+        result = self.run_cli("bench", "latency", "--help", env={"CLICOLOR_FORCE": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, ANSI)
+        result = self.run_cli("--help", env={"CLICOLOR_FORCE": "1", "NO_COLOR": "1"})
+        self.assertNotRegex(result.stdout, ANSI)
 
     def test_semantic_styles_in_colored_output(self):
         # Placeholders render yellow, option names and commands cyan.
-        result = self.run_cli("serve", "--model", "--port", "8000", "--color=always")
+        result = self.run_cli("serve", "--model", "--port", "8000",
+                              env={"CLICOLOR_FORCE": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("\x1b[33m<model>\x1b[0m", result.stderr)
         self.assertIn("\x1b[36m--model\x1b[0m", result.stderr)
-        result = self.run_cli("bench", "latency", "--help", "--color=always")
+        result = self.run_cli("bench", "latency", "--help", env={"CLICOLOR_FORCE": "1"})
         self.assertEqual(result.returncode, 0)
         self.assertIn("\x1b[33m<batch-size>\x1b[0m", result.stdout)
         self.assertIn("\x1b[1mUsage:\x1b[0m", result.stdout)
         self.assertIn("\x1b[36minferx bench latency\x1b[0m", result.stdout)
-        # The same invocations without --color (piped) stay plain.
+        # The same invocations without forcing stay plain when piped.
         self.assertNotIn("\x1b[33m<model>\x1b[0m",
                          self.run_cli("serve", "--model", "--port", "8000").stderr)
 
     def test_redirect_to_file(self):
-        for mode in ["auto", "never", "always"]:
+        for env, colored in [({}, False), ({"NO_COLOR": "1"}, False),
+                             ({"CLICOLOR_FORCE": "1"}, True)]:
             with tempfile.TemporaryFile(mode="w+") as output:
-                result = subprocess.run([INFERX, f"--color={mode}", "--help"],
+                result = subprocess.run([INFERX, "--help"],
                                         stdout=output, stderr=subprocess.PIPE,
-                                        env=environment(), timeout=20)
+                                        env=environment(**env), timeout=20)
                 output.seek(0)
                 self.assertEqual(result.returncode, 0)
-                self.assertEqual(bool(ANSI.search(output.read())), mode == "always")
+                self.assertEqual(bool(ANSI.search(output.read())), colored)
 
     @unittest.skipUnless(os.name == "posix", "requires a pseudo-terminal")
     def test_interactive_streams_independently(self):
@@ -206,7 +205,7 @@ class CliOutputTest(unittest.TestCase):
             ("stdout", ["bench", "--help"], {"NO_COLOR": "1"}, False),
             ("stdout", ["bench", "--help"], {"NO_COLOR": ""}, True),
             ("stdout", ["bench", "--help"], {"TERM": "dumb"}, False),
-            ("stdout", ["bench", "--color=never", "--help"], {}, False),
+            ("stdout", ["bench", "--help"], {"TERM": "dumb", "CLICOLOR_FORCE": "1"}, True),
             ("stderr", ["bench"], {}, True),
             ("stderr", ["bench"], {"NO_COLOR": "1"}, False),
             ("stdout", ["bench"], {}, False),  # stderr is a pipe

@@ -17,6 +17,7 @@ void RegisterCollectEnv(CLI::App& root);
 void RegisterLaunch(CLI::App& root);
 void RegisterDiagnostic(CLI::App& root);
 void RegisterBench(CLI::App& root);
+void RegisterVersion(CLI::App& root);
 // Internal: one tensor-parallel worker rank, spawned by the controller.
 void RegisterWorker(CLI::App& root);
 

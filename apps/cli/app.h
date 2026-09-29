@@ -25,7 +25,6 @@ class InferxCli {
     // Set the default behavior for subcommands: allow 0 or 1 subcommand to be
     // specified.
     app_.require_subcommand(0, 1);
-    app_.set_version_flag("-v,--version", INFERX_VERSION);
     RegisterCommands();
   }
 
@@ -39,6 +38,7 @@ class InferxCli {
 
  private:
   void RegisterCommands();
+  int ParseCommandLine(int argc, const char* const argv[]);
 
   CLI::App app_;
 };

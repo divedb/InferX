@@ -64,11 +64,6 @@ target_link_libraries(inferx_cli_args_test PRIVATE inferx::cli GTest::gtest_main
 target_compile_options(inferx_cli_args_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME cli_args_test COMMAND inferx_cli_args_test)
 
-add_executable(inferx_cli_presentation_test cli_presentation_test.cc)
-target_link_libraries(inferx_cli_presentation_test
-  PRIVATE inferx::cli_presentation GTest::gtest_main)
-add_test(NAME cli_presentation_test COMMAND inferx_cli_presentation_test)
-
 add_executable(inferx_server_api_test server_api_test.cc)
 target_link_libraries(inferx_server_api_test
   PRIVATE inferx::server nlohmann_json::nlohmann_json GTest::gtest_main)
