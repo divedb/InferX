@@ -64,8 +64,8 @@ class LoopbackComm final : public CommBackend {
   int size() const override;
   int rank() const override;
 
-  Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) override;
-  Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+  Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) override;
+  Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override;
 
   ~LoopbackComm() override;
@@ -79,7 +79,7 @@ class LoopbackComm final : public CommBackend {
   ///        hidden, and logit collectives from reallocating.
   StatusOr<Tensor*> Slot(const Shape& shape, DeviceId device);
 
-  Status Publish(const ops::ExecutionContext& ctx, const Tensor& contribution);
+  Status Publish(const ops::OpContext& ctx, const Tensor& contribution);
   Status Meet();                 ///< Barrier over the shared generation.
   Status Finish(Status status);  ///< Propagates local failures to waiting peers.
 

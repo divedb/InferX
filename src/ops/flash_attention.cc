@@ -14,12 +14,12 @@ Status CheckTensor(const Tensor& t, DataType dtype, int rank, const DeviceId& de
   }
   return OkStatus();
 }
-Status CheckDevice(ExecutionContext& ctx) {
-  if (!ctx.device().IsCuda()) return UnimplementedError("FlashInfer requires CUDA");
-  return ctx.runtime().Activate();
+Status CheckDevice(OpContext& ctx) {
+  if (!ctx.Device().IsCuda()) return UnimplementedError("FlashInfer requires CUDA");
+  return ctx.Runtime().Activate();
 }
-Status CheckPlan(ExecutionContext& ctx, const Tensor& plan, int tiles, int tile_rows) {
-  INFERX_RETURN_IF_ERROR(CheckTensor(plan, DataType::kInt32, 1, ctx.device()));
+Status CheckPlan(OpContext& ctx, const Tensor& plan, int tiles, int tile_rows) {
+  INFERX_RETURN_IF_ERROR(CheckTensor(plan, DataType::kInt32, 1, ctx.Device()));
   if (tiles <= 0 || plan.Numel() < 3LL * tiles + 1 || (tile_rows != 64 && tile_rows != 128)) {
     return InvalidArgumentError("invalid FlashInfer plan capacity or tile size");
   }
@@ -27,11 +27,11 @@ Status CheckPlan(ExecutionContext& ctx, const Tensor& plan, int tiles, int tile_
 }
 }  // namespace
 
-Status PrepareFlashDecode(ExecutionContext& ctx, const Tensor& kv, const Tensor& last,
+Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv, const Tensor& last,
                           int block_size, FlashDecodeWorkspace& workspace) {
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
   for (const Tensor* t : std::initializer_list<const Tensor*>{&kv, &last, &workspace.plan}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.Device()));
   }
   const int64_t batch = last.Numel();
   if (batch <= 0 || batch > FlashDecodeWorkspace::kMaxBatch || kv.Numel() != batch + 1 ||
@@ -42,10 +42,10 @@ Status PrepareFlashDecode(ExecutionContext& ctx, const Tensor& kv, const Tensor&
   return cuda::PrepareFlashDecode(ctx, kv, last, block_size, workspace);
 }
 
-Status PrepareFlashAttention(ExecutionContext& ctx, const Tensor& qo, Tensor& plan, int group,
+Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo, Tensor& plan, int group,
                              int tiles, int tile_rows) {
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
-  INFERX_RETURN_IF_ERROR(CheckTensor(qo, DataType::kInt32, 1, ctx.device()));
+  INFERX_RETURN_IF_ERROR(CheckTensor(qo, DataType::kInt32, 1, ctx.Device()));
   INFERX_RETURN_IF_ERROR(CheckPlan(ctx, plan, tiles, tile_rows));
   if (qo.Numel() < 2 || qo.Numel() > std::numeric_limits<int>::max() || group <= 0 ||
       group > 32) {
@@ -54,7 +54,7 @@ Status PrepareFlashAttention(ExecutionContext& ctx, const Tensor& qo, Tensor& pl
   return cuda::PrepareFlashAttention(ctx, qo, plan, group, tiles, tile_rows);
 }
 
-Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo,
+Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
                            const Tensor& kv, const Tensor& indices, const Tensor& last,
                            const Tensor& key, const Tensor& value, int64_t block_size,
                            const AttentionParams& p, const Tensor& plan, int tiles, Tensor& out,
@@ -63,13 +63,13 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
   INFERX_RETURN_IF_ERROR(CheckPlan(ctx, plan, tiles, tile_rows));
   for (const Tensor* t : {&qo, &kv, &indices, &last}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.Device()));
   }
   for (const Tensor* t : std::initializer_list<const Tensor*>{&q, &out}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 2, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 2, ctx.Device()));
   }
   for (const Tensor* t : {&key, &value}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 4, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 4, ctx.Device()));
     if (t->Dim(0) <= 0 || t->Dim(1) != block_size || t->Dim(2) != p.kv_heads ||
         t->Dim(3) != p.head_dim) {
       return InvalidArgumentError("FlashInfer KV cache geometry mismatch");
@@ -86,9 +86,9 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
     return InvalidArgumentError("FlashInfer query, cache or ragged batch geometry mismatch");
   }
   if (decode != nullptr) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->plan, DataType::kInt32, 1, ctx.device()));
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->values, DataType::kBFloat16, 1, ctx.device()));
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat32, 1, ctx.device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->plan, DataType::kInt32, 1, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->values, DataType::kBFloat16, 1, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat32, 1, ctx.Device()));
     const int64_t splits = batch * FlashDecodeWorkspace::kPartitions;
     if (batch > FlashDecodeWorkspace::kMaxBatch || q.Dim(0) != batch ||
         decode->plan.Numel() < 3 * splits + batch + 2 ||
@@ -103,7 +103,7 @@ Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor&
   });
 }
 
-Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
+Status BeginAttentionStep(OpContext& ctx, const Tensor& kv_indptr,
                           const Tensor& last_page_len, int64_t block_size, int num_tokens,
                           int num_seqs, AttentionPlanWorkspace& ws) {
   // The flash-attention plan carries last step's tile layout; the first
@@ -119,7 +119,7 @@ Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
   return OkStatus();
 }
 
-Status PagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+Status PagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
                       const Tensor& kv_indptr, const Tensor& kv_indices,
                       const Tensor& last_page_len, absl::Span<const int32_t> host_qo_indptr,
                       int num_seqs, const Tensor& key_cache, const Tensor& value_cache,

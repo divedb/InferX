@@ -38,14 +38,14 @@ Status CudaError(cudaError_t err, const char* what) {
 
 }  // namespace
 
-Status AssembleMlaCaches(ExecutionContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
+Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
                          int64_t heads, int64_t nope, int64_t rope, int64_t v_dim, Tensor& k_out,
                          Tensor& v_out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t head_dim = nope + rope;
   const int64_t total = k_rope.Dim(0) * heads * head_dim;
   AssembleMlaKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
-                      static_cast<cudaStream_t>(ctx.stream())>>>(
+                      static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(k_rope.Data()),
       static_cast<const __nv_bfloat16*>(up_projected.Data()),
       static_cast<int>(k_rope.Dim(0)), static_cast<int>(heads),

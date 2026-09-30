@@ -4,7 +4,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -14,7 +14,7 @@ namespace inferx::ops {
 /// [q (rows x key_heads*key_dim) | k | v | z] block-contiguous. `conv_in`
 /// receives [q | k | v] in one buffer (the causal convolution's input) and
 /// `z` its own buffer.
-Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& conv_in,
+Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
                           Tensor& z, int64_t key_heads, int64_t key_dim, int64_t value_heads,
                           int64_t value_dim);
 
@@ -25,7 +25,7 @@ Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& c
 /// previous steps. `batch_indices` maps each token row to its sequence and
 /// `qo_indptr` bounds the sequential walk. Writes the convolved+activated
 /// output over `x` in place and leaves the last kernel-1 inputs in state.
-Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
+Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
                      const Tensor& state, const Tensor& batch_indices,
                      const Tensor& qo_indptr, int64_t kernel);
 
@@ -35,7 +35,7 @@ Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
 /// checkpoint layout); beta = sigmoid(b) and
 /// g = -exp(a_log) * softplus(a + dt_bias) run in fp32. `a_log` and
 /// `dt_bias` are [value_heads] float32.
-Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
+Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
                 const Tensor& dt_bias, Tensor& beta, Tensor& g);
 
 /// \brief Sequential gated-delta update over the flat token batch.
@@ -46,7 +46,7 @@ Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
 /// by `slot_indices` per sequence. `conv` is the convolved [q | k | v] buffer
 /// ([tokens, 2 * query_width + value_width]) with `query_width` the total
 /// per-k-head key columns; `y` is [tokens, value_heads * value_dim]. 
-Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_width,
+Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
                     const Tensor& beta, const Tensor& g, Tensor& state,
                     const Tensor& slot_indices, const Tensor& qo_indptr,
                     const Tensor& batch_indices, Tensor& y);
@@ -55,7 +55,7 @@ Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_wid
 ///
 /// `y` and `z` are [tokens, value_heads * value_dim]; `weight` is
 /// [value_dim]; heads are independent.
-Status RmsNormGated(ExecutionContext& ctx, const Tensor& y, const Tensor& z,
+Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out);
 
 }  // namespace inferx::ops

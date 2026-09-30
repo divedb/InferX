@@ -15,7 +15,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 namespace dist {
@@ -46,28 +46,28 @@ class CommBackend {
   /// produce rank-local partial sums that this folds into the full result.
   /// Also folds the masked partials of a vocab-parallel embedding lookup.
   /// Accepts any tensor rank, including scalars and empty tensors.
-  virtual Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) = 0;
+  virtual Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) = 0;
 
   /// \brief Concatenates rank shards along the last dimension: each rank
   ///        contributes `partial` [rows, shard] and receives `full`
   ///        [rows, size * shard], in rank order. Both tensors must be BF16.
   /// Buffers must not overlap, except exact aliasing is allowed at size 1.
-  virtual Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+  virtual Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                                   Tensor& full) = 0;
 
  protected:
-  static Status ValidateTensor(const ops::ExecutionContext& ctx, const Tensor& tensor) {
+  static Status ValidateTensor(const ops::OpContext& ctx, const Tensor& tensor) {
     if (tensor.GetDataType() != DataType::kBFloat16) {
       return InvalidArgumentError("collectives carry bfloat16, got ",
                                   DataTypeName(tensor.GetDataType()));
     }
-    if (tensor.Device() != ctx.device()) {
+    if (tensor.Device() != ctx.Device()) {
       return InvalidArgumentError("collective tensors must live on the context's device");
     }
     return OkStatus();
   }
 
-  Status ValidateGather(const ops::ExecutionContext& ctx, const Tensor& partial,
+  Status ValidateGather(const ops::OpContext& ctx, const Tensor& partial,
                         const Tensor& full) const {
     INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, partial));
     INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, full));
@@ -99,16 +99,16 @@ class SingleRankComm final : public CommBackend {
   int size() const override { return 1; }
   int rank() const override { return 0; }
 
-  Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) override {
+  Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) override {
     return ValidateTensor(ctx, partial);
   }
 
-  Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+  Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override {
     INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
     if (full.Data() == partial.Data() || partial.IsEmpty()) return OkStatus();
-    return ctx.runtime().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
-                                   CopyKind::kDeviceToDevice, ctx.stream());
+    return ctx.Runtime().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
+                                   CopyKind::kDeviceToDevice, ctx.GetStream());
   }
 };
 

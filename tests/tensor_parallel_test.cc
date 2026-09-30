@@ -24,12 +24,12 @@ class ObservedModel final : public Model {
     return model_->StateRequirements();
   }
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
+                           ops::OpContext& ctx, dist::CommBackend& comm) override {
     INFERX_ASSIGN_OR_RETURN(auto logits, model_->Forward(input, state, ctx, comm));
     std::vector<uint16_t> bits(logits.Numel());
-    INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(bits.data(), logits.Data(), logits.NBytes(),
-                                                   CopyKind::kDeviceToHost, ctx.stream()));
-    INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(bits.data(), logits.Data(), logits.NBytes(),
+                                                   CopyKind::kDeviceToHost, ctx.GetStream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
     std::vector<float> values;
     for (uint16_t value : bits) values.push_back(std::bit_cast<float>(uint32_t(value) << 16));
     steps.push_back(std::move(values));

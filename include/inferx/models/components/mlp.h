@@ -11,11 +11,9 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/components/linear.h"
 #include "inferx/ops/elementwise.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
-
-class DiagnosticTrace;
 
 namespace components {
 
@@ -62,8 +60,8 @@ struct MlpWorkspace {
 /// fused-row bias, the configured gated activation, then the down projection
 /// and its optional bias.
 Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights, const Tensor& normed,
-                 MlpWorkspace& ws, Tensor* packed_buffer, ops::ExecutionContext& ctx,
-                 DiagnosticTrace* trace, std::string_view prefix, Tensor& mixed_out);
+                 MlpWorkspace& ws, Tensor* packed_buffer, ops::OpContext& ctx,
+                 Tensor& mixed_out);
 
 /// A concrete gated-MLP component selected by model traits. Activation
 /// flavor, clamps, and biases are runtime configuration; execution is shared.
@@ -78,9 +76,8 @@ class GatedMlp {
       : config_(std::move(config)), weights_(std::move(weights)) {}
 
   Status Forward(const Tensor& input, MlpWorkspace& workspace, Tensor* packed,
-                 ops::ExecutionContext& ctx, DiagnosticTrace* trace, std::string_view prefix,
-                 Tensor& output) const {
-    return RunSwiGlu(config_, weights_, input, workspace, packed, ctx, trace, prefix, output);
+                 ops::OpContext& ctx, Tensor& output) const {
+    return RunSwiGlu(config_, weights_, input, workspace, packed, ctx, output);
   }
 
  private:

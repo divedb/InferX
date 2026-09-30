@@ -17,7 +17,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
 #include "inferx/dist/nccl_comm.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/sampling/sampler.h"
 
 namespace inferx {
@@ -349,7 +349,7 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::CreateGroup(
 StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& output) {
   ModelRunnerOutput result;
   // Process removals before admission so a finished ID can safely be reused.
-  ops::ExecutionContext lifecycle_ctx(*runtime, stream);
+  ops::OpContext lifecycle_ctx(*runtime, stream);
   for (RequestId id : output.finished_request_ids) {
     const auto it = states.find(id);
     if (it != states.end() && it->second.recurrent_slot >= 0) {
@@ -504,7 +504,7 @@ StatusOr<ModelRunnerOutput> ModelRunnerImpl::Execute(const SchedulerOutput& outp
                      absl::MakeConstSpan(kv), static_cast<int>(tokens.size()), batch},
       std::move(logit_rows_v)};
   input.attention.recurrent_indices = std::move(recurrent_v);
-  ops::ExecutionContext ctx(*runtime, stream);
+  ops::OpContext ctx(*runtime, stream);
   std::optional<Tensor> logits;
   std::optional<sampling::SamplerOutput> sampled;
   INFERX_VLOG(2) << "step: tokens=" << tokens.size() << " seqs=" << batch

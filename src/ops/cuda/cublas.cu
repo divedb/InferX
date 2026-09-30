@@ -16,15 +16,15 @@ Status CublasError(cublasStatus_t status, const char* what) {
 
 }  // namespace
 
-StatusOr<cublasHandle_t> AcquireCublas(ExecutionContext& ctx) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+StatusOr<cublasHandle_t> AcquireCublas(OpContext& ctx) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   static std::mutex mutex;
   // One handle per (device, stream): a handle shared across streams would
   // let one thread's cublasSetStream reroute another's pending GEMM, which
   // concurrent tensor-parallel ranks on one device would hit immediately.
   static std::map<std::pair<int, void*>, cublasHandle_t> handles;
   const std::lock_guard<std::mutex> lock(mutex);
-  const auto key = std::make_pair(ctx.device().index, static_cast<void*>(ctx.stream()));
+  const auto key = std::make_pair(ctx.Device().index, static_cast<void*>(ctx.GetStream()));
   auto it = handles.find(key);
   if (it == handles.end()) {
     cublasHandle_t handle = nullptr;
@@ -32,7 +32,7 @@ StatusOr<cublasHandle_t> AcquireCublas(ExecutionContext& ctx) {
     it = handles.emplace(key, handle).first;
   }
   INFERX_RETURN_IF_ERROR(
-      CublasError(cublasSetStream(it->second, static_cast<cudaStream_t>(ctx.stream())),
+      CublasError(cublasSetStream(it->second, static_cast<cudaStream_t>(ctx.GetStream())),
                   "cublasSetStream"));
   return it->second;
 }

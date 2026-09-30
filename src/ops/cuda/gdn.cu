@@ -229,14 +229,14 @@ __global__ void NormGatedKernel(const __nv_bfloat16* __restrict__ y,
 
 }  // namespace
 
-Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& conv_in,
+Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
                           Tensor& z, int64_t key_heads, int64_t key_dim, int64_t value_heads,
                           int64_t value_dim) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t nvg = value_heads / key_heads;
   const int64_t total = packed.Numel();
   SplitGdnKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
-                   static_cast<cudaStream_t>(ctx.stream())>>>(
+                   static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()),
       static_cast<__nv_bfloat16*>(conv_in.Data()), static_cast<__nv_bfloat16*>(z.Data()),
       packed.Dim(0), static_cast<int>(key_heads), static_cast<int>(key_dim),
@@ -244,14 +244,14 @@ Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& c
   return CudaError(cudaGetLastError(), "split gdn projection");
 }
 
-Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
+Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
                      const Tensor& state, const Tensor& batch_indices,
                      const Tensor& qo_indptr, int64_t kernel) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int channels = static_cast<int>(x.Dim(1));
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   ConvKernel<<<(channels + kThreads - 1) / kThreads, kThreads, 0,
-               static_cast<cudaStream_t>(ctx.stream())>>>(
+               static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(weight.Data()),
       static_cast<float*>(state.Data()),
@@ -260,25 +260,25 @@ Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
   return CudaError(cudaGetLastError(), "gdn causal conv");
 }
 
-Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
+Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
                 const Tensor& dt_bias, Tensor& beta, Tensor& g) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t rows = ba.Dim(0);
   const int64_t heads = beta.Numel() / rows;
   const int64_t nvg = ba.Dim(1) / 2 / heads;  // b/a pairs per head, grouped.
   GatesKernel<<<static_cast<uint32_t>((rows * heads + kThreads - 1) / kThreads), kThreads, 0,
-                static_cast<cudaStream_t>(ctx.stream())>>>(
+                static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(ba.Data()), static_cast<const float*>(a_log.Data()),
       static_cast<const float*>(dt_bias.Data()), static_cast<float*>(beta.Data()),
       static_cast<float*>(g.Data()), rows, static_cast<int>(heads), static_cast<int>(nvg));
   return CudaError(cudaGetLastError(), "gdn gates");
 }
 
-Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_width,
+Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
                     const Tensor& beta, const Tensor& g, Tensor& state,
                     const Tensor& slot_indices, const Tensor& qo_indptr,
                     const Tensor& batch_indices, Tensor& y) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   const int dv = static_cast<int>(state.Dim(3));
   const int dk = static_cast<int>(state.Dim(2));
@@ -288,7 +288,7 @@ Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_wid
   dim3 grid(num_seqs, value_heads, tiles);
   const int smem = (dk * kDvTile + 2 * dk) * sizeof(float);
   if (dk > kThreads) return UnimplementedError("gdn recurrent supports key dims up to 256");
-  RecurrentKernel<<<grid, kThreads, smem, static_cast<cudaStream_t>(ctx.stream())>>>(
+  RecurrentKernel<<<grid, kThreads, smem, static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(conv.Data()),
       static_cast<const float*>(beta.Data()), static_cast<const float*>(g.Data()),
       static_cast<float*>(state.Data()), static_cast<const int*>(slot_indices.Data()),
@@ -297,12 +297,12 @@ Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_wid
   return CudaError(cudaGetLastError(), "gdn recurrent");
 }
 
-Status RmsNormGated(ExecutionContext& ctx, const Tensor& y, const Tensor& z,
+Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t heads_total = y.Dim(0) * (y.Dim(1) / weight.Dim(0));
   NormGatedKernel<<<static_cast<uint32_t>((heads_total + kThreads - 1) / kThreads), kThreads,
-                    0, static_cast<cudaStream_t>(ctx.stream())>>>(
+                    0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(y.Data()),
       static_cast<const __nv_bfloat16*>(z.Data()),
       static_cast<const __nv_bfloat16*>(weight.Data()), eps,

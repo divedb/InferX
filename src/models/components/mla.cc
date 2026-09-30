@@ -4,10 +4,9 @@
 #include <string_view>
 
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/attention.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/linear.h"
 #include "inferx/ops/mla.h"
 #include "inferx/ops/rms_norm.h"
@@ -17,16 +16,12 @@ namespace inferx::components {
 
 Status RunMlaAttention(const MlaConfig& a, const MlaWeights& w, const Tensor& normed,
                        float norm_eps, const AttentionBatch& batch, const PagedKvState& kv_state,
-                       const KvBlockPool& pool, MlaWorkspace& ws, ops::ExecutionContext& ctx,
-                       DiagnosticTrace* trace, std::string_view prefix, Tensor& mixed_out) {
+                       const KvBlockPool& pool, MlaWorkspace& ws, ops::OpContext& ctx,
+                       Tensor& mixed_out) {
   const int64_t rows = normed.Dim(0);
   const int64_t heads = a.query_heads;
   const int64_t nope = a.qk_nope_head_dim, rope = a.qk_rope_head_dim;
   const int64_t v_dim = a.v_head_dim, head_dim = a.head_dim();
-  const bool tracing = trace != nullptr && trace->enabled();
-  const auto write = [&](std::string_view stage, const Tensor& t) {
-    if (tracing) trace->Write(std::string(prefix) + std::string(stage), t);
-  };
 
   // Query side: down-project, normalize, up-project per head [rope | nope].
   INFERX_ASSIGN_OR_RETURN(Tensor qa, ws.q_lora->Slice(0, rows * a.q_lora_rank));
@@ -63,8 +58,6 @@ Status RunMlaAttention(const MlaConfig& a, const MlaWeights& w, const Tensor& no
   // RoPE rotates the leading rope slice of every head; the nope columns and
   // the zero tail pass through untouched.
   INFERX_RETURN_IF_ERROR(ops::ApplyRope(ctx, q, k, batch.positions, a.rotary.Params()));
-  write("q_proj", *ws.query);
-  write("k_proj", *ws.key);
 
   INFERX_ASSIGN_OR_RETURN(Tensor key_cache, pool.KeyCache(kv_state.pool_layer));
   INFERX_ASSIGN_OR_RETURN(Tensor value_cache, pool.ValueCache(kv_state.pool_layer));
@@ -89,9 +82,7 @@ Status RunMlaAttention(const MlaConfig& a, const MlaWeights& w, const Tensor& no
                                              batch.host_qo_indptr, batch.num_seqs, key_cache,
                                              value_cache, block_size, params, ws.plan,
                                              attn_out));
-  write("attention", attn_out);
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, attn_out, w.output, mixed_out));
-  write("o_proj", mixed_out);
   return OkStatus();
 }
 

@@ -2,7 +2,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -14,7 +14,7 @@ namespace inferx::ops {
 /// nothing. `k_rope` is [rows, rope_dim]; `up-projected` is
 /// [rows, heads * (nope + v)]; outputs are [rows, heads, head_dim] with
 /// head_dim = nope + rope.
-Status AssembleMlaCaches(ExecutionContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
+Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
                          int64_t heads, int64_t nope, int64_t rope, int64_t v_dim, Tensor& k_out,
                          Tensor& v_out);
 

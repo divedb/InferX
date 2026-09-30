@@ -60,11 +60,11 @@ Status ApplyParallelSharding(DecoderConfig& config, const ParallelConfig& parall
 }  // namespace
 
 StatusOr<Tensor> LanguageModelHead::Forward(const Tensor& hidden, const Tensor& rows,
-                                            ops::ExecutionContext& ctx, dist::CommBackend& comm) {
+                                            ops::OpContext& ctx, dist::CommBackend& comm) {
   if (hidden.Rank() != 2 || rows.Rank() != 1 || weight.Rank() != 2 ||
       hidden.Dim(1) != weight.Dim(1) || rows.GetDataType() != DataType::kInt32 ||
-      hidden.Device() != ctx.device() || rows.Device() != ctx.device() ||
-      weight.Device() != ctx.device()) {
+      hidden.Device() != ctx.Device() || rows.Device() != ctx.Device() ||
+      weight.Device() != ctx.Device()) {
     return InvalidArgumentError("invalid language-model head inputs");
   }
   const int64_t count = rows.Numel();
@@ -79,14 +79,14 @@ StatusOr<Tensor> LanguageModelHead::Forward(const Tensor& hidden, const Tensor& 
     const int64_t reserve = std::max<int64_t>(count, capacity);
     INFERX_ASSIGN_OR_RETURN(
         rows_,
-        Tensor::Empty(DataType::kBFloat16, Shape({reserve, weight.Dim(1)}), ctx.device()));
+        Tensor::Empty(DataType::kBFloat16, Shape({reserve, weight.Dim(1)}), ctx.Device()));
     INFERX_ASSIGN_OR_RETURN(
         logits_,
-        Tensor::Empty(DataType::kBFloat16, Shape({reserve, weight.Dim(0)}), ctx.device()));
+        Tensor::Empty(DataType::kBFloat16, Shape({reserve, weight.Dim(0)}), ctx.Device()));
     if (vocab != weight.Dim(0)) {
       INFERX_ASSIGN_OR_RETURN(
           full_logits_,
-          Tensor::Empty(DataType::kBFloat16, Shape({reserve, vocab}), ctx.device()));
+          Tensor::Empty(DataType::kBFloat16, Shape({reserve, vocab}), ctx.Device()));
     }
     workspace_ready_ = true;
   }

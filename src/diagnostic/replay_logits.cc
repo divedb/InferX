@@ -67,7 +67,7 @@ void Replay(const ReplayLogitsParams& params) {
   ModelState state;
   state.paged_kv = &pool;
   for (int i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  ops::ExecutionContext ctx(*runtime, stream);
+  ops::OpContext ctx(*runtime, stream);
   dist::SingleRankComm comm;
   const auto upload = [&](const std::vector<int32_t>& values) {
     auto tensor = Take(Tensor::Empty(DataType::kInt32,

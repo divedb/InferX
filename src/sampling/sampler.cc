@@ -107,7 +107,7 @@ StatusOr<std::unique_ptr<Sampler>> Sampler::Create(int max_num_seqs,
                                               std::move(probs), max_num_seqs));
 }
 
-Status Sampler::UploadParams(ops::ExecutionContext& ctx, const SamplingMetadata& metadata) {
+Status Sampler::UploadParams(ops::OpContext& ctx, const SamplingMetadata& metadata) {
   const auto& d = metadata.device;
   const int batch = metadata.batch;
   if (batch > max_num_seqs_) {
@@ -119,8 +119,8 @@ Status Sampler::UploadParams(ops::ExecutionContext& ctx, const SamplingMetadata&
     return ResourceExhaustedError("sampling CSR payload exceeds capacity");
   }
   auto upload = [&](const void* src, Tensor& dst, int64_t bytes) {
-    return ctx.runtime().CopyAsync(dst.Data(), src, bytes, CopyKind::kHostToDevice,
-                                   ctx.stream());
+    return ctx.Runtime().CopyAsync(dst.Data(), src, bytes, CopyKind::kHostToDevice,
+                                   ctx.GetStream());
   };
   INFERX_RETURN_IF_ERROR(upload(d.temperature.data(), *params_->temperature, batch * 4));
   INFERX_RETURN_IF_ERROR(upload(d.top_p.data(), *params_->top_p, batch * 4));
@@ -148,12 +148,12 @@ Status Sampler::UploadParams(ops::ExecutionContext& ctx, const SamplingMetadata&
   return OkStatus();
 }
 
-StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
+StatusOr<SamplerOutput> Sampler::Sample(ops::OpContext& ctx, const Tensor& logits,
                                         const SamplingMetadata& metadata) {
   if (logits.Rank() != 2 ||
       (logits.GetDataType() != DataType::kBFloat16 &&
        logits.GetDataType() != DataType::kFloat32) ||
-      logits.Device() != ctx.device()) {
+      logits.Device() != ctx.Device()) {
     return InvalidArgumentError("sampler requires a float32/bfloat16 [batch, vocab] matrix");
   }
   const int batch = static_cast<int>(logits.Dim(0));
@@ -165,7 +165,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
   if (batch == 0) return SamplerOutput{std::move(sampled), std::nullopt};
 
   if (!metadata.all_greedy) {
-    if (ctx.device().IsCuda()) {
+    if (ctx.Device().IsCuda()) {
       INFERX_RETURN_IF_ERROR(UploadParams(ctx, metadata));
       INFERX_RETURN_IF_ERROR(cuda::SampleRows(ctx, logits, *params_, *probs_, sampled));
       return SamplerOutput{std::move(sampled), std::nullopt};
@@ -173,7 +173,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
     return SampleCpuReference(ctx, logits, metadata, std::move(sampled));
   }
 
-  if (ctx.device().IsCuda()) {
+  if (ctx.Device().IsCuda()) {
     INFERX_RETURN_IF_ERROR(
         ops::GreedyArgmax(ctx, logits, *values_, *indices_, sampled));
     return SamplerOutput{std::move(sampled), std::nullopt};
@@ -183,16 +183,16 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
 
 // CPU reference: mirrors the CUDA pipeline stage for stage, including the
 // greedy op's lowest-index tie break, so CPU and CUDA agree token-for-token.
-StatusOr<SamplerOutput> Sampler::SampleCpuReference(ops::ExecutionContext& ctx,
+StatusOr<SamplerOutput> Sampler::SampleCpuReference(ops::OpContext& ctx,
                                                     const Tensor& logits,
                                                     const SamplingMetadata& metadata,
                                                     Tensor sampled) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
   const std::int64_t vocab = logits.Dim(1);
   const bool is_bf16 = logits.GetDataType() == DataType::kBFloat16;
   const size_t elem = is_bf16 ? sizeof(uint16_t) : sizeof(float);
   std::vector<std::byte> host(static_cast<size_t>(logits.NBytes()));
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Copy(host.data(), logits.Data(), host.size(),
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Copy(host.data(), logits.Data(), host.size(),
                                             CopyKind::kDeviceToHost));
   auto value_at = [&](int64_t row, int64_t col) -> float {
     const std::byte* p = host.data() + (row * vocab + col) * elem;

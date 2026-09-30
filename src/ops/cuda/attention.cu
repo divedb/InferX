@@ -64,11 +64,11 @@ __global__ void WritePagedKvKernel(const __nv_bfloat16* __restrict__ k,
 
 }  // namespace
 
-Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
+Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
                     const Tensor& key_cache, const Tensor& value_cache, int64_t block_size) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   static const bool scalar_write = [] {
     const char* value = std::getenv("INFERX_DIAGNOSTIC_SCALAR_KV");
     return value != nullptr && std::string_view(value) == "1";
@@ -79,7 +79,7 @@ Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
       reinterpret_cast<uintptr_t>(key_cache.Data()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(value_cache.Data()) % 16 == 0) {
     const int64_t count = k.Numel() / 8;
-    WritePagedKvVectorKernel<<<(count + 127) / 128, 128, 0, ctx.stream()>>>(
+    WritePagedKvVectorKernel<<<(count + 127) / 128, 128, 0, ctx.GetStream()>>>(
         static_cast<const uint4*>(k.Data()), static_cast<const uint4*>(v.Data()),
         positions.DataAs<int32_t>(), batch_indices.DataAs<int32_t>(),
         kv_indptr.DataAs<int32_t>(), kv_indices.DataAs<int32_t>(),
@@ -90,7 +90,7 @@ Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
   }
   const dim3 grid(static_cast<uint32_t>(k.Dim(0)), static_cast<uint32_t>(key_cache.Dim(2)));
   const uint32_t threads = 128;
-  WritePagedKvKernel<<<grid, threads, 0, static_cast<cudaStream_t>(ctx.stream())>>>(
+  WritePagedKvKernel<<<grid, threads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(k.Data()),
       static_cast<const __nv_bfloat16*>(v.Data()),
       static_cast<const int32_t*>(positions.Data()),

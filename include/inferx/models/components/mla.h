@@ -12,13 +12,12 @@
 #include "inferx/models/components/rope.h"
 #include "inferx/models/state.h"
 #include "inferx/ops/attention.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/flash_attention.h"
 
 namespace inferx {
 
 struct AttentionBatch;
-class DiagnosticTrace;
 class KvBlockPool;
 
 namespace components {
@@ -85,8 +84,8 @@ struct MlaWorkspace {
 /// mixer uses.
 Status RunMlaAttention(const MlaConfig& config, const MlaWeights& weights, const Tensor& normed,
                        float norm_eps, const AttentionBatch& batch, const PagedKvState& kv_state,
-                       const KvBlockPool& pool, MlaWorkspace& ws, ops::ExecutionContext& ctx,
-                       DiagnosticTrace* trace, std::string_view prefix, Tensor& mixed_out);
+                       const KvBlockPool& pool, MlaWorkspace& ws, ops::OpContext& ctx,
+                       Tensor& mixed_out);
 
 }  // namespace inferx::components
 }  // namespace inferx

@@ -9,7 +9,6 @@
 #include "inferx/models/components/gdn.h"
 #include "inferx/models/components/mla.h"
 #include "inferx/models/components/norm.h"
-#include "inferx/models/diagnostic_trace.h"
 
 namespace inferx::causal {
 
@@ -48,27 +47,26 @@ class DecoderLayer {
                  const RecurrentStatePool& recurrent, components::AttentionWorkspace& attention_ws,
                  components::MlaWorkspace& mla_ws, components::GdnWorkspace& gdn_ws,
                  components::MlpWorkspace& mlp_ws, components::MoeWorkspace& moe_ws,
-                 Tensor& packed, ops::ExecutionContext& ctx, dist::CommBackend& comm,
-                 DiagnosticTrace& trace, const std::string& prefix) const {
+                 Tensor& packed, ops::OpContext& ctx, dist::CommBackend& comm,
+                 ) const {
     if (first) {
       INFERX_RETURN_IF_ERROR(input_norm_.Forward(ctx, hidden, normed));
     } else {
       INFERX_RETURN_IF_ERROR(input_norm_.AddForward(ctx, mixed, hidden, normed));
     }
-    if (trace.enabled()) trace.Write(prefix + "input_norm", normed);
     if (auto* gdn = std::get_if<components::GdnWeights>(&mixer_weights_)) {
       INFERX_RETURN_IF_ERROR(components::RunGatedDeltaNet(
           std::get<components::GatedDeltaNetConfig>(mixer_), *gdn, normed, batch,
-          std::get<RecurrentState>(state), recurrent, gdn_ws, ctx, &trace, prefix, mixed));
+          std::get<RecurrentState>(state), recurrent, gdn_ws, ctx, mixed));
     } else if (auto* mla = std::get_if<components::MlaWeights>(&mixer_weights_)) {
       INFERX_RETURN_IF_ERROR(components::RunMlaAttention(
           std::get<components::MlaConfig>(mixer_), *mla, normed, norm_eps_, batch,
-          std::get<PagedKvState>(state), pool, mla_ws, ctx, &trace, prefix, mixed));
+          std::get<PagedKvState>(state), pool, mla_ws, ctx, mixed));
     } else if (const auto* a = std::get_if<components::AttentionConfig>(&mixer_)) {
       INFERX_RETURN_IF_ERROR(
           components::RunAttention(*a, std::get<components::AttentionWeights>(mixer_weights_),
                                    normed, norm_eps_, batch, std::get<PagedKvState>(state), pool,
-                                   attention_ws, &packed, ctx, &trace, prefix, mixed));
+                                   attention_ws, &packed, ctx, mixed));
     } else {
       return InvalidArgumentError("layer mixer has no weights");
     }
@@ -80,20 +78,15 @@ class DecoderLayer {
       // Gemma sandwich: the mixer output is normalized before the residual
       // add, which the feed-forward-side norm then fuses.
       INFERX_RETURN_IF_ERROR(mixer_out_norm_->Forward(ctx, mixed, mixed));
-      if (trace.enabled()) trace.Write(prefix + "mixer_out_norm", mixed);
     }
     INFERX_RETURN_IF_ERROR(ffn_norm_.AddForward(ctx, mixed, hidden, normed));
-    if (trace.enabled()) trace.Write(prefix + "post_norm", normed);
-    if (trace.enabled()) trace.Write(prefix + "residual", hidden);
     INFERX_RETURN_IF_ERROR(components::RunFeedForward(feed_forward_, feed_forward_weights_,
-                                                      normed, mlp_ws, moe_ws, &packed, ctx, &trace,
-                                                      prefix, mixed));
+                                                      normed, mlp_ws, moe_ws, &packed, ctx, mixed));
     // Same folding for the feed-forward: down projections (dense, expert,
     // and shared) sum rank-local partials over the sharded input.
     INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, mixed));
     if (output_norm_residual_) {
       INFERX_RETURN_IF_ERROR(feed_forward_out_norm_->Forward(ctx, mixed, mixed));
-      if (trace.enabled()) trace.Write(prefix + "feed_forward_out_norm", mixed);
     }
     return OkStatus();
   }

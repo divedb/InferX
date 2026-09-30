@@ -11,12 +11,10 @@
 
 #include "inferx/core/tensor.h"
 #include "inferx/models/components/mlp.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/moe.h"
 
 namespace inferx {
-
-class DiagnosticTrace;
 
 namespace components {
 
@@ -82,8 +80,7 @@ struct MoeWorkspace {
 /// gated shared expert.
 Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& normed,
               MoeWorkspace& ws, MlpWorkspace& mlp_ws, Tensor* packed_buffer,
-              ops::ExecutionContext& ctx, DiagnosticTrace* trace, std::string_view prefix,
-              Tensor& mixed_out);
+              ops::OpContext& ctx, Tensor& mixed_out);
 
 }  // namespace inferx::components
 }  // namespace inferx

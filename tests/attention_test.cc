@@ -106,7 +106,7 @@ class AttentionTest : public ::testing::Test {
               .value(),
           Tensor::Empty(DataType::kFloat32, Shape({n * heads}), DeviceId::Cuda(0)).value()};
     }
-    ops::ExecutionContext ctx(*runtime_, stream_);
+    ops::OpContext ctx(*runtime_, stream_);
     ops::AttentionParams p{heads, kvheads, dim, scale_multiplier / std::sqrt(float(dim))};
     auto run = [&]() -> Status {
       INFERX_RETURN_IF_ERROR(ops::PrepareFlashAttention(ctx, qo_d, plan, group, tiles));
@@ -229,7 +229,7 @@ TEST_F(AttentionTest, SinksAndSlidingWindowMatchReferenceOnGenericPath) {
   auto value = Upload(values, Shape({kv.back(), page, kvheads, dim}));
   auto sinks = Upload(sink_values, Shape({heads}));
   auto out = Tensor::Empty(DataType::kBFloat16, q.GetShape(), DeviceId::Cuda(0)).value();
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   ops::AttentionParams p{heads, kvheads, dim, 1.0f / std::sqrt(float(dim)), 7, &sinks};
   ASSERT_FALSE(ops::FlashAttentionSupports(p));
   ops::AttentionPlanWorkspace plan;
@@ -287,7 +287,7 @@ TEST(AttentionGeometryTest, ValidatesKernelCapabilities) {
   EXPECT_TRUE(ops::FlashAttentionSupports(ops::AttentionParams{4, 2, 64}));
 }
 TEST_F(AttentionTest, RejectsMalformedMetadataAndWorkspacesBeforeLaunching) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   auto qo = Ints({0, 1}), kv = Ints({0, 1}), ids = Ints({0}), last = Ints({1});
   auto plan = Ints(std::vector<int>(4));
   auto q = Upload(std::vector<float>(128), Shape({1, 128}));

@@ -32,7 +32,7 @@ class CommTest : public ::testing::Test {
 
 TEST_F(CommTest, SingleRankReductionAcceptsAllTensorRanks) {
   SingleRankComm comm;
-  const ops::ExecutionContext ctx(*runtime_, stream_);
+  const ops::OpContext ctx(*runtime_, stream_);
   for (const Shape shape : {Shape{}, Shape{3}, Shape{1, 2, 3}, Shape{0}}) {
     auto tensor = Tensor::Empty(DataType::kBFloat16, shape, DeviceId::Cpu());
     ASSERT_TRUE(tensor.ok()) << tensor.status();
@@ -42,7 +42,7 @@ TEST_F(CommTest, SingleRankReductionAcceptsAllTensorRanks) {
 
 TEST_F(CommTest, GatherValidatesShapeDtypeDeviceAndOverlap) {
   SingleRankComm comm;
-  const ops::ExecutionContext ctx(*runtime_, stream_);
+  const ops::OpContext ctx(*runtime_, stream_);
   auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
   auto wrong_shape = Tensor::Empty(DataType::kBFloat16, Shape{3, 2}, DeviceId::Cpu());
   auto wrong_dtype = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, DeviceId::Cpu());
@@ -79,7 +79,7 @@ TEST_F(CommTest, LoopbackPropagatesValidationFailureToPeers) {
   auto invalid = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, DeviceId::Cpu());
   ASSERT_TRUE(valid.ok());
   ASSERT_TRUE(invalid.ok());
-  const ops::ExecutionContext ctx(*runtime_, stream_);
+  const ops::OpContext ctx(*runtime_, stream_);
   auto peer = std::async(std::launch::async,
                          [&] { return (*world)->rank(0).AllReduceSum(ctx, *valid); });
   const Status failure = (*world)->rank(1).AllReduceSum(ctx, *invalid);
@@ -96,7 +96,7 @@ TEST_F(CommTest, LoopbackRejectsMismatchedPeerShapes) {
   auto b = Tensor::Empty(DataType::kBFloat16, Shape{2, 4}, DeviceId::Cpu());
   ASSERT_TRUE(a.ok());
   ASSERT_TRUE(b.ok());
-  const ops::ExecutionContext ctx(*runtime_, stream_);
+  const ops::OpContext ctx(*runtime_, stream_);
   auto peer =
       std::async(std::launch::async, [&] { return (*world)->rank(0).AllReduceSum(ctx, *a); });
   EXPECT_EQ((*world)->rank(1).AllReduceSum(ctx, *b).code(), absl::StatusCode::kInvalidArgument);
@@ -107,7 +107,7 @@ TEST_F(CommTest, LoopbackEmptyCollectivesPreserveSequence) {
   auto world = LoopbackWorld::Create(2);
   ASSERT_TRUE(world.ok());
   auto run = [&](int rank) -> Status {
-    const ops::ExecutionContext ctx(*runtime_, stream_);
+    const ops::OpContext ctx(*runtime_, stream_);
     INFERX_ASSIGN_OR_RETURN(auto partial,
                             Tensor::Empty(DataType::kBFloat16, Shape{0, 3}, DeviceId::Cpu()));
     INFERX_ASSIGN_OR_RETURN(auto full,
@@ -136,10 +136,10 @@ class CommCudaTest : public CommTest {
 };
 
 TEST_F(CommCudaTest, SingleRankGatherOrdersCopiesOnTheContextStream) {
-  const ops::ExecutionContext ctx(*runtime_, stream_);
+  const ops::OpContext ctx(*runtime_, stream_);
   SingleRankComm comm;
-  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.device());
-  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.device());
+  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device());
+  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device());
   ASSERT_TRUE(input.ok());
   ASSERT_TRUE(output.ok());
   std::vector<uint16_t> values{0x3f80, 0x4000, 0x4040, 0x4080}, result(4);
@@ -161,13 +161,13 @@ TEST_F(CommCudaTest, LoopbackReducesAllShapesAndGathersInRankOrder) {
   ASSERT_TRUE(world.ok());
   auto run = [&](int rank) -> Status {
     INFERX_ASSIGN_OR_RETURN(auto stream, runtime_->CreateStream());
-    const ops::ExecutionContext ctx(*runtime_, stream);
+    const ops::OpContext ctx(*runtime_, stream);
     Status status = [&]() -> Status {
       auto& comm = (*world)->rank(rank);
       // Repeated leading dimensions with different tails exercise slot reuse.
       for (const Shape shape : {Shape{}, Shape{5}, Shape{1, 2, 3}, Shape{1, 2, 4}}) {
         INFERX_ASSIGN_OR_RETURN(auto input,
-                                Tensor::Empty(DataType::kBFloat16, shape, ctx.device()));
+                                Tensor::Empty(DataType::kBFloat16, shape, ctx.Device()));
         const uint16_t value = rank == 0 ? 0x3f80 : rank == 1 ? 0x4000 : 0x4040;
         std::vector<uint16_t> values(input.Numel(), value);
         INFERX_RETURN_IF_ERROR(runtime_->CopyAsync(input.Data(), values.data(), input.NBytes(),
@@ -179,9 +179,9 @@ TEST_F(CommCudaTest, LoopbackReducesAllShapesAndGathersInRankOrder) {
         EXPECT_EQ(values, std::vector<uint16_t>(input.Numel(), 0x40c0));  // 1 + 2 + 3 = 6.
       }
       INFERX_ASSIGN_OR_RETURN(auto input,
-                              Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.device()));
+                              Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device()));
       INFERX_ASSIGN_OR_RETURN(auto full,
-                              Tensor::Empty(DataType::kBFloat16, Shape{2, 6}, ctx.device()));
+                              Tensor::Empty(DataType::kBFloat16, Shape{2, 6}, ctx.Device()));
       const uint16_t value = rank == 0 ? 0x3f80 : rank == 1 ? 0x4000 : 0x4040;
       std::vector<uint16_t> values(4, value), result(12);
       for (int i = 0; i < 3; ++i) {
@@ -215,9 +215,9 @@ TEST_F(CommCudaTest, NcclSingleRankUsesBfloat16AndCopiesGatherOutput) {
   ASSERT_TRUE(id.ok()) << id.status();
   auto comm = NcclComm::Join(0, 1, *id, runtime_->device());
   ASSERT_TRUE(comm.ok()) << comm.status();
-  const ops::ExecutionContext ctx(*runtime_, stream_);
-  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.device());
-  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.device());
+  const ops::OpContext ctx(*runtime_, stream_);
+  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.Device());
+  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.Device());
   ASSERT_TRUE(input.ok());
   ASSERT_TRUE(output.ok());
   std::vector<uint16_t> values{0x3f80, 0x4000, 0x4040, 0xc000, 0x0000, 0x3f80}, result(6);

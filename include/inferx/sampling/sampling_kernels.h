@@ -6,7 +6,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/sampling/sampling_metadata.h"
 
 namespace inferx::sampling::cuda {
@@ -44,7 +44,7 @@ struct DeviceParams {
 /// repeated max extraction), and a counter-based draw from the renormalized
 /// distribution. One block per row; greedy rows degenerate to argmax with
 /// the op's lowest-index tie break.
-Status SampleRows(ops::ExecutionContext& ctx, const Tensor& logits, const DeviceParams& params,
+Status SampleRows(ops::OpContext& ctx, const Tensor& logits, const DeviceParams& params,
                   const Tensor& probs_workspace, Tensor& output);
 
 }  // namespace inferx::sampling::cuda

@@ -258,15 +258,15 @@ Status CudaError(cudaError_t err, const char* what) {
 
 }  // namespace
 
-Status SampleRows(ops::ExecutionContext& ctx, const Tensor& logits, const DeviceParams& params,
+Status SampleRows(ops::OpContext& ctx, const Tensor& logits, const DeviceParams& params,
                   const Tensor& probs_workspace, Tensor& output) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int batch = static_cast<int>(logits.Dim(0));
   const int vocab = static_cast<int>(logits.Dim(1));
   if (logits.GetDataType() != DataType::kBFloat16) {
     return UnimplementedError("sampling pipeline expects bfloat16 logits");
   }
-  SampleRowsKernel<<<batch, kThreads, 0, static_cast<cudaStream_t>(ctx.stream())>>>(
+  SampleRowsKernel<<<batch, kThreads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(logits.Data()),
       static_cast<const float*>(params.temperature->Data()),
       static_cast<const int*>(params.top_k->Data()),

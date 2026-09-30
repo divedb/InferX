@@ -4,7 +4,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -15,7 +15,7 @@ namespace inferx::ops {
 /// pos % block_size. `k` and `v` are [tokens, kv_heads * head_dim]; the
 /// caches are [num_blocks, block_size, kv_heads, head_dim] views for one
 /// layer (KvBlockPool::KeyCache/ValueCache shapes).
-Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
+Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
                     const Tensor& key_cache, const Tensor& value_cache,

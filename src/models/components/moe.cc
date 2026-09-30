@@ -4,7 +4,6 @@
 
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/ops/elementwise.h"
 #include "inferx/ops/linear.h"
 #include "inferx/ops/moe.h"
@@ -13,14 +12,9 @@ namespace inferx::components {
 
 Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& normed,
               MoeWorkspace& ws, MlpWorkspace& mlp_ws, Tensor* packed_buffer,
-              ops::ExecutionContext& ctx, DiagnosticTrace* trace, std::string_view prefix,
-              Tensor& mixed_out) {
+              ops::OpContext& ctx, Tensor& mixed_out) {
   const int64_t rows = normed.Dim(0);
   const int64_t hidden = normed.Dim(1);
-  const bool tracing = trace != nullptr && trace->enabled();
-  const auto write = [&](std::string_view stage, const Tensor& t) {
-    if (tracing) trace->Write(std::string(prefix) + std::string(stage), t);
-  };
 
   const int64_t topk = config.experts_per_token;
   INFERX_ASSIGN_OR_RETURN(Tensor indices_flat, ws.topk_indices->Slice(0, rows * topk));
@@ -32,7 +26,6 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
       ctx, normed, weights.router, weights.router_bias.has_value() ? &*weights.router_bias : nullptr,
       weights.correction_bias.has_value() ? &*weights.correction_bias : nullptr, routing,
       indices_flat, weights2d));
-  write("router_weights", *ws.topk_weights);
 
   // Route, then bring the per-expert counts to the host once: expert GEMMs
   // need host-side row counts. A fused MoE kernel removes this sync later.
@@ -77,7 +70,7 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
     SwiGluConfig shared_cfg;
     shared_cfg.intermediate_size = config.shared_intermediate_size;
     INFERX_RETURN_IF_ERROR(RunSwiGlu(shared_cfg, *weights.shared_expert, normed, mlp_ws,
-                                     packed_buffer, ctx, trace, prefix, mixed_out));
+                                     packed_buffer, ctx, mixed_out));
     if (weights.shared_expert_gate.has_value()) {
       // The gate is a per-token scalar: project, then scale sigmoid-wise.
       INFERX_ASSIGN_OR_RETURN(Tensor gate_rows, ws.shared_gate->Slice(0, rows));
@@ -95,7 +88,6 @@ Status RunMoe(const MoeConfig& config, const MoeWeights& weights, const Tensor& 
                                                      weights_by_slot, offsets[e], count,
                                                      mixed_out));
   }
-  write("moe_out", mixed_out);
   return OkStatus();
 }
 

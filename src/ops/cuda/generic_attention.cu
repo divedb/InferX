@@ -134,12 +134,12 @@ Status CudaError(cudaError_t err, const char* what) {
 
 }  // namespace
 
-Status GenericPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
                              const Tensor& kv_indptr, const Tensor& kv_indices,
                              const Tensor& last_page_len, const Tensor& key_cache,
                              const Tensor& value_cache, int64_t block_size,
                              const AttentionParams& params, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   if ((params.head_dim + kThreads - 1) / kThreads > 8) {
     return UnimplementedError("generic attention supports head_dim up to ", 8 * kThreads);
   }
@@ -160,7 +160,7 @@ Status GenericPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tenso
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   dim3 grid(static_cast<uint32_t>(q.Dim(0)), static_cast<uint32_t>(params.query_heads),
             static_cast<uint32_t>(num_seqs));
-  GenericAttentionKernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(ctx.stream())>>>(
+  GenericAttentionKernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const __nv_bfloat16*>(q.Data()), sink_bf16,
       static_cast<const int*>(qo_indptr.Data()), static_cast<const int*>(kv_indptr.Data()),
       static_cast<const int*>(kv_indices.Data()),

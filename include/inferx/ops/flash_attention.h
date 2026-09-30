@@ -33,7 +33,7 @@ struct AttentionPlanWorkspace {
 ///
 /// Chooses the split-decode kernel when its workspace is allocated and the
 /// batch is pure decode within its capacity, else the shared paged path.
-Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
+Status BeginAttentionStep(OpContext& ctx, const Tensor& kv_indptr,
                           const Tensor& last_page_len, int64_t block_size, int num_tokens,
                           int num_seqs, AttentionPlanWorkspace& ws);
 
@@ -43,14 +43,14 @@ Status BeginAttentionStep(ExecutionContext& ctx, const Tensor& kv_indptr,
 /// Rebuilds the flash-attention plan when the GQA group changes, then
 /// dispatches to the kernel BeginAttentionStep selected for the step.
 /// `host_qo_indptr` mirrors `qo_indptr` for host-side tile planning.
-Status PagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+Status PagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
                       const Tensor& kv_indptr, const Tensor& kv_indices,
                       const Tensor& last_page_len, absl::Span<const int32_t> host_qo_indptr,
                       int num_seqs, const Tensor& key_cache, const Tensor& value_cache,
                       int64_t block_size, const AttentionParams& params,
                       AttentionPlanWorkspace& ws, Tensor& attn_out);
 
-Status PrepareFlashDecode(ExecutionContext& ctx, const Tensor& kv_indptr,
+Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv_indptr,
                           const Tensor& last_page_len, int block_size,
                           FlashDecodeWorkspace& workspace);
 // Graph-safe GPU planning, reused across layers. Inputs must describe positive
@@ -60,9 +60,9 @@ Status PrepareFlashDecode(ExecutionContext& ctx, const Tensor& kv_indptr,
 // owns validating device metadata values and keeping buffers alive on stream.
 // Supported BF16 full causal geometry: head_dim 64/128/256, GQA ratio 1..32.
 // Both tile sizes 64 and 128 are supported. Other geometry returns a Status.
-Status PrepareFlashAttention(ExecutionContext& ctx, const Tensor& qo_indptr, Tensor& plan,
+Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo_indptr, Tensor& plan,
                              int group, int tiles, int tile_rows = 64);
-Status FlashPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo,
+Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
                            const Tensor& kv, const Tensor& indices, const Tensor& last_page_len,
                            const Tensor& key, const Tensor& value, int64_t block_size,
                            const AttentionParams& params, const Tensor& plan, int tiles,

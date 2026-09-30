@@ -2,7 +2,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -33,18 +33,18 @@ struct RMSNormConfig {
 /// Validation and backend selection live in this entry point; dtype support
 /// is reported per backend and the kernel details stay inside them.
 ///
-/// \param ctx     Execution context; all tensors must live on ctx.device().
+/// \param ctx     Execution context; all tensors must live on ctx.Device().
 /// \param x       [rows, dim] input activations.
 /// \param weight  [dim] per-channel scale, same dtype as `x`.
 /// \param out     [rows, dim] output tensor, same dtype and shape as `x`.
 /// \param config  Normalization parameters.
 /// \return        OK, or InvalidArgument/Unimplemented for bad inputs.
-Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+Status RmsNorm(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config);
 
 /// Add x into residual with activation-dtype rounding, then normalize residual
 /// into out. Out must be separate from residual so both results are retained.
-Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+Status AddRmsNorm(OpContext& ctx, const Tensor& x, Tensor& residual,
                   const Tensor& weight, Tensor& out, const RMSNormConfig& config);
 
 }  // namespace inferx::ops

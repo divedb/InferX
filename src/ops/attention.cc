@@ -68,7 +68,7 @@ Status CheckCache(const Tensor& key_cache, const Tensor& value_cache, int64_t bl
 
 }  // namespace
 
-Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
+Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
                     const Tensor& key_cache, const Tensor& value_cache, int64_t block_size) {
@@ -93,7 +93,7 @@ Status WritePagedKv(ExecutionContext& ctx, const Tensor& k, const Tensor& v,
     return InvalidArgumentError("WritePagedKv k width ", k.Dim(1), " disagrees with cache geometry ",
                                 kv_heads * head_dim);
   }
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   INFERX_RETURN_IF_ERROR(
       CheckRaggedBatch(positions, batch_indices, kv_indptr, kv_indices, k.Dim(0)));
   INFERX_RETURN_IF_ERROR(CheckCache(key_cache, value_cache, block_size, kv_heads, head_dim, device));

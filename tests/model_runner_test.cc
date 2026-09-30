@@ -9,7 +9,7 @@
 #include "inferx/dist/loopback_comm.h"
 #include "inferx/engine/scheduler.h"
 #include "inferx/models/model.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/gather.h"
 
 namespace inferx {
@@ -42,14 +42,14 @@ class TestModel final : public Model {
       PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
 
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
+                           ops::OpContext& ctx, dist::CommBackend& comm) override {
     observed_comm = &comm;
     EXPECT_EQ(comm.size(), expected_world);
     EXPECT_EQ(comm.rank(), expected_rank);
     INFERX_RETURN_IF_ERROR(injected_failure);
     if (use_collective) {
       INFERX_ASSIGN_OR_RETURN(auto empty,
-                              Tensor::Empty(DataType::kBFloat16, Shape{0}, ctx.device()));
+                              Tensor::Empty(DataType::kBFloat16, Shape{0}, ctx.Device()));
       INFERX_RETURN_IF_ERROR(comm.AllReduceSum(ctx, empty));
     }
     EXPECT_NE(state.paged_kv, nullptr);
@@ -390,7 +390,7 @@ class PositionModel final : public Model {
   std::vector<LayerStateSpec> StateRequirements() const override {
     return {PagedKvStateSpec{KvLayout{2, 1, 8, DataType::kBFloat16}}};
   }
-  StatusOr<Tensor> Forward(const ModelInput& input, ModelState&, ops::ExecutionContext& ctx,
+  StatusOr<Tensor> Forward(const ModelInput& input, ModelState&, ops::OpContext& ctx,
                            dist::CommBackend&) override {
     ++calls;
     INFERX_ASSIGN_OR_RETURN(auto hidden, hidden_->Slice(0, input.attention.num_tokens));

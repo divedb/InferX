@@ -47,7 +47,7 @@ Status CublasError(cublasStatus_t status, const char* what) {
 
 }  // namespace
 
-Status Linear(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out) {
+Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out) {
   // Row-major out[t, o] = sum_i x[t, i] * weight[o, i] is the column-major
   // problem out^T[o, t] = weight^T(out x in) * x^T(in x tokens), so the
   // checkpoint's [out, in] weight matrix participates with OP_T.
@@ -62,11 +62,11 @@ Status Linear(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tens
       k % 256 == 0 && m <= 16384 &&
       reinterpret_cast<uintptr_t>(weight.Data()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(x.Data()) % 16 == 0) {
-    INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
     const auto* input = static_cast<const __nv_bfloat16*>(x.Data());
     const auto* weights = static_cast<const __nv_bfloat16*>(weight.Data());
     auto* output = static_cast<__nv_bfloat16*>(out.Data());
-    const auto stream = static_cast<cudaStream_t>(ctx.stream());
+    const auto stream = static_cast<cudaStream_t>(ctx.GetStream());
     switch (n) {
       case 1: DecodeLinear<1><<<(m + 3) / 4, dim3(32, 4), 0, stream>>>(input, weights, output, m, k); break;
       case 2: DecodeLinear<2><<<(m + 3) / 4, dim3(32, 4), 0, stream>>>(input, weights, output, m, k); break;

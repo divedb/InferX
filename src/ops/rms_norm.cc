@@ -9,7 +9,7 @@
 namespace inferx::ops {
 
 namespace {
-Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+Status ValidateNorm(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                     const RMSNormConfig& config) {
   if (x.Rank() != 2 || weight.Rank() != 1 || out.Rank() != 2) {
     return InvalidArgumentError(
@@ -40,7 +40,7 @@ Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight
       x.Dim(1) > std::numeric_limits<uint32_t>::max()) {
     return InvalidArgumentError("RmsNorm shape exceeds 32-bit kernel extents");
   }
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (x.Device() != device || weight.Device() != device || out.Device() != device) {
     return InvalidArgumentError("RmsNorm tensors must live on the context's device ",
                                 device.ToString());
@@ -49,26 +49,26 @@ Status ValidateNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight
 }
 }  // namespace
 
-Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+Status RmsNorm(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config) {
   INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, x, weight, out, config));
-  switch (ctx.device().kind) {
+  switch (ctx.Device().kind) {
     case DeviceKind::kCuda:
       return cuda::RmsNorm(ctx, x, weight, out, config);
     case DeviceKind::kCpu:
       return cpu::RmsNorm(ctx, x, weight, out, config);
     default:
-      return UnimplementedError("RmsNorm has no implementation for device ", ctx.device().ToString());
+      return UnimplementedError("RmsNorm has no implementation for device ", ctx.Device().ToString());
   }
 }
 
-Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+Status AddRmsNorm(OpContext& ctx, const Tensor& x, Tensor& residual,
                   const Tensor& weight, Tensor& out, const RMSNormConfig& config) {
   INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, x, weight, out, config));
   INFERX_RETURN_IF_ERROR(ValidateNorm(ctx, residual, weight, out, config));
   if (residual.Data() == out.Data())
     return InvalidArgumentError("AddRmsNorm requires distinct residual and output buffers");
-  if (ctx.device().IsCuda() && config.round_before_weight &&
+  if (ctx.Device().IsCuda() && config.round_before_weight &&
       x.GetDataType() == DataType::kBFloat16) {
     return cuda::AddRmsNorm(ctx, x, residual, weight, out, config);
   }

@@ -32,7 +32,7 @@
 #include "inferx/models/model.h"
 #include "inferx/models/model_registry.h"
 #include "inferx/dist/comm.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/moe.h"
 
 namespace inferx {
@@ -154,7 +154,7 @@ class Engine {
         state.layers.push_back(RecurrentState{rec++});
       }
     }
-    ops::ExecutionContext ctx(*runtime_, stream_);
+    ops::OpContext ctx(*runtime_, stream_);
     dist::SingleRankComm comm;
     if (rpool.has_value()) rpool->ResetSlot(ctx, 0).ok();
 

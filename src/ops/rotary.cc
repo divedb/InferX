@@ -6,7 +6,7 @@
 namespace inferx::ops {
 
 namespace {
-Status ValidateRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
+Status ValidateRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params) {
   if (q.Rank() != 3 || k.Rank() != 3) {
     return InvalidArgumentError("ApplyRope expects rank-3 q and k of [tokens, heads, head_dim]");
@@ -35,7 +35,7 @@ Status ValidateRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
   if (!(params.theta > 0.0f)) {
     return InvalidArgumentError("ApplyRope theta must be positive");
   }
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (q.Device() != device || k.Device() != device || positions.Device() != device) {
     return InvalidArgumentError("ApplyRope tensors must live on the context's device ",
                                 device.ToString());
@@ -44,30 +44,30 @@ Status ValidateRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
 }
 }  // namespace
 
-Status ApplyRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
+Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params) {
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   if (q.IsEmpty()) return OkStatus();
-  switch (ctx.device().kind) {
+  switch (ctx.Device().kind) {
     case DeviceKind::kCuda:
       return cuda::ApplyRope(ctx, q, k, positions, params);
     default:
       return UnimplementedError("ApplyRope has no implementation for device ",
-                                ctx.device().ToString());
+                                ctx.Device().ToString());
   }
 }
 
-Status NormalizeAndApplyRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
+Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                              const Tensor& q_weight, const Tensor& k_weight,
                              const Tensor& positions, float eps, const RotaryParams& params) {
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   for (const auto* weight : {&q_weight, &k_weight}) {
     if (weight->Rank() != 1 || weight->Dim(0) != q.Dim(2) ||
-        weight->GetDataType() != q.GetDataType() || weight->Device() != ctx.device())
+        weight->GetDataType() != q.GetDataType() || weight->Device() != ctx.Device())
       return InvalidArgumentError("NormalizeAndApplyRope requires per-head BF16 weights");
   }
   if (!std::isfinite(eps) || eps < 0) return InvalidArgumentError("invalid normalization epsilon");
-  if (q.Dim(2) != 128 || !ctx.device().IsCuda())
+  if (q.Dim(2) != 128 || !ctx.Device().IsCuda())
     return UnimplementedError("NormalizeAndApplyRope requires CUDA and head dimension 128");
   if (q.IsEmpty()) return OkStatus();
   return cuda::NormalizeAndApplyRope(ctx, q, k, q_weight, k_weight, positions, eps, params);

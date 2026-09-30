@@ -4,7 +4,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "inferx/core/shape.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 
@@ -75,7 +75,7 @@ StatusOr<Tensor> RecurrentStatePool::ConvState(int64_t layer) const {
                 Shape({max_slots_, conv_dim, spec.conv_kernel_size - 1}), device_);
 }
 
-Status RecurrentStatePool::ResetSlot(ops::ExecutionContext& ctx, int64_t slot) {
+Status RecurrentStatePool::ResetSlot(ops::OpContext& ctx, int64_t slot) {
   if (slot < 0 || slot >= max_slots_) {
     return InvalidArgumentError("recurrent slot ", slot, " is out of range");
   }
@@ -90,7 +90,7 @@ Status RecurrentStatePool::ResetSlot(ops::ExecutionContext& ctx, int64_t slot) {
     // cudaMemsetAsync per region per slot; slots are rare (per admission).
     auto* base = const_cast<std::byte*>(storage_.data()) + offset +
                  slot * bytes;
-    INFERX_RETURN_IF_ERROR(ctx.runtime().MemsetAsync(base, bytes, ctx.stream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().MemsetAsync(base, bytes, ctx.GetStream()));
     offset += max_slots_ * bytes;
   }
   return OkStatus();

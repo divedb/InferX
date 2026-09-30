@@ -4,7 +4,7 @@
 
 namespace inferx::ops {
 
-Status AssembleMlaCaches(ExecutionContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
+Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
                          int64_t heads, int64_t nope, int64_t rope, int64_t v_dim, Tensor& k_out,
                          Tensor& v_out) {
   const int64_t head_dim = nope + rope;
@@ -19,14 +19,14 @@ Status AssembleMlaCaches(ExecutionContext& ctx, const Tensor& k_rope, const Tens
   }
   for (const Tensor* t : std::initializer_list<const Tensor*>{
            &k_rope, &up_projected, &k_out, &v_out}) {
-    if (t->Device() != ctx.device()) {
+    if (t->Device() != ctx.Device()) {
       return InvalidArgumentError("MLA cache assembly must run on the context device");
     }
   }
   if (v_dim > head_dim || rope <= 0 || nope <= 0 || v_dim <= 0) {
     return InvalidArgumentError("MLA dimensions must be positive with v within head_dim");
   }
-  if (!ctx.device().IsCuda()) return UnimplementedError("MLA cache assembly requires CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("MLA cache assembly requires CUDA");
   if (k_rope.IsEmpty()) return OkStatus();
   return cuda::AssembleMlaCaches(ctx, k_rope, up_projected, heads, nope, rope, v_dim, k_out, v_out);
 }

@@ -4,7 +4,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -36,7 +36,7 @@ struct RoutingConfig {
 /// the scoring policy, and emits `topk_indices` ([rows, topk] int32) and
 /// `topk_weights` ([rows, topk] float32). `correction_bias`
 /// ([num_experts], float32) participates in DeepSeek selection only.
-Status RouteTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& router_weight,
+Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_weight,
                    const Tensor* router_bias, const Tensor* correction_bias,
                    const RoutingConfig& config, Tensor& topk_indices, Tensor& topk_weights);
 
@@ -47,19 +47,19 @@ Status RouteTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& ro
 /// `offsets[expert] + i` holds the i-th (token row, weight) pair assigned to
 /// that expert. Returns the host-side offsets, one per expert plus the end.
 StatusOr<std::vector<int64_t>> BuildExpertDispatch(
-    ExecutionContext& ctx, const Tensor& topk_indices, const Tensor& topk_weights,
+    OpContext& ctx, const Tensor& topk_indices, const Tensor& topk_weights,
     int64_t num_experts, Tensor& counts, Tensor& offsets, Tensor& cursor, Tensor& token_rows,
     Tensor& weights_by_slot);
 
 /// \brief Gathers rows for expert execution: out[i] <- hidden[token_rows[i]].
-Status GatherRoutedTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& token_rows,
+Status GatherRoutedTokens(OpContext& ctx, const Tensor& hidden, const Tensor& token_rows,
                           Tensor& out);
 
 /// \brief Accumulates expert outputs back: out[r] += w * expert_rows[slot].
 ///
 /// `token_rows` and `weights_by_slot` come from BuildExpertDispatch; the
 /// expert's slice of `expert_rows` starts at its offset.
-Status ScatterRoutedOutputs(ExecutionContext& ctx, const Tensor& expert_rows,
+Status ScatterRoutedOutputs(OpContext& ctx, const Tensor& expert_rows,
                             const Tensor& token_rows, const Tensor& weights_by_slot,
                             int64_t begin, int64_t count, Tensor& out);
 

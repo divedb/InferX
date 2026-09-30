@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "inferx/core/logging.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 namespace dist {
@@ -139,32 +139,32 @@ NcclComm::~NcclComm() {
   }
 }
 
-Status NcclComm::AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) {
+Status NcclComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
   INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, partial));
-  if (ctx.device() != device_) {
+  if (ctx.Device() != device_) {
     return InvalidArgumentError("NCCL context must match the communicator's device");
   }
   if (partial.IsEmpty()) return OkStatus();
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const NcclApi* api = NcclApi::Load();
   if (!api->Ready()) return Unavailable();
   return NcclCall(
       api->all_reduce(partial.Data(), partial.Data(), static_cast<size_t>(partial.Numel()),
-                      kNcclBfloat16, kNcclSum, comm_, static_cast<void*>(ctx.stream())),
+                      kNcclBfloat16, kNcclSum, comm_, static_cast<void*>(ctx.GetStream())),
       "ncclAllReduce");
 }
 
-Status NcclComm::AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+Status NcclComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                                   Tensor& full) {
   // NCCL's all-gather concatenates FLAT rank chunks, so [rows, shard] row
   // shards would land rank-major. Gathering per row keeps the result
   // [rows, size * shard] in the layout the caller expects.
   INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
-  if (ctx.device() != device_) {
+  if (ctx.Device() != device_) {
     return InvalidArgumentError("NCCL context must match the communicator's device");
   }
   if (partial.IsEmpty()) return OkStatus();
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const NcclApi* api = NcclApi::Load();
   if (!api->Ready()) return Unavailable();
   const int64_t shard = partial.Dim(1);
@@ -175,7 +175,7 @@ Status NcclComm::AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor
     INFERX_RETURN_IF_ERROR(
         NcclCall(api->all_gather(send + row * shard * elem, recv + row * size() * shard * elem,
                                  static_cast<size_t>(shard), kNcclBfloat16, comm_,
-                                 static_cast<void*>(ctx.stream())),
+                                 static_cast<void*>(ctx.GetStream())),
                  "ncclAllGather"));
   }
   return OkStatus();
@@ -280,21 +280,21 @@ class NcclWorldRank final : public CommBackend {
       : state_(std::move(state)), rank_(rank) {}
   int size() const override { return state_->devices.size(); }
   int rank() const override { return rank_; }
-  Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) override {
+  Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) override {
     INFERX_RETURN_IF_ERROR(Validate(ctx, ValidateTensor(ctx, partial)));
     return state_->Submit(
-        rank_, {NcclWorldState::Kind::kSum, partial, partial, &ctx.runtime(), ctx.stream()});
+        rank_, {NcclWorldState::Kind::kSum, partial, partial, &ctx.Runtime(), ctx.GetStream()});
   }
-  Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+  Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override {
     INFERX_RETURN_IF_ERROR(Validate(ctx, ValidateGather(ctx, partial, full)));
     return state_->Submit(
-        rank_, {NcclWorldState::Kind::kGather, partial, full, &ctx.runtime(), ctx.stream()});
+        rank_, {NcclWorldState::Kind::kGather, partial, full, &ctx.Runtime(), ctx.GetStream()});
   }
 
  private:
-  Status Validate(const ops::ExecutionContext& ctx, Status status) {
-    if (status.ok() && ctx.device() != state_->devices[rank_]) {
+  Status Validate(const ops::OpContext& ctx, Status status) {
+    if (status.ok() && ctx.Device() != state_->devices[rank_]) {
       status = InvalidArgumentError("NCCL rank context uses the wrong device");
     }
     if (!status.ok()) {

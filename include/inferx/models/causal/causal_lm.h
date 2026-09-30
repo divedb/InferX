@@ -15,7 +15,7 @@
 #include "inferx/models/checkpoint.h"
 #include "inferx/models/loading/weight_loader.h"
 #include "inferx/models/model.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::causal {
 
@@ -34,7 +34,7 @@ struct LanguageModelHead {
 
   /// \brief Gathers `rows`, then projects them to [rows, vocab] logits.
   /// The row buffer and logits borrow workspace allocated on first use.
-  StatusOr<Tensor> Forward(const Tensor& hidden, const Tensor& rows, ops::ExecutionContext& ctx,
+  StatusOr<Tensor> Forward(const Tensor& hidden, const Tensor& rows, ops::OpContext& ctx,
                            dist::CommBackend& comm);
 
  private:
@@ -74,11 +74,11 @@ class CausalLM final : public Model {
     return decoder_.StateRequirements();
   }
   StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::ExecutionContext& ctx, dist::CommBackend& comm) override {
+                           ops::OpContext& ctx, dist::CommBackend& comm) override {
     if (input.attention.num_seqs <= 0 || input.attention.num_seqs > max_seqs_ ||
         input.logit_rows.Rank() != 1 || input.logit_rows.Numel() != input.attention.num_seqs ||
         input.logit_rows.GetDataType() != DataType::kInt32 ||
-        input.logit_rows.Device() != ctx.device()) {
+        input.logit_rows.Device() != ctx.Device()) {
       return InvalidArgumentError("invalid requested language-model output rows");
     }
     DecoderInput decoder_input{input.token_ids, {}, input.attention};

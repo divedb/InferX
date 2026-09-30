@@ -13,7 +13,7 @@
 #include "inferx/core/tensor.h"
 #include "inferx/ops/attention.h"
 #include "inferx/ops/elementwise.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/gather.h"
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
@@ -106,7 +106,7 @@ TEST_F(OpsTest, GreedyArgmaxMatchesHostIncludingTiesAndNonFiniteValues) {
   auto values=alloc(DataType::kFloat32,rows*parts);
   auto indices=alloc(DataType::kInt32,rows*parts);
   auto output=alloc(DataType::kInt32,rows);
-  ops::ExecutionContext ctx(*runtime_,stream_);
+  ops::OpContext ctx(*runtime_,stream_);
   for(auto dtype:{DataType::kFloat32,DataType::kBFloat16}) {
     const bool is_bf16 = dtype==DataType::kBFloat16;
     Tensor logits = is_bf16 ? Upload(x,Shape({rows,vocab}))
@@ -136,7 +136,7 @@ TEST_F(OpsTest, FlashAttentionMatchesDoubleReferenceWithRaggedPrefixAndShuffledP
   auto key=Upload(keys,Shape({blocks,page,kvheads,dim}));
   auto value=Upload(values,Shape({blocks,page,kvheads,dim}));
   auto kv=UploadInt(kvptr),ids=UploadInt(block_ids),last=UploadInt({1,1});
-  ops::ExecutionContext ctx(*runtime_,stream_);
+  ops::OpContext ctx(*runtime_,stream_);
   for(int mode : {0, 1, 2, 3, 4}) {
     const bool decode = mode == 1 || mode == 2;
     std::vector<int> qo=decode?std::vector<int>{0,1,2}:std::vector<int>{0,2,5};
@@ -193,7 +193,7 @@ TEST_F(OpsTest, FlashAttentionMatchesDoubleReferenceWithRaggedPrefixAndShuffledP
 }
 
 TEST_F(OpsTest, GatherRowsSelectsAndReorders) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   Tensor src = Upload({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, Shape({4, 3}));
   Tensor indices = UploadInt({3, 0, 3});
   Tensor out = MakeBf16(Shape({3, 3}));
@@ -202,7 +202,7 @@ TEST_F(OpsTest, GatherRowsSelectsAndReorders) {
 }
 
 TEST_F(OpsTest, LinearMultipliesByWeightTranspose) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   Tensor x = Upload({1, 2, 3, 4, 5, 6}, Shape({2, 3}));
   Tensor weight = Upload({1, 0, -1, 0, 1, 0, 1, 1, 1, 2, -1, 0}, Shape({4, 3}));
   Tensor out = MakeBf16(Shape({2, 4}));
@@ -226,7 +226,7 @@ TEST_F(OpsTest, DecodeLinearMatchesDoublePrecisionDotProducts) {
     std::memcpy(&f, &bits, sizeof(f));
     return f;
   };
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   for (int batch : {1, 2, 3, 4, 5, 16}) for (int width : {256, 1024, 3072, 259}) {
     constexpr int channels = 37;  // Partial final output tile.
     std::vector<float> x(batch * width), w(channels * width);
@@ -247,7 +247,7 @@ TEST_F(OpsTest, DecodeLinearMatchesDoublePrecisionDotProducts) {
 }
 
 TEST_F(OpsTest, FusedResidualNormExactlyMatchesSeparateRoundedOperations) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   for (int width : {128, 1024, 1031}) for (bool plus_one : {false, true}) {
     std::vector<float> x(7 * width), residual(x.size()), weight(width);
     for (size_t i = 0; i < x.size(); ++i) {
@@ -272,7 +272,7 @@ TEST_F(OpsTest, FusedResidualNormExactlyMatchesSeparateRoundedOperations) {
 }
 
 TEST_F(OpsTest, PackedProjectionsPreserveColumnOrderAndSiluRounding) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   for (int rows : {1, 4, 17}) {
     constexpr int qw = 19, kw = 7, vw = 11, width = qw + kw + vw;
     std::vector<float> packed(rows * width), qh, kh, vh;
@@ -307,7 +307,7 @@ TEST_F(OpsTest, PackedProjectionsPreserveColumnOrderAndSiluRounding) {
 }
 
 TEST_F(OpsTest, FusedNormRopeExactlyMatchesSeparateRoundedOperations) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   constexpr int tokens = 3, qheads = 4, kheads = 2, dim = 128;
   std::vector<float> qh(tokens * qheads * dim), kh(tokens * kheads * dim), qw(dim), kw(dim);
   for (size_t i = 0; i < qh.size(); ++i) qh[i] = std::sin(float(i * 3)) * 2;
@@ -336,7 +336,7 @@ TEST_F(OpsTest, FusedNormRopeExactlyMatchesSeparateRoundedOperations) {
 }
 
 TEST_F(OpsTest, VectorCacheWritePreservesShuffledPagesAndUntouchedSlots) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // Cross the dispatch threshold, page boundaries, and both supported and
   // scalar-fallback widths. Interleave sequences with unequal cached prefixes.
   for (int tokens : {1, 31, 32, 33, 67, 512}) {
@@ -379,7 +379,7 @@ TEST_F(OpsTest, VectorCacheWritePreservesShuffledPagesAndUntouchedSlots) {
 }
 
 TEST_F(OpsTest, AddAndSiluAndMulMatchReferences) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   Tensor a = Upload({1, -2, 0.5f, 3}, Shape({2, 2}));
   Tensor b = Upload({0.25f, 2, -0.5f, -1}, Shape({2, 2}));
   Tensor sum = MakeBf16(Shape({2, 2}));
@@ -401,7 +401,7 @@ TEST_F(OpsTest, AddAndSiluAndMulMatchReferences) {
 }
 
 TEST_F(OpsTest, PackedGatedActivationFlavors) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // gate = [2, -0.5, 10], up = [0.5, 2, -3]; headroom around the clamps.
   Tensor packed = Upload({2, -0.5, 10, 0.5, 2, -3}, Shape({1, 6}));
   Tensor out = MakeBf16(Shape({1, 3}));
@@ -429,7 +429,7 @@ TEST_F(OpsTest, PackedGatedActivationFlavors) {
 }
 
 TEST_F(OpsTest, BiasAndSigmoidGates) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   Tensor x = Upload({1, 2, 3, 4}, Shape({2, 2}));
   Tensor bias = Upload({10, -1}, Shape({2}));
   Tensor out = MakeBf16(Shape({2, 2}));
@@ -460,7 +460,7 @@ TEST_F(OpsTest, BiasAndSigmoidGates) {
 }
 
 TEST_F(OpsTest, RouteTokensMatchesReferencePolicies) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // Two tokens, three experts, hidden 4.
   Tensor hidden = Upload({1, 0.5f, -0.25f, 0.125f, -0.5f, 0.25f, 0.75f, -1},
                          Shape({2, 4}));
@@ -513,7 +513,7 @@ TEST_F(OpsTest, RouteTokensMatchesReferencePolicies) {
 }
 
 TEST_F(OpsTest, RouteTokensGroupedSigmoidSelection) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // One token, four experts in two groups, one group kept, top-1.
   Tensor hidden = Upload({1, 2, 3, 4}, Shape({1, 4}));
   Tensor router = Upload({10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
@@ -544,7 +544,7 @@ TEST_F(OpsTest, RouteTokensGroupedSigmoidSelection) {
 }
 
 TEST_F(OpsTest, AssembleMlaCachesLaysOutRotatedAndPaddedSlices) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // Two heads: nope 4, rope 2, v 3 -> head_dim 6 with a zero-padded V tail.
   Tensor k_rope = Upload({1, 2, 3, 4}, Shape({2, 2}));
   Tensor up = Upload({10, 11, 12, 13, 20, 21, 22,   // Row 0, head 0.
@@ -576,7 +576,7 @@ TEST_F(OpsTest, AssembleMlaCachesLaysOutRotatedAndPaddedSlices) {
 }
 
 TEST_F(OpsTest, GdnRecurrentMatchesReferenceUpdate) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // One sequence of three tokens, one key head, two value heads, dk = dv = 4.
   const int tokens = 3, kh = 1, vh = 2, dk = 4, dv = 4;
   const int conv_width = 2 * kh * dk + vh * dv;
@@ -717,7 +717,7 @@ TEST(RopeScaling, YarnAttentionTemperatureFollowsFactor) {
 }
 
 TEST_F(OpsTest, ApplyRopeRotatesHalfPairs) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // Two tokens, one query head and one kv head, head_dim 4, rotary_dim 4.
   const float theta = 10000.0f;
   Tensor q = Upload({1, 2, 3, 4, 1, 2, 3, 4}, Shape({2, 1, 4}));
@@ -750,7 +750,7 @@ TEST_F(OpsTest, ApplyRopeMatchesBf16ReferenceRounding) {
   Tensor q = Upload(queries, Shape({3, 2, 8}));
   Tensor k = Upload(keys, Shape({3, 1, 8}));
   Tensor positions = UploadInt({0, 17, 1024});
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   ASSERT_TRUE(ops::ApplyRope(ctx, q, k, positions, ops::RotaryParams{4, 1e6f}).ok());
   const std::vector<float> expected_q{
       .125f, .25f, .375f, .5f, .625f, .75f, .875f, 1,
@@ -767,7 +767,7 @@ TEST_F(OpsTest, ApplyRopeMatchesBf16ReferenceRounding) {
 }
 
 TEST_F(OpsTest, PagedAttentionMatchesCausalReference) {
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   // Two sequences over a 3-block pool: seq 0 holds positions 0..2 (blocks 0
   // and 1), seq 1 holds positions 0..1 (block 2). One prefill-style call.
   constexpr int kTokens = 5, kQueryHeads = 4, kKvHeads = 2, kHeadDim = 64, kBlockSize = 2;

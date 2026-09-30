@@ -5,7 +5,7 @@
 
 namespace inferx::ops {
 
-Status Linear(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out) {
+Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out) {
   if (x.Rank() != 2 || weight.Rank() != 2 || out.Rank() != 2) {
     return InvalidArgumentError("Linear expects rank-2 x, weight, and out");
   }
@@ -30,7 +30,7 @@ Status Linear(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tens
     return InvalidArgumentError("Linear out is [", out.Dim(0), ", ", out.Dim(1),
                                 "] but should be [", x.Dim(0), ", ", weight.Dim(0), "]");
   }
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (x.Device() != device || weight.Device() != device || out.Device() != device) {
     return InvalidArgumentError("Linear tensors must live on the context's device ",
                                 device.ToString());

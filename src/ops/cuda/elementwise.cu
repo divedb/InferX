@@ -131,15 +131,15 @@ uint32_t BlocksFor(int64_t n) { return static_cast<uint32_t>((n + kThreads - 1) 
 
 }  // namespace
 
-Status SplitQkv(ExecutionContext& ctx, const Tensor& packed, Tensor& q, Tensor& k, Tensor& v) {
+Status SplitQkv(OpContext& ctx, const Tensor& packed, Tensor& q, Tensor& k, Tensor& v) {
   return cuda::SplitProjection(ctx, packed, q, nullptr, k, v);
 }
 
-Status SplitProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& q, Tensor* gate,
+Status SplitProjection(OpContext& ctx, const Tensor& packed, Tensor& q, Tensor* gate,
                        Tensor& k, Tensor& v) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int gw = gate == nullptr ? 0 : static_cast<int>(gate->Dim(1));
-  SplitProjectionKernel<<<BlocksFor(packed.Numel()), kThreads, 0, ctx.stream()>>>(
+  SplitProjectionKernel<<<BlocksFor(packed.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()),
       static_cast<__nv_bfloat16*>(q.Data()),
       gate == nullptr ? nullptr : static_cast<__nv_bfloat16*>(gate->Data()),
@@ -149,55 +149,55 @@ Status SplitProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& q, T
   return CudaError(cudaGetLastError(), "split projection");
 }
 
-Status PackedSiluAndMul(ExecutionContext& ctx, const Tensor& packed, Tensor& out) {
+Status PackedSiluAndMul(OpContext& ctx, const Tensor& packed, Tensor& out) {
   return cuda::PackedGatedActivation(ctx, packed, out, Activation::kSilu, 1.702f, 7.0f);
 }
 
-Status PackedGatedActivation(ExecutionContext& ctx, const Tensor& packed, Tensor& out,
+Status PackedGatedActivation(OpContext& ctx, const Tensor& packed, Tensor& out,
                              Activation act, float oai_alpha, float oai_limit) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  PackedGatedActivationKernel<<<BlocksFor(out.Numel()), kThreads, 0, ctx.stream()>>>(
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  PackedGatedActivationKernel<<<BlocksFor(out.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()), static_cast<__nv_bfloat16*>(out.Data()),
       static_cast<int>(out.Dim(1)), act, oai_alpha, oai_limit, out.Numel());
   return CudaError(cudaGetLastError(), "packed gated activation");
 }
 
-Status AddBias(ExecutionContext& ctx, const Tensor& x, const Tensor& bias, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  AddBiasKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.stream()>>>(
+Status AddBias(OpContext& ctx, const Tensor& x, const Tensor& bias, Tensor& out) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  AddBiasKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<const __nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(bias.Data()),
       static_cast<__nv_bfloat16*>(out.Data()), static_cast<int>(x.Dim(1)), x.Numel());
   return CudaError(cudaGetLastError(), "add bias");
 }
 
-Status MulSigmoidGate(ExecutionContext& ctx, Tensor& x, const Tensor& gate) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  MulSigmoidGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.stream()>>>(
+Status MulSigmoidGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  MulSigmoidGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(gate.Data()), x.Numel());
   return CudaError(cudaGetLastError(), "mul sigmoid gate");
 }
 
-Status MulSigmoidRowGate(ExecutionContext& ctx, Tensor& x, const Tensor& gate) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  MulSigmoidRowGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.stream()>>>(
+Status MulSigmoidRowGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  MulSigmoidRowGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(gate.Data()), static_cast<int>(x.Dim(1)), x.Numel());
   return CudaError(cudaGetLastError(), "mul sigmoid row gate");
 }
 
-Status MulScalar(ExecutionContext& ctx, Tensor& x, float scalar) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  MulScalarKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.stream()>>>(
+Status MulScalar(OpContext& ctx, Tensor& x, float scalar) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  MulScalarKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
       static_cast<__nv_bfloat16*>(x.Data()), scalar, x.Numel());
   return CudaError(cudaGetLastError(), "mul scalar");
 }
 
-Status Add(ExecutionContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+Status Add(OpContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t n = a.Numel();
-  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.stream());
+  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
   if (a.GetDataType() == DataType::kBFloat16) {
     AddKernel<<<BlocksFor(n), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(a.Data()), static_cast<const __nv_bfloat16*>(b.Data()),
@@ -210,10 +210,10 @@ Status Add(ExecutionContext& ctx, const Tensor& a, const Tensor& b, Tensor& out)
   return CudaError(cudaGetLastError(), "add launch");
 }
 
-Status SiluAndMul(ExecutionContext& ctx, const Tensor& gate, const Tensor& up, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+Status SiluAndMul(OpContext& ctx, const Tensor& gate, const Tensor& up, Tensor& out) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t n = gate.Numel();
-  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.stream());
+  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
   if (gate.GetDataType() == DataType::kBFloat16) {
     SiluAndMulKernel<<<BlocksFor(n), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(gate.Data()),

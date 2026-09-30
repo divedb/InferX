@@ -1,5 +1,3 @@
-# One CMakeLists per engine layer; each declares its library through
-# inferx_add_library (cmake/InferxHelpers.cmake).
 add_subdirectory(core)       # element types, tensors, status, memory
 add_subdirectory(cache)      # paged KV block pool
 add_subdirectory(ops)        # portable compute ops + cpu/cuda backends

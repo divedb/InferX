@@ -5,7 +5,6 @@
 #include <string_view>
 
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/attention.h"
 #include "inferx/ops/elementwise.h"
@@ -20,13 +19,8 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
                     const Tensor& normed, float norm_eps, const AttentionBatch& batch,
                     const PagedKvState& kv_state, const KvBlockPool& pool,
                     AttentionWorkspace& ws, Tensor* packed_buffer,
-                    ops::ExecutionContext& ctx, DiagnosticTrace* trace,
-                    std::string_view prefix, Tensor& mixed_out) {
+                    ops::OpContext& ctx, Tensor& mixed_out) {
   const int64_t rows = normed.Dim(0);
-  const bool tracing = trace != nullptr && trace->enabled();
-  const auto write = [&](std::string_view stage, const Tensor& t) {
-    if (tracing) trace->Write(std::string(prefix) + std::string(stage), t);
-  };
 
   // Project, optionally bias, normalize q/k per head, rotate, cache, attend.
   const int64_t query_width = a.query_heads * a.head_dim;
@@ -54,11 +48,8 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
     gate = std::move(gate2d);
   }
   INFERX_RETURN_IF_ERROR(ops::SplitProjection(ctx, packed, q, gate ? &*gate : nullptr, k, v));
-  write("q_proj", q);
-  write("k_proj", k);
-  write("v_proj", v);
   const bool fused_norm_rope =
-      a.qk_norm && !a.qk_norm_plus_one && a.head_dim == 128 && ctx.device().IsCuda();
+      a.qk_norm && !a.qk_norm_plus_one && a.head_dim == 128 && ctx.Device().IsCuda();
   if (a.qk_norm && !fused_norm_rope) {
     const ops::RMSNormConfig head_norm{norm_eps, a.qk_norm_plus_one, !a.qk_norm_plus_one};
     INFERX_ASSIGN_OR_RETURN(Tensor q_heads, q.Reshape(Shape({rows * a.query_heads, a.head_dim})));
@@ -76,8 +67,6 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
     INFERX_RETURN_IF_ERROR(ops::ApplyRope(ctx, q3, k3, batch.positions, rotary));
   }
 
-  write("q_rope", q);
-  write("k_rope", k);
   INFERX_ASSIGN_OR_RETURN(Tensor key_cache, pool.KeyCache(kv_state.pool_layer));
   INFERX_ASSIGN_OR_RETURN(Tensor value_cache, pool.ValueCache(kv_state.pool_layer));
   const int64_t block_size = pool.BlockSize();
@@ -100,7 +89,6 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
                                              batch.kv_indices, batch.last_page_len,
                                              batch.host_qo_indptr, batch.num_seqs, key_cache,
                                              value_cache, block_size, params, ws.plan, attn_out));
-  write("attention", attn_out);
   if (gate.has_value()) {
     // Qwen3-Next gates the attention output elementwise before the projection.
     INFERX_RETURN_IF_ERROR(ops::MulSigmoidGate(ctx, attn_out, *gate));
@@ -109,7 +97,6 @@ Status RunAttention(const AttentionConfig& a, const AttentionWeights& w,
   if (w.output_bias.has_value()) {
     INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, mixed_out, *w.output_bias, mixed_out));
   }
-  write("o_proj", mixed_out);
   return OkStatus();
 }
 

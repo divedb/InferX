@@ -1,7 +1,6 @@
 #include "inferx/models/components/mlp.h"
 
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/ops/elementwise.h"
 #include "inferx/ops/linear.h"
 
@@ -9,13 +8,8 @@ namespace inferx::components {
 
 Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights,
                  const Tensor& normed, MlpWorkspace& ws, Tensor* packed_buffer,
-                 ops::ExecutionContext& ctx, DiagnosticTrace* trace,
-                 std::string_view prefix, Tensor& mixed_out) {
+                 ops::OpContext& ctx, Tensor& mixed_out) {
   const int64_t rows = normed.Dim(0);
-  const bool tracing = trace != nullptr && trace->enabled();
-  const auto write = [&](std::string_view stage, const Tensor& t) {
-    if (tracing) trace->Write(std::string(prefix) + std::string(stage), t);
-  };
 
   INFERX_ASSIGN_OR_RETURN(Tensor gate_flat, ws.gate->Slice(0, rows * config.intermediate_size));
   INFERX_ASSIGN_OR_RETURN(Tensor gate, gate_flat.Reshape(Shape({rows, config.intermediate_size})));
@@ -33,8 +27,6 @@ Status RunSwiGlu(const SwiGluConfig& config, const SwiGluWeights& weights,
   if (weights.down_bias.has_value()) {
     INFERX_RETURN_IF_ERROR(ops::AddBias(ctx, mixed_out, *weights.down_bias, mixed_out));
   }
-  write("silu", gate);
-  write("down_proj", mixed_out);
   return OkStatus();
 }
 

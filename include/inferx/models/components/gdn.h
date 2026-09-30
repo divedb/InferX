@@ -12,12 +12,11 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/components/attention.h"
 #include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 
 struct AttentionBatch;
-class DiagnosticTrace;
 
 namespace components {
 
@@ -52,8 +51,7 @@ struct GdnWorkspace {
 Status RunGatedDeltaNet(const GatedDeltaNetConfig& config, const GdnWeights& weights,
                         const Tensor& normed, const AttentionBatch& batch,
                         const RecurrentState& state, const RecurrentStatePool& pool,
-                        GdnWorkspace& ws, ops::ExecutionContext& ctx, DiagnosticTrace* trace,
-                        std::string_view prefix, Tensor& mixed_out);
+                        GdnWorkspace& ws, ops::OpContext& ctx, Tensor& mixed_out);
 
 }  // namespace inferx::components
 }  // namespace inferx

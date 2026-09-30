@@ -350,7 +350,7 @@ All paths in this section are future changes. Only this plan is added during the
 | `src/cache/kv_block_pool.cc`, state headers | Prefer no layout/allocator changes; add a validated descriptor helper only if pool accessors are insufficient. |
 | `src/CMakeLists.txt`, `cmake/InferXCUDA.cmake` | Optional build target, SM89 specialization, target-local compilation flags, register/spill reporting; separate optional SM90a/SM100a variants. Keep provider-only builds working. |
 | `tests/CMakeLists.txt`, existing operator/model/runner suites, new mega tests | Numerical, cache compatibility, synchronization, graph transition, and failure tests described below. |
-| `src/diagnostic/replay_logits.cc`, `src/models/diagnostic_trace.h` | Add candidate backend selection and full-batch device snapshots; existing trace emits only the last row and synchronizes eagerly. |
+| `src/diagnostic/replay_logits.cc` | Add candidate backend selection and full-batch device snapshots. |
 | `benchmarks/inferx_bench/runner.py`, `provenance.py`, `benchmarks/qwen3/` | Record backend/plan/fallback, device variant, schedules, source additions, resource usage, and benchmark ablations. |
 
 The scheduler's admission/page-allocation algorithm and the external provider ABI do not require redesign for one-step decode fusion. A GPU-resident multi-token loop would require new stopping, cancellation, admission, allocation, and streaming protocols and is deferred.

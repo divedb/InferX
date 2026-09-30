@@ -13,13 +13,12 @@
 #include "inferx/models/components/mla.h"
 #include "inferx/models/components/rope.h"
 #include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/ops/flash_attention.h"
 
 namespace inferx {
 
 struct AttentionBatch;  // defined in inferx/models/model.h
-class DiagnosticTrace;  // src-private diagnostic helper
 
 namespace components {
 
@@ -100,8 +99,8 @@ struct AttentionWorkspace {
 Status RunAttention(const AttentionConfig& config, const AttentionWeights& weights,
                     const Tensor& normed, float norm_eps, const AttentionBatch& batch,
                     const PagedKvState& kv_state, const KvBlockPool& pool,
-                    AttentionWorkspace& ws, Tensor* packed_buffer, ops::ExecutionContext& ctx,
-                    DiagnosticTrace* trace, std::string_view prefix, Tensor& mixed_out);
+                    AttentionWorkspace& ws, Tensor* packed_buffer, ops::OpContext& ctx,
+                    Tensor& mixed_out);
 
 enum class QkvBias { kDisabled, kEnabled };
 enum class QkNorm { kNone, kRmsNorm };
@@ -122,10 +121,10 @@ class GqaAttention {
 
   Status Forward(const Tensor& input, float norm_eps, const AttentionBatch& batch,
                  const PagedKvState& state, const KvBlockPool& pool,
-                 AttentionWorkspace& workspace, Tensor* packed, ops::ExecutionContext& ctx,
-                 DiagnosticTrace* trace, std::string_view prefix, Tensor& output) const {
+                 AttentionWorkspace& workspace, Tensor* packed, ops::OpContext& ctx,
+                 Tensor& output) const {
     return RunAttention(config_, weights_, input, norm_eps, batch, state, pool, workspace,
-                        packed, ctx, trace, prefix, output);
+                        packed, ctx, output);
   }
 
  private:

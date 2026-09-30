@@ -4,7 +4,7 @@
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
 #include "inferx/ops/attention.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops::cuda {
 
@@ -15,7 +15,7 @@ namespace inferx::ops::cuda {
 /// sinks (denominator-only logits), any head dimension, any GQA ratio, and
 /// per-layer sliding windows. Slower than the FlashInfer fast path; the
 /// dispatcher only selects it when FlashAttentionSupports() is false.
-Status GenericPagedAttention(ExecutionContext& ctx, const Tensor& q, const Tensor& qo_indptr,
+Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
                              const Tensor& kv_indptr, const Tensor& kv_indices,
                              const Tensor& last_page_len, const Tensor& key_cache,
                              const Tensor& value_cache, int64_t block_size,

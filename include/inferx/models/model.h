@@ -11,7 +11,7 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/checkpoint_config.h"
 #include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 
@@ -94,7 +94,7 @@ class Model {
   /// \param comm   This rank's communicator, matching the loaded model topology.
   /// \return       [num_seqs, vocab] logits, or an error status.
   virtual StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                                   ops::ExecutionContext& ctx, dist::CommBackend& comm) = 0;
+                                   ops::OpContext& ctx, dist::CommBackend& comm) = 0;
 };
 
 }  // namespace inferx

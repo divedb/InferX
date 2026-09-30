@@ -10,7 +10,7 @@
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 namespace {
@@ -139,7 +139,7 @@ class RmsNormTest : public ::testing::Test {
     RMSNormConfig config;
     config.eps = eps;
     config.plus_one_weight = plus_one;
-    ExecutionContext exec_ctx(*runtime_, stream_);
+    OpContext exec_ctx(*runtime_, stream_);
     EXPECT_TRUE(RmsNorm(exec_ctx, x, w, out, config).ok());
     ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
 
@@ -203,7 +203,7 @@ class RmsNormTest : public ::testing::Test {
     }
   }
 
-  ExecutionContext ctx() { return ExecutionContext(*runtime_, stream_); }
+  OpContext ctx() { return OpContext(*runtime_, stream_); }
 
   DeviceRuntime* runtime_ = nullptr;
   Stream stream_;
@@ -265,7 +265,7 @@ TEST_F(CudaRmsNormTest, RejectsWeightLengthMismatch) {
   auto w = Tensor::Empty(DataType::kBFloat16, Shape({7}), device_);
   auto out = Tensor::Empty(DataType::kBFloat16, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
 }
@@ -275,7 +275,7 @@ TEST_F(CudaRmsNormTest, RejectsDtypeMismatch) {
   auto w = Tensor::Empty(DataType::kFloat16, Shape({8}), device_);
   auto out = Tensor::Empty(DataType::kBFloat16, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
 }
@@ -285,7 +285,7 @@ TEST_F(CudaRmsNormTest, RejectsOutputShapeMismatch) {
   auto w = Tensor::Empty(DataType::kBFloat16, Shape({8}), device_);
   auto out = Tensor::Empty(DataType::kBFloat16, Shape({4, 9}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
 }
@@ -295,7 +295,7 @@ TEST_F(CudaRmsNormTest, RejectsUnsupportedDtype) {
   auto w = Tensor::Empty(DataType::kFloat64, Shape({8}), device_);
   auto out = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
 }
@@ -305,7 +305,7 @@ TEST_F(CudaRmsNormTest, RejectsForeignDevice) {
   auto w = Tensor::Empty(DataType::kBFloat16, Shape({8}), DeviceId::Cpu());
   auto out = Tensor::Empty(DataType::kBFloat16, Shape({4, 8}), DeviceId::Cpu());
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
 }
@@ -335,7 +335,7 @@ TEST_F(CpuRmsNormTest, RejectsWeightLengthMismatch) {
   auto w = Tensor::Empty(DataType::kBFloat16, Shape({7}), device_);
   auto out = Tensor::Empty(DataType::kBFloat16, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
 }
@@ -345,7 +345,7 @@ TEST_F(CpuRmsNormTest, RejectsUnsupportedDtype) {
   auto w = Tensor::Empty(DataType::kFloat64, Shape({8}), device_);
   auto out = Tensor::Empty(DataType::kFloat64, Shape({4, 8}), device_);
   ASSERT_TRUE(x.ok() && w.ok() && out.ok());
-  ExecutionContext exec_ctx(*runtime_, stream_);
+  OpContext exec_ctx(*runtime_, stream_);
   const Status status = RmsNorm(exec_ctx, *x, *w, *out, RMSNormConfig{});
   EXPECT_EQ(status.code(), absl::StatusCode::kUnimplemented);
 }

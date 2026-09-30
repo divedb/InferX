@@ -9,7 +9,7 @@
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
 #include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 
@@ -42,7 +42,7 @@ class RecurrentStatePool {
   ///
   /// Called when a slot is assigned to a new request, before the step's
   /// kernels read it; stream ordering makes that safe under graph capture.
-  Status ResetSlot(ops::ExecutionContext& ctx, int64_t slot);
+  Status ResetSlot(ops::OpContext& ctx, int64_t slot);
 
   int64_t NumLayers() const { return num_layers_; }
   int64_t MaxSlots() const { return max_slots_; }

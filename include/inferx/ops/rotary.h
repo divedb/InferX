@@ -6,7 +6,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops {
 
@@ -25,13 +25,13 @@ enum class RopeFlavor : uint8_t {
 /// computed once on the host, so kernels and validation share one formula.
 struct RopeScaling {
   RopeFlavor flavor = RopeFlavor::kDefault;
-  float factor = 1.0f;                ///< Interpolation factor; >1 extends context.
-  float low_freq_factor = 1.0f;       ///< Llama3: wavelengths above this interpolate fully.
-  float high_freq_factor = 4.0f;      ///< Llama3: wavelengths below this stay extrapolated.
-  float original_max_position = 0.0f; ///< Llama3 old context; YaRN original length.
-  float ramp_low = 0.0f;              ///< YaRN ramp start, in frequency indices.
-  float ramp_high = 0.0f;             ///< YaRN ramp end, in frequency indices.
-  float attention_scale = 1.0f;       ///< YaRN temperature folded into cos/sin.
+  float factor = 1.0f;                 ///< Interpolation factor; >1 extends context.
+  float low_freq_factor = 1.0f;        ///< Llama3: wavelengths above this interpolate fully.
+  float high_freq_factor = 4.0f;       ///< Llama3: wavelengths below this stay extrapolated.
+  float original_max_position = 0.0f;  ///< Llama3 old context; YaRN original length.
+  float ramp_low = 0.0f;               ///< YaRN ramp start, in frequency indices.
+  float ramp_high = 0.0f;              ///< YaRN ramp end, in frequency indices.
+  float attention_scale = 1.0f;        ///< YaRN temperature folded into cos/sin.
 };
 
 /// \brief Parameters of one rotary position encoding.
@@ -52,9 +52,9 @@ struct RotaryParams {
 #else
 #define INFERX_ROPE_HD inline
 #endif
+
 INFERX_ROPE_HD float InverseFrequency(int64_t i, const RotaryParams& p) {
-  const float exponent =
-      2.0f * static_cast<float>(i) / static_cast<float>(p.rotary_dim);
+  const float exponent = 2.0f * static_cast<float>(i) / static_cast<float>(p.rotary_dim);
   const float inv = ::powf(p.theta, -exponent);
   const RopeScaling& s = p.scaling;
   switch (s.flavor) {
@@ -93,18 +93,18 @@ INFERX_ROPE_HD float InverseFrequency(int64_t i, const RotaryParams& p) {
 /// and each multiply/add are rounded to the activation dtype, matching the
 /// reference BF16 cache and rotation. Work is enqueued on the context's stream.
 ///
-/// \param ctx        Execution context; all tensors must live on ctx.device().
+/// \param ctx        Execution context; all tensors must live on ctx.Device().
 /// \param q          [tokens, query_heads, head_dim] queries; updated in place.
 /// \param k          [tokens, kv_heads, head_dim] keys; updated in place.
 /// \param positions  [tokens] int32 position of each token.
 /// \param params     Rotary parameters.
 /// \return           OK, or InvalidArgument/Unimplemented for bad inputs.
-Status ApplyRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
+Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params);
 
 /// Rounded per-head RMSNorm followed by RoPE, fused for BF16 heads of width
 /// 128. Preserves the intermediate BF16 normalization and rotation roundings.
-Status NormalizeAndApplyRope(ExecutionContext& ctx, const Tensor& q, const Tensor& k,
+Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                              const Tensor& q_weight, const Tensor& k_weight,
                              const Tensor& positions, float eps, const RotaryParams& params);
 

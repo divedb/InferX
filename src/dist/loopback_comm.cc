@@ -91,13 +91,13 @@ StatusOr<Tensor*> LoopbackComm::Slot(const Shape& shape, DeviceId device) {
   return &found->second;
 }
 
-Status LoopbackComm::Publish(const ops::ExecutionContext& ctx, const Tensor& contribution) {
+Status LoopbackComm::Publish(const ops::OpContext& ctx, const Tensor& contribution) {
   INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, contribution));
-  INFERX_ASSIGN_OR_RETURN(Tensor * slot, Slot(contribution.GetShape(), ctx.device()));
+  INFERX_ASSIGN_OR_RETURN(Tensor * slot, Slot(contribution.GetShape(), ctx.Device()));
   if (!contribution.IsEmpty() && slot->Data() != contribution.Data()) {
-    INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(slot->Data(), contribution.Data(),
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(slot->Data(), contribution.Data(),
                                                    contribution.NBytes(),
-                                                   CopyKind::kDeviceToDevice, ctx.stream()));
+                                                   CopyKind::kDeviceToDevice, ctx.GetStream()));
   }
   {
     const std::lock_guard<std::mutex> lock(state_->mu);
@@ -105,7 +105,7 @@ Status LoopbackComm::Publish(const ops::ExecutionContext& ctx, const Tensor& con
   }
   // The slot must hold EXECUTED data before peers read it; stream order
   // alone does not cross streams.
-  return ctx.runtime().SynchronizeStream(ctx.stream());
+  return ctx.Runtime().SynchronizeStream(ctx.GetStream());
 }
 
 Status LoopbackComm::Meet() { return state_->Wait(size()); }
@@ -119,32 +119,32 @@ Status LoopbackComm::Finish(Status status) {
   return state_->failure;
 }
 
-Status LoopbackComm::AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) {
+Status LoopbackComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
   return Finish([&]() -> Status {
     INFERX_RETURN_IF_ERROR(Publish(ctx, partial));
     INFERX_RETURN_IF_ERROR(Meet());
     const auto& published = state_->published;
     for (const Tensor* peer : published) {
-      if (peer->GetShape() != partial.GetShape() || peer->Device() != ctx.device()) {
+      if (peer->GetShape() != partial.GetShape() || peer->Device() != ctx.Device()) {
         return InvalidArgumentError("all-reduce peers must have matching shapes and devices");
       }
     }
     // Every rank uses the same summation order, including BF16 rounding.
     if (!partial.IsEmpty()) {
-      INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(partial.Data(), published.front()->Data(),
+      INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(partial.Data(), published.front()->Data(),
                                                      partial.NBytes(),
-                                                     CopyKind::kDeviceToDevice, ctx.stream()));
+                                                     CopyKind::kDeviceToDevice, ctx.GetStream()));
     }
     auto op_ctx = ctx;
     for (int r = 1; r < size(); ++r) {
       INFERX_RETURN_IF_ERROR(ops::Add(op_ctx, partial, *published[r], partial));
     }
-    INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
     return Meet();
   }());
 }
 
-Status LoopbackComm::AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+Status LoopbackComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                                       Tensor& full) {
   return Finish([&]() -> Status {
     INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
@@ -154,13 +154,13 @@ Status LoopbackComm::AllGatherLastDim(const ops::ExecutionContext& ctx, const Te
     auto op_ctx = ctx;
     for (int r = 0; r < size(); ++r) {
       if (published[r]->GetShape() != partial.GetShape() ||
-          published[r]->Device() != ctx.device()) {
+          published[r]->Device() != ctx.Device()) {
         return InvalidArgumentError("all-gather peers must have matching shapes and devices");
       }
       INFERX_RETURN_IF_ERROR(ops::CopyColumnBlock(op_ctx, *published[r], full,
                                                   static_cast<int64_t>(r) * partial.Dim(1)));
     }
-    INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
     return Meet();
   }());
 }

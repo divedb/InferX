@@ -16,7 +16,7 @@ namespace {
 using inferx::DeviceId;
 using inferx::Status;
 using inferx::Tensor;
-using inferx::ops::ExecutionContext;
+using inferx::ops::OpContext;
 using inferx::sampling::SamplingMetadata;
 using inferx::sampling::SamplingParams;
 using inferx::sampling::Sampler;
@@ -146,7 +146,7 @@ TEST_F(SamplerTest, GreedyCpuPathPicksArgmaxWithLowestIndexTieBreak) {
   greedy.temperature = 0.0f;
   const SamplingMetadata::PerRequest batch[] = {{&greedy, 0}, {&greedy, 3}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
   const int32_t* ids = output->sampled_token_ids.DataAs<int32_t>();
@@ -162,7 +162,7 @@ TEST_F(SamplerTest, TopKOneMatchesGreedy) {
   topk1.top_k = 1;
   const SamplingMetadata::PerRequest batch[] = {{&topk1, 0}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
   ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
@@ -178,7 +178,7 @@ TEST_F(SamplerTest, SeededDrawIsReproducibleAndVariesWithOffset) {
   random.seed = 42;
   const SamplingMetadata::PerRequest a[] = {{&random, 0}};
   const SamplingMetadata::PerRequest b[] = {{&random, 1}};
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   const auto first = (*sampler)->Sample(ctx, logits, SamplingMetadata::Build(8, a));
   const auto repeat = (*sampler)->Sample(ctx, logits, SamplingMetadata::Build(8, a));
   const auto next = (*sampler)->Sample(ctx, logits, SamplingMetadata::Build(8, b));
@@ -199,7 +199,7 @@ TEST_F(SamplerTest, LogitBiasBansTokens) {
   biased.logit_bias[2] = 100.0f;     // Crown token 2.
   const SamplingMetadata::PerRequest batch[] = {{&biased, 0}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
   ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
@@ -217,7 +217,7 @@ TEST_F(SamplerTest, RepetitionPenaltyPushesOffHistory) {
   const std::vector<int32_t> history{5, 5};  // 9 / 8 + ... demoted below 6.
   const SamplingMetadata::PerRequest batch[] = {{&penalized, 0, &history}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
   ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
@@ -232,7 +232,7 @@ TEST_F(SamplerTest, AllowlistRestrictsToEntries) {
   constrained.allowed_token_ids = {0, 3, 6};
   const SamplingMetadata::PerRequest batch[] = {{&constrained, 0}};
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
   ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
@@ -282,11 +282,11 @@ TEST_F(SamplerTest, CudaPipelineAgreesWithCpuReference) {
                                                 {&b, 3, &history},
                                                 {&c, 1, &history}};
   const SamplingMetadata metadata = SamplingMetadata::Build(64, batch);
-  ExecutionContext ctx(*cuda_, cuda_stream_);
+  OpContext ctx(*cuda_, cuda_stream_);
   const auto gpu_out = (*gpu)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(gpu_out.ok()) << gpu_out.status();
   // The CPU reference reads the same device tensor through its own lane.
-  ExecutionContext cpu_ctx(*runtime_, stream_);
+  OpContext cpu_ctx(*runtime_, stream_);
   const auto cpu_out = (*cpu)->Sample(cpu_ctx, logits_cpu, metadata);
   ASSERT_TRUE(cpu_out.ok()) << cpu_out.status();
   ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
@@ -309,7 +309,7 @@ TEST_F(SamplerTest, RejectsMetadataMismatch) {
   greedy.temperature = 0.0f;
   const SamplingMetadata::PerRequest batch[] = {{&greedy, 0}};  // One of two rows.
   const SamplingMetadata metadata = SamplingMetadata::Build(8, batch);
-  ExecutionContext ctx(*runtime_, stream_);
+  OpContext ctx(*runtime_, stream_);
   EXPECT_FALSE((*sampler)->Sample(ctx, logits, metadata).ok());
 }
 

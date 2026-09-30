@@ -3,7 +3,6 @@
 #include <string_view>
 
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/models/model.h"
 #include "inferx/ops/gdn.h"
 #include "inferx/ops/linear.h"
@@ -13,16 +12,11 @@ namespace inferx::components {
 Status RunGatedDeltaNet(const GatedDeltaNetConfig& a, const GdnWeights& w, const Tensor& normed,
                         const AttentionBatch& batch, const RecurrentState& state,
                         const RecurrentStatePool& pool, GdnWorkspace& ws,
-                        ops::ExecutionContext& ctx, DiagnosticTrace* trace,
-                        std::string_view prefix, Tensor& mixed_out) {
+                        ops::OpContext& ctx, Tensor& mixed_out) {
   const int64_t rows = normed.Dim(0);
   const int64_t kh = a.key_heads, vh = a.value_heads;
   const int64_t kd = a.key_dim, vd = a.value_dim;
   const int64_t q_total = kh * kd, v_total = vh * vd;
-  const bool tracing = trace != nullptr && trace->enabled();
-  const auto write = [&](std::string_view stage, const Tensor& t) {
-    if (tracing) trace->Write(std::string(prefix) + std::string(stage), t);
-  };
 
   INFERX_ASSIGN_OR_RETURN(Tensor packed,
                           ws.packed->Slice(0, rows * (2 * q_total + 2 * v_total))
@@ -60,11 +54,9 @@ Status RunGatedDeltaNet(const GatedDeltaNetConfig& a, const GdnWeights& w, const
   INFERX_RETURN_IF_ERROR(ops::GdnRecurrent(ctx, conv_in, q_total, beta, g, state_t,
                                            *batch.recurrent_indices, batch.qo_indptr,
                                            batch.batch_indices, y));
-  write("gdn_out", y);
   // The gated norm consumes y and z per head.
   INFERX_RETURN_IF_ERROR(ops::RmsNormGated(ctx, y, z, w.norm_weight, 1e-6f, y));
   INFERX_RETURN_IF_ERROR(ops::Linear(ctx, y, w.out_proj, mixed_out));
-  write("o_proj", mixed_out);
   return OkStatus();
 }
 

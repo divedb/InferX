@@ -4,7 +4,7 @@
 #include <cublas_v2.h>
 
 #include "inferx/core/status.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops::cuda {
 
@@ -14,7 +14,7 @@ namespace inferx::ops::cuda {
 /// The handle is created lazily on first use and never destroyed; the stream
 /// is reset on every acquisition so callers can share one handle across
 /// streams.
-StatusOr<cublasHandle_t> AcquireCublas(ExecutionContext& ctx);
+StatusOr<cublasHandle_t> AcquireCublas(OpContext& ctx);
 
 }  // namespace inferx::ops::cuda
 

@@ -17,10 +17,10 @@ Status CheckHost(const Tensor& t, DataType dtype, const DeviceId& device) {
 
 }  // namespace
 
-Status RouteTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& router_weight,
+Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_weight,
                    const Tensor* router_bias, const Tensor* correction_bias,
                    const RoutingConfig& config, Tensor& topk_indices, Tensor& topk_weights) {
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (hidden.Rank() != 2 || router_weight.Rank() != 2 ||
       hidden.GetDataType() != DataType::kBFloat16 ||
       router_weight.GetDataType() != DataType::kBFloat16 ||
@@ -66,7 +66,7 @@ Status RouteTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& ro
 }
 
 StatusOr<std::vector<int64_t>> BuildExpertDispatch(
-    ExecutionContext& ctx, const Tensor& topk_indices, const Tensor& topk_weights,
+    OpContext& ctx, const Tensor& topk_indices, const Tensor& topk_weights,
     int64_t num_experts, Tensor& counts, Tensor& offsets, Tensor& cursor, Tensor& token_rows,
     Tensor& weights_by_slot) {
   const int64_t total = topk_indices.Numel();
@@ -80,10 +80,10 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
   // writes through those offsets, so ordering is load-bearing.
   INFERX_RETURN_IF_ERROR(cuda::ExpertHistogram(ctx, topk_indices, num_experts, counts));
   std::vector<int32_t> host(num_experts);
-  INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(
       host.data(), counts.Data(), num_experts * sizeof(int32_t), CopyKind::kDeviceToHost,
-      ctx.stream()));
-  INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+      ctx.GetStream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
   std::vector<int64_t> host_offsets(num_experts + 1);
   host_offsets[0] = 0;
   for (int64_t e = 0; e < num_experts; ++e) {
@@ -96,15 +96,15 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
   for (int64_t e = 0; e <= num_experts; ++e) {
     device_offsets[e] = static_cast<int32_t>(host_offsets[e]);
   }
-  INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(offsets.Data(), device_offsets.data(),
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(offsets.Data(), device_offsets.data(),
                                                  device_offsets.size() * sizeof(int32_t),
-                                                 CopyKind::kHostToDevice, ctx.stream()));
+                                                 CopyKind::kHostToDevice, ctx.GetStream()));
   INFERX_RETURN_IF_ERROR(cuda::ScatterSlots(ctx, topk_indices, topk_weights, offsets, cursor,
                                             token_rows, weights_by_slot));
   return host_offsets;
 }
 
-Status GatherRoutedTokens(ExecutionContext& ctx, const Tensor& hidden, const Tensor& token_rows,
+Status GatherRoutedTokens(OpContext& ctx, const Tensor& hidden, const Tensor& token_rows,
                           Tensor& out) {
   if (hidden.Rank() != 2 || token_rows.Rank() != 1 || out.Rank() != 2 ||
       out.Dim(0) < token_rows.Numel() || out.Dim(1) != hidden.Dim(1) ||
@@ -115,7 +115,7 @@ Status GatherRoutedTokens(ExecutionContext& ctx, const Tensor& hidden, const Ten
   return cuda::GatherRoutedTokens(ctx, hidden, token_rows, out);
 }
 
-Status ScatterRoutedOutputs(ExecutionContext& ctx, const Tensor& expert_rows,
+Status ScatterRoutedOutputs(OpContext& ctx, const Tensor& expert_rows,
                             const Tensor& token_rows, const Tensor& weights_by_slot,
                             int64_t begin, int64_t count, Tensor& out) {
   if (count <= 0) return InvalidArgumentError("scatter needs a positive expert slice");

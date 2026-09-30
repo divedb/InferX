@@ -63,9 +63,9 @@ __global__ void Finish(const T* x, int vocab, int parts, const float* values,
     out[row] = isnan(static_cast<float>(x[static_cast<int64_t>(row) * vocab])) ? 0 : a.index;
 }
 }  // namespace
-Status GreedyArgmax(ExecutionContext& ctx, const Tensor& logits, Tensor& values,
+Status GreedyArgmax(OpContext& ctx, const Tensor& logits, Tensor& values,
                     Tensor& indices, Tensor& output) {
-  if (ctx.device().kind != DeviceKind::kCuda || logits.Rank() != 2 || logits.IsEmpty() ||
+  if (ctx.Device().kind != DeviceKind::kCuda || logits.Rank() != 2 || logits.IsEmpty() ||
       (logits.GetDataType() != DataType::kBFloat16 && logits.GetDataType() != DataType::kFloat32))
     return InvalidArgumentError("GreedyArgmax requires CUDA float32/bfloat16 matrix");
   const int batch = logits.Dim(0), vocab = logits.Dim(1), parts = (vocab + 4095) / 4096;
@@ -75,10 +75,10 @@ Status GreedyArgmax(ExecutionContext& ctx, const Tensor& logits, Tensor& values,
     return InvalidArgumentError("GreedyArgmax workspace too small or wrong dtype");
   const Tensor* tensors[] = {&logits, &values, &indices, &output};
   for (const Tensor* t : tensors)
-    if (t->Device() != ctx.device())
+    if (t->Device() != ctx.Device())
       return InvalidArgumentError("GreedyArgmax device mismatch");
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  auto stream = static_cast<cudaStream_t>(ctx.stream());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  auto stream = static_cast<cudaStream_t>(ctx.GetStream());
   auto launch = [&]<class T>() {
     Partial<<<dim3(batch, parts), 256, 0, stream>>>(static_cast<const T*>(logits.Data()), vocab,
                                                     parts, static_cast<float*>(values.Data()),

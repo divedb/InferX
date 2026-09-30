@@ -23,11 +23,11 @@ class RmsNorm {
   RmsNorm(NormConfig config, Tensor weight)
       : config_{config.eps, config.plus_one, !config.plus_one}, weight_(std::move(weight)) {}
 
-  Status Forward(ops::ExecutionContext& ctx, const Tensor& input, Tensor& output) const {
+  Status Forward(ops::OpContext& ctx, const Tensor& input, Tensor& output) const {
     return ops::RmsNorm(ctx, input, weight_, output, config_);
   }
 
-  Status AddForward(ops::ExecutionContext& ctx, const Tensor& input, Tensor& residual,
+  Status AddForward(ops::OpContext& ctx, const Tensor& input, Tensor& residual,
                     Tensor& output) const {
     return ops::AddRmsNorm(ctx, input, residual, weight_, output, config_);
   }

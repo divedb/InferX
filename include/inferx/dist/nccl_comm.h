@@ -57,8 +57,8 @@ class NcclComm final : public CommBackend {
   int size() const override { return size_; }
   int rank() const override { return rank_; }
 
-  Status AllReduceSum(const ops::ExecutionContext& ctx, Tensor& partial) override;
-  Status AllGatherLastDim(const ops::ExecutionContext& ctx, const Tensor& partial,
+  Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) override;
+  Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override;
 
  private:

@@ -136,7 +136,7 @@ Status RmsNormConverted(const uint16_t* x, const uint16_t* w, uint16_t* out, int
 
 }  // namespace
 
-Status RmsNorm(ExecutionContext& /*ctx*/, const Tensor& x, const Tensor& weight, Tensor& out,
+Status RmsNorm(OpContext& /*ctx*/, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config) {
   // Host memory is synchronous: the op completes before returning.
   const int64_t rows = x.Dim(0);

@@ -9,7 +9,6 @@
 
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
-#include "inferx/models/diagnostic_trace.h"
 #include "inferx/models/state.h"
 #include "inferx/ops/attention.h"
 #include "inferx/ops/flash_attention.h"
@@ -188,8 +187,8 @@ Status DecoderWorkspace::InitWorkspace(DeviceId device) {
 }
 
 StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, ModelState& state,
-                                                ops::ExecutionContext& ctx,
-                                                dist::CommBackend& comm, DiagnosticTrace& trace) {
+                                                ops::OpContext& ctx,
+                                                dist::CommBackend& comm) {
   if (comm.size() <= 0 || comm.rank() < 0 || comm.rank() >= comm.size() ||
       config_.model.vocab_size != comm.size() * embedding_.Dim(0) ||
       config_.embedding_row_offset != comm.rank() * embedding_.Dim(0)) {
@@ -202,12 +201,12 @@ StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, Model
   if (input.embeddings.has_value()) {
     if (input.embeddings->Rank() != 2 || input.embeddings->Dim(0) != rows ||
         input.embeddings->Dim(1) != config_.model.hidden_size ||
-        input.embeddings->Device() != ctx.device()) {
+        input.embeddings->Device() != ctx.Device()) {
       return InvalidArgumentError("invalid prepared decoder embeddings");
     }
   } else if (input.token_ids.Rank() != 1 || input.token_ids.Numel() != rows ||
              input.token_ids.GetDataType() != DataType::kInt32 ||
-             input.token_ids.Device() != ctx.device()) {
+             input.token_ids.Device() != ctx.Device()) {
     return InvalidArgumentError("invalid decoder token input");
   }
   if (state.layers.size() != config_.blocks.size()) {
@@ -226,15 +225,15 @@ StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, Model
     }
   }
   if (!workspace_ready_) {
-    INFERX_RETURN_IF_ERROR(InitWorkspace(ctx.device()));
+    INFERX_RETURN_IF_ERROR(InitWorkspace(ctx.Device()));
   }
 
   // Embed tokens, or accept prepared embeddings, into the hidden workspace.
   INFERX_ASSIGN_OR_RETURN(Tensor hidden, hidden_->Slice(0, rows));
   if (input.embeddings.has_value()) {
-    INFERX_RETURN_IF_ERROR(ctx.runtime().CopyAsync(hidden.Data(), input.embeddings->Data(),
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(hidden.Data(), input.embeddings->Data(),
                                                    hidden.NBytes(), CopyKind::kDeviceToDevice,
-                                                   ctx.stream()));
+                                                   ctx.GetStream()));
   } else {
     const bool sharded = comm.size() > 1;
     if (sharded) {
@@ -254,7 +253,6 @@ StatusOr<Tensor> DecoderWorkspace::BeginForward(const DecoderInput& input, Model
   }
 
   const auto& attention_batch = input.attention;
-  if (trace.enabled()) trace.Write("embedding", hidden);
   if (attention_batch.num_seqs <= 0 ||
       attention_batch.host_qo_indptr.size() !=
           static_cast<size_t>(attention_batch.num_seqs + 1) ||

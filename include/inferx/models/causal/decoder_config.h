@@ -17,7 +17,7 @@
 #include "inferx/models/components/norm.h"
 #include "inferx/models/model.h"
 #include "inferx/models/state.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::causal {
 

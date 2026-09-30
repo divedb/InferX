@@ -5,9 +5,9 @@
 namespace inferx::ops {
 namespace {
 
-Status CheckBf16OnDevice(ExecutionContext& ctx, std::initializer_list<const Tensor*> tensors) {
+Status CheckBf16OnDevice(OpContext& ctx, std::initializer_list<const Tensor*> tensors) {
   for (const Tensor* t : tensors) {
-    if (t->GetDataType() != DataType::kBFloat16 || t->Device() != ctx.device()) {
+    if (t->GetDataType() != DataType::kBFloat16 || t->Device() != ctx.Device()) {
       return InvalidArgumentError("GDN op requires bfloat16 tensors on the context device");
     }
   }
@@ -16,7 +16,7 @@ Status CheckBf16OnDevice(ExecutionContext& ctx, std::initializer_list<const Tens
 
 }  // namespace
 
-Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& conv_in,
+Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
                           Tensor& z, int64_t key_heads, int64_t key_dim, int64_t value_heads,
                           int64_t value_dim) {
   const int64_t nvg = value_heads / key_heads;
@@ -29,13 +29,13 @@ Status SplitGdnProjection(ExecutionContext& ctx, const Tensor& packed, Tensor& c
   }
   INFERX_RETURN_IF_ERROR(
       CheckBf16OnDevice(ctx, {&packed, &conv_in, &z}));
-  if (!ctx.device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
   if (packed.IsEmpty()) return OkStatus();
   return cuda::SplitGdnProjection(ctx, packed, conv_in, z, key_heads, key_dim, value_heads,
                                   value_dim);
 }
 
-Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
+Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
                      const Tensor& state, const Tensor& batch_indices,
                      const Tensor& qo_indptr, int64_t kernel) {
   if (x.Rank() != 2 || weight.Rank() != 2 || weight.Dim(0) != x.Dim(1) ||
@@ -47,12 +47,12 @@ Status GdnCausalConv(ExecutionContext& ctx, Tensor& x, const Tensor& weight,
     return InvalidArgumentError("GDN conv state must be [slots, channels, kernel-1] float32");
   }
   INFERX_RETURN_IF_ERROR(CheckBf16OnDevice(ctx, {&x, &weight}));
-  if (!ctx.device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
   if (x.IsEmpty()) return OkStatus();
   return cuda::GdnCausalConv(ctx, x, weight, state, batch_indices, qo_indptr, kernel);
 }
 
-Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
+Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
                 const Tensor& dt_bias, Tensor& beta, Tensor& g) {
   if (ba.Rank() != 2 || a_log.Rank() != 1 || dt_bias.Rank() != 1 ||
       a_log.GetDataType() != DataType::kFloat32 ||
@@ -62,12 +62,12 @@ Status GdnGates(ExecutionContext& ctx, const Tensor& ba, const Tensor& a_log,
       dt_bias.Numel() != a_log.Numel()) {
     return InvalidArgumentError("GDN gate shapes or dtypes disagree");
   }
-  if (!ctx.device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
   if (ba.IsEmpty()) return OkStatus();
   return cuda::GdnGates(ctx, ba, a_log, dt_bias, beta, g);
 }
 
-Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_width,
+Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
                     const Tensor& beta, const Tensor& g, Tensor& state,
                     const Tensor& slot_indices, const Tensor& qo_indptr,
                     const Tensor& batch_indices, Tensor& y) {
@@ -83,13 +83,13 @@ Status GdnRecurrent(ExecutionContext& ctx, const Tensor& conv, int64_t query_wid
     return InvalidArgumentError("GDN recurrent shapes disagree");
   }
   INFERX_RETURN_IF_ERROR(CheckBf16OnDevice(ctx, {&conv, &y}));
-  if (!ctx.device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
   if (conv.IsEmpty()) return OkStatus();
   return cuda::GdnRecurrent(ctx, conv, query_width, beta, g, state, slot_indices, qo_indptr,
                             batch_indices, y);
 }
 
-Status RmsNormGated(ExecutionContext& ctx, const Tensor& y, const Tensor& z,
+Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out) {
   if (y.Rank() != 2 || z.Rank() != 2 || weight.Rank() != 1 || out.Rank() != 2 ||
       y.Dim(1) != z.Dim(1) || out.Dim(1) != y.Dim(1) || y.Dim(0) != z.Dim(0) ||
@@ -97,7 +97,7 @@ Status RmsNormGated(ExecutionContext& ctx, const Tensor& y, const Tensor& z,
     return InvalidArgumentError("gated norm shapes disagree");
   }
   INFERX_RETURN_IF_ERROR(CheckBf16OnDevice(ctx, {&y, &z, &weight, &out}));
-  if (!ctx.device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
+  if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");
   if (y.IsEmpty()) return OkStatus();
   return cuda::RmsNormGated(ctx, y, z, weight, eps, out);
 }

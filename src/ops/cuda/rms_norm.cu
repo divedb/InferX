@@ -50,9 +50,9 @@ __global__ void RoundedRmsNorm(const T* input, const T* weight, T* output,
 /// launcher takes a non-const weight pointer although the kernel never writes
 /// it, and supports `x` aliasing `out` for in-place updates.
 template <typename T>
-Status RmsNormImpl(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+Status RmsNormImpl(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                    const RMSNormConfig& config) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const uint32_t rows = static_cast<uint32_t>(x.Dim(0));
   const uint32_t dim = static_cast<uint32_t>(x.Dim(1));
   // FlashInfer's launchers take non-const pointers although the kernel never
@@ -61,25 +61,25 @@ Status RmsNormImpl(ExecutionContext& ctx, const Tensor& x, const Tensor& weight,
   T* scale = const_cast<T*>(static_cast<const T*>(weight.Data()));
   T* output = static_cast<T*>(out.Data());
   if (config.round_before_weight) {
-    RoundedRmsNorm<<<rows, 256, 0, ctx.stream()>>>(
+    RoundedRmsNorm<<<rows, 256, 0, ctx.GetStream()>>>(
         input, scale, output, dim, config.eps, config.plus_one_weight ? 1.0f : 0.0f);
     return CudaError(cudaGetLastError(), "rounded rms norm");
   }
   const cudaError_t err =
       config.plus_one_weight
           ? flashinfer::norm::GemmaRMSNorm<T>(input, scale, output, rows, dim, dim, dim,
-                                              config.eps, /*enable_pdl=*/false, ctx.stream())
+                                              config.eps, /*enable_pdl=*/false, ctx.GetStream())
           : flashinfer::norm::RMSNorm<T>(input, scale, output, rows, dim, dim, dim, config.eps,
-                                         /*enable_pdl=*/false, ctx.stream());
+                                         /*enable_pdl=*/false, ctx.GetStream());
   return CudaError(err, config.plus_one_weight ? "gemma rms norm" : "rms norm");
 }
 
 }  // namespace
 
-Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
+Status AddRmsNorm(OpContext& ctx, const Tensor& x, Tensor& residual,
                   const Tensor& weight, Tensor& out, const RMSNormConfig& config) {
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Activate());
-  RoundedRmsNorm<__nv_bfloat16, true><<<x.Dim(0), 256, 0, ctx.stream()>>>(
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  RoundedRmsNorm<__nv_bfloat16, true><<<x.Dim(0), 256, 0, ctx.GetStream()>>>(
       static_cast<const __nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(weight.Data()),
       static_cast<__nv_bfloat16*>(out.Data()), x.Dim(1), config.eps,
@@ -87,7 +87,7 @@ Status AddRmsNorm(ExecutionContext& ctx, const Tensor& x, Tensor& residual,
   return CudaError(cudaGetLastError(), "add rms norm");
 }
 
-Status RmsNorm(ExecutionContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
+Status RmsNorm(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out,
                const RMSNormConfig& config) {
   switch (x.GetDataType()) {
     case DataType::kFloat32:

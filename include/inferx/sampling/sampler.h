@@ -7,7 +7,7 @@
 #include "inferx/core/device.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 #include "inferx/sampling/sampling_kernels.h"
 #include "inferx/sampling/sampling_metadata.h"
 #include "inferx/sampling/sampler_output.h"
@@ -38,12 +38,12 @@ class Sampler {
 
   /// \brief Samples one token per row of `logits`.
   ///
-  /// \param ctx      Execution lane; work is enqueued on ctx.stream().
+  /// \param ctx      Execution lane; work is enqueued on ctx.GetStream().
   /// \param logits   [batch, vocab] float32 or bfloat16 matrix.
   /// \param metadata Batch description, requests.size() == batch.
   /// \return         Tensors aliasing this sampler's workspace, valid until
   ///                 the next Sample call.
-  StatusOr<SamplerOutput> Sample(ops::ExecutionContext& ctx, const Tensor& logits,
+  StatusOr<SamplerOutput> Sample(ops::OpContext& ctx, const Tensor& logits,
                                  const SamplingMetadata& metadata);
 
  private:
@@ -51,9 +51,9 @@ class Sampler {
           std::int64_t vocab_size, std::optional<cuda::DeviceParams> params,
           std::optional<Tensor> probs, int64_t max_num_seqs);
 
-  Status UploadParams(ops::ExecutionContext& ctx, const SamplingMetadata& metadata);
+  Status UploadParams(ops::OpContext& ctx, const SamplingMetadata& metadata);
 
-  StatusOr<SamplerOutput> SampleCpuReference(ops::ExecutionContext& ctx, const Tensor& logits,
+  StatusOr<SamplerOutput> SampleCpuReference(ops::OpContext& ctx, const Tensor& logits,
                                              const SamplingMetadata& metadata, Tensor sampled);
 
   std::optional<Tensor> values_;   ///< float32 argmax partials, [max_num_seqs * parts]; CUDA only.

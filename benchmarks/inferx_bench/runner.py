@@ -31,8 +31,6 @@ def environment():
                CUDA_VISIBLE_DEVICES='0', TOKENIZERS_PARALLELISM='false')
     env['PATH'] = '/usr/local/cuda/bin:' + env['PATH']
     env.pop('INFERX_PROFILE_OPS', None)
-    env.pop('INFERX_DIAGNOSTIC_TRACE_DIR', None)
-    env.pop('INFERX_DIAGNOSTIC_TRACE_STEP', None)
     return env
 
 

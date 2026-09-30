@@ -6,7 +6,7 @@
 
 namespace inferx::ops {
 
-Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indices,
+Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices,
                   Tensor& out) {
   if (src.Rank() != 2 || indices.Rank() != 1 || out.Rank() != 2) {
     return InvalidArgumentError("GatherRows expects rank-2 src/out and rank-1 indices");
@@ -26,7 +26,7 @@ Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indice
     return InvalidArgumentError("GatherRows has ", indices.Dim(0), " indices but ", out.Dim(0),
                                 " output rows");
   }
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (src.Device() != device || indices.Device() != device || out.Device() != device) {
     return InvalidArgumentError("GatherRows tensors must live on the context's device ",
                                 device.ToString());
@@ -43,7 +43,7 @@ Status GatherRows(ExecutionContext& ctx, const Tensor& src, const Tensor& indice
   }
 }
 
-Status GatherRowsRange(ExecutionContext& ctx, const Tensor& src, const Tensor& indices,
+Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
                        Tensor& out, int64_t row_begin) {
   if (row_begin < 0) {
     return InvalidArgumentError("GatherRowsRange row offset must be non-negative");
@@ -57,7 +57,7 @@ Status GatherRowsRange(ExecutionContext& ctx, const Tensor& src, const Tensor& i
     return InvalidArgumentError("GatherRowsRange shapes disagree");
   }
   if (out.IsEmpty()) return OkStatus();
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (src.Device() != device || indices.Device() != device || out.Device() != device) {
     return InvalidArgumentError("GatherRowsRange tensors must live on the context's device ",
                                 device.ToString());
@@ -71,7 +71,7 @@ Status GatherRowsRange(ExecutionContext& ctx, const Tensor& src, const Tensor& i
   }
 }
 
-Status CopyColumnBlock(ExecutionContext& ctx, const Tensor& src, Tensor& dst,
+Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
                        int64_t col_begin) {
   if (src.Rank() != 2 || dst.Rank() != 2 || src.Dim(0) != dst.Dim(0) ||
       src.GetDataType() != dst.GetDataType() || col_begin < 0 ||
@@ -79,7 +79,7 @@ Status CopyColumnBlock(ExecutionContext& ctx, const Tensor& src, Tensor& dst,
     return InvalidArgumentError("CopyColumnBlock shapes disagree");
   }
   if (src.IsEmpty()) return OkStatus();
-  const DeviceId device = ctx.device();
+  const DeviceId device = ctx.Device();
   if (src.Device() != device || dst.Device() != device) {
     return InvalidArgumentError("CopyColumnBlock tensors must live on the context's device ",
                                 device.ToString());

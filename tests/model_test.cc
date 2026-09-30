@@ -13,7 +13,7 @@
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
 #include "inferx/dist/comm.h"
-#include "inferx/ops/execution_context.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx {
 namespace {
@@ -122,7 +122,7 @@ TEST_F(ModelTest, ForwardReturnsLogits) {
   ASSERT_TRUE(pool.ok());
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &*pool;
@@ -142,7 +142,7 @@ namespace {
 StatusOr<std::vector<float>> ForwardLogits(Model& model, const CheckpointConfig& config,
                                            DeviceRuntime& runtime, Stream stream,
                                            const ModelInput& input, KvBlockPool& pool) {
-  ops::ExecutionContext ctx(runtime, stream);
+  ops::OpContext ctx(runtime, stream);
   dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &pool;
@@ -306,7 +306,7 @@ TEST_F(ModelTest, LoadsSyntheticQwen2AndRunsBiasedAttention) {
   ASSERT_TRUE(pool.ok());
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
-  ops::ExecutionContext ctx(*runtime_, stream_);
+  ops::OpContext ctx(*runtime_, stream_);
   dist::SingleRankComm comm;
   ModelState state;
   state.paged_kv = &*pool;

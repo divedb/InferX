@@ -96,12 +96,12 @@ StatusOr<std::unique_ptr<Sampler>> Sampler::Create(int max_num_seqs,
                                               std::move(probs), max_num_seqs));
 }
 
-StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor& logits,
+StatusOr<SamplerOutput> Sampler::Sample(ops::OpContext& ctx, const Tensor& logits,
                                         const SamplingMetadata& metadata) {
   if (logits.Rank() != 2 ||
       (logits.GetDataType() != DataType::kBFloat16 &&
        logits.GetDataType() != DataType::kFloat32) ||
-      logits.Device() != ctx.device()) {
+      logits.Device() != ctx.Device()) {
     return InvalidArgumentError("sampler requires a float32/bfloat16 [batch, vocab] matrix");
   }
   const int batch = static_cast<int>(logits.Dim(0));
@@ -112,7 +112,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
   INFERX_ASSIGN_OR_RETURN(Tensor sampled, results_.Slice(0, batch));
   if (batch == 0) return SamplerOutput{std::move(sampled), std::nullopt};
   if (!metadata.all_greedy) {
-    if (ctx.device().IsCuda()) {
+    if (ctx.Device().IsCuda()) {
       INFERX_RETURN_IF_ERROR(UploadParams(ctx, metadata));
       return cuda::SampleRows(ctx, logits, *params_, *probs_, sampled) -
              Status();  // wrap keeps SamplerOutput assembly below.
@@ -120,7 +120,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
     return SampleCpuReference(logits, metadata, sampled);
   }
 
-  if (ctx.device().IsCuda()) {
+  if (ctx.Device().IsCuda()) {
     INFERX_RETURN_IF_ERROR(
         ops::GreedyArgmax(ctx, logits, *values_, *indices_, sampled));
     return SamplerOutput{std::move(sampled), std::nullopt};
@@ -128,12 +128,12 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::ExecutionContext& ctx, const Tensor
 
   // CPU reference path: retains the GPU op's lowest-index tie break and its
   // NaN-in-column-zero rule, so CPU and CUDA agree token-for-token.
-  INFERX_RETURN_IF_ERROR(ctx.runtime().SynchronizeStream(ctx.stream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
   const std::int64_t vocab = logits.Dim(1);
   const bool is_bf16 = logits.GetDataType() == DataType::kBFloat16;
   const size_t elem = is_bf16 ? sizeof(uint16_t) : sizeof(float);
   std::vector<std::byte> host(static_cast<size_t>(logits.NBytes()));
-  INFERX_RETURN_IF_ERROR(ctx.runtime().Copy(host.data(), logits.Data(), host.size(),
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Copy(host.data(), logits.Data(), host.size(),
                                             CopyKind::kDeviceToHost));
   auto value_at = [&](int64_t row, int64_t col) -> float {
     const std::byte* p = host.data() + (row * vocab + col) * elem;
