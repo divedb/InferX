@@ -2,12 +2,10 @@
 #define INFERX_ENGINE_REQUEST_H_
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <vector>
 
 #include "absl/types/span.h"
-#include "inferx/cache/kv_block_pool.h"
 #include "inferx/core/status.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/tokenizer/id.h"
@@ -57,19 +55,10 @@ class Request {
   /// \brief Updates the computed-token watermark. Scheduler-only.
   void set_num_computed_tokens(int computed) { num_computed_tokens_ = computed; }
 
-  /// \brief True when the scheduler has granted this request cache blocks.
-  bool has_blocks() const { return block_table_.has_value(); }
-  /// \brief Returns the granted block table; must have_blocks().
-  const BlockTable& block_table() const { return *block_table_; }
-  /// \brief Returns the granted block table for mutation; scheduler-only.
-  BlockTable* mutable_block_table() { return &*block_table_; }
-  /// \brief Attaches a block table. Scheduler-only, on cache grant.
-  void GrantBlocks(BlockTable table) { block_table_ = std::move(table); }
-
   /// \brief Appends sampled tokens; refuses when finished.
   Status AppendOutput(absl::Span<const int> token_ids);
 
-  /// \brief Transitions to the terminal state and drops the block table.
+  /// \brief Transitions to the terminal state. Cache release belongs to CacheManager.
   ///
   /// \param reason Why the request ended.
   /// \return       OK, or FailedPrecondition when already finished.
@@ -89,7 +78,6 @@ class Request {
 
   int max_new_tokens_ = 0;
   int num_computed_tokens_ = 0;
-  std::optional<BlockTable> block_table_;
 };
 
 }  // namespace inferx

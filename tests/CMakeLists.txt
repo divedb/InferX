@@ -15,6 +15,11 @@ target_compile_options(inferx_scheduler_output_test PRIVATE -Wall -Wextra
                        -Wpedantic)
 add_test(NAME scheduler_output_test COMMAND inferx_scheduler_output_test)
 
+add_executable(inferx_cache_manager_test cache_manager_test.cc)
+target_link_libraries(inferx_cache_manager_test PRIVATE inferx::cache GTest::gtest_main)
+target_compile_options(inferx_cache_manager_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME cache_manager_test COMMAND inferx_cache_manager_test)
+
 add_executable(inferx_scheduler_test scheduler_test.cc)
 target_link_libraries(inferx_scheduler_test PRIVATE inferx::engine
                       GTest::gtest_main)

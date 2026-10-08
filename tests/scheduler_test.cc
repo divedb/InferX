@@ -49,6 +49,32 @@ ModelRunnerOutput ResultFor(const SchedulerOutput& output, TokenId token) {
   return result;
 }
 
+TEST_F(SchedulerTest, FailedAdmissionAndAbortDoNotLeakBlocks) {
+  MakePool(2);
+  MakeScheduler(SchedulerConfig{});
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, std::vector<TokenId>(12, 1))).ok());
+  auto plan = scheduler_->Schedule();
+  ASSERT_TRUE(plan.ok());
+  EXPECT_TRUE(plan->scheduled.empty());
+  EXPECT_EQ(pool_->FreeBlocks(), 2);
+  EXPECT_EQ(scheduler_->AbortRequests({1}), std::vector<uint64_t>({1}));
+  EXPECT_EQ(pool_->FreeBlocks(), 2);
+  ASSERT_TRUE(scheduler_->AddRequest(Request(2, {1, 2, 3, 4, 5})).ok());
+  auto next = scheduler_->Schedule();
+  ASSERT_TRUE(next.ok());
+  ASSERT_EQ(next->scheduled_new_reqs.size(), 1);
+  EXPECT_EQ(next->scheduled_new_reqs[0].block_ids.size(), 2);
+}
+
+TEST_F(SchedulerTest, DestructionReleasesActiveAllocations) {
+  MakeScheduler(SchedulerConfig{});
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3})).ok());
+  ASSERT_TRUE(scheduler_->Schedule().ok());
+  EXPECT_LT(pool_->FreeBlocks(), pool_->NumBlocks());
+  scheduler_.reset();
+  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
+}
+
 TEST_F(SchedulerTest, PrefillSchedulesWholePromptAndGrantsBlocks) {
   MakeScheduler(SchedulerConfig{});
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3, 4, 5})).ok());

@@ -7,12 +7,8 @@
 namespace inferx {
 
 Scheduler::Scheduler(SchedulerConfig config, KvBlockPool* pool, TokenId eos_token_id)
-    : config_(config), pool_(pool), eos_token_id_(eos_token_id),
-      waiting_(static_cast<size_t>(config.queue_capacity)) {
-  if (pool_ == nullptr) {
-    assert(false && "Scheduler requires a KV block pool");
-  }
-}
+    : config_(config), cache_manager_(pool), eos_token_id_(eos_token_id),
+      waiting_(static_cast<size_t>(config.queue_capacity)) {}
 
 Status Scheduler::AddRequest(Request request) {
   INFERX_RETURN_IF_ERROR(request.sampling_params().Validate());
@@ -21,24 +17,6 @@ Status Scheduler::AddRequest(Request request) {
     ++stats_.num_rejected;
   }
   return status;
-}
-
-Status Scheduler::EnsureBlockCapacity(Request* request, int64_t target_tokens,
-                                      std::vector<int32_t>* granted) {
-  if (!request->has_blocks()) {
-    request->GrantBlocks(BlockTable(pool_->BlockSize()));
-  }
-  BlockTable* table = request->mutable_block_table();
-  const int64_t needed = pool_->BlocksForTokens(target_tokens);
-  while (table->Size() < needed) {
-    StatusOr<int32_t> block = pool_->AllocateBlock();
-    if (!block.ok()) {
-      return block.status();
-    }
-    table->Append(*block);
-    granted->push_back(*block);
-  }
-  return OkStatus();
 }
 
 StatusOr<SchedulerOutput> Scheduler::Schedule() {
@@ -56,16 +34,14 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
         static_cast<int>(request.prompt().size()) - request.num_computed_tokens();
     const int chunk = remaining_prompt > 0 ? std::min(budget, remaining_prompt) : 1;
 
-    std::vector<int32_t> granted;
-    if (Status status = EnsureBlockCapacity(&request, request.num_computed_tokens() + chunk,
-                                            &granted);
-        !status.ok()) {
+    auto granted = cache_manager_.Reserve(request.id(), request.num_computed_tokens() + chunk);
+    if (!granted.ok()) {
       continue;
     }
 
     CachedRequestUpdate update;
     update.request_id = request.id();
-    update.new_block_ids = std::move(granted);
+    update.new_block_ids = std::move(*granted);
     update.num_computed_tokens = request.num_computed_tokens() + chunk;
     output.scheduled_cached_reqs.push_back(std::move(update));
 
@@ -88,8 +64,8 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     const int chunk =
         std::min(budget, static_cast<int>(request.prompt().size()));
 
-    std::vector<int32_t> granted;
-    if (Status status = EnsureBlockCapacity(&request, chunk, &granted); !status.ok()) {
+    auto granted = cache_manager_.Reserve(request.id(), chunk);
+    if (!granted.ok()) {
       // Not enough KV for even the first chunk: stop admitting this step and
       // put the request back at the head of the queue.
       waiting_.PushFront(std::move(request));
@@ -100,7 +76,7 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     data.request_id = request.id();
     data.prompt_token_ids = absl::MakeConstSpan(request.prompt());
     data.sampling_params = request.sampling_params();
-    data.block_ids = std::move(granted);
+    data.block_ids = std::move(*granted);
     data.num_computed_tokens = 0;
     output.scheduled_new_reqs.push_back(std::move(data));
 
@@ -171,7 +147,7 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
       continue;
     }
     const size_t index = it->second;
-    pool_->FreeBlocks(request.block_table().Blocks());
+    INFERX_RETURN_IF_ERROR(cache_manager_.Release(id));
     request.Finish(reason);
     pending_finish_notifications_.push_back(id);
     finished_.push_back(std::move(running_[index]));
@@ -209,7 +185,9 @@ std::vector<uint64_t> Scheduler::AbortRequests(absl::Span<const uint64_t> reques
     }
     const size_t index = it->second;
     Request& request = running_[index];
-    pool_->FreeBlocks(request.block_table().Blocks());
+    const Status released = cache_manager_.Release(id);
+    assert(released.ok());
+    (void)released;
     request.Finish(FinishReason::kAborted);
     pending_finish_notifications_.push_back(id);
     finished_.push_back(std::move(running_[index]));
@@ -229,10 +207,7 @@ SchedulerStats Scheduler::Stats() const {
   SchedulerStats stats = stats_;
   stats.num_running = static_cast<int>(running_.size());
   stats.num_waiting = static_cast<int>(waiting_.size());
-  if (pool_ != nullptr && pool_->NumBlocks() > 0) {
-    stats.kv_cache_usage =
-        static_cast<float>(pool_->UsedBlocks()) / static_cast<float>(pool_->NumBlocks());
-  }
+  stats.kv_cache_usage = cache_manager_.usage();
   return stats;
 }
 

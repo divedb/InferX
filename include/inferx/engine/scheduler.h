@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "inferx/cache/kv_block_pool.h"
+#include "inferx/cache/cache_manager.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/engine/request.h"
 #include "inferx/engine/request_queue.h"
@@ -39,7 +39,7 @@ struct SchedulerStats {
 /// token per step (or the next prefill chunk when their prompt is longer
 /// than the budget admits), and waiting requests are admitted in arrival
 /// order while budget, sequence slots, and KV blocks allow. KV blocks come
-/// from the KvBlockPool shared with the model runner; the scheduler never
+/// from CacheManager over the pool shared with the model runner; the scheduler never
 /// touches tensors.
 class Scheduler {
  public:
@@ -95,18 +95,8 @@ class Scheduler {
   SchedulerStats Stats() const;
 
  private:
-  /// \brief Grants blocks until the request can hold `target_tokens`.
-  ///
-  /// \param request The request, already holding zero or more blocks.
-  /// \param target_tokens Tokens the block table must cover.
-  /// \param granted   Output: newly granted block ids, in order.
-  /// \return          OK, or ResourceExhausted when the pool cannot cover the
-  ///                  request this step (the caller leaves it scheduled-out).
-  Status EnsureBlockCapacity(Request* request, int64_t target_tokens,
-                             std::vector<int32_t>* granted);
-
   SchedulerConfig config_;
-  KvBlockPool* pool_ = nullptr;
+  CacheManager cache_manager_;
   TokenId eos_token_id_ = 0;
 
   RequestQueue waiting_;

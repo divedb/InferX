@@ -18,7 +18,6 @@ Status Request::Finish(FinishReason reason) {
   }
   status_ = RequestStatus::kFinished;
   finish_reason_ = reason;
-  block_table_.reset();
   return OkStatus();
 }
 
