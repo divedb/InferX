@@ -47,7 +47,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
                           ModelRunner::Create(options.model, options.cache,
                                               options.scheduler, options.execution,
                                               options.parallel));
-  const auto& checkpoint = runner->checkpoint_config();
+  const auto& checkpoint = runner->model_info();
   if (checkpoint.eos_token_id < 0) {
     return InternalError("checkpoint declares no eos token id");
   }

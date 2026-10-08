@@ -10,7 +10,7 @@
 #include "inferx/bench/workload.h"
 #include "inferx/core/status_util.h"
 #include "inferx/engine/scheduler.h"
-#include "inferx/models/model_runner.h"
+#include "inferx/engine/model_executor.h"
 #include "nlohmann/json.hpp"
 
 namespace inferx::bench {
@@ -29,8 +29,9 @@ void Run(const WorkloadParams& params) {
   cc.num_kv_blocks = suite_json.value("kv_blocks", cc.num_kv_blocks);
   cc.block_size = suite_json.value("block_size", cc.block_size);
   const int batch = sc.max_num_seqs;
-  auto runner = Take(ModelRunner::Create(params.model, cc, sc, params.execution, params.parallel));
-  Scheduler scheduler(sc, runner->kv_pool(), 151645);
+  auto executor = Take(ModelExecutor::Create(params.model, cc, sc, params.execution,
+                                             params.parallel));
+  Scheduler scheduler(sc, executor->kv_pool(), 151645);
   uint64_t next_id = 1;
   for (const auto& c : suite_json.at("cases")) {
     if (c.at("batch") != batch) continue;
@@ -39,7 +40,7 @@ void Run(const WorkloadParams& params) {
     for (int repeat = -1; repeat < params.repeats; ++repeat) {
       // Complete full, identical warmup for every shape, excluding it from timing.
       auto flush = Take(scheduler.Schedule());
-      Take(runner->Run(flush));
+      Take(executor->Execute(flush));
       const auto base = next_id;
       next_id += count;
       std::vector<std::vector<int>> outputs(count);
@@ -59,7 +60,7 @@ void Run(const WorkloadParams& params) {
         auto plan = Take(scheduler.Schedule());
         if (repeat == 0 && step == params.profile_step) cudaProfilerStart();
         const auto run_start = Clock::now();
-        auto result = Take(runner->Run(plan));
+        auto result = Take(executor->Execute(plan));
         const auto run_end = Clock::now();
         if (repeat == 0 && step == params.profile_step) cudaProfilerStop();
         if (params.step_timings && repeat >= 0) {

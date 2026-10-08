@@ -1,11 +1,12 @@
 /// \file
-/// \brief Full-model numerical parity: synthetic checkpoints per family run
-///        through Model::Load -> Forward and compared against an independent
-///        float32 reference implementation of the same translated config.
+/// \brief Full-model numerical parity: synthetic checkpoints per
+///        architecture run through LoadModel -> Forward -> ComputeLogits
+///        and are compared against an independent float32 reference
+///        implementation of the same composed stack.
 ///
-/// The reference consumes the SAME DecoderConfig the family translator
-/// produces (dims, windows, routing policy) but executes the forward in
-/// plain fp32 host code written from each family's reference math. The
+/// The reference consumes the SAME stack configuration the architecture
+/// composes (dims, windows, routing policy) but executes the forward in
+/// plain fp32 host code written from each architecture's reference math. The
 /// engine rounds activations to bf16 at every kernel boundary, so parity is
 /// asserted on relative L2 error of the logits plus top-1 agreement.
 
@@ -28,15 +29,23 @@
 #include "inferx/cache/recurrent_state_pool.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/tensor.h"
-#include "inferx/models/causal/decoder_config.h"
+#include "inferx/models/architectures/deepseek_v3/model.h"
+#include "inferx/models/architectures/gemma3/model.h"
+#include "inferx/models/architectures/mixtral/model.h"
+#include "inferx/models/architectures/qwen3_next/model.h"
+#include "inferx/models/layers/decoder.h"
 #include "inferx/models/model.h"
-#include "inferx/models/model_registry.h"
+#include "inferx/models/registry.h"
+#include "nlohmann/json.hpp"
 #include "inferx/dist/comm.h"
 #include "inferx/ops/op_context.h"
 #include "inferx/ops/moe.h"
 
 namespace inferx {
 namespace {
+
+namespace models = ::inferx::models;
+namespace layers = ::inferx::models::layers;
 
 constexpr int64_t kHidden = 16;
 constexpr int64_t kHeads = 4;
@@ -122,17 +131,22 @@ class Engine {
   }
 
   std::vector<float> Forward(const std::string& dir, const std::vector<int32_t>& tokens) {
-    auto model = Model::Load(dir, DeviceId::Cuda(0), /*max_tokens=*/64, /*max_seqs=*/2);
+    models::ModelLoadOptions options;
+    options.directory = dir;
+    options.device = DeviceId::Cuda(0);
+    options.max_tokens = 64;
+    options.max_seqs = 2;
+    auto model = models::LoadModel(options);
     EXPECT_TRUE(model.ok()) << model.status();
     if (!model.ok()) return {};
-    const auto requirements = (*model)->StateRequirements();
+    const auto requirements = (*model)->requirements().layers;
     std::vector<KvLayout> layouts;
-    std::vector<RecurrentStateSpec> recurrent_specs;
+    std::vector<models::RecurrentStateSpec> recurrent_specs;
     for (const auto& spec : requirements) {
-      if (const auto* paged = std::get_if<PagedKvStateSpec>(&spec)) {
+      if (const auto* paged = std::get_if<models::PagedKvStateSpec>(&spec)) {
         layouts.push_back(paged->layout);
       } else {
-        recurrent_specs.push_back(std::get<RecurrentStateSpec>(spec));
+        recurrent_specs.push_back(std::get<models::RecurrentStateSpec>(spec));
       }
     }
     auto pool = KvBlockPool::Create(8, 8, layouts, DeviceId::Cuda(0));
@@ -143,15 +157,15 @@ class Engine {
       EXPECT_TRUE(made.ok());
       rpool = std::move(*made);
     }
-    ModelState state;
+    models::ModelState state;
     state.paged_kv = &*pool;
     state.recurrent = rpool.has_value() ? &*rpool : nullptr;
     int64_t paged = 0, rec = 0;
     for (const auto& spec : requirements) {
-      if (std::holds_alternative<PagedKvStateSpec>(spec)) {
-        state.layers.push_back(PagedKvState{paged++});
+      if (std::holds_alternative<models::PagedKvStateSpec>(spec)) {
+        state.layers.push_back(models::PagedKvState{paged++});
       } else {
-        state.layers.push_back(RecurrentState{rec++});
+        state.layers.push_back(models::RecurrentState{rec++});
       }
     }
     ops::OpContext ctx(*runtime_, stream_);
@@ -186,18 +200,24 @@ class Engine {
       runtime_->Copy(slots->Data(), std::vector<int32_t>{0}.data(), 4,
                      CopyKind::kHostToDevice).ok();
     }
-    ModelInput input{token_ids,
-                     AttentionBatch{positions, batch_indices, qo, kv, blocks, last,
-                                    absl::MakeConstSpan(qo_h), absl::MakeConstSpan(kv_h),
-                                    static_cast<int>(n), 1},
-                     logit_rows};
+    models::ModelInputs input{
+        token_ids,
+        models::AttentionBatch{positions, batch_indices, qo, kv, blocks, last,
+                               absl::MakeConstSpan(qo_h), absl::MakeConstSpan(kv_h),
+                               static_cast<int>(n), 1}};
     input.attention.recurrent_indices = std::move(slots);
-    auto logits = (*model)->Forward(input, state, ctx, comm);
+    models::ForwardContext fctx{ctx, state, comm};
+    auto hidden_states = (*model)->Forward(input, fctx);
+    EXPECT_TRUE(hidden_states.ok()) << hidden_states.status();
+    if (!hidden_states.ok()) return {};
+    auto logits =
+        (*model)->ComputeLogits(*hidden_states, models::LogitSelection{logit_rows}, fctx);
     EXPECT_TRUE(logits.ok()) << logits.status();
     if (!logits.ok()) return {};
-    std::vector<uint16_t> raw(logits->Numel());
+    std::vector<uint16_t> raw(logits->values.Numel());
     runtime_->SynchronizeStream(stream_).ok();
-    runtime_->Copy(raw.data(), logits->Data(), raw.size() * 2, CopyKind::kDeviceToHost).ok();
+    runtime_->Copy(raw.data(), logits->values.Data(), raw.size() * 2,
+                   CopyKind::kDeviceToHost).ok();
     std::vector<float> out(raw.size());
     for (size_t i = 0; i < raw.size(); ++i) {
       const uint32_t bits = static_cast<uint32_t>(raw[i]) << 16;
@@ -238,43 +258,39 @@ float RmsNorm(const float* x, int64_t dim, float eps, bool plus_one, const float
   return inv;
 }
 
-float InvFreq(int64_t i, const components::RotaryConfig& rotary) {
-  const float inv = std::pow(rotary.theta, -2.0f * i / rotary.dim);
-  if (rotary.type == "linear") return inv / rotary.factor;
-  if (rotary.type == "llama3") {
-    const float wavelen = 6.283185307179586f / inv;
-    const float orig = static_cast<float>(rotary.original_max_position);
-    const float low = orig / rotary.low_freq_factor, high = orig / rotary.high_freq_factor;
-    if (wavelen > low) return inv / rotary.factor;
-    if (wavelen < high) return inv;
-    const float t =
-        (orig / wavelen - rotary.low_freq_factor) / (rotary.high_freq_factor - rotary.low_freq_factor);
-    return (1 - t) * inv / rotary.factor + t * inv;
-  }
-  if (rotary.type == "yarn") {
-    const float orig = static_cast<float>(rotary.original_max_position);
-    const auto correction = [&](float rotations) {
-      return rotary.dim * std::log(orig / (rotations * 6.283185307179586f)) /
-             (2 * std::log(rotary.theta));
-    };
-    const float lo = correction(rotary.beta_fast), hi = correction(rotary.beta_slow);
-    const float span = hi - lo;
-    float ramp = span > 0 ? std::min(std::max((static_cast<float>(i) - lo) / span, 0.0f), 1.0f) : 1.0f;
-    if (rotary.truncate) {
-      // floor/ceil applied by the engine; mirror per index.
-      ramp = span > 0 ? std::min(std::max((static_cast<float>(i) - std::floor(lo)) /
-                                              (std::ceil(hi) - std::floor(lo)),
-                                          0.0f),
-                                  1.0f)
-                      : 1.0f;
+float InvFreq(int64_t i, const ops::RotaryParams& rotary) {
+  const float inv = std::pow(rotary.theta, -2.0f * i / rotary.rotary_dim);
+  const auto& s = rotary.scaling;
+  switch (s.flavor) {
+    case ops::RopeFlavor::kLinear:
+      return inv / s.factor;
+    case ops::RopeFlavor::kLlama3: {
+      const float wavelen = 6.283185307179586f / inv;
+      const float orig = s.original_max_position;
+      const float low = orig / s.low_freq_factor, high = orig / s.high_freq_factor;
+      if (wavelen > low) return inv / s.factor;
+      if (wavelen < high) return inv;
+      const float t = (orig / wavelen - s.low_freq_factor) /
+                      (s.high_freq_factor - s.low_freq_factor);
+      return (1 - t) * inv / s.factor + t * inv;
     }
-    return (inv / rotary.factor) * ramp + inv * (1 - ramp);
+    case ops::RopeFlavor::kYarn: {
+      // Ramp bounds arrive already truncated (floored/ceiled) by
+      // RopeConfig::Params, mirroring the engine's kernel parameters.
+      const float span = s.ramp_high - s.ramp_low;
+      const float ramp = span > 0 ? std::min(std::max((static_cast<float>(i) - s.ramp_low) / span,
+                                                      0.0f),
+                                             1.0f)
+                                  : 1.0f;
+      return (inv / s.factor) * ramp + inv * (1 - ramp);
+    }
+    default:
+      return inv;
   }
-  return inv;
 }
 
-void Rope(float* x, const components::RotaryConfig& rotary, int64_t pos, float attn_scale) {
-  const int64_t half = rotary.dim / 2;
+void Rope(float* x, const ops::RotaryParams& rotary, int64_t pos, float attn_scale) {
+  const int64_t half = rotary.rotary_dim / 2;
   for (int64_t i = 0; i < half; ++i) {
     const float angle = pos * InvFreq(i, rotary) * attn_scale;
     const float c = std::cos(angle), s = std::sin(angle);
@@ -318,12 +334,18 @@ void Matvec(const float* w, const float* x, int64_t out, int64_t in, float* y,
 /// \brief Step-by-step fp32 decoder matching the translated config exactly.
 class ReferenceModel {
  public:
-  ReferenceModel(causal::DecoderConfig config, Fixture weights)
-      : config_(std::move(config)), w_(std::move(weights)) {
+  struct Translated {
+    layers::StackConfig stack;
+    bool tie_word_embeddings = false;
+  };
+  ReferenceModel(Translated config, Fixture weights)
+      : config_(std::move(config.stack)),
+        tie_word_embeddings_(config.tie_word_embeddings),
+        w_(std::move(weights)) {
     for (const auto& block : config_.blocks) {
       keys_.emplace_back();
       values_.emplace_back();
-      if (const auto* g = std::get_if<components::GatedDeltaNetConfig>(&block.mixer)) {
+      if (const auto* g = std::get_if<layers::GatedDeltaNetConfig>(&block.mixer)) {
         gdn_.push_back(GdnState{*g});
       } else {
         gdn_.push_back(GdnState{});
@@ -332,7 +354,7 @@ class ReferenceModel {
   }
 
   std::vector<float> Forward(const std::vector<int32_t>& tokens) {
-    const int64_t hidden = config_.model.hidden_size;
+    const int64_t hidden = config_.hidden_size;
     last_tokens_ = tokens.size();
     std::vector<float> x(hidden);
     const auto& embed = w_.at("model.embed_tokens.weight").values;
@@ -360,11 +382,11 @@ class ReferenceModel {
     ref::RmsNorm(&all_x[(tokens.size() - 1) * hidden], hidden, config_.final_norm.eps,
                  config_.final_norm.plus_one, W("model.norm.weight"), normed.data());
     Dump("final_norm", normed.data(), hidden);
-    std::vector<float> logits(config_.model.vocab_size);
-    if (config_.model.tie_word_embeddings) {
-      ref::Matvec(embed.data(), normed.data(), config_.model.vocab_size, hidden, logits.data());
+    std::vector<float> logits(config_.vocab_size);
+    if (tie_word_embeddings_) {
+      ref::Matvec(embed.data(), normed.data(), config_.vocab_size, hidden, logits.data());
     } else {
-      ref::Matvec(W("lm_head.weight"), normed.data(), config_.model.vocab_size, hidden,
+      ref::Matvec(W("lm_head.weight"), normed.data(), config_.vocab_size, hidden,
                   logits.data());
     }
     return logits;
@@ -374,7 +396,7 @@ class ReferenceModel {
   const float* W(const std::string& name) const { return w_.at(name).values.data(); }
 
   struct GdnState {
-    components::GatedDeltaNetConfig config;
+    layers::GatedDeltaNetConfig config;
     std::vector<float> state;   // [vh * dk * dv]
     std::vector<float> conv;    // [conv_dim * (k-1)]
     std::vector<float> q_hist;  // conv inputs of this sequence, grows per step.
@@ -384,22 +406,22 @@ class ReferenceModel {
     const auto& block = config_.blocks[layer];
     trace_ = RefTrace() && t + 1 == last_tokens_;
     const std::string p = "model.layers." + std::to_string(layer) + ".";
-    const int64_t hidden_dim = config_.model.hidden_size;
+    const int64_t hidden_dim = config_.hidden_size;
     std::vector<float> normed(hidden_dim), mixed(hidden_dim);
     ref::RmsNorm(hidden.data(), hidden_dim, block.norm.eps, block.norm.plus_one,
                  W(p + "input_layernorm.weight"), normed.data());
     if (trace_) Dump("layer_N.input_norm", normed.data(), hidden_dim);
 
-    if (const auto* a = std::get_if<components::AttentionConfig>(&block.mixer)) {
+    if (const auto* a = std::get_if<layers::AttentionConfig>(&block.mixer)) {
       AttentionStep(*a, p, block.norm.eps, layer, t, normed, mixed);
       if (trace_) Dump("layer_N.o_proj", mixed.data(), hidden_dim);
-    } else if (const auto* m = std::get_if<components::MlaConfig>(&block.mixer)) {
+    } else if (const auto* m = std::get_if<layers::MlaConfig>(&block.mixer)) {
       MlaStep(*m, p, block.norm.eps, layer, t, normed, mixed);
     } else {
-      GdnStep(std::get<components::GatedDeltaNetConfig>(block.mixer), p, layer, t, normed, mixed);
+      GdnStep(std::get<layers::GatedDeltaNetConfig>(block.mixer), p, layer, t, normed, mixed);
     }
 
-    if (block.residual == components::ResidualStyle::kOutputNorm) {
+    if (block.residual == layers::ResidualStyle::kOutputNorm) {
       ref::RmsNorm(mixed.data(), hidden_dim, block.mixer_out_norm.eps, block.mixer_out_norm.plus_one,
                    W(p + "post_attention_layernorm.weight"), mixed.data());
       if (trace_) Dump("layer_N.mixer_out_norm", mixed.data(), hidden_dim);
@@ -408,18 +430,18 @@ class ReferenceModel {
     if (trace_) Dump("layer_N.residual", hidden.data(), hidden_dim);
 
     ref::RmsNorm(hidden.data(), hidden_dim, block.norm.eps, block.norm.plus_one,
-                 W(p + (block.residual == components::ResidualStyle::kOutputNorm
+                 W(p + (block.residual == layers::ResidualStyle::kOutputNorm
                             ? std::string("pre_feedforward_layernorm.weight")
                             : std::string("post_attention_layernorm.weight"))),
                  normed.data());
-    if (const auto* dense = std::get_if<components::SwiGluConfig>(&block.feed_forward)) {
+    if (const auto* dense = std::get_if<layers::GatedMlpConfig>(&block.feed_forward)) {
       DenseStep(*dense, p, normed, mixed);
       if (trace_) Dump("layer_N.down_proj", mixed.data(), hidden_dim);
     } else {
-      MoeStep(std::get<components::MoeConfig>(block.feed_forward), p, normed, mixed);
+      MoeStep(std::get<layers::MoeConfig>(block.feed_forward), p, normed, mixed);
       if (trace_) Dump("layer_N.moe_out", mixed.data(), hidden_dim);
     }
-    if (block.residual == components::ResidualStyle::kOutputNorm) {
+    if (block.residual == layers::ResidualStyle::kOutputNorm) {
       ref::RmsNorm(mixed.data(), hidden_dim, block.feed_forward_out_norm.eps,
                    block.feed_forward_out_norm.plus_one,
                    W(p + "post_feedforward_layernorm.weight"), mixed.data());
@@ -428,25 +450,25 @@ class ReferenceModel {
     for (int64_t i = 0; i < hidden_dim; ++i) hidden[i] += mixed[i];
   }
 
-  void AttentionStep(const components::AttentionConfig& a, const std::string& p, float eps,
+  void AttentionStep(const layers::AttentionConfig& a, const std::string& p, float eps,
                      size_t layer, size_t t, const std::vector<float>& normed,
                      std::vector<float>& mixed) {
     const int64_t qw = a.query_heads * a.head_dim, kvw = a.kv_heads * a.head_dim;
-    const bool gated = a.output_gate == components::OutputGate::kSigmoid;
+    const bool gated = a.output_gate == layers::OutputGate::kSigmoid;
     std::vector<float> q(qw), k(kvw), v(kvw), gate(gated ? qw : 0);
     {
       std::vector<float> qkv(gated ? 2 * qw : qw);
       ref::Matvec(W(p + "self_attn.q_proj.weight"), normed.data(), qkv.size(),
-                  config_.model.hidden_size, qkv.data());
+                  config_.hidden_size, qkv.data());
       if (a.qkv_bias) {
         const auto& qb = W(p + "self_attn.q_proj.bias");
         for (size_t i = 0; i < qkv.size(); ++i) qkv[i] += qb[i];
       }
       std::vector<float> kv(2 * kvw);
       ref::Matvec(W(p + "self_attn.k_proj.weight"), normed.data(), kvw,
-                  config_.model.hidden_size, kv.data());
+                  config_.hidden_size, kv.data());
       ref::Matvec(W(p + "self_attn.v_proj.weight"), normed.data(), kvw,
-                  config_.model.hidden_size, &kv[kvw]);
+                  config_.hidden_size, &kv[kvw]);
       if (a.qkv_bias) {
         const auto& kb = W(p + "self_attn.k_proj.bias");
         const auto& vb = W(p + "self_attn.v_proj.bias");
@@ -473,7 +495,7 @@ class ReferenceModel {
         std::memcpy(head.data(), normed_head.data(), a.head_dim * sizeof(float));
       }
       ref::Rope(head.data(), a.rotary, static_cast<int64_t>(t),
-                a.rotary.Params().scaling.attention_scale);
+                a.rotary.scaling.attention_scale);
       std::memcpy(&q[h * a.head_dim], head.data(), a.head_dim * sizeof(float));
     }
     for (int64_t h = 0; h < a.kv_heads; ++h) {
@@ -484,7 +506,7 @@ class ReferenceModel {
         std::memcpy(head.data(), normed_head.data(), a.head_dim * sizeof(float));
       }
       ref::Rope(head.data(), a.rotary, static_cast<int64_t>(t),
-                a.rotary.Params().scaling.attention_scale);
+                a.rotary.scaling.attention_scale);
       std::memcpy(&k[h * a.head_dim], head.data(), a.head_dim * sizeof(float));
     }
     if (trace_) Dump("layer_N.k_rope", k.data(), kvw);
@@ -539,17 +561,17 @@ class ReferenceModel {
       for (int64_t i = 0; i < qw; ++i) out[i] /= (1.0f + std::exp(-gate[i]));
     }
     if (trace_) Dump("layer_N.attention", out.data(), qw);
-    ref::Matvec(W(p + "self_attn.o_proj.weight"), out.data(), config_.model.hidden_size, qw,
+    ref::Matvec(W(p + "self_attn.o_proj.weight"), out.data(), config_.hidden_size, qw,
                 mixed.data());
     if (a.output_bias) {
       const auto& ob = W(p + "self_attn.o_proj.bias");
-      for (int64_t i = 0; i < config_.model.hidden_size; ++i) mixed[i] += ob[i];
+      for (int64_t i = 0; i < config_.hidden_size; ++i) mixed[i] += ob[i];
     }
   }
 
-  void MlaStep(const components::MlaConfig& a, const std::string& p, float eps, size_t layer,
+  void MlaStep(const layers::MlaConfig& a, const std::string& p, float eps, size_t layer,
                size_t t, const std::vector<float>& normed, std::vector<float>& mixed) {
-    const int64_t hidden = config_.model.hidden_size;
+    const int64_t hidden = config_.hidden_size;
     const int64_t hd = a.head_dim();
     std::vector<float> qa(a.q_lora_rank);
     ref::Matvec(W(p + "self_attn.q_a_proj.weight"), normed.data(), a.q_lora_rank, hidden, qa.data());
@@ -585,17 +607,15 @@ class ReferenceModel {
     }
     // RoPE over the leading rope slice of every head (q and k share layout).
     for (int64_t h = 0; h < a.query_heads; ++h) {
-      components::RotaryConfig per_head = a.rotary;
-      (void)per_head;
       ref::Rope(&q[h * hd], a.rotary, static_cast<int64_t>(t),
-                a.rotary.Params().scaling.attention_scale);
+                a.rotary.scaling.attention_scale);
     }
     // k rope slice: only the rope part rotates; replicate per head by rotating
     // the shared slice then re-inserting.
     {
       std::vector<float> rope_copy = rope_part;
       ref::Rope(rope_copy.data(), a.rotary, static_cast<int64_t>(t),
-                a.rotary.Params().scaling.attention_scale);
+                a.rotary.scaling.attention_scale);
       for (int64_t h = 0; h < a.query_heads; ++h) {
         for (int64_t d = 0; d < a.qk_rope_head_dim; ++d) k[h * hd + d] = rope_copy[d];
       }
@@ -637,9 +657,9 @@ class ReferenceModel {
                 mixed.data());
   }
 
-  void GdnStep(const components::GatedDeltaNetConfig& a, const std::string& p, size_t layer,
+  void GdnStep(const layers::GatedDeltaNetConfig& a, const std::string& p, size_t layer,
                size_t t, const std::vector<float>& normed, std::vector<float>& mixed) {
-    const int64_t hidden = config_.model.hidden_size;
+    const int64_t hidden = config_.hidden_size;
     const int64_t kh = a.key_heads, vh = a.value_heads, kd = a.key_dim, vd = a.value_dim;
     const int64_t q_total = kh * kd, v_total = vh * vd;
     GdnState& st = gdn_[layer];
@@ -757,13 +777,13 @@ class ReferenceModel {
         y[h * vd + c] = normed_head[c] * (gate / (1.0f + std::exp(-gate)));
       }
     }
-    ref::Matvec(W(p + "self_attn.out_proj.weight"), y.data(), config_.model.hidden_size, v_total,
+    ref::Matvec(W(p + "self_attn.out_proj.weight"), y.data(), config_.hidden_size, v_total,
                 mixed.data());
   }
 
-  void DenseStep(const components::SwiGluConfig& dense, const std::string& p,
+  void DenseStep(const layers::GatedMlpConfig& dense, const std::string& p,
                  const std::vector<float>& normed, std::vector<float>& mixed) {
-    const int64_t hidden = config_.model.hidden_size;
+    const int64_t hidden = config_.hidden_size;
     const int64_t inter = dense.intermediate_size;
     std::vector<float> gate(inter), up(inter);
     ref::Matvec(W(p + "mlp.gate_proj.weight"), normed.data(), inter, hidden, gate.data());
@@ -782,9 +802,9 @@ class ReferenceModel {
     ref::Matvec(W(p + "mlp.down_proj.weight"), gate.data(), hidden, inter, mixed.data());
   }
 
-  void MoeStep(const components::MoeConfig& moe, const std::string& p,
+  void MoeStep(const layers::MoeConfig& moe, const std::string& p,
                const std::vector<float>& normed, std::vector<float>& mixed) {
-    const int64_t hidden = config_.model.hidden_size;
+    const int64_t hidden = config_.hidden_size;
     std::vector<float> logits(moe.num_experts);
     ref::Matvec(W(p + "mlp.gate.weight"), normed.data(), moe.num_experts, hidden, logits.data());
     const float* router_bias = nullptr;
@@ -911,7 +931,8 @@ class ReferenceModel {
     }
   }
 
-  causal::DecoderConfig config_;
+  layers::StackConfig config_;
+  bool tie_word_embeddings_ = false;
   Fixture w_;
   size_t last_tokens_ = 0;
   bool trace_ = false;
@@ -930,8 +951,20 @@ const std::string kCommon =
     "\"vocab_size\":40,\"max_position_embeddings\":128,\"rms_norm_eps\":0.00001,"
     "\"rope_theta\":10000.0";
 
+/// Canonical HF identity for a model_type; every real checkpoint states
+/// its architecture and the loader requires it.
+std::string ArchitectureFor(const std::string& model_type) {
+  if (model_type == "gemma3_text") return "Gemma3ForCausalLM";
+  if (model_type == "mixtral") return "MixtralForCausalLM";
+  if (model_type == "deepseek_v3") return "DeepseekV3ForCausalLM";
+  if (model_type == "qwen3_next") return "Qwen3NextForCausalLM";
+  ADD_FAILURE() << "no architecture mapped for " << model_type;
+  return "UnknownForCausalLM";
+}
+
 std::string Json(const std::string& model_type, const std::vector<std::string>& extra) {
-  std::string json = "{\"model_type\":\"" + model_type + "\"";
+  std::string json = "{\"model_type\":\"" + model_type + "\",\"architectures\":[\"" +
+                     ArchitectureFor(model_type) + "\"]";
   for (const auto& field : extra) json += "," + field;
   return json + "," + kCommon + "}";
 }
@@ -972,15 +1005,28 @@ void AddDenseLayer(Fixture& tensors, const std::string& prefix, int64_t hidden, 
   }
 }
 
-causal::DecoderConfig TranslateOrDie(const std::string& model_type, const std::string& json) {
-  CheckpointConfig identity;
-  identity.model_type = model_type;
-  auto config = TranslateFamilyConfig(identity, json);
+/// Parses one architecture's typed config and composes its stack; the
+/// reference consumes exactly what the model factory would.
+template <typename ConfigT, auto Build>
+ReferenceModel::Translated TranslateOrDie(const std::string& json) {
+  const nlohmann::json doc =
+      nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
+  if (doc.is_discarded()) {
+    ADD_FAILURE() << "fixture config is not valid JSON";
+    return {};
+  }
+  const ConfigView view(&doc, "");
+  auto config = ConfigT::Parse(view);
   if (!config.ok()) {
     ADD_FAILURE() << config.status().ToString();
-    return causal::DecoderConfig{};
+    return {};
   }
-  return *config;
+  auto stack = Build(*config);
+  if (!stack.ok()) {
+    ADD_FAILURE() << stack.status().ToString();
+    return {};
+  }
+  return {*stack, config->tie_word_embeddings};
 }
 
 // ------------------------------------------------------------------- tests
@@ -1018,7 +1064,7 @@ TEST(ParityTest, Gemma3SandwichWindowsAndGelu) {
 
   Engine engine;
   const auto got = engine.Forward(dir.path.string(), kTokens);
-  ReferenceModel reference(TranslateOrDie("gemma3_text", json), tensors);
+  ReferenceModel reference(TranslateOrDie<models::gemma3::Gemma3Config, models::gemma3::BuildStackConfig>(json), tensors);
   const auto want = reference.Forward(kTokens);
   CompareLogits(got, want, 0.12, "gemma3");
 }
@@ -1054,7 +1100,7 @@ TEST(ParityTest, MixtralSoftmaxRoutedExperts) {
   WriteCheckpoint(dir, tensors);
   Engine engine;
   const auto got = engine.Forward(dir.path.string(), kTokens);
-  ReferenceModel reference(TranslateOrDie("mixtral", json), tensors);
+  ReferenceModel reference(TranslateOrDie<models::mixtral::MixtralConfig, models::mixtral::BuildStackConfig>(json), tensors);
   CompareLogits(got, reference.Forward(kTokens), 0.12, "mixtral");
 }
 
@@ -1113,7 +1159,7 @@ TEST(ParityTest, DeepseekV3MlaAndGroupedRouting) {
     }
     reference_tensors[p + "self_attn.o_proj.weight"] = FTensor{{16, 32}, std::move(padded)};
   }
-  ReferenceModel reference(TranslateOrDie("deepseek_v3", json), reference_tensors);
+  ReferenceModel reference(TranslateOrDie<models::deepseek_v3::DeepseekV3Config, models::deepseek_v3::BuildStackConfig>(json), reference_tensors);
   CompareLogits(got, reference.Forward(kTokens), 0.15, "deepseek_v3");
 }
 
@@ -1207,7 +1253,7 @@ TEST(ParityTest, Qwen3NextHybridGdnAndGatedAttention) {
         FTensor{{qw, kHidden},
                 std::vector<float>(plain.begin() + qw * kHidden, plain.end())};
   }
-  ReferenceModel reference(TranslateOrDie("qwen3_next", json), reference_tensors);
+  ReferenceModel reference(TranslateOrDie<models::qwen3_next::Qwen3NextConfig, models::qwen3_next::BuildStackConfig>(json), reference_tensors);
   CompareLogits(got, reference.Forward(kTokens), 0.15, "qwen3_next");
 }
 

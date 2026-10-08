@@ -8,7 +8,7 @@
 #include "inferx/core/device_buffer.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/models/state.h"
+#include "inferx/models/requirements.h"
 #include "inferx/ops/op_context.h"
 
 namespace inferx {
@@ -29,7 +29,7 @@ class RecurrentStatePool {
   /// \param specs  One entry per recurrent layer, in model layer order.
   /// \param max_slots  Concurrent sequences the pool can serve.
   /// \param device  Where the state lives.
-  static StatusOr<RecurrentStatePool> Create(const std::vector<RecurrentStateSpec>& specs,
+  static StatusOr<RecurrentStatePool> Create(const std::vector<models::RecurrentStateSpec>& specs,
                                              int64_t max_slots, DeviceId device);
 
   /// \brief The delta-rule state of one layer: [slots, v, dk, dv] float32.
@@ -52,7 +52,7 @@ class RecurrentStatePool {
   RecurrentStatePool() = default;
 
   DeviceBuffer storage_;
-  std::vector<RecurrentStateSpec> specs_;
+  std::vector<models::RecurrentStateSpec> specs_;
   int64_t num_layers_ = 0;
   int64_t max_slots_ = 0;
   /// Byte offset of each layer's region within the allocation.

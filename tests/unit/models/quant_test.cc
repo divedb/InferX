@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "inferx/models/checkpoint.h"
+#include "inferx/models/loading/checkpoint_reader.h"
 
 namespace inferx::models {
 namespace {

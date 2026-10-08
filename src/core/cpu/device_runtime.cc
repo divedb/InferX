@@ -150,4 +150,9 @@ class CpuRuntime final : public DeviceRuntime {
 
 }  // namespace
 
+DeviceRuntime* CpuDeviceRuntime() {
+  static CpuRuntime runtime;
+  return &runtime;
+}
+
 }  // namespace inferx::internal

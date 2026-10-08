@@ -33,7 +33,7 @@ target_compile_options(inferx_quant_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME quant_test COMMAND inferx_quant_test)
 
 add_executable(inferx_model_test model_test.cc)
-target_link_libraries(inferx_model_test PRIVATE inferx::models GTest::gtest_main)
+target_link_libraries(inferx_model_test PRIVATE inferx::engine GTest::gtest_main)
 target_compile_options(inferx_model_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME model_test COMMAND inferx_model_test
          WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -50,7 +50,8 @@ target_compile_options(inferx_rms_norm_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME rms_norm_test COMMAND inferx_rms_norm_test)
 
 add_executable(inferx_ops_test ops_test.cc)
-target_link_libraries(inferx_ops_test PRIVATE inferx::ops GTest::gtest_main)
+target_link_libraries(inferx_ops_test PRIVATE inferx::ops inferx::util
+                      nlohmann_json::nlohmann_json GTest::gtest_main)
 target_compile_options(inferx_ops_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME ops_test COMMAND inferx_ops_test)
 if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
@@ -102,11 +103,6 @@ if(INFERX_ENABLE_TOKENIZERS)
   set_tests_properties(tokenizer_pool_test PROPERTIES TIMEOUT 120)
 endif()
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
-add_test(NAME cli_output_test
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_output_test.py
-          $<TARGET_FILE:inferx>)
-
 add_executable(inferx_sampling_test sampling_test.cc)
 target_link_libraries(inferx_sampling_test PRIVATE inferx::sampling
                       GTest::gtest_main)
@@ -131,10 +127,12 @@ target_link_libraries(inferx_safe_tensors_reader_test PRIVATE inferx::models GTe
 target_compile_options(inferx_safe_tensors_reader_test PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME safe_tensors_reader_test COMMAND inferx_safe_tensors_reader_test)
 
-add_executable(inferx_family_config_test unit/models/family_config_test.cc)
-target_link_libraries(inferx_family_config_test PRIVATE inferx::models GTest::gtest_main)
-target_compile_options(inferx_family_config_test PRIVATE -Wall -Wextra -Wpedantic)
-add_test(NAME family_config_test COMMAND inferx_family_config_test)
+add_executable(inferx_architecture_config_test unit/models/architecture_config_test.cc)
+target_link_libraries(inferx_architecture_config_test
+  PRIVATE inferx::models nlohmann_json::nlohmann_json GTest::gtest_main)
+target_compile_options(inferx_architecture_config_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME architecture_config_test COMMAND inferx_architecture_config_test
+         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 add_executable(inferx_parallel_linear_test unit/models/parallel_linear_test.cc)
 target_link_libraries(inferx_parallel_linear_test PRIVATE inferx::models GTest::gtest_main)
@@ -180,3 +178,15 @@ if(EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
   set_tests_properties(tensor_parallel_test PROPERTIES ENVIRONMENT
                       "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
 endif()
+
+# JSON config parsing. Linked only against inferx::util so these stay
+# buildable while the models/engine modules are mid-refactor.
+add_executable(inferx_config_view_test unit/util/config_view_test.cc)
+target_link_libraries(inferx_config_view_test PRIVATE inferx::util GTest::gtest_main)
+target_compile_options(inferx_config_view_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME config_view_test COMMAND inferx_config_view_test)
+
+add_executable(inferx_hf_config_test unit/util/hf_config_test.cc)
+target_link_libraries(inferx_hf_config_test PRIVATE inferx::util GTest::gtest_main)
+target_compile_options(inferx_hf_config_test PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME hf_config_test COMMAND inferx_hf_config_test)

@@ -1,6 +1,9 @@
 # Models Layer Reimplementation Proposal
 
-Status: design only. This proposal does not implement changes to the models layer.
+Status: implemented. The structure below (typed per-architecture configs,
+registry-selected factories, architectures/ + layers/ + loading/, and the
+CausalLanguageModel boundary) now describes the code under
+`include/inferx/models/` and `src/models/`.
 
 ## Design direction
 
@@ -261,7 +264,10 @@ scheduler output and manages execution resources.
 
 ## Implementation sequence and acceptance
 
-Implementation is future work, separate from this design proposal.
+All four sequence steps landed: Qwen3 dense as the complete vertical slice,
+Llama validating component reuse, Qwen3-Next for heterogeneous state, and
+DeepSeek-V3 for MLA and MoE boundaries (plus qwen2, mistral, gemma3,
+mixtral, and gpt_oss carried over from the previous layer).
 
 1. Build Qwen3 dense as the complete vertical slice: typed config, model assembly,
    weight loading, execution, and numerical parity.

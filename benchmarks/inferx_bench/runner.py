@@ -100,14 +100,14 @@ def run_suite(root: Path, model, engine: str, tag: str, suite_path: str, repeats
                       'per-process accounting unavailable on WSL')
     (out / 'metadata.json').write_text(json.dumps(meta, indent=2))
     (out / 'source.patch').write_bytes(subprocess.check_output(['git', 'diff'], cwd=root))
-    write_source_archive(root, out / 'source.tar.gz', extra_py_dirs=harness_dirs + (
+    write_source_archive(root, out / 'source.tar.gz', extra_py_dirs=tuple(harness_dirs) + (
         root / 'benchmarks/inferx_bench',))
 
     for batch in batches(suite):
         if engine == 'inferx' and digest(root / inferx_binary) != meta['binary_sha256']:
             raise RuntimeError('Benchmark binary changed between batch processes')
         cmd = ([sys.executable, worker_module] if engine == 'vllm'
-               else [inferx_binary, 'bench', 'workload', '--attention-backend', 'flashinfer'])
+               else [inferx_binary, 'bench', 'workload'])
         cmd += ['--max-num-seqs' if engine == 'inferx' else '--batch', str(batch),
                 '--repeats', str(repeats), '--suite', suite_path]
         cmd += (['--model', model.path, '--kv-cache-memory-bytes', str(kv_bytes)]

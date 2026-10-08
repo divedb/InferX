@@ -9,7 +9,7 @@
 namespace inferx {
 
 StatusOr<RecurrentStatePool> RecurrentStatePool::Create(
-    const std::vector<RecurrentStateSpec>& specs, int64_t max_slots, DeviceId device) {
+    const std::vector<models::RecurrentStateSpec>& specs, int64_t max_slots, DeviceId device) {
   if (specs.empty() || max_slots <= 0) {
     return InvalidArgumentError("recurrent pool needs layers and positive slots");
   }

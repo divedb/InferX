@@ -1,4 +1,4 @@
-#include "inferx/models/safe_tensors_reader.h"
+#include "inferx/models/loading/safe_tensors_reader.h"
 
 #include <cstddef>
 #include <cstdint>

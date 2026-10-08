@@ -11,7 +11,7 @@
 #include "gtest/gtest.h"
 
 #include "cli/args/dataset_args.h"
-#include "inferx/models/checkpoint_config.h"
+#include "inferx/server/generation_config.h"
 #include "inferx/ops/attention.h"
 #include "inferx/server/serve.h"
 #include "cli/args/engine_args.h"
@@ -183,17 +183,17 @@ TEST(ModelConfigArgsTest, RejectsInvalidValues) {
 
 TEST(GenerationConfigResolveTest, ModeSemantics) {
   // "vllm" always keeps engine defaults.
-  auto none = GenerationConfig::Resolve("models/foo", "vllm");
+  auto none = server::GenerationConfig::Resolve("models/foo", "vllm");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // "auto" with no generation_config.json is normal, not an error.
-  none = GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
+  none = server::GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // An explicit directory must exist and load.
-  auto missing = GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
+  auto missing = server::GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
                                            "/nonexistent-inferx-model-dir");
   EXPECT_FALSE(missing.ok());
 }
@@ -202,7 +202,7 @@ TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
   const std::string dir = "/tmp/inferx_generation_config_test";
   std::filesystem::create_directories(dir);
   { std::ofstream(dir + "/generation_config.json") << R"({"temperature": 0.7})"; }
-  auto loaded = GenerationConfig::Resolve("models/foo", dir);
+  auto loaded = server::GenerationConfig::Resolve("models/foo", dir);
   ASSERT_TRUE(loaded.ok());
   ASSERT_TRUE(loaded->has_value());
   ASSERT_TRUE((*loaded)->temperature.has_value());
@@ -210,7 +210,7 @@ TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
 }
 
 TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
-  auto gen = GenerationConfig::FromJson(
+  auto gen = server::GenerationConfig::FromJson(
       R"({"temperature": 0.6, "top_p": 0.95, "top_k": 20,)"
       R"( "repetition_penalty": 1.05, "max_new_tokens": 512})");
   ASSERT_TRUE(gen.ok());
@@ -236,7 +236,7 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
 }
 
 TEST(GenerationConfigTest, HfDisabledTopKMapsToZero) {
-  auto gen = GenerationConfig::FromJson(R"({"top_k": -1})");
+  auto gen = server::GenerationConfig::FromJson(R"({"top_k": -1})");
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams merged;
   inferx::server::MergeGenerationConfig(*gen, &merged);
@@ -244,7 +244,7 @@ TEST(GenerationConfigTest, HfDisabledTopKMapsToZero) {
 }
 
 TEST(GenerationConfigTest, EmptyJsonKeepsDefaults) {
-  auto gen = GenerationConfig::FromJson("{}");
+  auto gen = server::GenerationConfig::FromJson("{}");
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams defaults;
   const sampling::SamplingParams untouched = defaults;

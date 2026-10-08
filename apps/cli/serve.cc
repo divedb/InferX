@@ -9,7 +9,7 @@
 #include "cli/args/sampling_args.h"
 #include "cli/commands.h"
 #include "cli/error.h"
-#include "inferx/models/checkpoint_config.h"
+#include "inferx/server/generation_config.h"
 
 namespace inferx::cli {
 namespace {
@@ -52,13 +52,13 @@ struct ServeArgs {
   ///        last regardless.
   void ApplyGenerationConfig(sampling::SamplingParams* defaults) const {
     auto resolved =
-        GenerationConfig::Resolve(model.config.model_dir, model.config.generation_config);
+        server::GenerationConfig::Resolve(model.config.model_dir, model.config.generation_config);
     if (!resolved.ok()) throw CommandError(resolved.status());
     if (resolved->has_value()) {
       server::MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
     }
     if (!model.config.override_generation_config.empty()) {
-      auto overrides = GenerationConfig::FromJson(model.config.override_generation_config);
+      auto overrides = server::GenerationConfig::FromJson(model.config.override_generation_config);
       if (!overrides.ok()) throw CommandError(overrides.status());
       server::MergeGenerationConfig(*overrides, defaults);
     }

@@ -37,24 +37,31 @@ void Replay(const ReplayLogitsParams& params) {
     Stream stream;
     ~StreamGuard() { (void)runtime->DestroyStream(stream); }
   } guard{runtime, stream};
-  auto model = Take(Model::Load(params.model_dir, device, params.chunk_size, 1));
-  const auto& config = model->config();
+  models::ModelLoadOptions options;
+  options.directory = params.model_dir;
+  options.device = device;
+  options.max_tokens = params.chunk_size;
+  options.max_seqs = 1;
+  auto model = Take(models::LoadModel(options));
+  const auto& info = model->info();
+  const auto& requirements = model->requirements().layers;
+  if (requirements.empty() || !std::holds_alternative<models::PagedKvStateSpec>(requirements[0]))
+    throw std::runtime_error("replay requires a paged-attention model");
+  const int num_layers = static_cast<int>(requirements.size());
+  const KvLayout layout = std::get<models::PagedKvStateSpec>(requirements[0]).layout;
   const int page_size = 16;
   int max_length = 0;
   for (const auto& entry : fixture.at("cases")) {
     const auto tokens = entry.at("tokens").get<std::vector<int32_t>>();
     const int prompt_length = entry.at("prompt_length");
-    if (tokens.empty() || tokens.size() > static_cast<size_t>(config.max_position_embeddings) ||
+    if (tokens.empty() ||
+        tokens.size() > static_cast<size_t>(info.max_position_embeddings) ||
         prompt_length <= 0 || static_cast<size_t>(prompt_length) > tokens.size())
       throw std::runtime_error("invalid replay prefix length");
     for (int token : tokens)
-      if (token < 0 || token >= config.vocab_size) throw std::runtime_error("invalid token ID");
+      if (token < 0 || token >= info.vocab_size) throw std::runtime_error("invalid token ID");
     max_length = std::max(max_length, static_cast<int>(tokens.size()));
   }
-  KvLayout layout;
-  layout.kv_heads = config.num_key_value_heads;
-  layout.head_dim = config.head_dim;
-  layout.dtype = DataType::kBFloat16;
   const int blocks = (max_length + page_size - 1) / page_size;
   std::vector<int32_t> physical_pages(blocks);
   std::iota(physical_pages.begin(), physical_pages.end(), 0);
@@ -63,10 +70,10 @@ void Replay(const ReplayLogitsParams& params) {
     std::mt19937 rng(20260922);
     std::shuffle(physical_pages.begin(), physical_pages.end(), rng);
   }
-  auto pool = Take(KvBlockPool::Create(config.num_hidden_layers, blocks, page_size, layout, device));
-  ModelState state;
+  auto pool = Take(KvBlockPool::Create(num_layers, blocks, page_size, layout, device));
+  models::ModelState state;
   state.paged_kv = &pool;
-  for (int i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
+  for (int i = 0; i < num_layers; ++i) state.layers.push_back(models::PagedKvState{i});
   ops::OpContext ctx(*runtime, stream);
   dist::SingleRankComm comm;
   const auto upload = [&](const std::vector<int32_t>& values) {
@@ -93,19 +100,21 @@ void Replay(const ReplayLogitsParams& params) {
       for (int i = 0; i < used_blocks; ++i) pages[i] = physical_pages[i];
       const Tensor token_ids = upload(std::vector<int32_t>(tokens.begin() + start, tokens.begin() + end));
       const Tensor logit_rows = upload({count - 1});
-      ModelInput input{token_ids,
-                       {upload(positions), upload(std::vector<int32_t>(count, 0)),
-                        upload(qo), upload(kv), upload(pages),
-                        upload({(end - 1) % page_size + 1}), qo, kv, count, 1},
-                       logit_rows};
-      logits = Take(model->Forward(input, state, ctx, comm));
+      models::ModelInputs input{
+          token_ids,
+          {upload(positions), upload(std::vector<int32_t>(count, 0)),
+           upload(qo), upload(kv), upload(pages),
+           upload({(end - 1) % page_size + 1}), qo, kv, count, 1}};
+      models::ForwardContext fctx{ctx, state, comm};
+      auto hidden = Take(model->Forward(input, fctx));
+      logits = Take(model->ComputeLogits(hidden, models::LogitSelection{logit_rows}, fctx)).values;
       // Keep all input allocations alive until the forward has finished.
       Check(runtime->SynchronizeStream(stream));
       start = end;
     }
-    if (logits->GetDataType() != DataType::kBFloat16 || logits->Numel() != config.vocab_size)
+    if (logits->GetDataType() != DataType::kBFloat16 || logits->Numel() != info.vocab_size)
       throw std::runtime_error("unexpected replay logit dtype or shape");
-    std::vector<uint16_t> bits(config.vocab_size);
+    std::vector<uint16_t> bits(info.vocab_size);
     Check(runtime->Copy(bits.data(), logits->Data(), bits.size() * sizeof(uint16_t),
                         CopyKind::kDeviceToHost));
     std::vector<float> values(bits.size());
@@ -115,7 +124,7 @@ void Replay(const ReplayLogitsParams& params) {
     if (!params.cache_dir.empty()) {
       const auto dir = std::filesystem::path(params.cache_dir) / std::to_string(case_index);
       if (!std::filesystem::create_directories(dir)) throw std::runtime_error("cache dump directory exists");
-      for (int layer = 0; layer < config.num_hidden_layers; ++layer) {
+      for (int layer = 0; layer < num_layers; ++layer) {
         for (bool key : {true, false}) {
           Tensor cache = Take(key ? pool.KeyCache(layer) : pool.ValueCache(layer));
           std::vector<uint16_t> raw(cache.Numel());

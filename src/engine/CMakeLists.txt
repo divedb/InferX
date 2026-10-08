@@ -9,7 +9,9 @@ inferx_add_library(
     request_queue.cc
     scheduler.cc
     ../models/model_runner.cc
+    model_executor.cc
     ../tokenizer/tokenizer.cc
+  PRIVATE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src
   DEPS
     inferx::core
     inferx::cache

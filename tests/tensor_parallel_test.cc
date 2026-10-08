@@ -11,25 +11,32 @@
 #include "inferx/dist/loopback_comm.h"
 #include "inferx/dist/nccl_comm.h"
 #include "inferx/engine/scheduler.h"
-#include "inferx/models/model_runner.h"
+#include "inferx/engine/model_executor.h"
 
 namespace inferx {
 namespace {
 
-class ObservedModel final : public Model {
+class ObservedModel final : public models::CausalLanguageModel {
  public:
-  explicit ObservedModel(std::unique_ptr<Model> model) : model_(std::move(model)) {}
-  const CheckpointConfig& config() const override { return model_->config(); }
-  std::vector<LayerStateSpec> StateRequirements() const override {
-    return model_->StateRequirements();
+  explicit ObservedModel(std::unique_ptr<models::CausalLanguageModel> model)
+      : model_(std::move(model)) {}
+  const models::ModelInfo& info() const override { return model_->info(); }
+  const models::ModelRequirements& requirements() const override {
+    return model_->requirements();
   }
-  StatusOr<Tensor> Forward(const ModelInput& input, ModelState& state,
-                           ops::OpContext& ctx, dist::CommBackend& comm) override {
-    INFERX_ASSIGN_OR_RETURN(auto logits, model_->Forward(input, state, ctx, comm));
-    std::vector<uint16_t> bits(logits.Numel());
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(bits.data(), logits.Data(), logits.NBytes(),
-                                                   CopyKind::kDeviceToHost, ctx.GetStream()));
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
+  StatusOr<models::HiddenStates> Forward(const models::ModelInputs& input,
+                                         models::ForwardContext& fctx) override {
+    return model_->Forward(input, fctx);
+  }
+  StatusOr<models::Logits> ComputeLogits(const models::HiddenStates& states,
+                                         const models::LogitSelection& selection,
+                                         models::ForwardContext& fctx) override {
+    INFERX_ASSIGN_OR_RETURN(auto logits, model_->ComputeLogits(states, selection, fctx));
+    std::vector<uint16_t> bits(logits.values.Numel());
+    INFERX_RETURN_IF_ERROR(fctx.ops.Runtime().CopyAsync(
+        bits.data(), logits.values.Data(), logits.values.NBytes(), CopyKind::kDeviceToHost,
+        fctx.ops.GetStream()));
+    INFERX_RETURN_IF_ERROR(fctx.ops.Runtime().SynchronizeStream(fctx.ops.GetStream()));
     std::vector<float> values;
     for (uint16_t value : bits) values.push_back(std::bit_cast<float>(uint32_t(value) << 16));
     steps.push_back(std::move(values));
@@ -38,7 +45,7 @@ class ObservedModel final : public Model {
   std::vector<std::vector<float>> steps;
 
  private:
-  std::unique_ptr<Model> model_;
+  std::unique_ptr<models::CausalLanguageModel> model_;
 };
 
 class TensorParallelTest : public ::testing::Test {
@@ -60,10 +67,15 @@ class TensorParallelTest : public ::testing::Test {
   StatusOr<std::unique_ptr<ModelRunner>> MakeRank(int rank, int size,
                                                   std::unique_ptr<dist::CommBackend> comm,
                                                   ObservedModel** observed) {
-    INFERX_ASSIGN_OR_RETURN(auto model, Model::Load(model_.model_dir, DeviceId::Cuda(0), 4, 2,
-                                                    ParallelConfig{size, rank}));
-    for (const auto& state : model->StateRequirements()) {
-      EXPECT_EQ(std::get<PagedKvStateSpec>(state).layout.kv_heads, 8 / size);
+    models::ModelLoadOptions options;
+    options.directory = model_.model_dir;
+    options.device = DeviceId::Cuda(0);
+    options.max_tokens = 4;
+    options.max_seqs = 2;
+    options.parallel = ParallelConfig{size, rank};
+    INFERX_ASSIGN_OR_RETURN(auto model, models::LoadModel(options));
+    for (const auto& state : model->requirements().layers) {
+      EXPECT_EQ(std::get<models::PagedKvStateSpec>(state).layout.kv_heads, 8 / size);
     }
     auto wrapper = std::make_unique<ObservedModel>(std::move(model));
     *observed = wrapper.get();
@@ -71,7 +83,16 @@ class TensorParallelTest : public ::testing::Test {
                                std::move(wrapper), std::move(comm));
   }
 
-  StatusOr<std::map<RequestId, std::vector<TokenId>>> Generate(ModelRunner& runner) {
+  template <class ExecutorT>
+  static StatusOr<ModelRunnerOutput> Step(ExecutorT& ex, const SchedulerOutput& plan) {
+    return ex.Execute(plan);
+  }
+  static StatusOr<ModelRunnerOutput> Step(ModelRunner& rank, const SchedulerOutput& plan) {
+    return rank.Run(plan);
+  }
+
+  template <class ExecutorT>
+  StatusOr<std::map<RequestId, std::vector<TokenId>>> Generate(ExecutorT& runner) {
     Scheduler scheduler(scheduler_, runner.kv_pool(), 151645);
     sampling::SamplingParams params;
     params.temperature = 0;
@@ -87,12 +108,12 @@ class TensorParallelTest : public ::testing::Test {
     while (scheduler.HasRequests()) {
       if (++steps > 20) return InternalError("generation did not finish");
       INFERX_ASSIGN_OR_RETURN(auto plan, scheduler.Schedule());
-      INFERX_ASSIGN_OR_RETURN(auto result, runner.Run(plan));
+      INFERX_ASSIGN_OR_RETURN(auto result, Step(runner, plan));
       INFERX_RETURN_IF_ERROR(scheduler.UpdateFromOutput(plan, result));
       while (auto done = scheduler.PopFinished()) generated[done->id()] = done->output();
     }
     INFERX_ASSIGN_OR_RETURN(auto removals, scheduler.Schedule());
-    INFERX_RETURN_IF_ERROR(runner.Run(removals).status());
+    INFERX_RETURN_IF_ERROR(Step(runner, removals).status());
     return generated;
   }
 
@@ -121,7 +142,7 @@ TEST_F(TensorParallelTest, Qwen3TwoRanksMatchSingleRankPrefillAndDecode) {
     ASSERT_TRUE(runner.ok()) << runner.status();
     ranks.push_back(*std::move(runner));
   }
-  auto parallel = ModelRunner::CreateGroup(
+  auto parallel = ModelExecutor::CreateGroup(
       std::move(ranks), [world](const Status& status) { world->Abort(status); });
   ASSERT_TRUE(parallel.ok()) << parallel.status();
   auto actual = Generate(**parallel);
@@ -154,14 +175,14 @@ TEST_F(TensorParallelTest, Qwen3MultiGpuServingRunnerMatchesSingleRank) {
   auto id = dist::NcclComm::NewUniqueId();
   if (absl::IsNotFound(id.status())) GTEST_SKIP() << "NCCL is not installed";
   ASSERT_TRUE(id.ok()) << id.status();
-  auto baseline = ModelRunner::Create(model_, cache_, scheduler_, ExecutionConfig{});
+  auto baseline = ModelExecutor::Create(model_, cache_, scheduler_, ExecutionConfig{});
   ASSERT_TRUE(baseline.ok()) << baseline.status();
   auto expected = Generate(**baseline);
   ASSERT_TRUE(expected.ok()) << expected.status();
   baseline->reset();
   model_.device.device_ids = {0, 1};
   auto parallel =
-      ModelRunner::Create(model_, cache_, scheduler_, ExecutionConfig{}, ParallelConfig{2, 0});
+      ModelExecutor::Create(model_, cache_, scheduler_, ExecutionConfig{}, ParallelConfig{2, 0});
   ASSERT_TRUE(parallel.ok()) << parallel.status();
   auto actual = Generate(**parallel);
   ASSERT_TRUE(actual.ok()) << actual.status();

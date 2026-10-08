@@ -1,4 +1,5 @@
 add_subdirectory(core)       # element types, tensors, status, memory
+add_subdirectory(util)       # typed views over HuggingFace JSON configs
 add_subdirectory(cache)      # paged KV block pool
 add_subdirectory(ops)        # portable compute ops + cpu/cuda backends
 add_subdirectory(sampling)   # sampling pipeline

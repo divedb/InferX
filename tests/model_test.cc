@@ -8,15 +8,29 @@
 
 #include "gtest/gtest.h"
 #include "inferx/cache/kv_block_pool.h"
+#include "inferx/engine/model_executor.h"
+#include "inferx/engine/scheduler.h"
 #include "inferx/core/device.h"
 #include "inferx/core/device_runtime.h"
 #include "inferx/core/shape.h"
 #include "inferx/core/tensor.h"
 #include "inferx/dist/comm.h"
+#include "inferx/models/architectures/qwen3/config.h"
+#include "inferx/models/load_options.h"
 #include "inferx/ops/op_context.h"
+#include "inferx/util/hf_config.h"
 
 namespace inferx {
 namespace {
+
+models::ModelLoadOptions LoadOptions(const std::string& directory) {
+  models::ModelLoadOptions options;
+  options.directory = directory;
+  options.device = DeviceId::Cuda(0);
+  options.max_tokens = 8;
+  options.max_seqs = 2;
+  return options;
+}
 
 class ModelTest : public ::testing::Test {
  protected:
@@ -30,8 +44,8 @@ class ModelTest : public ::testing::Test {
     stream_ = *stream;
   }
 
-  /// \brief A minimal valid ModelInput: one single-token sequence.
-  StatusOr<ModelInput> MakeInput(int num_tokens) {
+  /// \brief A minimal valid batch: one single-token sequence.
+  StatusOr<models::ModelInputs> MakeInput(int num_tokens) {
     const DeviceId device = DeviceId::Cuda(0);
     auto i32 = [&](Shape shape) { return Tensor::Empty(DataType::kInt32, shape, device); };
     INFERX_ASSIGN_OR_RETURN(Tensor token_ids, i32(Shape({num_tokens})));
@@ -68,70 +82,107 @@ class ModelTest : public ::testing::Test {
         runtime_->Copy(last_page_len.Data(), page, sizeof(page), CopyKind::kHostToDevice));
     INFERX_RETURN_IF_ERROR(
         runtime_->Copy(logit_rows.Data(), row, sizeof(row), CopyKind::kHostToDevice));
+    logit_rows_ = std::move(logit_rows);
 
-    return ModelInput{std::move(token_ids),
-                      AttentionBatch{std::move(positions),
-                                     std::move(batch_indices),
-                                     std::move(qo_indptr),
-                                     std::move(kv_indptr),
-                                     std::move(kv_indices),
-                                     std::move(last_page_len),
-                                     host_qo_,
-                                     {},
-                                     num_tokens,
-                                     1},
-                      std::move(logit_rows)};
+    return models::ModelInputs{
+        std::move(token_ids),
+        models::AttentionBatch{std::move(positions),
+                               std::move(batch_indices),
+                               std::move(qo_indptr),
+                               std::move(kv_indptr),
+                               std::move(kv_indices),
+                               std::move(last_page_len),
+                               host_qo_,
+                               {},
+                               num_tokens,
+                               1}};
+  }
+
+  /// Binds runner-style state: one paged-KV pool layer per declared layer.
+  StatusOr<models::ModelState> MakeState(const models::CausalLanguageModel& model,
+                                         int num_kv_blocks, int block_size) {
+    const auto& requirements = model.requirements().layers;
+    std::vector<KvLayout> layouts;
+    for (const auto& spec : requirements) {
+      layouts.push_back(std::get<models::PagedKvStateSpec>(spec).layout);
+    }
+    INFERX_ASSIGN_OR_RETURN(auto pool, KvBlockPool::Create(num_kv_blocks, block_size, layouts,
+                                                           DeviceId::Cuda(0)));
+    pools_.push_back(std::make_unique<KvBlockPool>(std::move(pool)));
+    models::ModelState state;
+    state.paged_kv = pools_.back().get();
+    for (int64_t i = 0; i < static_cast<int64_t>(requirements.size()); ++i) {
+      state.layers.push_back(models::PagedKvState{i});
+    }
+    return state;
+  }
+
+  StatusOr<Tensor> ForwardLogits(models::CausalLanguageModel& model,
+                                 const models::ModelInputs& input,
+                                 models::ModelState& state) {
+    ops::OpContext ctx(*runtime_, stream_);
+    dist::SingleRankComm comm;
+    models::ForwardContext fctx{ctx, state, comm};
+    INFERX_ASSIGN_OR_RETURN(auto hidden, model.Forward(input, fctx));
+    INFERX_ASSIGN_OR_RETURN(auto logits, model.ComputeLogits(
+                                    hidden, models::LogitSelection{*logit_rows_}, fctx));
+    return std::move(logits.values);
   }
 
   std::vector<int32_t> host_qo_;
+  std::optional<Tensor> logit_rows_;
+  std::vector<std::unique_ptr<KvBlockPool>> pools_;
   DeviceRuntime* runtime_ = nullptr;
   Stream stream_;
 };
 
-TEST_F(ModelTest, LoadsQwen3CheckpointAndConfig) {
-  auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), /*max_tokens=*/8,
-                           /*max_seqs=*/2);
+TEST_F(ModelTest, LoadsQwen3CheckpointAndInfo) {
+  auto model = models::LoadModel(LoadOptions("models/Qwen3-0.6B"));
   ASSERT_TRUE(model.ok()) << model.status();
-  const CheckpointConfig& config = (*model)->config();
-  EXPECT_EQ(config.model_type, "qwen3");
-  EXPECT_EQ(config.architectures, "Qwen3ForCausalLM");
-  EXPECT_EQ(config.hidden_size, 1024);
-  EXPECT_EQ(config.intermediate_size, 3072);
-  EXPECT_EQ(config.num_hidden_layers, 28);
-  EXPECT_EQ(config.num_attention_heads, 16);
-  EXPECT_EQ(config.num_key_value_heads, 8);
-  EXPECT_EQ(config.head_dim, 128);
-  EXPECT_EQ(config.vocab_size, 151936);
-  EXPECT_FLOAT_EQ(config.rms_norm_eps, 1e-6f);
-  EXPECT_FLOAT_EQ(config.rope_theta, 1e6f);
-  EXPECT_TRUE(config.tie_word_embeddings);
+  const models::ModelInfo& info = (*model)->info();
+  EXPECT_EQ(info.architecture, "Qwen3ForCausalLM");
+  EXPECT_EQ(info.vocab_size, 151936);
+  EXPECT_EQ(info.max_position_embeddings, 40960);
+  ASSERT_FALSE((*model)->requirements().layers.empty());
+}
+
+/// The architecture's typed config owns the full dimension set; the
+/// checkpoint's config.json parses directly into it.
+TEST(Qwen3ConfigTest, ParsesCheckpointConfig) {
+  auto hf = HfConfig::FromFile("models/Qwen3-0.6B/config.json");
+  if (!hf.ok()) GTEST_SKIP() << "local Qwen3-0.6B checkpoint not present";
+  auto config = models::qwen3::Qwen3Config::Parse(hf->Text());
+  ASSERT_TRUE(config.ok()) << config.status();
+  EXPECT_EQ(config->hidden_size, 1024);
+  EXPECT_EQ(config->intermediate_size, 3072);
+  EXPECT_EQ(config->num_hidden_layers, 28);
+  EXPECT_EQ(config->num_attention_heads, 16);
+  EXPECT_EQ(config->num_key_value_heads, 8);
+  EXPECT_EQ(config->head_dim, 128);
+  EXPECT_EQ(config->vocab_size, 151936);
+  EXPECT_FLOAT_EQ(config->rms_norm_eps, 1e-6);
+  EXPECT_FLOAT_EQ(config->rope.theta, 1e6f);
+  EXPECT_TRUE(config->tie_word_embeddings);
+  EXPECT_TRUE(config->Validate().ok());
 }
 
 TEST_F(ModelTest, ForwardReturnsLogits) {
-  auto model = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), /*max_tokens=*/8,
-                           /*max_seqs=*/2);
+  auto model = models::LoadModel(LoadOptions("models/Qwen3-0.6B"));
   ASSERT_TRUE(model.ok()) << model.status();
-  const CheckpointConfig& config = (*model)->config();
-  KvLayout layout;
-  layout.entries_per_token = 2;
-  layout.kv_heads = config.num_key_value_heads;
-  layout.head_dim = config.head_dim;
-  layout.dtype = DataType::kBFloat16;
-  auto pool = KvBlockPool::Create(config.num_hidden_layers, /*num_kv_blocks=*/4,
-                                  /*block_size=*/2, layout, DeviceId::Cuda(0));
-  ASSERT_TRUE(pool.ok());
+  const auto& requirements = (*model)->requirements().layers;
+  ASSERT_EQ(requirements.size(), 28u);
+  const KvLayout& layout = std::get<models::PagedKvStateSpec>(requirements[0]).layout;
+  EXPECT_EQ(layout.kv_heads, 8);
+  EXPECT_EQ(layout.head_dim, 128);
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
-  ops::OpContext ctx(*runtime_, stream_);
-  dist::SingleRankComm comm;
-  ModelState state;
-  state.paged_kv = &*pool;
-  for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx, comm);
+  auto state = MakeState(**model, /*num_kv_blocks=*/4, /*block_size=*/2);
+  ASSERT_TRUE(state.ok());
+  const StatusOr<Tensor> logits = ForwardLogits(**model, *input, *state);
   ASSERT_TRUE(logits.ok()) << logits.status();
   EXPECT_EQ(logits->Rank(), 2);
   EXPECT_EQ(logits->Dim(0), 1);
-  EXPECT_EQ(logits->Dim(1), config.vocab_size);
+  EXPECT_EQ(logits->Dim(1), (*model)->info().vocab_size);
   EXPECT_EQ(logits->GetDataType(), DataType::kBFloat16);
 }
 
@@ -139,18 +190,19 @@ namespace {
 
 /// Runs one fixed two-token prompt through a loaded model and returns the
 /// last-row logits on the host.
-StatusOr<std::vector<float>> ForwardLogits(Model& model, const CheckpointConfig& config,
-                                           DeviceRuntime& runtime, Stream stream,
-                                           const ModelInput& input, KvBlockPool& pool) {
+StatusOr<std::vector<float>> ForwardLogitsOnHost(models::CausalLanguageModel& model,
+                                           const models::ModelInfo& info, DeviceRuntime& runtime,
+                                           Stream stream, const models::ModelInputs& input,
+                                           models::ModelState& state, Tensor logit_rows) {
   ops::OpContext ctx(runtime, stream);
   dist::SingleRankComm comm;
-  ModelState state;
-  state.paged_kv = &pool;
-  for (int64_t i = 0; i < config.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  INFERX_ASSIGN_OR_RETURN(auto logits, model.Forward(input, state, ctx, comm));
+  models::ForwardContext fctx{ctx, state, comm};
+  INFERX_ASSIGN_OR_RETURN(auto hidden, model.Forward(input, fctx));
+  INFERX_ASSIGN_OR_RETURN(auto out,
+                          model.ComputeLogits(hidden, models::LogitSelection{logit_rows}, fctx));
   INFERX_RETURN_IF_ERROR(runtime.SynchronizeStream(stream));
-  std::vector<uint16_t> raw(logits.Numel());
-  INFERX_RETURN_IF_ERROR(runtime.Copy(raw.data(), logits.Data(), raw.size() * 2,
+  std::vector<uint16_t> raw(out.values.Numel());
+  INFERX_RETURN_IF_ERROR(runtime.Copy(raw.data(), out.values.Data(), raw.size() * 2,
                                       CopyKind::kDeviceToHost));
   std::vector<float> values(raw.size());
   for (size_t i = 0; i < raw.size(); ++i) {
@@ -173,31 +225,43 @@ TEST_F(ModelTest, GptqInt8CheckpointMatchesBf16Reference) {
       !std::filesystem::exists("models/Qwen3-0.6B/model.safetensors")) {
     GTEST_SKIP() << "local Qwen3-0.6B checkpoints not present";
   }
-  auto reference = Model::Load("models/Qwen3-0.6B", DeviceId::Cuda(0), 8, 2);
+  auto reference = models::LoadModel(LoadOptions("models/Qwen3-0.6B"));
   ASSERT_TRUE(reference.ok()) << reference.status();
-  auto quantized = Model::Load("models/Qwen3-0.6B-GPTQ-Int8", DeviceId::Cuda(0), 8, 2);
+  auto quantized = models::LoadModel(LoadOptions("models/Qwen3-0.6B-GPTQ-Int8"));
   ASSERT_TRUE(quantized.ok()) << quantized.status();
 
-  const CheckpointConfig& config = (*quantized)->config();
-  ASSERT_EQ(config.num_hidden_layers, (*reference)->config().num_hidden_layers);
-  KvLayout layout;
-  layout.entries_per_token = 2;
-  layout.kv_heads = config.num_key_value_heads;
-  layout.head_dim = config.head_dim;
-  layout.dtype = DataType::kBFloat16;
+  ASSERT_EQ((*quantized)->requirements().layers.size(),
+            (*reference)->requirements().layers.size());
   const DeviceId device = DeviceId::Cuda(0);
-  auto ref_pool = KvBlockPool::Create(config.num_hidden_layers, 4, 2, layout, device);
+  auto pool_for = [&](const models::CausalLanguageModel& model) {
+    std::vector<KvLayout> layouts;
+    for (const auto& spec : model.requirements().layers) {
+      layouts.push_back(std::get<models::PagedKvStateSpec>(spec).layout);
+    }
+    return KvBlockPool::Create(4, 2, layouts, device);
+  };
+  auto ref_pool = pool_for(**reference);
   ASSERT_TRUE(ref_pool.ok());
-  auto quant_pool = KvBlockPool::Create(config.num_hidden_layers, 4, 2, layout, device);
+  auto quant_pool = pool_for(**quantized);
   ASSERT_TRUE(quant_pool.ok());
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
 
-  auto ref_logits = ForwardLogits(**reference, (*reference)->config(), *runtime_, stream_,
-                                  *input, *ref_pool);
+  models::ModelState ref_state;
+  ref_state.paged_kv = &*ref_pool;
+  for (size_t i = 0; i < (*reference)->requirements().layers.size(); ++i) {
+    ref_state.layers.push_back(models::PagedKvState{static_cast<int64_t>(i)});
+  }
+  models::ModelState quant_state;
+  quant_state.paged_kv = &*quant_pool;
+  for (size_t i = 0; i < (*quantized)->requirements().layers.size(); ++i) {
+    quant_state.layers.push_back(models::PagedKvState{static_cast<int64_t>(i)});
+  }
+  auto ref_logits = ForwardLogitsOnHost(**reference, (*reference)->info(), *runtime_, stream_, *input,
+                                  ref_state, *logit_rows_);
   ASSERT_TRUE(ref_logits.ok()) << ref_logits.status();
-  auto quant_logits = ForwardLogits(**quantized, config, *runtime_, stream_, *input,
-                                    *quant_pool);
+  auto quant_logits = ForwardLogitsOnHost(**quantized, (*quantized)->info(), *runtime_, stream_,
+                                    *input, quant_state, *logit_rows_);
   ASSERT_TRUE(quant_logits.ok()) << quant_logits.status();
   ASSERT_EQ(ref_logits->size(), quant_logits->size());
 
@@ -218,8 +282,8 @@ TEST_F(ModelTest, GptqInt8CheckpointMatchesBf16Reference) {
 namespace {
 
 /// Writes a tiny synthetic Qwen2.5 checkpoint and loads it end to end: the
-/// biased QKV projections, the packed-bias execution path, and the family
-/// registry selection all have to agree for forward to produce logits.
+/// biased QKV projections, the packed-bias execution path, and the registry
+/// selection all have to agree for forward to produce logits.
 struct TempDir {
   std::filesystem::path path = std::filesystem::temp_directory_path() /
                                ("inferx_qwen2_smoke_" + std::to_string(::getpid()));
@@ -297,21 +361,14 @@ TEST_F(ModelTest, LoadsSyntheticQwen2AndRunsBiasedAttention) {
   }
   WriteF32(dir.path / "model.safetensors", tensors);
 
-  auto model = Model::Load(dir.path.string(), DeviceId::Cuda(0), /*max_tokens=*/8,
-                           /*max_seqs=*/2);
+  auto options = LoadOptions(dir.path.string());
+  auto model = models::LoadModel(options);
   ASSERT_TRUE(model.ok()) << model.status();
-  const CheckpointConfig& cfg = (*model)->config();
-  KvLayout layout{2, cfg.num_key_value_heads, cfg.head_dim, DataType::kBFloat16};
-  auto pool = KvBlockPool::Create(cfg.num_hidden_layers, 4, 2, layout, DeviceId::Cuda(0));
-  ASSERT_TRUE(pool.ok());
+  auto state = MakeState(**model, 4, 2);
+  ASSERT_TRUE(state.ok());
   auto input = MakeInput(2);
   ASSERT_TRUE(input.ok());
-  ops::OpContext ctx(*runtime_, stream_);
-  dist::SingleRankComm comm;
-  ModelState state;
-  state.paged_kv = &*pool;
-  for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) state.layers.push_back(PagedKvState{i});
-  const StatusOr<Tensor> logits = (*model)->Forward(*input, state, ctx, comm);
+  const StatusOr<Tensor> logits = ForwardLogits(**model, *input, *state);
   ASSERT_TRUE(logits.ok()) << logits.status();
   ASSERT_EQ(logits->Dim(1), kVocab);
   // F32 weights round to small nonzero values; every logit must be finite.
@@ -334,13 +391,75 @@ TEST_F(ModelTest, RejectsUnsupportedArchitecture) {
       << R"({"model_type": "gpt_neox", "architectures": ["GPTNeoXForCausalLM"],)"
       << R"( "hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 1,)"
       << R"( "vocab_size": 16})";
-  auto model = Model::Load(dir, DeviceId::Cuda(0), 8, 2);
+  auto model = models::LoadModel(LoadOptions(dir));
   EXPECT_EQ(model.status().code(), absl::StatusCode::kUnimplemented);
 }
 
 
+/// Graph replay must reproduce eager sampling exactly: sampling stays
+/// outside the captured model path, so per-step parameters and RNG offsets
+/// are applied fresh on every replay.
+TEST_F(ModelTest, GraphReplaySamplingMatchesEager) {
+  if (!std::filesystem::exists("models/Qwen3-0.6B/model.safetensors")) {
+    GTEST_SKIP() << "local Qwen3-0.6B checkpoint not present";
+  }
+  const auto generate = [&](bool graphs) -> std::vector<int> {
+    ModelConfig mc;
+    mc.device.device_type = "cuda";
+    mc.model_dir = "models/Qwen3-0.6B";
+    SchedulerConfig sc;
+    sc.max_num_batched_tokens = 4096;
+    sc.max_num_seqs = 2;
+    CacheConfig cc;
+    cc.num_kv_blocks = 512;
+    cc.block_size = 16;
+    ExecutionConfig ec;
+    ec.enable_cuda_graphs = graphs;
+    auto built = ModelExecutor::Create(mc, cc, sc, ec);
+    if (!built.ok()) {
+      // No CUDA device in this environment.
+      return std::vector<int>{};
+    }
+    Scheduler scheduler(sc, (*built)->kv_pool(), 151645);
+    sampling::SamplingParams params;
+    params.temperature = 0.8f;
+    params.top_p = 0.95f;
+    params.seed = 42;
+    params.ignore_eos = true;
+    params.max_tokens = 8;
+    Request request(1, {785, 6722, 315, 9625, 374}, params);
+    EXPECT_TRUE(scheduler.AddRequest(std::move(request)).ok());
+    std::vector<int> tokens;
+    while (scheduler.HasRequests()) {
+      auto plan = scheduler.Schedule();
+      if (!plan.ok()) {
+        ADD_FAILURE() << plan.status();
+        return {};
+      }
+      auto result = (*built)->Execute(*plan);
+      if (!result.ok()) {
+        ADD_FAILURE() << result.status();
+        return {};
+      }
+      if (!scheduler.UpdateFromOutput(*plan, *result).ok()) {
+        ADD_FAILURE() << "update failed";
+        return {};
+      }
+    }
+    while (auto finished = scheduler.PopFinished()) {
+      tokens = finished->output();
+    }
+    return tokens;
+  };
+  const auto eager = generate(false);
+  ASSERT_EQ(eager.size(), 8u) << "eager generation incomplete";
+  const auto replayed = generate(true);
+  ASSERT_EQ(replayed.size(), 8u) << "graph generation incomplete";
+  EXPECT_EQ(eager, replayed);
+}
+
 TEST_F(ModelTest, RejectsMissingConfig) {
-  auto model = Model::Load("/nonexistent/model-dir", DeviceId::Cuda(0), 8, 2);
+  auto model = models::LoadModel(LoadOptions("/nonexistent/model-dir"));
   EXPECT_FALSE(model.ok());
 }
 

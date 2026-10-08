@@ -8,6 +8,7 @@ inferx_add_library(
     serve.cc
     api.cc
     engine_gateway.cc
+    generation_config.cc
     http_server.cc
     tokenizer_pool.cc
   DEPS inferx::engine inferx::boost

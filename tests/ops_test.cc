@@ -17,7 +17,7 @@
 #include "inferx/ops/gather.h"
 #include "inferx/ops/linear.h"
 #include "inferx/ops/rotary.h"
-#include "inferx/models/components/rope.h"
+#include "inferx/models/configs/rope.h"
 #include "inferx/ops/gdn.h"
 #include "inferx/ops/mla.h"
 #include "inferx/ops/moe.h"
@@ -699,7 +699,7 @@ TEST(RopeScaling, MatchesReferenceFrequencyFormulas) {
 }
 
 TEST(RopeScaling, YarnAttentionTemperatureFollowsFactor) {
-  components::RotaryConfig config;
+  models::RopeConfig config;
   config.dim = 64;
   config.theta = 150000.0f;
   config.type = "yarn";

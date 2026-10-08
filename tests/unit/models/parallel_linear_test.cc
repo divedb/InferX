@@ -1,4 +1,4 @@
-#include "inferx/models/components/parallel_linear.h"
+#include "inferx/models/layers/linear.h"
 
 #include <unistd.h>
 
@@ -14,18 +14,25 @@
 #include "inferx/config/parallel_config.h"
 #include "inferx/core/device.h"
 #include "inferx/core/tensor.h"
-#include "inferx/models/causal/decoder_config.h"
-#include "inferx/models/checkpoint.h"
-#include "inferx/models/components/attention.h"
-#include "inferx/models/components/qkv_linear.h"
+#include "nlohmann/json.hpp"
+#include "inferx/models/architectures/llama/model.h"
+#include "inferx/models/layers/attention.h"
+#include "inferx/models/layers/decoder.h"
+#include "inferx/models/loading/checkpoint_reader.h"
 #include "inferx/models/loading/weight_loader.h"
-#include "inferx/models/model_registry.h"
+#include "inferx/util/config_view.h"
 
 namespace inferx {
 namespace {
 
-components::AttentionConfig Attention(int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
-  components::AttentionConfig a;
+namespace layers = ::inferx::models::layers;
+namespace loading = ::inferx::models::loading;
+using ::inferx::models::WeightNames;
+using ::inferx::models::WeightLayout;
+using ::inferx::models::QkvLayout;
+
+layers::AttentionConfig Attention(int64_t query_heads, int64_t kv_heads, int64_t head_dim) {
+  layers::AttentionConfig a;
   a.query_heads = query_heads;
   a.kv_heads = kv_heads;
   a.head_dim = head_dim;
@@ -42,26 +49,26 @@ float Bf16ToFloat(uint16_t bits) {
 }
 
 TEST(ShardDimTest, DividesEvenlyAcrossRanks) {
-  const auto shard = components::ShardDim(16, Parallel(2, 1));
+  const auto shard = layers::ShardDim(16, Parallel(2, 1));
   ASSERT_TRUE(shard.ok()) << shard.status();
   EXPECT_EQ(shard->size, 8);
   EXPECT_EQ(shard->begin, 8);
-  const auto whole = components::ShardDim(16, Parallel(1, 0));
+  const auto whole = layers::ShardDim(16, Parallel(1, 0));
   ASSERT_TRUE(whole.ok());
   EXPECT_EQ(whole->size, 16);
   EXPECT_EQ(whole->begin, 0);
 }
 
 TEST(ShardDimTest, RejectsIndivisibleAndInvalidExtents) {
-  EXPECT_FALSE(components::ShardDim(15, Parallel(2, 0)).ok());
-  EXPECT_FALSE(components::ShardDim(0, Parallel(1, 0)).ok());
-  EXPECT_FALSE(components::ShardDim(-4, Parallel(1, 0)).ok());
-  EXPECT_FALSE(components::ShardDim(16, Parallel(0, 0)).ok());
-  EXPECT_FALSE(components::ShardDim(16, Parallel(2, 2)).ok());
+  EXPECT_FALSE(layers::ShardDim(15, Parallel(2, 0)).ok());
+  EXPECT_FALSE(layers::ShardDim(0, Parallel(1, 0)).ok());
+  EXPECT_FALSE(layers::ShardDim(-4, Parallel(1, 0)).ok());
+  EXPECT_FALSE(layers::ShardDim(16, Parallel(0, 0)).ok());
+  EXPECT_FALSE(layers::ShardDim(16, Parallel(2, 2)).ok());
 }
 
 TEST(ShardQkvTest, SingleRankIsIdentity) {
-  const auto g = components::ShardQkv(Attention(4, 2, 64), Parallel(1, 0));
+  const auto g = layers::ShardQkv(Attention(4, 2, 64), Parallel(1, 0));
   ASSERT_TRUE(g.ok()) << g.status();
   EXPECT_EQ(g->query_heads, 4);
   EXPECT_EQ(g->kv_heads, 2);
@@ -72,7 +79,7 @@ TEST(ShardQkvTest, SingleRankIsIdentity) {
 }
 
 TEST(ShardQkvTest, HeadsDivideAcrossRanks) {
-  const auto g = components::ShardQkv(Attention(32, 8, 128), Parallel(4, 1));
+  const auto g = layers::ShardQkv(Attention(32, 8, 128), Parallel(4, 1));
   ASSERT_TRUE(g.ok()) << g.status();
   EXPECT_EQ(g->query_heads, 8);
   EXPECT_EQ(g->kv_heads, 2);
@@ -84,7 +91,7 @@ TEST(ShardQkvTest, HeadsDivideAcrossRanks) {
 
 TEST(ShardQkvTest, KvHeadsReplicateWhenFewerThanRanks) {
   for (int rank = 0; rank < 8; ++rank) {
-    const auto g = components::ShardQkv(Attention(32, 4, 64), Parallel(8, rank));
+    const auto g = layers::ShardQkv(Attention(32, 4, 64), Parallel(8, rank));
     ASSERT_TRUE(g.ok()) << g.status();
     EXPECT_EQ(g->kv_heads, 1);
     EXPECT_EQ(g->kv_head_replicas, 2);
@@ -95,20 +102,20 @@ TEST(ShardQkvTest, KvHeadsReplicateWhenFewerThanRanks) {
 
 TEST(ShardQkvTest, GatedOutputDoublesQueryRows) {
   auto total = Attention(8, 4, 64);
-  total.output_gate = components::OutputGate::kSigmoid;
-  const auto g = components::ShardQkv(total, Parallel(2, 1));
+  total.output_gate = layers::OutputGate::kSigmoid;
+  const auto g = layers::ShardQkv(total, Parallel(2, 1));
   ASSERT_TRUE(g.ok()) << g.status();
   EXPECT_EQ(g->query_heads, 4);
   EXPECT_EQ(g->query_rows, 4 * 64 * 2);
 }
 
 TEST(ShardQkvTest, RejectsBadTopologyAndIndivisibleHeads) {
-  EXPECT_FALSE(components::ShardQkv(Attention(32, 8, 64), Parallel(0, 0)).ok());
-  EXPECT_FALSE(components::ShardQkv(Attention(32, 8, 64), Parallel(4, 4)).ok());
-  EXPECT_FALSE(components::ShardQkv(Attention(32, 8, 64), Parallel(4, -1)).ok());
-  EXPECT_FALSE(components::ShardQkv(Attention(33, 33, 64), Parallel(4, 0)).ok());
-  EXPECT_FALSE(components::ShardQkv(Attention(32, 6, 64), Parallel(4, 0)).ok());
-  EXPECT_FALSE(components::ShardQkv(Attention(32, 3, 64), Parallel(4, 0)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(32, 8, 64), Parallel(0, 0)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(32, 8, 64), Parallel(4, 4)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(32, 8, 64), Parallel(4, -1)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(33, 33, 64), Parallel(4, 0)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(32, 6, 64), Parallel(4, 0)).ok());
+  EXPECT_FALSE(layers::ShardQkv(Attention(32, 3, 64), Parallel(4, 0)).ok());
 }
 
 /// \brief A tiny one-layer llama-layout checkpoint on disk, f32, whose q/k/v
@@ -203,26 +210,27 @@ class ParallelLoadingTest : public ::testing::Test {
     };
   }
 
-  StatusOr<causal::DecoderConfig> Config() {
+  StatusOr<layers::StackConfig> Config() {
     const std::string json =
         "{\"model_type\":\"llama\",\"hidden_size\":8,\"intermediate_size\":16,"
         "\"num_hidden_layers\":1,\"num_attention_heads\":4,\"num_key_value_heads\":2,"
         "\"head_dim\":4,\"vocab_size\":8,\"max_position_embeddings\":64,"
         "\"rms_norm_eps\":0.00001,\"rope_theta\":10000.0,\"tie_word_embeddings\":false}";
-    CheckpointConfig identity;
-    identity.model_type = "llama";
-    return TranslateFamilyConfig(identity, json);
+    const nlohmann::json parsed = nlohmann::json::parse(json);
+    const ConfigView view(&parsed, "");
+    INFERX_ASSIGN_OR_RETURN(auto config, models::llama::LlamaConfig::Parse(view));
+    return models::llama::BuildStackConfig(config);
   }
 
-  StatusOr<causal::DecoderWeights> Load(const std::vector<TensorSpec>& tensors,
+  StatusOr<layers::StackWeights> Load(const std::vector<TensorSpec>& tensors,
                                         const ParallelConfig& parallel,
-                                        const models::WeightNames& names = {},
-                                        const models::WeightLayout& layout = {}) {
+                                        const WeightNames& names = {},
+                                        const WeightLayout& layout = {}) {
     WriteCheckpoint(tensors);
     INFERX_ASSIGN_OR_RETURN(auto checkpoint, models::Checkpoint::Open(dir_.string()));
     INFERX_ASSIGN_OR_RETURN(auto config, Config());
-    return causal::LoadDecoderWeights(checkpoint, config, names, layout, parallel,
-                                      DeviceId::Cpu());
+    return loading::LoadStackWeights(checkpoint, config, names, layout, parallel,
+                                     DeviceId::Cpu());
   }
 
   float RowValue(const Tensor& packed, int64_t row, int64_t width = kHidden) {
@@ -241,7 +249,7 @@ class ParallelLoadingTest : public ::testing::Test {
 TEST_F(ParallelLoadingTest, PacksQkvInBlockContiguousOrder) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
+  const auto& attn = std::get<layers::AttentionWeights>(weights->blocks[0].mixer);
   EXPECT_EQ(attn.packed_qkv.GetShape().ToString(),
             Shape({kQueryRows + 2 * kKvRows, kHidden}).ToString());
   for (int64_t row = 0; row < kQueryRows; ++row) {
@@ -260,12 +268,12 @@ TEST_F(ParallelLoadingTest, FusedCheckpointQkvUsesTheSameRankSlices) {
   tensors.erase(tensors.begin() + 4, tensors.begin() + 7);
   tensors.push_back(
       {"model.layers.0.self_attn.qkv.weight", {kQueryRows + 2 * kKvRows, kHidden}, 0.0f});
-  models::WeightNames names;
+  WeightNames names;
   names.qkv = "self_attn.qkv";
   const auto weights =
-      Load(tensors, Parallel(2, 1), names, models::WeightLayout{models::QkvLayout::kFused});
+      Load(tensors, Parallel(2, 1), names, WeightLayout{QkvLayout::kFused});
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attention = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
+  const auto& attention = std::get<layers::AttentionWeights>(weights->blocks[0].mixer);
   for (int64_t row = 0; row < 8; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attention.packed_qkv, row), 8.0f + row);
   }
@@ -291,7 +299,7 @@ TEST_F(ParallelLoadingTest, CompleteNameMappingPreservesGateAndUpRoles) {
                                             "transformer.h.0.mlp.c_proj"};
   ASSERT_EQ(tensors.size(), renamed.size());
   for (size_t i = 0; i < tensors.size(); ++i) tensors[i].name = renamed[i] + ".weight";
-  const models::WeightNames names{.embed = "transformer.wte",
+  const WeightNames names{.embed = "transformer.wte",
                                   .layers = "transformer.h",
                                   .final_norm = "transformer.ln_f",
                                   .attn_norm = "ln_1",
@@ -305,21 +313,21 @@ TEST_F(ParallelLoadingTest, CompleteNameMappingPreservesGateAndUpRoles) {
                                   .down = "mlp.c_proj"};
   const auto weights = Load(tensors, Parallel(1, 0), names);
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& mlp = std::get<components::SwiGluWeights>(weights->blocks[0].feed_forward);
+  const auto& mlp = std::get<layers::GatedMlpWeights>(weights->blocks[0].feed_forward);
   EXPECT_FLOAT_EQ(RowValue(mlp.gate.weight, 3), 3.0f);
   EXPECT_FLOAT_EQ(RowValue(mlp.up.weight, 3), 103.0f);
 }
 
 TEST_F(ParallelLoadingTest, FusedLayoutRequiresAnExplicitName) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0), {},
-                            models::WeightLayout{models::QkvLayout::kFused});
+                            WeightLayout{QkvLayout::kFused});
   EXPECT_EQ(weights.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 TEST_F(ParallelLoadingTest, PerProjectionWeightsAreViewsIntoThePackedTensor) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
+  const auto& attn = std::get<layers::AttentionWeights>(weights->blocks[0].mixer);
   const auto* base = static_cast<const std::byte*>(attn.packed_qkv.Data());
   EXPECT_EQ(static_cast<const std::byte*>(attn.query.weight.Data()), base);
   EXPECT_EQ(static_cast<const std::byte*>(attn.key.weight.Data()),
@@ -333,7 +341,7 @@ TEST_F(ParallelLoadingTest, ShardsQueryAndKvRowsByRank) {
   // (rows 4..7 of k_proj and v_proj).
   const auto weights = Load(StandardTensors(), Parallel(2, 1));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
+  const auto& attn = std::get<layers::AttentionWeights>(weights->blocks[0].mixer);
   ASSERT_EQ(attn.packed_qkv.Dim(0), 8 + 2 * 4);
   for (int64_t row = 0; row < 8; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, row), 8.0f + row);
@@ -349,7 +357,7 @@ TEST_F(ParallelLoadingTest, ReplicatesKvHeadsBelowRankCount) {
   // k/v rows 4..7; query rows 12..15 (rank * 1 q head * head_dim 4).
   const auto weights = Load(StandardTensors(), Parallel(4, 3));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& attn = std::get<components::AttentionWeights>(weights->blocks[0].mixer);
+  const auto& attn = std::get<layers::AttentionWeights>(weights->blocks[0].mixer);
   ASSERT_EQ(attn.packed_qkv.Dim(0), 4 + 2 * 4);  // 1 q head, 1 kv head.
   for (int64_t row = 0; row < 4; ++row) {
     EXPECT_FLOAT_EQ(RowValue(attn.packed_qkv, row), 12.0f + row);
@@ -379,7 +387,7 @@ TEST_F(ParallelLoadingTest, WrongProjectionShapeIsRejected) {
 TEST_F(ParallelLoadingTest, MergesGateUpInBlockContiguousOrder) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
-  const auto& ffn = std::get<components::SwiGluWeights>(weights->blocks[0].feed_forward);
+  const auto& ffn = std::get<layers::GatedMlpWeights>(weights->blocks[0].feed_forward);
   EXPECT_EQ(ffn.packed_gate_up.GetShape().ToString(), Shape({32, kHidden}).ToString());
   for (int64_t row = 0; row < 16; ++row) {
     EXPECT_FLOAT_EQ(RowValue(ffn.packed_gate_up, row), static_cast<float>(row));
@@ -397,7 +405,7 @@ TEST_F(ParallelLoadingTest, ShardsMergedGateUpAndRowParallelProjections) {
   const auto weights = Load(StandardTensors(), Parallel(2, 1));
   ASSERT_TRUE(weights.ok()) << weights.status();
   const auto& block = weights->blocks[0];
-  const auto& ffn = std::get<components::SwiGluWeights>(block.feed_forward);
+  const auto& ffn = std::get<layers::GatedMlpWeights>(block.feed_forward);
   EXPECT_EQ(ffn.packed_gate_up.Dim(0), 16);  // 2 * shard rows.
   for (int64_t row = 0; row < 8; ++row) {
     EXPECT_FLOAT_EQ(RowValue(ffn.packed_gate_up, row), 8.0f + row);
@@ -410,10 +418,10 @@ TEST_F(ParallelLoadingTest, ShardsMergedGateUpAndRowParallelProjections) {
     EXPECT_FLOAT_EQ(ElemValue(ffn.down.weight, 3, col, 8), 8.0f + col);
   }
   // o_proj likewise, over the (undoubled) query width.
-  ASSERT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(0), kHidden);
-  ASSERT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(1), 8);
+  ASSERT_EQ(std::get<layers::AttentionWeights>(block.mixer).output.weight.Dim(0), kHidden);
+  ASSERT_EQ(std::get<layers::AttentionWeights>(block.mixer).output.weight.Dim(1), 8);
   for (int64_t col = 0; col < 8; ++col) {
-    EXPECT_FLOAT_EQ(ElemValue(std::get<components::AttentionWeights>(block.mixer).output.weight, 0, col, 8), 8.0f + col);
+    EXPECT_FLOAT_EQ(ElemValue(std::get<layers::AttentionWeights>(block.mixer).output.weight, 0, col, 8), 8.0f + col);
   }
 }
 
@@ -421,8 +429,8 @@ TEST_F(ParallelLoadingTest, SingleRankRowParallelLoadsWholeTensor) {
   const auto weights = Load(StandardTensors(), Parallel(1, 0));
   ASSERT_TRUE(weights.ok()) << weights.status();
   const auto& block = weights->blocks[0];
-  EXPECT_EQ(std::get<components::AttentionWeights>(block.mixer).output.weight.Dim(1), kQueryRows);  // Full input width.
-  EXPECT_FLOAT_EQ(ElemValue(std::get<components::AttentionWeights>(block.mixer).output.weight, 0, 15, kQueryRows), 15.0f);
+  EXPECT_EQ(std::get<layers::AttentionWeights>(block.mixer).output.weight.Dim(1), kQueryRows);  // Full input width.
+  EXPECT_FLOAT_EQ(ElemValue(std::get<layers::AttentionWeights>(block.mixer).output.weight, 0, 15, kQueryRows), 15.0f);
 }
 
 TEST_F(ParallelLoadingTest, ShardsEmbeddingByVocabRows) {

@@ -1,5 +1,7 @@
 #include "inferx/models/loading/weight_loader.h"
 
+#include "inferx/models/loading/parameter_spec.h"
+
 #include <cstring>
 #include <iterator>
 #include <optional>
@@ -8,17 +10,19 @@
 #include <variant>
 #include <vector>
 
-#include "inferx/config/parallel_config.h"
-#include "inferx/models/checkpoint.h"
-#include "inferx/models/components/parallel_linear.h"
-#include "inferx/models/components/qkv_linear.h"
+#include "inferx/core/logging.h"
+#include "inferx/models/layers/linear.h"
 
-namespace inferx::causal {
+namespace inferx::models::loading {
 namespace {
 
-StatusOr<Tensor> Weight(const models::Checkpoint& checkpoint, const std::string& name,
+/// \brief Loads one replicated parameter by name and full shape; the
+///        ParameterSpec form is the loader's declared contract.
+StatusOr<Tensor> Weight(const Checkpoint& checkpoint, const std::string& name,
                         std::vector<int64_t> shape, DeviceId device) {
-  return checkpoint.UploadBf16(name, Shape(absl::MakeConstSpan(shape)), device);
+  return LoadReplicatedParameter(
+      checkpoint, ParameterSpec{name, Shape(absl::MakeConstSpan(shape)), ShardRule::kReplicated},
+      device);
 }
 
 /// \brief Copies columns [begin, end) of a rank-2 host tensor into a fresh
@@ -97,10 +101,10 @@ StatusOr<Tensor> PadColumnsZero(const Tensor& host, int64_t padded_cols) {
 ///
 /// The rank-local GEMM yields partial sums over its input slice; the
 /// cross-rank reduction arrives with the tensor-parallel milestone.
-StatusOr<Tensor> LoadRowParallel(const models::Checkpoint& checkpoint, const std::string& name,
+StatusOr<Tensor> LoadRowParallel(const Checkpoint& checkpoint, const std::string& name,
                                  int64_t rows, int64_t total_cols,
                                  const ParallelConfig& parallel, DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(total_cols, parallel));
+  INFERX_ASSIGN_OR_RETURN(auto shard, layers::ShardDim(total_cols, parallel));
   if (parallel.tensor_parallel_size == 1) {
     return checkpoint.UploadBf16(name, Shape({rows, total_cols}), device);
   }
@@ -122,13 +126,13 @@ StatusOr<Tensor> LoadRowParallel(const models::Checkpoint& checkpoint, const std
 /// rows and offsets. o_proj is RowParallel: its input columns shard by this
 /// rank's (undoubled) query width. Projection biases are never loaded --
 /// ValidateExecutable() rejects biased projections before any weight is read.
-StatusOr<components::AttentionWeights> LoadAttentionWeights(
-    const models::Checkpoint& checkpoint, const std::string& prefix,
-    const models::WeightNames& names, const models::WeightLayout& layout,
-    const components::AttentionConfig& a, const ParallelConfig& parallel, int64_t hidden,
+StatusOr<layers::AttentionWeights> LoadAttentionWeights(
+    const Checkpoint& checkpoint, const std::string& prefix,
+    const WeightNames& names, const WeightLayout& layout,
+    const layers::AttentionConfig& a, const ParallelConfig& parallel, int64_t hidden,
     DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto geometry, components::ShardQkv(a, parallel));
-  const int64_t gate_rows = a.output_gate == components::OutputGate::kNone ? 1 : 2;
+  INFERX_ASSIGN_OR_RETURN(auto geometry, layers::ShardQkv(a, parallel));
+  const int64_t gate_rows = a.output_gate == layers::OutputGate::kNone ? 1 : 2;
   const int64_t total_query_rows = a.query_heads * a.head_dim * gate_rows;
   const int64_t total_kv_rows = a.kv_heads * a.head_dim;
 
@@ -153,7 +157,7 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
   std::optional<Tensor> query_view, key_view, value_view;
   std::optional<Tensor>* views[3] = {&query_view, &key_view, &value_view};
   std::optional<Tensor> fused;
-  if (layout.qkv == models::QkvLayout::kFused) {
+  if (layout.qkv == QkvLayout::kFused) {
     if (names.qkv.empty()) return InvalidArgumentError("fused QKV requires a checkpoint name");
     INFERX_ASSIGN_OR_RETURN(
         fused, checkpoint.FindHostBf16(prefix + std::string(names.qkv) + ".weight",
@@ -169,7 +173,7 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
                                      Shape({part.full_rows, hidden}));
     };
     INFERX_ASSIGN_OR_RETURN(auto host, source());
-    if (i == 0 && a.output_gate == components::OutputGate::kSigmoid) {
+    if (i == 0 && a.output_gate == layers::OutputGate::kSigmoid) {
       // Qwen3-Next stores [q_h | gate_h] per head; reorder once here so the
       // packed projection splits [query | gate | key | value] in blocks.
       INFERX_ASSIGN_OR_RETURN(auto split, DeinterleaveRows(host, a.head_dim));
@@ -196,7 +200,7 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
           auto host,
           checkpoint.FindHostBf16(prefix + std::string(bias_names[i]) + ".bias",
                                   Shape({part.full_rows})));
-      if (i == 0 && a.output_gate == components::OutputGate::kSigmoid) {
+      if (i == 0 && a.output_gate == layers::OutputGate::kSigmoid) {
         // The doubled query bias interleaves [q_h | gate_h] per element.
         INFERX_ASSIGN_OR_RETURN(auto two_d, host.Reshape(Shape({part.full_rows, 1})));
         INFERX_ASSIGN_OR_RETURN(auto split, DeinterleaveRows(two_d, 1));
@@ -238,12 +242,12 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
                                    {a.query_heads}, device));
     sinks = std::move(sink_weights);
   }
-  return components::AttentionWeights{
+  return layers::AttentionWeights{
       std::move(packed),
-      components::LinearWeights{std::move(*query_view), std::nullopt},
-      components::LinearWeights{std::move(*key_view), std::nullopt},
-      components::LinearWeights{std::move(*value_view), std::nullopt},
-      components::LinearWeights{std::move(output), std::nullopt},
+      layers::LinearWeights{std::move(*query_view), std::nullopt},
+      layers::LinearWeights{std::move(*key_view), std::nullopt},
+      layers::LinearWeights{std::move(*value_view), std::nullopt},
+      layers::LinearWeights{std::move(output), std::nullopt},
       std::move(query_norm),
       std::move(key_norm),
       std::move(qkv_bias),
@@ -254,13 +258,13 @@ StatusOr<components::AttentionWeights> LoadAttentionWeights(
 /// \brief Loads a SwiGLU block: fused gate|up (MergedColumnParallelLinear --
 ///        one [2 * shard, hidden] allocation, per-rank row slices uploaded
 ///        directly) plus a RowParallel down projection.
-StatusOr<components::SwiGluWeights> SwiGlu(const models::Checkpoint& checkpoint,
+StatusOr<layers::GatedMlpWeights> LoadGatedMlp(const Checkpoint& checkpoint,
                                            const std::string& gate_name,
                                            const std::string& up_name,
                                            const std::string& down_name, int64_t hidden,
                                            int64_t total_intermediate,
                                            const ParallelConfig& parallel, DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(total_intermediate, parallel));
+  INFERX_ASSIGN_OR_RETURN(auto shard, layers::ShardDim(total_intermediate, parallel));
   const int64_t rows = shard.size;
   INFERX_ASSIGN_OR_RETURN(
       auto packed, Tensor::Empty(DataType::kBFloat16, Shape({2 * rows, hidden}), device));
@@ -280,20 +284,20 @@ StatusOr<components::SwiGluWeights> SwiGlu(const models::Checkpoint& checkpoint,
   INFERX_ASSIGN_OR_RETURN(Tensor up_view, packed.Slice(rows, 2 * rows));
   INFERX_ASSIGN_OR_RETURN(auto down, LoadRowParallel(checkpoint, down_name + ".weight", hidden,
                                                      total_intermediate, parallel, device));
-  return components::SwiGluWeights{
-      std::move(packed), components::LinearWeights{std::move(gate_view), std::nullopt},
-      components::LinearWeights{std::move(up_view), std::nullopt},
-      components::LinearWeights{std::move(down), std::nullopt}};
+  return layers::GatedMlpWeights{
+      std::move(packed), layers::LinearWeights{std::move(gate_view), std::nullopt},
+      layers::LinearWeights{std::move(up_view), std::nullopt},
+      layers::LinearWeights{std::move(down), std::nullopt}};
 }
 
 /// \brief Loads MLA projections with the layout the kernels assume.
 ///
 /// q_b rows reorder per head [nope | rope] -> [rope | nope]; kv_a splits into
 /// its rope slice and latent; o_proj gains zero columns for the padded V tail.
-StatusOr<components::MlaWeights> LoadMlaWeights(const models::Checkpoint& checkpoint,
+StatusOr<layers::MlaWeights> LoadMlaWeights(const Checkpoint& checkpoint,
                                                 const std::string& prefix,
-                                                const models::WeightNames& names,
-                                                const components::MlaConfig& a, int64_t hidden,
+                                                const WeightNames& names,
+                                                const layers::MlaConfig& a, int64_t hidden,
                                                 DeviceId device) {
   const int64_t head_dim = a.head_dim();
   INFERX_ASSIGN_OR_RETURN(auto q_a, Weight(checkpoint, prefix + std::string(names.mla_q_a) + ".weight",
@@ -339,16 +343,16 @@ StatusOr<components::MlaWeights> LoadMlaWeights(const models::Checkpoint& checkp
                                            Shape({hidden, a.query_heads * a.v_head_dim})));
   INFERX_ASSIGN_OR_RETURN(auto o_padded, PadColumnsZero(o_host, a.query_heads * head_dim));
   INFERX_ASSIGN_OR_RETURN(auto output, o_padded.To(device));
-  return components::MlaWeights{std::move(q_a),       std::move(q_a_norm),  std::move(q_b),
+  return layers::MlaWeights{std::move(q_a),       std::move(q_a_norm),  std::move(q_b),
                                 std::move(k_rope),    std::move(kv_latent), std::move(kv_a_norm),
                                 std::move(kv_b),      std::move(output)};
 }
 
 /// \brief Loads the Gated DeltaNet projections and float32 gates.
-StatusOr<components::GdnWeights> LoadGdnWeights(const models::Checkpoint& checkpoint,
+StatusOr<layers::GdnWeights> LoadGdnWeights(const Checkpoint& checkpoint,
                                                 const std::string& prefix,
-                                                const models::WeightNames& names,
-                                                const components::GatedDeltaNetConfig& a,
+                                                const WeightNames& names,
+                                                const layers::GatedDeltaNetConfig& a,
                                                 int64_t hidden, DeviceId device) {
   const int64_t q_total = a.key_heads * a.key_dim, v_total = a.value_heads * a.value_dim;
   INFERX_ASSIGN_OR_RETURN(
@@ -373,7 +377,7 @@ StatusOr<components::GdnWeights> LoadGdnWeights(const models::Checkpoint& checkp
                                  {a.value_dim}, device));
   INFERX_ASSIGN_OR_RETURN(auto out, Weight(checkpoint, prefix + std::string(names.gdn_out) + ".weight",
                                            {hidden, v_total}, device));
-  return components::GdnWeights{std::move(qkvz),  std::move(ba), std::move(conv),
+  return layers::GdnWeights{std::move(qkvz),  std::move(ba), std::move(conv),
                                 std::move(a_log), std::move(dt_bias),
                                 std::move(norm),   std::move(out)};
 }
@@ -382,9 +386,9 @@ StatusOr<components::GdnWeights> LoadGdnWeights(const models::Checkpoint& checkp
 ///
 /// Rows interleave gate/up per row; dequantization and de-interleaving both
 /// happen once on the host, leaving ordinary bf16 block-contiguous experts.
-StatusOr<std::vector<components::SwiGluWeights>> LoadFusedMxExperts(
-    const models::Checkpoint& checkpoint, const std::string& prefix,
-    const models::WeightNames& names, const components::MoeConfig& m, int64_t hidden,
+StatusOr<std::vector<layers::GatedMlpWeights>> LoadFusedMxExperts(
+    const Checkpoint& checkpoint, const std::string& prefix,
+    const WeightNames& names, const layers::MoeConfig& m, int64_t hidden,
     DeviceId device) {
   const int64_t inter = m.intermediate_size;
   const auto blocks = checkpoint.Find(prefix + std::string(names.experts_gate_up_blocks) + ".weight");
@@ -407,7 +411,7 @@ StatusOr<std::vector<components::SwiGluWeights>> LoadFusedMxExperts(
       auto down_bias,
       checkpoint.FindHostBf16(prefix + std::string(names.experts_down_bias) + ".weight",
                              Shape({m.num_experts, hidden})));
-  std::vector<components::SwiGluWeights> experts;
+  std::vector<layers::GatedMlpWeights> experts;
   experts.reserve(m.num_experts);
   for (int64_t e = 0; e < m.num_experts; ++e) {
     INFERX_ASSIGN_OR_RETURN(auto gate_up_host,
@@ -432,19 +436,19 @@ StatusOr<std::vector<components::SwiGluWeights>> LoadFusedMxExperts(
     INFERX_ASSIGN_OR_RETURN(auto down_bias_rows, down_bias.Slice(e, e + 1));
     INFERX_ASSIGN_OR_RETURN(auto down_bias_dev,
                             down_bias_rows.Reshape(Shape({hidden})).value().To(device));
-    experts.push_back(components::SwiGluWeights{
+    experts.push_back(layers::GatedMlpWeights{
         std::move(gate_up_dev),
-        components::LinearWeights{std::move(gate_rows), std::nullopt},
-        components::LinearWeights{std::move(up_rows), std::nullopt},
-        components::LinearWeights{std::move(down), std::nullopt},
+        layers::LinearWeights{std::move(gate_rows), std::nullopt},
+        layers::LinearWeights{std::move(up_rows), std::nullopt},
+        layers::LinearWeights{std::move(down), std::nullopt},
         std::move(packed_bias_dev), std::move(down_bias_dev)});
   }
   return experts;
 }
 
-StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
-    const models::Checkpoint& checkpoint, const components::DecoderLayerConfig& config,
-    const models::WeightNames& names, const models::WeightLayout& layout,
+StatusOr<layers::DecoderLayerWeights> LoadDecoderLayerWeights(
+    const Checkpoint& checkpoint, const layers::DecoderLayerConfig& config,
+    const WeightNames& names, const WeightLayout& layout,
     const std::string& prefix, int64_t hidden, const ParallelConfig& parallel,
     DeviceId device) {
   INFERX_ASSIGN_OR_RETURN(
@@ -454,7 +458,7 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
       auto post_mixer_norm,
       Weight(checkpoint, prefix + std::string(names.ffn_norm) + ".weight", {hidden}, device));
   std::optional<Tensor> mixer_out_norm, feed_forward_out_norm;
-  if (config.residual == components::ResidualStyle::kOutputNorm) {
+  if (config.residual == layers::ResidualStyle::kOutputNorm) {
     if (names.attn_out_norm.empty() || names.ffn_out_norm.empty()) {
       return InvalidArgumentError("output-normalized layers need their norm names");
     }
@@ -467,35 +471,35 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
     mixer_out_norm = std::move(mixer_norm);
     feed_forward_out_norm = std::move(ffn_norm_out);
   }
-  std::optional<std::variant<components::AttentionWeights, components::MlaWeights,
-                             components::GdnWeights>>
+  std::optional<std::variant<layers::AttentionWeights, layers::MlaWeights,
+                             layers::GdnWeights>>
       attn;
-  if (const auto* a = std::get_if<components::AttentionConfig>(&config.mixer)) {
+  if (const auto* a = std::get_if<layers::AttentionConfig>(&config.mixer)) {
     INFERX_ASSIGN_OR_RETURN(auto weights,
                             LoadAttentionWeights(checkpoint, prefix, names, layout, *a, parallel,
                                                  hidden, device));
     attn = std::move(weights);
-  } else if (const auto* m = std::get_if<components::MlaConfig>(&config.mixer)) {
+  } else if (const auto* m = std::get_if<layers::MlaConfig>(&config.mixer)) {
     INFERX_ASSIGN_OR_RETURN(auto weights, LoadMlaWeights(checkpoint, prefix, names, *m, hidden,
                                                           device));
     attn = std::move(weights);
   } else {
-    const auto& g = std::get<components::GatedDeltaNetConfig>(config.mixer);
+    const auto& g = std::get<layers::GatedDeltaNetConfig>(config.mixer);
     INFERX_ASSIGN_OR_RETURN(auto weights, LoadGdnWeights(checkpoint, prefix, names, g, hidden,
                                                           device));
     attn = std::move(weights);
   }
-  if (const auto* dense = std::get_if<components::SwiGluConfig>(&config.feed_forward)) {
+  if (const auto* dense = std::get_if<layers::GatedMlpConfig>(&config.feed_forward)) {
     INFERX_ASSIGN_OR_RETURN(
-        auto ffn, SwiGlu(checkpoint, prefix + std::string(names.gate),
+        auto ffn, LoadGatedMlp(checkpoint, prefix + std::string(names.gate),
                          prefix + std::string(names.up), prefix + std::string(names.down),
                          hidden, dense->intermediate_size, parallel, device));
-    return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
+    return layers::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
                                            std::move(mixer_out_norm),
                                            std::move(feed_forward_out_norm),
                                            std::move(*attn), std::move(ffn)};
   }
-  const auto& m = std::get<components::MoeConfig>(config.feed_forward);
+  const auto& m = std::get<layers::MoeConfig>(config.feed_forward);
   INFERX_ASSIGN_OR_RETURN(auto router,
                           Weight(checkpoint, prefix + std::string(names.router) + ".weight",
                                  {m.num_experts, hidden}, device));
@@ -514,7 +518,7 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
                                 {m.num_experts}, device));
     correction_bias = std::move(bias);
   }
-  std::vector<components::SwiGluWeights> experts;
+  std::vector<layers::GatedMlpWeights> experts;
   if (m.fused_mxfp4_experts) {
     INFERX_ASSIGN_OR_RETURN(experts,
                             LoadFusedMxExperts(checkpoint, prefix, names, m, hidden, device));
@@ -524,16 +528,16 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
         prefix + std::string(names.experts) + "." + std::to_string(i) + ".";
     INFERX_ASSIGN_OR_RETURN(
         auto expert,
-        SwiGlu(checkpoint, expert_prefix + "gate_proj", expert_prefix + "up_proj",
+        LoadGatedMlp(checkpoint, expert_prefix + "gate_proj", expert_prefix + "up_proj",
                expert_prefix + "down_proj", hidden, m.intermediate_size, parallel, device));
     experts.push_back(std::move(expert));
   }
-  std::optional<components::SwiGluWeights> shared_expert;
+  std::optional<layers::GatedMlpWeights> shared_expert;
   std::optional<Tensor> shared_expert_gate;
   if (m.shared_intermediate_size > 0) {
     const auto shared_prefix = prefix + std::string(names.shared_expert) + ".";
     INFERX_ASSIGN_OR_RETURN(
-        auto shared, SwiGlu(checkpoint, shared_prefix + "gate_proj",
+        auto shared, LoadGatedMlp(checkpoint, shared_prefix + "gate_proj",
                             shared_prefix + "up_proj", shared_prefix + "down_proj", hidden,
                             m.shared_intermediate_size, parallel, device));
     shared_expert = std::move(shared);
@@ -544,10 +548,10 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
       shared_expert_gate = std::move(gate);
     }
   }
-  components::MoeWeights moe{std::move(router),       std::move(router_bias),
+  layers::MoeWeights moe{std::move(router),       std::move(router_bias),
                              std::move(correction_bias), std::move(experts),
                              std::move(shared_expert),   std::move(shared_expert_gate)};
-  return components::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
+  return layers::DecoderLayerWeights{std::move(input_norm), std::move(post_mixer_norm),
                                          std::move(mixer_out_norm),
                                          std::move(feed_forward_out_norm),
                                          std::move(*attn), std::move(moe)};
@@ -555,41 +559,41 @@ StatusOr<components::DecoderLayerWeights> LoadDecoderLayer(
 
 }  // namespace
 
-StatusOr<Tensor> LoadWeight(const models::Checkpoint& checkpoint, std::string_view name,
-                            const Shape& expected, DeviceId device) {
-  return checkpoint.UploadBf16(name, expected, device);
+StatusOr<Tensor> LoadReplicatedParameter(const Checkpoint& checkpoint,
+                                         const ParameterSpec& spec, DeviceId device) {
+  return checkpoint.UploadBf16(spec.name, spec.shape, device);
 }
 
-StatusOr<Tensor> LoadVocabShard(const models::Checkpoint& checkpoint, std::string_view name,
+StatusOr<Tensor> LoadVocabShard(const Checkpoint& checkpoint, std::string_view name,
                                 int64_t vocab, int64_t hidden, const ParallelConfig& parallel,
                                 DeviceId device) {
-  INFERX_ASSIGN_OR_RETURN(auto shard, components::ShardDim(vocab, parallel));
+  INFERX_ASSIGN_OR_RETURN(auto shard, layers::ShardDim(vocab, parallel));
   INFERX_ASSIGN_OR_RETURN(auto host, checkpoint.FindHostBf16(name, Shape({vocab, hidden})));
   INFERX_ASSIGN_OR_RETURN(auto slice, host.Slice(shard.begin, shard.begin + shard.size));
   return slice.To(device);
 }
 
-StatusOr<DecoderWeights> LoadDecoderWeights(const models::Checkpoint& checkpoint,
-                                            const DecoderConfig& config,
-                                            const models::WeightNames& names,
-                                            const models::WeightLayout& layout,
-                                            const ParallelConfig& parallel, DeviceId device) {
-  const auto& mc = config.model;
+StatusOr<layers::StackWeights> LoadStackWeights(const Checkpoint& checkpoint,
+                                                const layers::StackConfig& config,
+                                                const WeightNames& names,
+                                                const WeightLayout& layout,
+                                                const ParallelConfig& parallel, DeviceId device) {
+  const auto& mc = config;
   INFERX_ASSIGN_OR_RETURN(auto token_embedding,
                           LoadVocabShard(checkpoint, std::string(names.embed) + ".weight",
                                          mc.vocab_size, mc.hidden_size, parallel, device));
   INFERX_ASSIGN_OR_RETURN(
       auto final_norm,
       Weight(checkpoint, std::string(names.final_norm) + ".weight", {mc.hidden_size}, device));
-  std::vector<components::DecoderLayerWeights> blocks;
+  std::vector<layers::DecoderLayerWeights> blocks;
   for (size_t i = 0; i < config.blocks.size(); ++i) {
     INFERX_ASSIGN_OR_RETURN(
-        auto block, LoadDecoderLayer(checkpoint, config.blocks[i], names, layout,
+        auto block, LoadDecoderLayerWeights(checkpoint, config.blocks[i], names, layout,
                                      std::string(names.layers) + "." + std::to_string(i) + ".",
                                      mc.hidden_size, parallel, device));
     blocks.push_back(std::move(block));
   }
-  return DecoderWeights{std::move(token_embedding), std::move(final_norm), std::move(blocks)};
+  return layers::StackWeights{std::move(token_embedding), std::move(final_norm), std::move(blocks)};
 }
 
-}  // namespace inferx::causal
+}  // namespace inferx::models::loading

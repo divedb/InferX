@@ -10,7 +10,7 @@
 #include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
-#include "inferx/models/checkpoint_config.h"
+#include "inferx/server/generation_config.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/server/tokenizer_pool.h"
 
