@@ -44,15 +44,14 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
   // parallel config names this worker's rank. Together they load exactly
   // this rank's weight shards.
   INFERX_ASSIGN_OR_RETURN(auto runner,
-                          ModelRunner::Create(options.model, options.cache,
+                          models::ModelRunner::Create(options.model, options.cache,
                                               options.scheduler, options.execution,
                                               options.parallel));
-  const auto& checkpoint = runner->model_info();
-  if (checkpoint.eos_token_id < 0) {
+  const auto& checkpoint = runner->GetModelSpec();
+  if (checkpoint.eos_token_ids.empty()) {
     return InternalError("checkpoint declares no eos token id");
   }
-  Scheduler scheduler(options.scheduler, runner->kv_pool(),
-                      static_cast<TokenId>(checkpoint.eos_token_id));
+  Scheduler scheduler(options.scheduler, runner->kv_pool(), checkpoint.eos_token_ids);
 
   INFERX_ASSIGN_OR_RETURN(auto commands, MessageChannel::Open(channels.commands));
   INFERX_ASSIGN_OR_RETURN(auto events, MessageChannel::Open(channels.events));

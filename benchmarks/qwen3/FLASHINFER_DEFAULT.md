@@ -44,7 +44,7 @@ through all measurements.
 1. All eight relevant CTest targets passed: attention, operators, model loading /
    forward, model runner, scheduler, scheduler output, CLI arguments and CLI output.
    The 13 existing Python numerical/archive validation tests also passed.
-2. The expanded [attention tests](../../tests/attention_test.cc) compare every
+2. The expanded [attention tests](../../tests/unit/ops/attention_test.cc) compare every
    output element against an independent FP64 causal-softmax calculation over
    BF16-rounded inputs, using the existing **0.005 absolute tolerance**, unchanged.
    Coverage includes 128 attention configurations: MHA, MQA, GQA ratios 1..32,

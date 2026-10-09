@@ -31,7 +31,7 @@ void Run(const WorkloadParams& params) {
   const int batch = sc.max_num_seqs;
   auto executor = Take(ModelExecutor::Create(params.model, cc, sc, params.execution,
                                              params.parallel));
-  Scheduler scheduler(sc, executor->kv_pool(), 151645);
+  Scheduler scheduler(sc, executor->kv_pool(), executor->GetModelSpec().eos_token_ids);
   uint64_t next_id = 1;
   for (const auto& c : suite_json.at("cases")) {
     if (c.at("batch") != batch) continue;

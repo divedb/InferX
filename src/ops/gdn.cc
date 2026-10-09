@@ -1,5 +1,8 @@
 #include "inferx/ops/gdn.h"
 
+#include <cmath>
+#include <limits>
+
 #include "inferx/ops/cuda/gdn.h"
 
 namespace inferx::ops {
@@ -92,9 +95,17 @@ Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
 Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out) {
   if (y.Rank() != 2 || z.Rank() != 2 || weight.Rank() != 1 || out.Rank() != 2 ||
+      weight.Dim(0) <= 0 || out.Dim(0) != y.Dim(0) ||
       y.Dim(1) != z.Dim(1) || out.Dim(1) != y.Dim(1) || y.Dim(0) != z.Dim(0) ||
       y.Dim(1) % weight.Dim(0) != 0) {
     return InvalidArgumentError("gated norm shapes disagree");
+  }
+  constexpr int64_t kMaxExtent = std::numeric_limits<int32_t>::max();
+  if (weight.Dim(0) > kMaxExtent || y.Numel() / weight.Dim(0) > kMaxExtent) {
+    return InvalidArgumentError("gated norm exceeds 32-bit kernel extents");
+  }
+  if (!std::isfinite(eps) || eps < 0.0f) {
+    return InvalidArgumentError("gated norm epsilon must be finite and non-negative");
   }
   INFERX_RETURN_IF_ERROR(CheckBf16OnDevice(ctx, {&y, &z, &weight, &out}));
   if (!ctx.Device().IsCuda()) return UnimplementedError("GDN ops require CUDA");

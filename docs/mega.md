@@ -408,7 +408,7 @@ Dependencies: M4 can proceed after M1 independently of M3, but M5 requires both.
 
 ### Operator and memory correctness
 
-Extend `tests/rms_norm_test.cc`, `tests/ops_test.cc`, and `tests/attention_test.cc` with the actual Qwen shapes. Cover BF16 boundary behavior, zero/large inputs, all RoPE positions of interest, packed column ordering, odd tile tails, alignment handling, and all valid active batch sizes. Exact assertions are appropriate for pure split/copy/pointwise fusion and cache addressing. GEMV, norm-reduction changes, and attention require independent numerical references in addition to comparisons with the old kernels.
+Extend `tests/unit/ops/norm_test.cc`, `tests/unit/ops/ops_test.cc`, and `tests/unit/ops/attention_test.cc` with the actual Qwen shapes. Cover BF16 boundary behavior, zero/large inputs, all RoPE positions of interest, packed column ordering, odd tile tails, alignment handling, and all valid active batch sizes. Exact assertions are appropriate for pure split/copy/pointwise fusion and cache addressing. GEMV, norm-reduction changes, and attention require independent numerical references in addition to comparisons with the old kernels.
 
 Use FP64 CPU attention over BF16 inputs and preserve the existing **0.005 absolute attention tolerance**. Do not reuse that tolerance for logits. Validate unsplit and split attention, short/empty partitions, long contexts, high scores, GQA mapping, and current-token inclusion. Give split reductions fixed order and test repeatability.
 
@@ -424,7 +424,7 @@ Record max/RMS/percentile logit error, top-k agreement, argmax margin, first div
 
 The historical `OPTIMIZATION_20260922.md` records unresolved exact cross-engine sequence mismatches. `FLASHINFER_DEFAULT.md` reports eager/graph agreement and sampled independent-prefix greedy agreement, while explicitly declining universal logit equivalence. These results establish useful fixtures and known limitations, not a correctness waiver for new kernels.
 
-Extend `tests/model_runner_test.cc` and `tests/model_test.cc` for:
+Extend `tests/unit/models/model_runner_test.cc` and `tests/integration/models/model_test.cc` for:
 
 - Standard prefill -> mega decode -> standard decode -> mega decode on the same pool.
 - Mixed/chunked prefill and one-token prompt chunks, respecting the runner's pure-decode classification.

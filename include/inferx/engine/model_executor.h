@@ -13,7 +13,7 @@
 #include "inferx/core/status.h"
 #include "inferx/dist/comm.h"
 #include "inferx/engine/scheduler_output.h"
-#include "inferx/models/model_info.h"
+#include "inferx/models/model_spec.h"
 #include "inferx/models/model_runner.h"
 
 namespace inferx {
@@ -21,7 +21,7 @@ namespace inferx {
 /// \brief Executes one already-scheduled step across the participating
 ///        ranks. The executor is rank coordination, never a second
 ///        scheduler: admission, token budgets, and cache policy stay in
-///        the Scheduler; each rank's ModelRunner owns local execution.
+///        the Scheduler; each rank's models::ModelRunner owns local execution.
 ///
 /// A local deployment uses the same object with a single rank. With no
 /// communicator and tensor parallelism above one, the executor builds an
@@ -46,7 +46,7 @@ class ModelExecutor {
   /// applied to every rank before the next step. `abort` must release
   /// blocked collectives and be safe to call concurrently.
   static StatusOr<std::unique_ptr<ModelExecutor>> CreateGroup(
-      std::vector<std::unique_ptr<ModelRunner>> ranks,
+      std::vector<std::unique_ptr<models::ModelRunner>> ranks,
       std::function<void(const Status&)> abort,
       std::function<Status()> check_health = {});
 
@@ -57,7 +57,7 @@ class ModelExecutor {
   KvBlockPool* kv_pool();
 
   /// \brief The coordinating rank's engine-facing model facts.
-  const models::ModelInfo& model_info() const;
+  const models::ModelSpec& GetModelSpec() const;
 
   /// \brief Executes one scheduler step across all participating ranks and
   ///        returns the output owner's samples.

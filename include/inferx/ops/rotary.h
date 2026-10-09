@@ -102,8 +102,8 @@ INFERX_ROPE_HD float InverseFrequency(int64_t i, const RotaryParams& p) {
 Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params);
 
-/// Rounded per-head RMSNorm followed by RoPE, fused for BF16 heads of width
-/// 128. Preserves the intermediate BF16 normalization and rotation roundings.
+/// Per-head FlashInfer RMSNorm followed by RoPE for BF16 activations.
+/// Preserves the intermediate BF16 normalization and rotation roundings.
 Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                              const Tensor& q_weight, const Tensor& k_weight,
                              const Tensor& positions, float eps, const RotaryParams& params);

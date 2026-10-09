@@ -117,3 +117,72 @@ function(inferx_add_library)
 
   add_library(inferx::${INFERX_LIB_NAME} ALIAS ${_target})
 endfunction()
+
+# inferx_add_test()
+#
+# Declares one gtest binary plus its CTest entry, following inferx_add_library:
+# the target is inferx_${NAME} and the CTest name is ${NAME}.
+#
+# Parameters:
+#   NAME:     logical test name; target inferx_${NAME}, CTest name ${NAME}
+#   SRCS:     test sources, relative to the calling directory
+#   DEPS:     link dependencies beyond GTest::gtest_main, which is always
+#             linked
+#   TIMEOUT:  CTest TIMEOUT in seconds
+#   WORKING_DIRECTORY: CTest working directory (absolute path)
+#   LABELS:   CTest labels (e.g. unit, integration)
+#   GPU:      the test needs libcuda; on WSL2 point LD_LIBRARY_PATH at the
+#             WSL copy, the only one that can see the GPU
+#
+# Example:
+#   inferx_add_test(
+#     NAME norm_test
+#     SRCS norm_test.cc
+#     DEPS inferx::ops
+#     LABELS unit
+#     GPU
+#   )
+function(inferx_add_test)
+  cmake_parse_arguments(INFERX_TEST
+    "GPU"
+    "NAME;TIMEOUT;WORKING_DIRECTORY"
+    "SRCS;DEPS;LABELS"
+    ${ARGN})
+
+  if(NOT INFERX_TEST_NAME)
+    message(FATAL_ERROR "inferx_add_test: NAME is required")
+  endif()
+  if(NOT INFERX_TEST_SRCS)
+    message(FATAL_ERROR "inferx_add_test(${INFERX_TEST_NAME}): SRCS is required")
+  endif()
+  if(INFERX_TEST_UNPARSED_ARGUMENTS)
+    message(FATAL_ERROR "inferx_add_test(${INFERX_TEST_NAME}): "
+      "unknown arguments: ${INFERX_TEST_UNPARSED_ARGUMENTS}")
+  endif()
+
+  set(_target inferx_${INFERX_TEST_NAME})
+  add_executable(${_target} ${INFERX_TEST_SRCS})
+  target_link_libraries(${_target} PRIVATE ${INFERX_TEST_DEPS} GTest::gtest_main)
+  target_compile_options(${_target} PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
+
+  add_test(NAME ${INFERX_TEST_NAME} COMMAND ${_target})
+
+  set(_properties "")
+  if(INFERX_TEST_WORKING_DIRECTORY)
+    list(APPEND _properties WORKING_DIRECTORY "${INFERX_TEST_WORKING_DIRECTORY}")
+  endif()
+  if(INFERX_TEST_TIMEOUT)
+    list(APPEND _properties TIMEOUT ${INFERX_TEST_TIMEOUT})
+  endif()
+  if(INFERX_TEST_LABELS)
+    list(APPEND _properties LABELS ${INFERX_TEST_LABELS})
+  endif()
+  if(INFERX_TEST_GPU AND EXISTS "/usr/lib/wsl/lib/libcuda.so.1")
+    # WSL2 ships two libcuda copies; only the WSL one can see the GPU.
+    list(APPEND _properties ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib")
+  endif()
+  if(_properties)
+    set_tests_properties(${INFERX_TEST_NAME} PROPERTIES ${_properties})
+  endif()
+endfunction()

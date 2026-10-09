@@ -54,7 +54,8 @@ Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
 /// \brief Per-head gated RMS norm: out = rmsnorm(y) * weight * silu(z).
 ///
 /// `y` and `z` are [tokens, value_heads * value_dim]; `weight` is
-/// [value_dim]; heads are independent.
+/// [value_dim]; heads are independent. The normalized, weighted activation
+/// is rounded to BF16 before multiplication by the FP32 SiLU gate.
 Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out);
 

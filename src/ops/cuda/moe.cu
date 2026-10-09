@@ -1,3 +1,4 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -178,13 +179,6 @@ __global__ void ScatterAddKernel(const __nv_bfloat16* __restrict__ expert_rows,
   }
 }
 
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
-
 }  // namespace
 
 Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_weight,
@@ -203,20 +197,20 @@ Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_we
       correction_bias == nullptr ? nullptr : static_cast<const float*>(correction_bias->Data()),
       static_cast<int>(hidden.Dim(0)), static_cast<int>(hidden.Dim(1)), experts, config,
       static_cast<int*>(topk_indices.Data()), static_cast<float*>(topk_weights.Data()));
-  return CudaError(cudaGetLastError(), "route tokens");
+  return CudaStatus(cudaGetLastError(), "route tokens");
 }
 
 Status ExpertHistogram(OpContext& ctx, const Tensor& topk_indices, int64_t num_experts,
                        Tensor& counts) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
-  INFERX_RETURN_IF_ERROR(CudaError(
+  INFERX_RETURN_IF_ERROR(CudaStatus(
       cudaMemsetAsync(counts.Data(), 0, num_experts * sizeof(int), stream), "zero counts"));
   const int64_t total = topk_indices.Numel();
   HistogramKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
                     stream>>>(static_cast<const int*>(topk_indices.Data()), total,
                               static_cast<int*>(counts.Data()));
-  return CudaError(cudaGetLastError(), "expert histogram");
+  return CudaStatus(cudaGetLastError(), "expert histogram");
 }
 
 Status ScatterSlots(OpContext& ctx, const Tensor& topk_indices, const Tensor& topk_weights,
@@ -225,7 +219,7 @@ Status ScatterSlots(OpContext& ctx, const Tensor& topk_indices, const Tensor& to
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
   const int64_t experts = offsets.Numel() - 1;
-  INFERX_RETURN_IF_ERROR(CudaError(
+  INFERX_RETURN_IF_ERROR(CudaStatus(
       cudaMemsetAsync(cursor.Data(), 0, experts * sizeof(int), stream), "zero cursor"));
   const int64_t total = topk_indices.Numel();
   ScatterSlotsKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
@@ -234,7 +228,7 @@ Status ScatterSlots(OpContext& ctx, const Tensor& topk_indices, const Tensor& to
       static_cast<const float*>(topk_weights.Data()), static_cast<const int*>(offsets.Data()),
       static_cast<int*>(cursor.Data()), static_cast<int>(topk_indices.Dim(1)), total,
       static_cast<int*>(token_rows.Data()), static_cast<float*>(weights_by_slot.Data()));
-  return CudaError(cudaGetLastError(), "scatter slots");
+  return CudaStatus(cudaGetLastError(), "scatter slots");
 }
 
 Status GatherRoutedTokens(OpContext& ctx, const Tensor& hidden, const Tensor& token_rows,
@@ -245,7 +239,7 @@ Status GatherRoutedTokens(OpContext& ctx, const Tensor& hidden, const Tensor& to
       static_cast<const __nv_bfloat16*>(hidden.Data()),
       static_cast<const int*>(token_rows.Data()), static_cast<int>(hidden.Dim(1)),
       token_rows.Numel(), static_cast<__nv_bfloat16*>(out.Data()));
-  return CudaError(cudaGetLastError(), "gather routed tokens");
+  return CudaStatus(cudaGetLastError(), "gather routed tokens");
 }
 
 Status ScatterRoutedOutputs(OpContext& ctx, const Tensor& expert_rows,
@@ -258,7 +252,7 @@ Status ScatterRoutedOutputs(OpContext& ctx, const Tensor& expert_rows,
       static_cast<const int*>(token_rows.Data()) + begin,
       static_cast<const float*>(weights_by_slot.Data()) + begin,
       static_cast<int>(expert_rows.Dim(1)), count, static_cast<__nv_bfloat16*>(out.Data()));
-  return CudaError(cudaGetLastError(), "scatter routed outputs");
+  return CudaStatus(cudaGetLastError(), "scatter routed outputs");
 }
 
 }  // namespace inferx::ops::cuda

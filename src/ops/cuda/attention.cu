@@ -1,3 +1,4 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
@@ -7,13 +8,6 @@
 
 namespace inferx::ops::cuda {
 namespace {
-
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
 
 // Eight BF16 values per thread. Packing multiple heads/tokens into each block
 // avoids launching one mostly memory-copy block for every cache row at prefill.
@@ -86,7 +80,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
         const_cast<uint4*>(static_cast<const uint4*>(key_cache.Data())),
         const_cast<uint4*>(static_cast<const uint4*>(value_cache.Data())),
         k.Dim(1) / 8, block_size, count);
-    return CudaError(cudaGetLastError(), "vector write paged kv launch");
+    return CudaStatus(cudaGetLastError(), "vector write paged kv launch");
   }
   const dim3 grid(static_cast<uint32_t>(k.Dim(0)), static_cast<uint32_t>(key_cache.Dim(2)));
   const uint32_t threads = 128;
@@ -100,7 +94,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
       const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(key_cache.Data())),
       const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(value_cache.Data())),
       static_cast<int>(key_cache.Dim(2)), static_cast<int>(key_cache.Dim(3)), block_size);
-  return CudaError(cudaGetLastError(), "write paged kv launch");
+  return CudaStatus(cudaGetLastError(), "write paged kv launch");
 }
 
 }  // namespace inferx::ops::cuda

@@ -1,7 +1,10 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "inferx/ops/cuda/elementwise.h"
 #include "inferx/ops/cuda/gdn.h"
+#include "inferx/ops/cuda/norm.h"
 
 namespace inferx::ops::cuda {
 namespace {
@@ -10,13 +13,6 @@ constexpr int kThreads = 256;
 constexpr int kDvTile = 32;  // Value columns one recurrent block owns.
 
 __device__ __forceinline__ float Silu(float x) { return x / (1.0f + __expf(-x)); }
-
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
 
 /// Source rows per key-head group: [q | k | v | z] with widths
 /// kd, kd, nvg * vd, nvg * vd. Destinations are block-contiguous.
@@ -205,28 +201,6 @@ __global__ void RecurrentKernel(const __nv_bfloat16* __restrict__ conv,
   }
 }
 
-__global__ void NormGatedKernel(const __nv_bfloat16* __restrict__ y,
-                                const __nv_bfloat16* __restrict__ z,
-                                const __nv_bfloat16* __restrict__ weight, float eps,
-                                __nv_bfloat16* __restrict__ out, int64_t rows, int heads,
-                                int dim) {
-  const int64_t head_index = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x);
-  if (head_index >= rows * heads) return;
-  const int64_t base = head_index * dim;
-  float sum = 0;
-  for (int d = 0; d < dim; ++d) {
-    const float value = __bfloat162float(y[base + d]);
-    sum += value * value;
-  }
-  const float inv = rsqrtf(sum / dim + eps);
-  for (int d = 0; d < dim; ++d) {
-    const float normed = __bfloat162float(y[base + d]) * inv *
-                         __bfloat162float(weight[d]);
-    const float gate = Silu(__bfloat162float(z[base + d]));
-    out[base + d] = __float2bfloat16(normed * gate);
-  }
-}
-
 }  // namespace
 
 Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
@@ -241,7 +215,7 @@ Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
       static_cast<__nv_bfloat16*>(conv_in.Data()), static_cast<__nv_bfloat16*>(z.Data()),
       packed.Dim(0), static_cast<int>(key_heads), static_cast<int>(key_dim),
       static_cast<int>(nvg), static_cast<int>(value_dim));
-  return CudaError(cudaGetLastError(), "split gdn projection");
+  return CudaStatus(cudaGetLastError(), "split gdn projection");
 }
 
 Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
@@ -257,7 +231,7 @@ Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
       static_cast<float*>(state.Data()),
       static_cast<const int*>(qo_indptr.Data()), channels, static_cast<int>(kernel),
       num_seqs);
-  return CudaError(cudaGetLastError(), "gdn causal conv");
+  return CudaStatus(cudaGetLastError(), "gdn causal conv");
 }
 
 Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
@@ -271,7 +245,7 @@ Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
       static_cast<const __nv_bfloat16*>(ba.Data()), static_cast<const float*>(a_log.Data()),
       static_cast<const float*>(dt_bias.Data()), static_cast<float*>(beta.Data()),
       static_cast<float*>(g.Data()), rows, static_cast<int>(heads), static_cast<int>(nvg));
-  return CudaError(cudaGetLastError(), "gdn gates");
+  return CudaStatus(cudaGetLastError(), "gdn gates");
 }
 
 Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
@@ -294,21 +268,20 @@ Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
       static_cast<float*>(state.Data()), static_cast<const int*>(slot_indices.Data()),
       static_cast<const int*>(qo_indptr.Data()), static_cast<__nv_bfloat16*>(y.Data()),
       static_cast<int>(conv.Dim(1)), value_heads / key_heads, dk, dv, value_heads);
-  return CudaError(cudaGetLastError(), "gdn recurrent");
+  return CudaStatus(cudaGetLastError(), "gdn recurrent");
 }
 
 Status RmsNormGated(OpContext& ctx, const Tensor& y, const Tensor& z,
                     const Tensor& weight, float eps, Tensor& out) {
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  const int64_t heads_total = y.Dim(0) * (y.Dim(1) / weight.Dim(0));
-  NormGatedKernel<<<static_cast<uint32_t>((heads_total + kThreads - 1) / kThreads), kThreads,
-                    0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
-      static_cast<const __nv_bfloat16*>(y.Data()),
-      static_cast<const __nv_bfloat16*>(z.Data()),
-      static_cast<const __nv_bfloat16*>(weight.Data()), eps,
-      static_cast<__nv_bfloat16*>(out.Data()), y.Dim(0),
-      static_cast<int>(y.Dim(1) / weight.Dim(0)), static_cast<int>(weight.Dim(0)));
-  return CudaError(cudaGetLastError(), "rms norm gated");
+  const int64_t dim = weight.Dim(0);
+  auto y_rows = y.Reshape(Shape({y.Numel() / dim, dim}));
+  if (!y_rows.ok()) return y_rows.status();
+  auto out_rows = out.Reshape(y_rows->GetShape());
+  if (!out_rows.ok()) return out_rows.status();
+  // Materialize the normalized activation before applying the SiLU gate.
+  INFERX_RETURN_IF_ERROR(::inferx::ops::cuda::RmsNorm(
+      ctx, *y_rows, weight, *out_rows, NormConfig{NormKind::kRms, eps}));
+  return ::inferx::ops::cuda::SiluAndMul(ctx, z, out, out);
 }
 
 }  // namespace inferx::ops::cuda

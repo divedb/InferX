@@ -48,9 +48,10 @@ class Scheduler {
   /// \param config       Policy knobs.
   /// \param pool         The KV block pool to allocate from; must outlive the
   ///                     scheduler.
-  /// \param eos_token_id Model end-of-sequence token used for finish
-  ///                     detection (requests may override via ignore_eos).
-  Scheduler(SchedulerConfig config, KvBlockPool* pool, TokenId eos_token_id);
+  /// \param eos_token_ids Model's declared end-of-sequence tokens used for
+  ///                     finish detection; generation halts on any (requests
+  ///                     may override via ignore_eos).
+  Scheduler(SchedulerConfig config, KvBlockPool* pool, std::vector<TokenId> eos_token_ids);
 
   /// \brief Admits a request to the waiting queue.
   ///
@@ -97,7 +98,7 @@ class Scheduler {
  private:
   SchedulerConfig config_;
   CacheManager cache_manager_;
-  TokenId eos_token_id_ = 0;
+  std::vector<TokenId> eos_token_ids_;
 
   RequestQueue waiting_;
   /// Running requests in admission order.

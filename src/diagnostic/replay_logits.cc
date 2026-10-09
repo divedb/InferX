@@ -40,11 +40,11 @@ void Replay(const ReplayLogitsParams& params) {
   models::ModelLoadOptions options;
   options.directory = params.model_dir;
   options.device = device;
-  options.max_tokens = params.chunk_size;
-  options.max_seqs = 1;
+
+
   auto model = Take(models::LoadModel(options));
-  const auto& info = model->info();
-  const auto& requirements = model->requirements().layers;
+  const auto& info = model->GetModelSpec();
+  const auto& requirements = model->GetRequirements().layers;
   if (requirements.empty() || !std::holds_alternative<models::PagedKvStateSpec>(requirements[0]))
     throw std::runtime_error("replay requires a paged-attention model");
   const int num_layers = static_cast<int>(requirements.size());
@@ -76,6 +76,8 @@ void Replay(const ReplayLogitsParams& params) {
   for (int i = 0; i < num_layers; ++i) state.layers.push_back(models::PagedKvState{i});
   ops::OpContext ctx(*runtime, stream);
   dist::SingleRankComm comm;
+  models::ForwardContext fctx{ctx, state, comm};
+  Check(model->Prepare({params.chunk_size, 1, 1}, fctx));
   const auto upload = [&](const std::vector<int32_t>& values) {
     auto tensor = Take(Tensor::Empty(DataType::kInt32,
         Shape({static_cast<int64_t>(values.size())}), device));
@@ -105,9 +107,10 @@ void Replay(const ReplayLogitsParams& params) {
           {upload(positions), upload(std::vector<int32_t>(count, 0)),
            upload(qo), upload(kv), upload(pages),
            upload({(end - 1) % page_size + 1}), qo, kv, count, 1}};
-      models::ForwardContext fctx{ctx, state, comm};
-      auto hidden = Take(model->Forward(input, fctx));
-      logits = Take(model->ComputeLogits(hidden, models::LogitSelection{logit_rows}, fctx)).values;
+      models::OutputRequest outputs{models::LogitSelection{logit_rows}};
+      (void)Take(model->PrepareStep(input, outputs, fctx));
+      auto result = Take(model->Forward(input, outputs, fctx));
+      logits = std::move(result.logits->values);
       // Keep all input allocations alive until the forward has finished.
       Check(runtime->SynchronizeStream(stream));
       start = end;

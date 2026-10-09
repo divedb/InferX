@@ -2,6 +2,7 @@
 /build/
 /build-engine/
 /build-cuda13/
+/build-debug/
 compile_commands.json
 
 # Local editor state

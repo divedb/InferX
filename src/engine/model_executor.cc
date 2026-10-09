@@ -15,7 +15,7 @@ namespace inferx {
 struct ModelExecutor::Impl {
   /// Rank-local runners, ordered by communicator rank; ranks_[0] is the
   /// coordinating and (initially sole) sampling rank.
-  std::vector<std::unique_ptr<ModelRunner>> ranks;
+  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
   std::function<void(const Status&)> abort;
   std::function<Status()> check_health;
   bool group = false;  ///< True when more than one rank participates.
@@ -25,8 +25,8 @@ ModelExecutor::ModelExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)
 ModelExecutor::~ModelExecutor() = default;
 
 KvBlockPool* ModelExecutor::kv_pool() { return impl_->ranks.front()->kv_pool(); }
-const models::ModelInfo& ModelExecutor::model_info() const {
-  return impl_->ranks.front()->model_info();
+const models::ModelSpec& ModelExecutor::GetModelSpec() const {
+  return impl_->ranks.front()->GetModelSpec();
 }
 
 StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
@@ -38,7 +38,7 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
   if (comm || parallel.tensor_parallel_size == 1) {
     // Rank-local execution: one runner, with this rank's communicator.
     auto runner =
-        ModelRunner::Create(model, cache, scheduler, execution, parallel, std::move(comm));
+        models::ModelRunner::Create(model, cache, scheduler, execution, parallel, std::move(comm));
     INFERX_RETURN_IF_ERROR(runner.status());
     auto impl = std::make_unique<Impl>();
     impl->ranks.push_back(*std::move(runner));
@@ -75,11 +75,11 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
                              .Resolve(hf.ModelType(), hf.Architecture())
                              .status());
   INFERX_ASSIGN_OR_RETURN(auto world, dist::NcclWorld::Create(devices));
-  std::vector<std::unique_ptr<ModelRunner>> ranks;
+  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
   for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) {
     ModelConfig local = model;
     local.device.device_ids = {ids[rank]};
-    auto made = ModelRunner::Create(local, cache, scheduler, execution,
+    auto made = models::ModelRunner::Create(local, cache, scheduler, execution,
                                     ParallelConfig{parallel.tensor_parallel_size, rank},
                                     world->MakeRank(rank));
     if (!made.ok()) {
@@ -93,7 +93,7 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
 }
 
 StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::CreateGroup(
-    std::vector<std::unique_ptr<ModelRunner>> ranks,
+    std::vector<std::unique_ptr<models::ModelRunner>> ranks,
     std::function<void(const Status&)> abort, std::function<Status()> check_health) {
   if (ranks.empty() || !abort) {
     return InvalidArgumentError("rank group needs runners and abort");
@@ -101,8 +101,8 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::CreateGroup(
   for (size_t rank = 0; rank < ranks.size(); ++rank) {
     if (!ranks[rank]) return InvalidArgumentError("rank group contains a null runner");
     if (rank == 0) continue;
-    if (ranks[rank]->model_info().vocab_size !=
-        ranks.front()->model_info().vocab_size) {
+    if (ranks[rank]->GetModelSpec().vocab_size !=
+        ranks.front()->GetModelSpec().vocab_size) {
       const auto status = InvalidArgumentError("rank group topology or capacities disagree");
       abort(status);
       return status;

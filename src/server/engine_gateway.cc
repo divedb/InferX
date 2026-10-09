@@ -43,14 +43,13 @@ struct EngineGateway::Impl {
       : io(io_arg), tokenizer(std::move(tokenizer_arg)) {
     executor = Take(ModelExecutor::Create(model_config, cache_config, scheduler_config,
                                           execution_config, parallel_config));
-    const int64_t eos = executor->model_info().eos_token_id;
-    if (eos < 0) {
-      throw std::runtime_error("model config has no eos_token_id");
+    const std::vector<TokenId> eos = executor->GetModelSpec().eos_token_ids;
+    if (eos.empty()) {
+      throw std::runtime_error("model config declares no eos_token_id");
     }
     scheduler_config.queue_capacity = std::max(scheduler_config.queue_capacity, 1);
     capacity = scheduler_config.queue_capacity + scheduler_config.max_num_seqs;
-    scheduler = std::make_unique<Scheduler>(scheduler_config, executor->kv_pool(),
-                                            static_cast<TokenId>(eos));
+    scheduler = std::make_unique<Scheduler>(scheduler_config, executor->kv_pool(), eos);
   }
 
   boost::asio::io_context& io;

@@ -1,3 +1,4 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -29,13 +30,6 @@ __global__ void AssembleMlaKernel(const __nv_bfloat16* __restrict__ k_rope,
   v_out[i] = col < v_dim ? up_row[nope + col] : __float2bfloat16(0.0f);
 }
 
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
-
 }  // namespace
 
 Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_projected,
@@ -52,7 +46,7 @@ Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_
       static_cast<int>(nope), static_cast<int>(rope), static_cast<int>(v_dim),
       static_cast<int>(head_dim), static_cast<__nv_bfloat16*>(k_out.Data()),
       static_cast<__nv_bfloat16*>(v_out.Data()));
-  return CudaError(cudaGetLastError(), "assemble mla caches");
+  return CudaStatus(cudaGetLastError(), "assemble mla caches");
 }
 
 }  // namespace inferx::ops::cuda

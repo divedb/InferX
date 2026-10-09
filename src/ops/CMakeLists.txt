@@ -6,9 +6,9 @@
 inferx_add_library(
   NAME ops
   SRCS
-    rms_norm.cc
-    cpu/rms_norm.cc
-    cuda/rms_norm.cu
+    norm.cc
+    cpu/norm.cc
+    cuda/norm.cu
     gather.cc
     linear.cc
     elementwise.cc
@@ -40,8 +40,12 @@ inferx_add_library(
 
 set_source_files_properties(cuda/flash_attention.cu PROPERTIES
   COMPILE_OPTIONS "--expt-relaxed-constexpr")
-# Highway re-includes rms_norm.cc once per SIMD target through
-# HWY_TARGET_INCLUDE ("ops/cpu/rms_norm.cc"), which resolves against the
+# Highway re-includes norm.cc once per SIMD target through
+# HWY_TARGET_INCLUDE ("ops/cpu/norm.cc"), which resolves against the
 # include path, so it points at src/, not this directory.
-set_source_files_properties(cpu/rms_norm.cc PROPERTIES
+set_source_files_properties(cpu/norm.cc PROPERTIES
   COMPILE_OPTIONS "-I${PROJECT_SOURCE_DIR}/src")
+
+# FlashInfer LayerNorm gates its BF16 type traits on this definition.
+set_source_files_properties(cuda/norm.cu PROPERTIES
+  COMPILE_DEFINITIONS "ENABLE_BF16=1")

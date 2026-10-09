@@ -1,5 +1,7 @@
 #include "inferx/ops/rotary.h"
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 #include "inferx/ops/cuda/rotary.h"
 
@@ -66,9 +68,14 @@ Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
         weight->GetDataType() != q.GetDataType() || weight->Device() != ctx.Device())
       return InvalidArgumentError("NormalizeAndApplyRope requires per-head BF16 weights");
   }
+  constexpr int64_t kMaxExtent = std::numeric_limits<int32_t>::max();
+  if (q.Dim(2) > kMaxExtent || q.Numel() / q.Dim(2) > kMaxExtent ||
+      k.Numel() / k.Dim(2) > kMaxExtent) {
+    return InvalidArgumentError("NormalizeAndApplyRope exceeds 32-bit kernel extents");
+  }
   if (!std::isfinite(eps) || eps < 0) return InvalidArgumentError("invalid normalization epsilon");
-  if (q.Dim(2) != 128 || !ctx.Device().IsCuda())
-    return UnimplementedError("NormalizeAndApplyRope requires CUDA and head dimension 128");
+  if (!ctx.Device().IsCuda())
+    return UnimplementedError("NormalizeAndApplyRope requires CUDA");
   if (q.IsEmpty()) return OkStatus();
   return cuda::NormalizeAndApplyRope(ctx, q, k, q_weight, k_weight, positions, eps, params);
 }

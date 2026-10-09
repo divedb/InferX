@@ -15,7 +15,7 @@ The notifier now uses `boost::asio::experimental::concurrent_channel`, which
 synchronizes shared access internally. The mutex-protected payload deque,
 one-slot wakeup coalescing, and posted notification lifetime remain intact.
 
-`tests/event_queue_test.cc` covers a slow consumer draining 8,192 queued
+`tests/unit/server/event_queue_test.cc` covers a slow consumer draining 8,192 queued
 deltas and a terminal event after notifications coalesce, plus 16 queues
 receiving 2,048 deltas each from an engine thread while four I/O threads
 process notifications and coroutine receives. Both finish and error terminal
@@ -61,7 +61,7 @@ settled replacements (more text follows) are permanent and emitted.
 so a finished request's deltas concatenate to exactly its final decode. A
 defensive re-sync replaces the throw if a decode ever shrinks anyway.
 
-`tests/text_delta_test.cc` covers ASCII growth, 2/3/4-byte characters split
+`tests/unit/server/text_delta_test.cc` covers ASCII growth, 2/3/4-byte characters split
 across steps (the field signature reproduced as
 `__pos (which is 4) > __size (which is 3)` before the fix), multiple
 trailing replacements, settled mid-text replacements, the finish flush,
@@ -103,7 +103,7 @@ the `PopFinished` loop so slow-consumer aborts deliver their terminal
 events in the same step instead of stranding them in the finished list
 when the scheduler drains.
 
-`tests/event_queue_test.cc` adds two deterministic regressions: events
+`tests/unit/server/event_queue_test.cc` adds two deterministic regressions: events
 pushed with no separate notification must reach a parked consumer, and an
 event pushed after the consumer drains and re-parks (the stall window)
 must still be delivered. Both time out against the old queue; the existing

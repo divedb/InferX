@@ -1,3 +1,4 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_runtime.h>
 
 #include "inferx/core/dtype.h"
@@ -5,13 +6,6 @@
 
 namespace inferx::ops::cuda {
 namespace {
-
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
 
 /// One block per output row; the block copies that row's bytes.
 __global__ void GatherRowsKernel(const char* __restrict__ src, const int32_t* __restrict__ indices,
@@ -61,7 +55,7 @@ Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices, Tens
                      static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const char*>(src.Data()), static_cast<const int32_t*>(indices.Data()),
       static_cast<char*>(out.Data()), row_bytes);
-  return CudaError(cudaGetLastError(), "gather rows launch");
+  return CudaStatus(cudaGetLastError(), "gather rows launch");
 }
 
 Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
@@ -72,7 +66,7 @@ Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
                           static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const char*>(src.Data()), static_cast<const int32_t*>(indices.Data()),
       static_cast<char*>(out.Data()), row_bytes, row_begin, src.Dim(0));
-  return CudaError(cudaGetLastError(), "gather rows range launch");
+  return CudaStatus(cudaGetLastError(), "gather rows range launch");
 }
 
 Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
@@ -83,7 +77,7 @@ Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
                           static_cast<cudaStream_t>(ctx.GetStream())>>>(
       static_cast<const char*>(src.Data()), static_cast<char*>(dst.Data()), src.Dim(1),
       dst.Dim(1), col_begin, elem_bytes);
-  return CudaError(cudaGetLastError(), "copy column block launch");
+  return CudaStatus(cudaGetLastError(), "copy column block launch");
 }
 
 }  // namespace inferx::ops::cuda

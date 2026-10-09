@@ -6,8 +6,9 @@
 
 namespace inferx {
 
-Scheduler::Scheduler(SchedulerConfig config, KvBlockPool* pool, TokenId eos_token_id)
-    : config_(config), cache_manager_(pool), eos_token_id_(eos_token_id),
+Scheduler::Scheduler(SchedulerConfig config, KvBlockPool* pool,
+                     std::vector<TokenId> eos_token_ids)
+    : config_(config), cache_manager_(pool), eos_token_ids_(std::move(eos_token_ids)),
       waiting_(static_cast<size_t>(config.queue_capacity)) {}
 
 Status Scheduler::AddRequest(Request request) {
@@ -132,7 +133,9 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
     if (static_cast<int>(request.output().size()) >= request.max_new_tokens()) {
       finish = true;
       reason = FinishReason::kLengthCapped;
-    } else if ((!params.ignore_eos && token == eos_token_id_) ||
+    } else if ((!params.ignore_eos &&
+                std::find(eos_token_ids_.begin(), eos_token_ids_.end(), token) !=
+                    eos_token_ids_.end()) ||
                (request.output().size() >= params.min_tokens &&
                 std::find(params.stop_token_ids.begin(), params.stop_token_ids.end(),
                           token) != params.stop_token_ids.end())) {

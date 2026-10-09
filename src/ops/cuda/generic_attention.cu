@@ -1,3 +1,4 @@
+#include "inferx/ops/cuda/status.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -125,13 +126,6 @@ __global__ void GenericAttentionKernel(
   }
 }
 
-Status CudaError(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) {
-    return InternalError(what, " failed: ", cudaGetErrorString(err));
-  }
-  return OkStatus();
-}
-
 }  // namespace
 
 Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
@@ -171,7 +165,7 @@ Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_i
       static_cast<int>(params.kv_heads), static_cast<int>(params.head_dim),
       static_cast<int>(block_size), params.scale,
       static_cast<long long>(params.sliding_window), params.softcap);
-  return CudaError(cudaGetLastError(), "generic attention launch");
+  return CudaStatus(cudaGetLastError(), "generic attention launch");
 }
 
 }  // namespace inferx::ops::cuda
