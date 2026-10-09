@@ -25,7 +25,7 @@
 #include "inferx/models/layers/gated_mlp.h"
 #include "inferx/models/layers/mla.h"
 #include "inferx/models/layers/moe.h"
-#include "inferx/models/layers/normalization.h"
+#include "inferx/models/layers/norm.h"
 #include "inferx/models/model.h"
 #include "inferx/models/requirements.h"
 #include "inferx/ops/op_context.h"

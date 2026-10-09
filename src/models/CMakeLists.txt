@@ -59,6 +59,7 @@ inferx_add_library(
     layers/lm_head.cc
     layers/mla.cc
     layers/moe.cc
+    layers/norm.cc
     loading/checkpoint_reader.cc
     loading/quant_plan.cc
     loading/safe_tensors_reader.cc
