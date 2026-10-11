@@ -8,6 +8,6 @@ namespace inferx::internal {
 DeviceRuntime* CpuDeviceRuntime();
 
 /// \brief The CUDA runtime bound to `device` (accelerator/device_runtime.cc).
-StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(DeviceId device);
+StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(Device device);
 
 }  // namespace inferx::internal

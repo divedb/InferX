@@ -1,12 +1,3 @@
-/// \file
-/// \brief Logging facade over Abseil's logging library.
-///
-/// One include, one spelling, engine-wide: leveled `INFERX_LOG` for
-/// operational messages, verbosity-gated `INFERX_VLOG` for milestone and
-/// hot-path tracing. Abseil defaults (INFO and up to stderr) apply until
-/// `InitializeLogging` runs, so early startup and tests log sanely with no
-/// setup. Statuses remain the error channel; logs are for humans.
-
 #ifndef INFERX_CORE_LOGGING_H_
 #define INFERX_CORE_LOGGING_H_
 

@@ -1,5 +1,6 @@
 #include "inferx/dist/loopback_comm.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <utility>
@@ -9,7 +10,6 @@
 #include "inferx/ops/gather.h"
 
 namespace inferx {
-namespace dist {
 
 /// Shared synchronization and contribution exchange across the world.
 struct LoopbackState {
@@ -18,6 +18,7 @@ struct LoopbackState {
   int arrived = 0;                       ///< Ranks inside the current barrier.
   int generation = 0;                    ///< Completed barrier count.
   std::vector<const Tensor*> published;  ///< Rank slots registered this round.
+  std::vector<int64_t> host_values;      ///< AllReduceMin staging, reset per use.
   Status failure;
 
   /// Blocks until all `size` ranks reach the barrier; the last one in
@@ -43,6 +44,7 @@ StatusOr<std::unique_ptr<LoopbackWorld>> LoopbackWorld::Create(int size) {
   }
   auto state = std::make_shared<LoopbackState>();
   state->published.resize(size, nullptr);
+  state->host_values.resize(size, 0);
   return std::unique_ptr<LoopbackWorld>(new LoopbackWorld(size, std::move(state)));
 }
 
@@ -80,8 +82,8 @@ LoopbackComm::~LoopbackComm() = default;
 int LoopbackComm::size() const { return static_cast<int>(state_->published.size()); }
 int LoopbackComm::rank() const { return rank_; }
 
-StatusOr<Tensor*> LoopbackComm::Slot(const Shape& shape, DeviceId device) {
-  const auto key = std::make_tuple(device.kind, static_cast<int>(device.index),
+StatusOr<Tensor*> LoopbackComm::Slot(const Shape& shape, Device device) {
+  const auto key = std::make_tuple(device.kind(), static_cast<int>(device.index()),
                                    std::vector<int64_t>(shape.begin(), shape.end()));
   auto found = slots_.find(key);
   if (found == slots_.end()) {
@@ -93,7 +95,7 @@ StatusOr<Tensor*> LoopbackComm::Slot(const Shape& shape, DeviceId device) {
 
 Status LoopbackComm::Publish(const ops::OpContext& ctx, const Tensor& contribution) {
   INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, contribution));
-  INFERX_ASSIGN_OR_RETURN(Tensor * slot, Slot(contribution.GetShape(), ctx.Device()));
+  INFERX_ASSIGN_OR_RETURN(Tensor * slot, Slot(contribution.GetShape(), ctx.GetDevice()));
   if (!contribution.IsEmpty() && slot->Data() != contribution.Data()) {
     INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(slot->Data(), contribution.Data(),
                                                    contribution.NBytes(),
@@ -110,6 +112,29 @@ Status LoopbackComm::Publish(const ops::OpContext& ctx, const Tensor& contributi
 
 Status LoopbackComm::Meet() { return state_->Wait(size()); }
 
+StatusOr<int64_t> LoopbackComm::AllReduceMin(const ops::OpContext& ctx, int64_t value) {
+  (void)ctx;
+  auto reduced = [&]() -> StatusOr<int64_t> {
+    {
+      const std::lock_guard<std::mutex> lock(state_->mu);
+      state_->host_values[static_cast<size_t>(rank_)] = value;
+    }
+    // Publish -> barrier -> read every slot -> barrier (slots are reused
+    // only once every rank is done reading), the host analogue of the
+    // tensor collectives' slot protocol.
+    INFERX_RETURN_IF_ERROR(Meet());
+    int64_t minimum = value;
+    {
+      const std::lock_guard<std::mutex> lock(state_->mu);
+      for (const int64_t peer : state_->host_values) minimum = std::min(minimum, peer);
+    }
+    INFERX_RETURN_IF_ERROR(Meet());
+    return minimum;
+  }();
+  INFERX_RETURN_IF_ERROR(Finish(reduced.status()));
+  return reduced;
+}
+
 Status LoopbackComm::Finish(Status status) {
   const std::lock_guard<std::mutex> lock(state_->mu);
   if (!status.ok() && state_->failure.ok()) {
@@ -125,7 +150,7 @@ Status LoopbackComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
     INFERX_RETURN_IF_ERROR(Meet());
     const auto& published = state_->published;
     for (const Tensor* peer : published) {
-      if (peer->GetShape() != partial.GetShape() || peer->Device() != ctx.Device()) {
+      if (peer->GetShape() != partial.GetShape() || peer->GetDevice() != ctx.GetDevice()) {
         return InvalidArgumentError("all-reduce peers must have matching shapes and devices");
       }
     }
@@ -154,7 +179,7 @@ Status LoopbackComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& p
     auto op_ctx = ctx;
     for (int r = 0; r < size(); ++r) {
       if (published[r]->GetShape() != partial.GetShape() ||
-          published[r]->Device() != ctx.Device()) {
+          published[r]->GetDevice() != ctx.GetDevice()) {
         return InvalidArgumentError("all-gather peers must have matching shapes and devices");
       }
       INFERX_RETURN_IF_ERROR(ops::CopyColumnBlock(op_ctx, *published[r], full,
@@ -165,5 +190,4 @@ Status LoopbackComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& p
   }());
 }
 
-}  // namespace dist
 }  // namespace inferx

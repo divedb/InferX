@@ -3,7 +3,9 @@
 
 #include "absl/types/span.h"
 #include "inferx/ops/attention.h"
+
 namespace inferx::ops {
+
 struct FlashDecodeWorkspace {
   // Eight partitions per request, up to 16 requests. Shared across layers.
   static constexpr int kPartitions = 8;
@@ -19,7 +21,7 @@ struct FlashDecodeWorkspace {
 /// rebuilt when the step's GQA group changes; the decode workspace, when
 /// allocated, enables the split-decode kernel for small pure-decode steps.
 struct AttentionPlanWorkspace {
-  std::optional<Tensor> plan;  ///< int32 [3 * max_tokens + 1] plan, once sized.
+  std::optional<Tensor> plan;                  ///< int32 [3 * max_tokens + 1] plan, once sized.
   std::optional<FlashDecodeWorkspace> decode;  ///< Present iff split decode is enabled.
   /// Selection state for the current step; updated by BeginAttentionStep
   /// and PagedAttention, meaningless between steps.
@@ -33,9 +35,9 @@ struct AttentionPlanWorkspace {
 ///
 /// Chooses the split-decode kernel when its workspace is allocated and the
 /// batch is pure decode within its capacity, else the shared paged path.
-Status BeginAttentionStep(OpContext& ctx, const Tensor& kv_indptr,
-                          const Tensor& last_page_len, int64_t block_size, int num_tokens,
-                          int num_seqs, AttentionPlanWorkspace& ws);
+Status BeginAttentionStep(OpContext& ctx, const Tensor& kv_indptr, const Tensor& last_page_len,
+                          int64_t block_size, int num_tokens, int num_seqs,
+                          AttentionPlanWorkspace& ws);
 
 /// \brief Runs causal paged attention for one layer, kernels chosen
 ///        internally.
@@ -50,9 +52,8 @@ Status PagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
                       int64_t block_size, const AttentionParams& params,
                       AttentionPlanWorkspace& ws, Tensor& attn_out);
 
-Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv_indptr,
-                          const Tensor& last_page_len, int block_size,
-                          FlashDecodeWorkspace& workspace);
+Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv_indptr, const Tensor& last_page_len,
+                          int block_size, FlashDecodeWorkspace& workspace);
 // Graph-safe GPU planning, reused across layers. Inputs must describe positive
 // query lengths and valid, nonempty KV page tables; each query chunk is the
 // suffix of its sequence's current KV. Host/device metadata must agree.
@@ -60,10 +61,11 @@ Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv_indptr,
 // owns validating device metadata values and keeping buffers alive on stream.
 // Supported BF16 full causal geometry: head_dim 64/128/256, GQA ratio 1..32.
 // Both tile sizes 64 and 128 are supported. Other geometry returns a Status.
-Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo_indptr, Tensor& plan,
-                             int group, int tiles, int tile_rows = 64);
-Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
-                           const Tensor& kv, const Tensor& indices, const Tensor& last_page_len,
+Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo_indptr, Tensor& plan, int group,
+                             int tiles, int tile_rows = 64);
+
+Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo, const Tensor& kv,
+                           const Tensor& indices, const Tensor& last_page_len,
                            const Tensor& key, const Tensor& value, int64_t block_size,
                            const AttentionParams& params, const Tensor& plan, int tiles,
                            Tensor& out, const FlashDecodeWorkspace* decode = nullptr,

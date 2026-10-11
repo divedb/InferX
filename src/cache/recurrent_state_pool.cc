@@ -9,7 +9,7 @@
 namespace inferx {
 
 StatusOr<RecurrentStatePool> RecurrentStatePool::Create(
-    const std::vector<models::RecurrentStateSpec>& specs, int64_t max_slots, DeviceId device) {
+    const std::vector<models::RecurrentStateSpec>& specs, int64_t max_slots, Device device) {
   if (specs.empty() || max_slots <= 0) {
     return InvalidArgumentError("recurrent pool needs layers and positive slots");
   }
@@ -46,7 +46,7 @@ StatusOr<RecurrentStatePool> RecurrentStatePool::Create(
 namespace {
 
 StatusOr<Tensor> ViewAt(const DeviceBuffer& storage, int64_t offset, const Shape& shape,
-                        DeviceId device) {
+                        Device device) {
   return Tensor::FromBlob(const_cast<std::byte*>(storage.data()) + offset, DataType::kFloat32,
                           shape, device);
 }

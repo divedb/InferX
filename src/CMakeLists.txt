@@ -3,7 +3,7 @@ add_subdirectory(util)       # typed views over HuggingFace JSON configs
 add_subdirectory(cache)      # paged KV block pool
 add_subdirectory(ops)        # portable compute ops + cpu/cuda backends
 add_subdirectory(sampling)   # sampling pipeline
-add_subdirectory(models)     # components, decoders, checkpoints, families
+add_subdirectory(models)     # families, reusable layers, registry, runner
 add_subdirectory(engine)     # scheduling and orchestration
 add_subdirectory(dist)       # collectives + tensor-parallel topology
 add_subdirectory(bench)      # benchmark entry points

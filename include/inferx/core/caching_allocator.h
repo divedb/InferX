@@ -75,7 +75,7 @@ class CachingAllocator final : public Allocator {
   /// \param capacity  The size of the memory region in bytes.
   /// \param device    The device ID associated with the allocator.
   /// \param alignment The alignment requirement for allocations.
-  CachingAllocator(std::byte* base, size_t capacity, DeviceId device,
+  CachingAllocator(std::byte* base, size_t capacity, Device device,
                    size_t alignment = kTensorAlignment);
 
   CachingAllocator(const CachingAllocator&) = delete;
@@ -130,7 +130,7 @@ class CachingAllocator final : public Allocator {
   size_t Granularity() const { return alignment_; }
 
   /// \brief Returns the device the region lives on.
-  DeviceId Device() const override { return device_; }
+  Device GetDevice() const override { return device_; }
   /// \brief Returns the allocator's diagnostic name.
   std::string_view Name() const override { return "workspace"; }
 
@@ -244,7 +244,7 @@ class CachingAllocator final : public Allocator {
   std::byte* base_ = nullptr;
   size_t capacity_ = 0;
   size_t alignment_ = kTensorAlignment;
-  DeviceId device_;
+  Device device_;
 
   std::vector<std::unique_ptr<Block>> pool_;
   std::vector<Block*> recycled_;

@@ -9,7 +9,6 @@
 #include "boost/interprocess/ipc/message_queue.hpp"
 
 namespace inferx {
-namespace dist {
 namespace {
 
 using boost::interprocess::message_queue;
@@ -95,5 +94,4 @@ void MessageChannel::Remove() {
   }
 }
 
-}  // namespace inferx::dist
 }  // namespace inferx

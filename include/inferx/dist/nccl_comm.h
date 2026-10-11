@@ -19,7 +19,6 @@
 #include "inferx/dist/comm.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief NCCL's ncclUniqueId is 128 opaque bytes; the wire type for
 ///        bootstrap exchange.
@@ -29,7 +28,7 @@ using NcclUniqueId = std::array<std::uint8_t, 128>;
 /// before issuing grouped NCCL calls, so a rank failure can release its peers.
 class NcclWorld {
  public:
-  static StatusOr<std::shared_ptr<NcclWorld>> Create(const std::vector<DeviceId>& devices);
+  static StatusOr<std::shared_ptr<NcclWorld>> Create(const std::vector<Device>& devices);
   std::unique_ptr<CommBackend> MakeRank(int rank);
   void Abort(const Status& reason);
   Status CheckHealth();
@@ -50,7 +49,7 @@ class NcclComm final : public CommBackend {
   ///        joined. The communicator is bound to `device`; later contexts
   ///        must use that device. Fails with NotFound when libnccl is unavailable.
   static StatusOr<std::unique_ptr<NcclComm>> Join(int rank, int size, const NcclUniqueId& id,
-                                                  DeviceId device);
+                                                  Device device);
 
   ~NcclComm() override;
 
@@ -61,16 +60,17 @@ class NcclComm final : public CommBackend {
   Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override;
 
+  StatusOr<int64_t> AllReduceMin(const ops::OpContext& ctx, int64_t value) override;
+
  private:
-  NcclComm(int rank, int size, void* comm, DeviceId device);
+  NcclComm(int rank, int size, void* comm, Device device);
 
   int rank_;
   int size_;
   void* comm_;  ///< ncclComm_t.
-  DeviceId device_;
+  Device device_;
 };
 
-}  // namespace dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_NCCL_COMM_H_

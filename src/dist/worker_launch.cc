@@ -15,7 +15,6 @@
 extern char** environ;
 
 namespace inferx {
-namespace dist {
 
 StatusOr<std::string> SelfExePath() {
   char path[4096] = {0};
@@ -118,5 +117,4 @@ Status WorkerPool::WaitAll() {
   return overall;
 }
 
-}  // namespace inferx::dist
 }  // namespace inferx

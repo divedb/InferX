@@ -12,7 +12,7 @@ namespace inferx::ops {
 /// token ids) and activation row selection (indices are output rows). Rows
 /// are independent; `out` must not alias `src`.
 ///
-/// \param ctx      Execution context; all tensors must live on ctx.Device().
+/// \param ctx      Execution context; all tensors must live on ctx.GetDevice().
 /// \param src      [rows, dim] source rows.
 /// \param indices  [count] int32 row indices into `src`.
 /// \param out      [count, dim] gathered rows, same dtype as `src`.

@@ -18,7 +18,6 @@
 #include "inferx/tokenizer/id.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief Prompts ride inline in one message; longer prompts are rejected
 ///        until streaming segmentation lands.
@@ -107,7 +106,6 @@ class MessageChannel {
   std::shared_ptr<Impl> impl_;
 };
 
-}  // namespace inferx::dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_WORKER_IPC_H_

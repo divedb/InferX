@@ -10,7 +10,7 @@ namespace inferx {
 
 StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers, int64_t num_blocks,
                                           int64_t block_size, const KvLayout& layout,
-                                          DeviceId device) {
+                                          Device device) {
   if (num_layers <= 0 || num_blocks <= 0 || block_size <= 0) {
     return InvalidArgumentError("KV pool needs positive dimensions, got layers=", num_layers,
                                 " blocks=", num_blocks, " block_size=", block_size);
@@ -60,7 +60,7 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers, int64_t num_blocks
 
 StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_blocks, int64_t block_size,
                                           const std::vector<KvLayout>& layouts,
-                                          DeviceId device) {
+                                          Device device) {
   if (layouts.empty()) {
     return InvalidArgumentError("KV pool needs at least one layer layout");
   }
@@ -129,7 +129,7 @@ Status KvBlockPool::FreeBlocks(const std::vector<int32_t>& blocks) {
 namespace {
 
 StatusOr<Tensor> ViewAt(const DeviceBuffer& storage, int64_t offset, const Shape& shape,
-                        DataType dtype, DeviceId device) {
+                        DataType dtype, Device device) {
   return Tensor::FromBlob(const_cast<std::byte*>(storage.data()) + offset, dtype, shape,
                           device);
 }

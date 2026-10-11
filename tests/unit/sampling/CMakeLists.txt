@@ -4,3 +4,4 @@ inferx_add_test(
   DEPS inferx::sampling
   LABELS unit
 )
+

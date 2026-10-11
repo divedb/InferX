@@ -189,7 +189,7 @@ Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_we
   if (experts > 512) return UnimplementedError("router kernel supports up to 512 experts");
   if (config.topk > 64) return UnimplementedError("router kernel supports up to 64 selected");
   RouteTokensKernel<<<static_cast<uint32_t>(hidden.Dim(0)), kThreads, 0,
-                      static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                      ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(hidden.Data()),
       static_cast<const __nv_bfloat16*>(router_weight.Data()),
       router_bias == nullptr ? nullptr
@@ -203,7 +203,7 @@ Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_we
 Status ExpertHistogram(OpContext& ctx, const Tensor& topk_indices, int64_t num_experts,
                        Tensor& counts) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
+  cudaStream_t stream = ctx.GetStream().As<cudaStream_t>();
   INFERX_RETURN_IF_ERROR(CudaStatus(
       cudaMemsetAsync(counts.Data(), 0, num_experts * sizeof(int), stream), "zero counts"));
   const int64_t total = topk_indices.Numel();
@@ -217,7 +217,7 @@ Status ScatterSlots(OpContext& ctx, const Tensor& topk_indices, const Tensor& to
                     const Tensor& offsets, Tensor& cursor, Tensor& token_rows,
                     Tensor& weights_by_slot) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
+  cudaStream_t stream = ctx.GetStream().As<cudaStream_t>();
   const int64_t experts = offsets.Numel() - 1;
   INFERX_RETURN_IF_ERROR(CudaStatus(
       cudaMemsetAsync(cursor.Data(), 0, experts * sizeof(int), stream), "zero cursor"));
@@ -235,7 +235,7 @@ Status GatherRoutedTokens(OpContext& ctx, const Tensor& hidden, const Tensor& to
                           Tensor& out) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   GatherKernel<<<static_cast<uint32_t>(token_rows.Numel()), kThreads, 0,
-                 static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                 ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(hidden.Data()),
       static_cast<const int*>(token_rows.Data()), static_cast<int>(hidden.Dim(1)),
       token_rows.Numel(), static_cast<__nv_bfloat16*>(out.Data()));
@@ -247,7 +247,7 @@ Status ScatterRoutedOutputs(OpContext& ctx, const Tensor& expert_rows,
                             int64_t begin, int64_t count, Tensor& out) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   ScatterAddKernel<<<static_cast<uint32_t>(count), kThreads, 0,
-                     static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                     ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(expert_rows.Data()) + begin * expert_rows.Dim(1),
       static_cast<const int*>(token_rows.Data()) + begin,
       static_cast<const float*>(weights_by_slot.Data()) + begin,

@@ -7,8 +7,8 @@
 namespace inferx::ops {
 namespace {
 
-Status CheckHost(const Tensor& t, DataType dtype, const DeviceId& device) {
-  if (t.GetDataType() != dtype || t.Device() != device) {
+Status CheckHost(const Tensor& t, DataType dtype, const Device& device) {
+  if (t.GetDataType() != dtype || t.GetDevice() != device) {
     return InvalidArgumentError("MoE routing tensors must be ", DataTypeName(dtype), " on ",
                                 device.ToString());
   }
@@ -20,7 +20,7 @@ Status CheckHost(const Tensor& t, DataType dtype, const DeviceId& device) {
 Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_weight,
                    const Tensor* router_bias, const Tensor* correction_bias,
                    const RoutingConfig& config, Tensor& topk_indices, Tensor& topk_weights) {
-  const DeviceId device = ctx.Device();
+  const Device device = ctx.GetDevice();
   if (hidden.Rank() != 2 || router_weight.Rank() != 2 ||
       hidden.GetDataType() != DataType::kBFloat16 ||
       router_weight.GetDataType() != DataType::kBFloat16 ||
@@ -55,7 +55,7 @@ Status RouteTokens(OpContext& ctx, const Tensor& hidden, const Tensor& router_we
   }
   for (const Tensor* t : std::initializer_list<const Tensor*>{
            &hidden, &router_weight, &topk_indices, &topk_weights}) {
-    if (t->Device() != device) {
+    if (t->GetDevice() != device) {
       return InvalidArgumentError("router tensors must live on the context device");
     }
   }

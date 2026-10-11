@@ -64,7 +64,7 @@ Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
   auto* q_ptr = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(q.Data()));
   auto* k_ptr = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(k.Data()));
   ApplyRopeKernel<<<static_cast<uint32_t>(q.Dim(0)), 256, 0,
-                    static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                    ctx.GetStream().As<cudaStream_t>()>>>(
       q_ptr, k_ptr, static_cast<const int32_t*>(positions.Data()),
       static_cast<int>(q.Dim(1)), static_cast<int>(k.Dim(1)), static_cast<int>(q.Dim(2)),
       static_cast<int>(params.rotary_dim), params);

@@ -39,7 +39,7 @@ class Storage final : public ThreadSafeRefCountedBase<Storage> {
   /// \param device The device to allocate on.
   /// \return       A StatusOr containing a StoragePtr on success, or an error
   ///               status on failure.
-  static StatusOr<StoragePtr> Allocate(size_t bytes, DeviceId device);
+  static StatusOr<StoragePtr> Allocate(size_t bytes, Device device);
 
   /// \brief Wraps memory owned elsewhere, freeing nothing. The caller
   ///        guarantees the bytes outlive every handle derived from this one.
@@ -49,7 +49,7 @@ class Storage final : public ThreadSafeRefCountedBase<Storage> {
   /// \param bytes  The size of the memory block to wrap, in bytes.
   /// \param device The device on which the memory block resides.
   /// \return       A StoragePtr that wraps the given memory block.
-  static StoragePtr Borrow(void* data, size_t bytes, DeviceId device);
+  static StoragePtr Borrow(void* data, size_t bytes, Device device);
 
   /// \brief Destroys the Storage, returning owned bytes to its allocator.
   ~Storage();
@@ -67,7 +67,7 @@ class Storage final : public ThreadSafeRefCountedBase<Storage> {
   /// \brief Returns the device on which the underlying memory block resides.
   ///
   /// \return The device on which the underlying memory block resides.
-  DeviceId Device() const { return device_; }
+  Device GetDevice() const { return device_; }
 
   /// \brief Check whether the storage is borrowed.
   ///
@@ -85,12 +85,12 @@ class Storage final : public ThreadSafeRefCountedBase<Storage> {
   /// \param device    The device on which the memory block resides.
   /// \param allocator The allocator responsible for the memory block. nullptr
   ///                  if borrowed.
-  Storage(void* data, size_t bytes, DeviceId device, Allocator* allocator)
+  Storage(void* data, size_t bytes, Device device, Allocator* allocator)
       : data_(data), size_(bytes), device_(device), allocator_(allocator) {}
 
   void* data_ = nullptr;
   size_t size_ = 0;
-  DeviceId device_;
+  Device device_;
   Allocator* allocator_ = nullptr;  ///< null => borrowed
 };
 

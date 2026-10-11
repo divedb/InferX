@@ -140,3 +140,103 @@ with suspended operations is supported by Asio; it destroys pending handlers.
 The concrete application lifetime risk is that a suspended `CancelGuard` can
 call an already-destroyed gateway. Neither that inspection finding nor an
 executor-contract violation proves the cause of the historical allocator errors.
+
+## 2026-10-09: InferX vs vLLM greedy agreement — 4 of 8 completions differ
+
+The first post-refactor serving comparison
+(`benchmarks/qwen3/serve_results/refactor_fix_20261009`; 8 fixed prompts,
+`temperature: 0`, 64 completion tokens, two repetitions per stack)
+completed all 80 InferX requests successfully. Four of the eight greedy
+completions match vLLM exactly; four differ, so exact output parity was
+not established.
+
+**Root cause: BF16 last-ulp divergence at near-tied decisions, not a
+semantic or serving defect.** The two stacks compute the same model with
+independent kernel orderings (cuBLAS GEMM tilings, FlashInfer
+attention/norm variants, rope roundings), so their logits differ in the
+final one or two BF16 bits. Whenever a step's top-2 candidates sit that
+close, each stack's argmax lands on its own rounding, and greedy decoding
+amplifies the single flipped token into a wholly different — still fluent
+— continuation. Both stacks are internally deterministic (each reproduced
+its own outputs across both repetitions, and today's build reproduces the
+recorded InferX outputs byte-for-byte on all 8 prompts), which rules out
+sampling configuration, mid-refactor build drift, and nondeterminism.
+
+Evidence, from the teacher-forced probe kept as
+`tests/integration/models/vllm_parity_probe_test.cc`: for each differing
+completion, tokenize both full texts, locate the first differing token,
+teacher-force the shared prefix through the model, and read the logits at
+exactly that decision position. InferX's own logits at the four decision
+points:
+
+| prompt | first diff token | logit(InferX) | logit(vLLM) | gap |
+|---|---|---|---|---|
+| 0 "The capital of France is" | 17 (`French` vs `Republic`) | 14.9375 | 14.8750 | 1 ulp |
+| 4 "The largest planet…" | 43 (`\n` vs `' '` after "Mars**") | 23.5000 | 23.5000 | exact tie |
+| 5 "A classic example of a prime…" | 16 (`Let's` vs `What`) | 17.3750 | 17.2500 | 1 ulp |
+| 7 "Cross-entropy loss…" | 16 (`incorrect` vs `correct`) | 19.5000 | 19.2500 | 2 ulps |
+
+Prompt 4 is a literal BF16 tie (both candidates 23.5000, bits 0x41BC):
+the engine's fused argmax reduction keeps one maximal token and vLLM's
+keeps the other — a tie-break with no numerically meaningful winner. The
+same mechanism explains the golden-trace tie documented in
+`model_test.cc` (15344 vs 9625 at exactly 16.6250).
+
+What this is not: not sampling (requests carried `temperature: 0` and
+both servers were deterministic across repetitions); not a regression
+(today's binary regenerates all 8 recorded outputs exactly, including the
+4 divergent ones); not KV/state corruption (the probe reproduces every
+InferX choice from the shared prefix up to the near-tie).
+
+Consequence for parity claims: exact text equality across independently
+implemented BF16 stacks is attainable only where every decision has a
+margin larger than rounding noise. The meaningful criterion is
+agreement-where-decided: the probe asserts each divergence occurs at a
+≤2-ulp decision point, and 4/8 prompts matching exactly is consistent
+with the remainder hitting near-ties within 64 sampled decisions each.
+
+### 2026-10-09 follow-up: tie semantics verified against vLLM; no engine defect
+
+Referred to vLLM's implementation to check the one engine behavior the
+tie explanation depends on: `vllm/v1/sample/sampler.py::greedy_sample` is
+`logits.argmax(dim=-1)`, and `torch.argmax` returns the FIRST maximal
+index on ties (verified empirically on CUDA, torch 2.12). InferX's three
+sampling paths -- the fused `GreedyArgmax` op, the mixed-batch pipeline's
+greedy rows, and the CPU reference -- all use the same comparator
+(maximum value, ties to the lowest index) and therefore already implement
+vLLM's convention; nothing to fix. What was missing was proof, so:
+
+- `tests/regression/argmax_tie_test.cc` pins the semantics at full
+  vocabulary scale (151,936 columns) using the investigation's actual
+  ties: 334/56177 at 23.5, 9625/15344 at 16.625, and a three-way tie
+  spanning the kernel's partial reductions. All resolve to the lowest
+  index, including across the 38 partial blocks.
+- `tests/regression/vllm_parity_probe_test.cc` (moved from
+  tests/integration) adds the serving-path check: walking each differing
+  prompt as the runner executed it -- prompt prefill, then one-token
+  decode steps against a persistent KV pool -- reproduces the engine's
+  recorded choice as the strict argmax of that path's logits. Notably,
+  for the exact-tie prompt (334/56177, both 23.5 in the single-chunk
+  view), the serving path's own logits rank 56177 strictly first: the
+  decode-kernel roundings differ from the single-chunk-prefill roundings
+  by an ulp, each view is self-consistent, and the engine picks its own
+  path's true argmax either way.
+
+Conclusion unchanged and now proven end to end: the divergences are
+strict-argmax differences over 0-2-ulp logit gaps produced by independent
+kernel paths (InferX's cuBLAS/FlashInfer invocations vs vLLM's), not a
+tie-break, sampling, or state defect. Exact text parity between the
+stacks is bounded by that; matching it further would require
+kernel-for-kernel bitwise equality, which is not a goal.
+
+Validation command:
+
+```sh
+cmake --build build-cuda13 --target inferx_argmax_tie_test inferx_vllm_parity_probe_test
+ctest --test-dir build-cuda13 -R '^(argmax_tie_test|vllm_parity_probe_test)$' --output-on-failure
+```
+
+Result: both pass. The probe reports the 0-, 1-, 1-, and 2-ulp decision
+gaps, reproduces InferX's own choice at every decision point under both
+the single-chunk and the serving execution path, and the argmax suite
+confirms lowest-index ties at vocabulary scale.

@@ -34,7 +34,7 @@ class Sampler {
   ///        over a `vocab_size` vocabulary on `device`.
   static StatusOr<std::unique_ptr<Sampler>> Create(int max_num_seqs,
                                                    std::int64_t vocab_size,
-                                                   DeviceId device);
+                                                   Device device);
 
   /// \brief Samples one token per row of `logits`.
   ///

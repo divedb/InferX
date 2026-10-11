@@ -15,7 +15,7 @@ class CacheManagerTest : public ::testing::Test {
     KvLayout layout;
     layout.kv_heads = 1;
     layout.head_dim = 8;
-    auto pool = KvBlockPool::Create(1, 3, 4, layout, DeviceId::Cpu());
+    auto pool = KvBlockPool::Create(1, 3, 4, layout, Device::Cpu());
     ASSERT_TRUE(pool.ok()) << pool.status();
     pool_ = std::make_unique<KvBlockPool>(std::move(*pool));
   }

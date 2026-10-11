@@ -24,7 +24,7 @@ struct ModelExecutor::Impl {
 ModelExecutor::ModelExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ModelExecutor::~ModelExecutor() = default;
 
-KvBlockPool* ModelExecutor::kv_pool() { return impl_->ranks.front()->kv_pool(); }
+KvBlockPool* ModelExecutor::KvPool() { return impl_->ranks.front()->KvPool(); }
 const models::ModelSpec& ModelExecutor::GetModelSpec() const {
   return impl_->ranks.front()->GetModelSpec();
 }
@@ -32,7 +32,7 @@ const models::ModelSpec& ModelExecutor::GetModelSpec() const {
 StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
     const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
     const ExecutionConfig& execution, const ParallelConfig& parallel,
-    std::unique_ptr<dist::CommBackend> comm) {
+    std::unique_ptr<CommBackend> comm) {
   INFERX_RETURN_IF_ERROR(parallel.Validate());
   INFERX_RETURN_IF_ERROR(model.device.Validate());
   if (comm || parallel.tensor_parallel_size == 1) {
@@ -62,26 +62,28 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
   if (ids.size() != static_cast<size_t>(parallel.tensor_parallel_size)) {
     return InvalidArgumentError("device-ids must contain one device per tensor-parallel rank");
   }
-  std::vector<DeviceId> devices;
+  std::vector<Device> devices;
   for (const int id : ids) {
     if (id > std::numeric_limits<int8_t>::max()) {
       return InvalidArgumentError("CUDA device ordinal is out of range");
     }
-    devices.push_back(DeviceId::Cuda(static_cast<int8_t>(id)));
+    devices.push_back(Device::Cuda(static_cast<int8_t>(id)));
   }
   // Reject unknown architectures before creating the communication world.
   INFERX_ASSIGN_OR_RETURN(auto hf, HfConfig::FromFile(model.model_dir + "/config.json"));
   INFERX_RETURN_IF_ERROR(models::ArchitectureRegistry::Builtins()
                              .Resolve(hf.ModelType(), hf.Architecture())
                              .status());
-  INFERX_ASSIGN_OR_RETURN(auto world, dist::NcclWorld::Create(devices));
+  INFERX_ASSIGN_OR_RETURN(auto world, NcclWorld::Create(devices));
   std::vector<std::unique_ptr<models::ModelRunner>> ranks;
   for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) {
     ModelConfig local = model;
     local.device.device_ids = {ids[rank]};
+    ParallelConfig rank_parallel;
+    rank_parallel.tensor_parallel_size = parallel.tensor_parallel_size;
+    rank_parallel.tensor_parallel_rank = rank;
     auto made = models::ModelRunner::Create(local, cache, scheduler, execution,
-                                    ParallelConfig{parallel.tensor_parallel_size, rank},
-                                    world->MakeRank(rank));
+                                            rank_parallel, world->MakeRank(rank));
     if (!made.ok()) {
       world->Abort(made.status());
       return made.status();

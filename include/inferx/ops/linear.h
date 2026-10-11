@@ -12,7 +12,7 @@ namespace inferx::ops {
 /// in_features], so no transposition happens at load time. On CUDA this is a
 /// vendor GEMM with fp32 accumulation; `out` must not alias `x` or `weight`.
 ///
-/// \param ctx     Execution context; all tensors must live on ctx.Device().
+/// \param ctx     Execution context; all tensors must live on ctx.GetDevice().
 /// \param x       [tokens, in_features] input activations.
 /// \param weight  [out_features, in_features] projection weights.
 /// \param out     [tokens, out_features] output, same dtype as the inputs.

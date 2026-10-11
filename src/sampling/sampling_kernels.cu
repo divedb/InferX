@@ -266,7 +266,7 @@ Status SampleRows(ops::OpContext& ctx, const Tensor& logits, const DeviceParams&
   if (logits.GetDataType() != DataType::kBFloat16) {
     return UnimplementedError("sampling pipeline expects bfloat16 logits");
   }
-  SampleRowsKernel<<<batch, kThreads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  SampleRowsKernel<<<batch, kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(logits.Data()),
       static_cast<const float*>(params.temperature->Data()),
       static_cast<const int*>(params.top_k->Data()),

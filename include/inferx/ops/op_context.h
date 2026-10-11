@@ -19,7 +19,7 @@ class OpContext {
   ///
   /// \param runtime The runtime bound to the execution device.
   /// \param stream  A stream created by that runtime.
-  OpContext(DeviceRuntime& runtime, Stream stream) : runtime_(runtime), stream_(stream) {}
+  OpContext(DeviceRuntime& runtime, DeviceStream stream) : runtime_(runtime), stream_(stream) {}
 
   /// \brief Returns the runtime ops execute on, which is bound to a device.
   ///
@@ -29,16 +29,16 @@ class OpContext {
   /// \brief Returns the stream ops enqueue work on, which is bound to a device.
   ///
   /// \return The stream.
-  Stream GetStream() const noexcept { return stream_; }
+  DeviceStream GetStream() const noexcept { return stream_; }
 
   /// \brief Returns the device ops execute on.
   ///
   /// \return The device.
-  DeviceId Device() const noexcept { return runtime_.device(); }
+  Device GetDevice() const noexcept { return runtime_.device(); }
 
  private:
   DeviceRuntime& runtime_;
-  Stream stream_;
+  DeviceStream stream_;
 };
 
 }  // namespace inferx::ops

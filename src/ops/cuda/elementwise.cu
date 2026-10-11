@@ -127,7 +127,7 @@ Status SplitProjection(OpContext& ctx, const Tensor& packed, Tensor& q, Tensor* 
                        Tensor& k, Tensor& v) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int gw = gate == nullptr ? 0 : static_cast<int>(gate->Dim(1));
-  SplitProjectionKernel<<<BlocksFor(packed.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  SplitProjectionKernel<<<BlocksFor(packed.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()),
       static_cast<__nv_bfloat16*>(q.Data()),
       gate == nullptr ? nullptr : static_cast<__nv_bfloat16*>(gate->Data()),
@@ -144,7 +144,7 @@ Status PackedSiluAndMul(OpContext& ctx, const Tensor& packed, Tensor& out) {
 Status PackedGatedActivation(OpContext& ctx, const Tensor& packed, Tensor& out,
                              Activation act, float oai_alpha, float oai_limit) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  PackedGatedActivationKernel<<<BlocksFor(out.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  PackedGatedActivationKernel<<<BlocksFor(out.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()), static_cast<__nv_bfloat16*>(out.Data()),
       static_cast<int>(out.Dim(1)), act, oai_alpha, oai_limit, out.Numel());
   return CudaStatus(cudaGetLastError(), "packed gated activation");
@@ -152,7 +152,7 @@ Status PackedGatedActivation(OpContext& ctx, const Tensor& packed, Tensor& out,
 
 Status AddBias(OpContext& ctx, const Tensor& x, const Tensor& bias, Tensor& out) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  AddBiasKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  AddBiasKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(bias.Data()),
       static_cast<__nv_bfloat16*>(out.Data()), static_cast<int>(x.Dim(1)), x.Numel());
@@ -161,7 +161,7 @@ Status AddBias(OpContext& ctx, const Tensor& x, const Tensor& bias, Tensor& out)
 
 Status MulSigmoidGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  MulSigmoidGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  MulSigmoidGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(gate.Data()), x.Numel());
   return CudaStatus(cudaGetLastError(), "mul sigmoid gate");
@@ -169,7 +169,7 @@ Status MulSigmoidGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
 
 Status MulSigmoidRowGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  MulSigmoidRowGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  MulSigmoidRowGateKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(gate.Data()), static_cast<int>(x.Dim(1)), x.Numel());
   return CudaStatus(cudaGetLastError(), "mul sigmoid row gate");
@@ -177,7 +177,7 @@ Status MulSigmoidRowGate(OpContext& ctx, Tensor& x, const Tensor& gate) {
 
 Status MulScalar(OpContext& ctx, Tensor& x, float scalar) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
-  MulScalarKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream()>>>(
+  MulScalarKernel<<<BlocksFor(x.Numel()), kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<__nv_bfloat16*>(x.Data()), scalar, x.Numel());
   return CudaStatus(cudaGetLastError(), "mul scalar");
 }
@@ -185,7 +185,7 @@ Status MulScalar(OpContext& ctx, Tensor& x, float scalar) {
 Status Add(OpContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t n = a.Numel();
-  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
+  const cudaStream_t stream = ctx.GetStream().As<cudaStream_t>();
   if (a.GetDataType() == DataType::kBFloat16) {
     AddKernel<<<BlocksFor(n), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(a.Data()), static_cast<const __nv_bfloat16*>(b.Data()),
@@ -207,7 +207,7 @@ Status Add(OpContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
 Status SiluAndMul(OpContext& ctx, const Tensor& gate, const Tensor& up, Tensor& out) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t n = gate.Numel();
-  const cudaStream_t stream = static_cast<cudaStream_t>(ctx.GetStream());
+  const cudaStream_t stream = ctx.GetStream().As<cudaStream_t>();
   if (gate.GetDataType() == DataType::kBFloat16) {
     SiluAndMulKernel<<<BlocksFor(n), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(gate.Data()),

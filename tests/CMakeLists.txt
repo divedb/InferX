@@ -12,3 +12,4 @@ FetchContent_MakeAvailable(googletest)
 # the inferx_add_test helper (cmake/InferxHelpers.cmake).
 add_subdirectory(unit)
 add_subdirectory(integration)
+add_subdirectory(regression)

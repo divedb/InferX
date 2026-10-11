@@ -66,7 +66,7 @@ Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out
     const auto* input = static_cast<const __nv_bfloat16*>(x.Data());
     const auto* weights = static_cast<const __nv_bfloat16*>(weight.Data());
     auto* output = static_cast<__nv_bfloat16*>(out.Data());
-    const auto stream = static_cast<cudaStream_t>(ctx.GetStream());
+    const auto stream = ctx.GetStream().As<cudaStream_t>();
     switch (n) {
       case 1: DecodeLinear<1><<<(m + 3) / 4, dim3(32, 4), 0, stream>>>(input, weights, output, m, k); break;
       case 2: DecodeLinear<2><<<(m + 3) / 4, dim3(32, 4), 0, stream>>>(input, weights, output, m, k); break;

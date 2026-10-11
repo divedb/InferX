@@ -37,7 +37,7 @@ class ModelExecutor {
   static StatusOr<std::unique_ptr<ModelExecutor>> Create(
       const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
       const ExecutionConfig& execution, const ParallelConfig& parallel = {},
-      std::unique_ptr<dist::CommBackend> comm = nullptr);
+      std::unique_ptr<CommBackend> comm = nullptr);
 
   /// \brief Combines already-built rank runners behind one executor.
   ///
@@ -54,7 +54,7 @@ class ModelExecutor {
 
   /// \brief The KV pool of the coordinating rank (the scheduler allocates
   ///        from it; group ranks share logical page IDs).
-  KvBlockPool* kv_pool();
+  KvBlockPool* KvPool();
 
   /// \brief The coordinating rank's engine-facing model facts.
   const models::ModelSpec& GetModelSpec() const;

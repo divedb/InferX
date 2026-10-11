@@ -50,9 +50,9 @@ class TensorImpl final : public ThreadSafeRefCountedBase<TensorImpl> {
 
   /// \brief Returns the Storage backing this tensor.
   ///
-  /// Named GetStorage/GetDataType/GetShape rather than
-  /// Storage/DataType/Shape: a member function may not share a name with a
-  /// type used in the same class.
+  /// Named GetStorage/GetDataType/GetShape/GetDevice rather than
+  /// Storage/DataType/Shape/Device: a member function may not share a name
+  /// with a type used in the same class.
   const StoragePtr& GetStorage() const { return storage_; }
   /// \brief Returns the byte offset into the Storage where this tensor's data
   ///        begins.
@@ -62,7 +62,7 @@ class TensorImpl final : public ThreadSafeRefCountedBase<TensorImpl> {
   /// \brief Returns the Shape of this tensor.
   const Shape& GetShape() const { return spec_.GetShape(); }
   /// \brief Returns the device the bytes live on.
-  DeviceId Device() const { return storage_->Device(); }
+  Device GetDevice() const { return storage_->GetDevice(); }
 
   /// \brief Returns a pointer to the tensor's data.
   void* Data() const { return storage_->Data() + StorageOffset(); }
@@ -102,10 +102,10 @@ class Tensor {
   /// \param dtype  The DataType of the tensor elements.
   /// \param shape  The Shape of the tensor, describing the dimensions and
   ///               extents.
-  /// \param device The DeviceId of the device on which to allocate the tensor.
+  /// \param device The Device of the device on which to allocate the tensor.
   /// \return       A StatusOr containing a Tensor on success, or an error
   ///               status on failure.
-  static StatusOr<Tensor> Empty(DataType dtype, const Shape& shape, DeviceId device);
+  static StatusOr<Tensor> Empty(DataType dtype, const Shape& shape, Device device);
 
   /// \brief Allocates uninitialized memory from a specific allocator -- a
   ///        per-rank workspace, say.
@@ -131,7 +131,7 @@ class Tensor {
   /// \return       A StatusOr containing a Tensor on success, or an error
   ///               status on failure.
   static StatusOr<Tensor> FromBlob(void* data, DataType dtype, const Shape& shape,
-                                   DeviceId device);
+                                   Device device);
 
   /// \brief Shares an existing Storage at a byte offset.
   ///
@@ -156,7 +156,7 @@ class Tensor {
   DataType GetDataType() const { return impl_->GetDataType(); }
 
   /// \brief Returns the device the tensor's bytes live on.
-  DeviceId Device() const { return impl_->Device(); }
+  Device GetDevice() const { return impl_->GetDevice(); }
 
   /// \brief Returns the tensor's shape.
   Shape GetShape() const { return impl_->GetShape(); }
@@ -228,7 +228,7 @@ class Tensor {
   ///
   /// \param device The destination device.
   /// \return       The tensor on `device`, or an error status.
-  StatusOr<Tensor> To(DeviceId device) const;
+  StatusOr<Tensor> To(Device device) const;
 
   /// \brief Copies this tensor's bytes into `dst`, an existing tensor.
   ///

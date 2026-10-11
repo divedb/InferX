@@ -20,14 +20,14 @@ StatusOr<Tensor> Tensor::Empty(DataType dtype, const Shape& shape, Allocator* al
   return Tensor(makeIntrusiveRefCnt<TensorImpl>(std::move(storage), 0, dtype, shape));
 }
 
-StatusOr<Tensor> Tensor::Empty(DataType dtype, const Shape& shape, DeviceId device) {
+StatusOr<Tensor> Tensor::Empty(DataType dtype, const Shape& shape, Device device) {
   INFERX_ASSIGN_OR_RETURN(Allocator * alloc, AllocatorFor(device));
 
   return Empty(dtype, shape, alloc);
 }
 
 StatusOr<Tensor> Tensor::FromBlob(void* data, DataType dtype, const Shape& shape,
-                                  DeviceId device) {
+                                  Device device) {
   INFERX_RETURN_IF_ERROR(TensorSpec(dtype, shape).Verify());
   if (data == nullptr && shape.Numel() != 0) {
     return InvalidArgumentError("null data pointer for non-empty tensor ", shape.ToString());
@@ -122,7 +122,7 @@ StatusOr<Tensor> Tensor::Bitcast(DataType new_dtype) const {
   return FromStorage(impl_->GetStorage(), StorageOffset(), new_dtype, out);
 }
 
-StatusOr<Tensor> Tensor::To(DeviceId device) const {
+StatusOr<Tensor> Tensor::To(Device device) const {
   if (Device() == device) return *this;
 
   if (!IsCpu() && !device.IsCpu() && Device() != device) {
@@ -140,7 +140,7 @@ StatusOr<Tensor> Tensor::To(DeviceId device) const {
   const auto kind = IsCpu()       ? CopyKind::kHostToDevice
                     : out.IsCpu() ? CopyKind::kDeviceToHost
                                   : CopyKind::kDeviceToDevice;
-  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.Device() : Device()));
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.GetDevice() : Device()));
   INFERX_RETURN_IF_ERROR(
       runtime->Copy(out.Data(), Data(), static_cast<size_t>(NBytes()), kind));
 
@@ -163,14 +163,14 @@ Status Tensor::CopyTo(Tensor& dst) const {
     std::memmove(dst.Data(), Data(), static_cast<size_t>(NBytes()));
     return OkStatus();
   }
-  if (!IsCpu() && !dst.IsCpu() && Device() != dst.Device()) {
+  if (!IsCpu() && !dst.IsCpu() && Device() != dst.GetDevice()) {
     return UnimplementedError("cross-device copy requires an explicit transfer");
   }
 
   const CopyKind kind = IsCpu()       ? CopyKind::kHostToDevice
                         : dst.IsCpu() ? CopyKind::kDeviceToHost
                                       : CopyKind::kDeviceToDevice;
-  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.Device() : Device()));
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.GetDevice() : Device()));
   INFERX_RETURN_IF_ERROR(
       runtime->Copy(dst.Data(), Data(), static_cast<size_t>(NBytes()), kind));
   return OkStatus();

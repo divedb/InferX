@@ -12,7 +12,6 @@
 #include "inferx/ops/op_context.h"
 
 namespace inferx {
-namespace dist {
 namespace {
 
 // ncclResult_t values this code distinguishes.
@@ -23,6 +22,8 @@ constexpr int kNcclBfloat16 = 9;
 
 // ncclRedOp_t.
 constexpr int kNcclSum = 0;
+constexpr int kNcclMin = 3;
+constexpr int kNcclInt64 = 4;
 
 // ncclCommInitRank takes this struct by value, not a pointer to its bytes.
 struct NcclIdAbi {
@@ -109,7 +110,7 @@ StatusOr<NcclUniqueId> NcclComm::NewUniqueId() {
 }
 
 StatusOr<std::unique_ptr<NcclComm>> NcclComm::Join(int rank, int size, const NcclUniqueId& id,
-                                                   DeviceId device) {
+                                                   Device device) {
   if (rank < 0 || size <= 0 || rank >= size) {
     return InvalidArgumentError("invalid NCCL topology: rank ", rank, " of ", size);
   }
@@ -126,7 +127,7 @@ StatusOr<std::unique_ptr<NcclComm>> NcclComm::Join(int rank, int size, const Ncc
   return std::unique_ptr<NcclComm>(new NcclComm(rank, size, comm, device));
 }
 
-NcclComm::NcclComm(int rank, int size, void* comm, DeviceId device)
+NcclComm::NcclComm(int rank, int size, void* comm, Device device)
     : rank_(rank), size_(size), comm_(comm), device_(device) {}
 
 NcclComm::~NcclComm() {
@@ -141,7 +142,7 @@ NcclComm::~NcclComm() {
 
 Status NcclComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
   INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, partial));
-  if (ctx.Device() != device_) {
+  if (ctx.GetDevice() != device_) {
     return InvalidArgumentError("NCCL context must match the communicator's device");
   }
   if (partial.IsEmpty()) return OkStatus();
@@ -150,8 +151,32 @@ Status NcclComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
   if (!api->Ready()) return Unavailable();
   return NcclCall(
       api->all_reduce(partial.Data(), partial.Data(), static_cast<size_t>(partial.Numel()),
-                      kNcclBfloat16, kNcclSum, comm_, static_cast<void*>(ctx.GetStream())),
+                      kNcclBfloat16, kNcclSum, comm_, ctx.GetStream().handle),
       "ncclAllReduce");
+}
+
+StatusOr<int64_t> NcclComm::AllReduceMin(const ops::OpContext& ctx, int64_t value) {
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  const NcclApi* api = NcclApi::Load();
+  if (!api->Ready()) return Unavailable();
+  INFERX_ASSIGN_OR_RETURN(void* buffer, ctx.Runtime().Allocate(sizeof(int64_t)));
+  Status staged = ctx.Runtime().CopyAsync(buffer, &value, sizeof(int64_t),
+                                          CopyKind::kHostToDevice, ctx.GetStream());
+  if (staged.ok()) {
+    staged = NcclCall(api->all_reduce(buffer, buffer, 1, kNcclInt64, kNcclMin, comm_,
+                                      ctx.GetStream().handle),
+                      "ncclAllReduce(min)");
+  }
+  int64_t result = 0;
+  if (staged.ok()) {
+    staged = ctx.Runtime().CopyAsync(&result, buffer, sizeof(int64_t),
+                                     CopyKind::kDeviceToHost, ctx.GetStream());
+  }
+  if (staged.ok()) staged = ctx.Runtime().SynchronizeStream(ctx.GetStream());
+  const Status freed = ctx.Runtime().Free(buffer);
+  INFERX_RETURN_IF_ERROR(staged);
+  INFERX_RETURN_IF_ERROR(freed);
+  return result;
 }
 
 Status NcclComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
@@ -160,7 +185,7 @@ Status NcclComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& parti
   // shards would land rank-major. Gathering per row keeps the result
   // [rows, size * shard] in the layout the caller expects.
   INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
-  if (ctx.Device() != device_) {
+  if (ctx.GetDevice() != device_) {
     return InvalidArgumentError("NCCL context must match the communicator's device");
   }
   if (partial.IsEmpty()) return OkStatus();
@@ -175,7 +200,7 @@ Status NcclComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& parti
     INFERX_RETURN_IF_ERROR(
         NcclCall(api->all_gather(send + row * shard * elem, recv + row * size() * shard * elem,
                                  static_cast<size_t>(shard), kNcclBfloat16, comm_,
-                                 static_cast<void*>(ctx.GetStream())),
+                                 ctx.GetStream().handle),
                  "ncclAllGather"));
   }
   return OkStatus();
@@ -188,15 +213,26 @@ struct NcclWorldState {
     Tensor input;
     Tensor output;
     DeviceRuntime* runtime;
-    Stream stream;
+    DeviceStream stream;
+  };
+  /// Host-value min request, submitted in parallel to the tensor jobs so
+  /// Submission stays a plain aggregate over Tensors.
+  struct HostMin {
+    int64_t value = 0;          ///< This rank's contribution.
+    int64_t* result = nullptr;  ///< Where the minimum lands.
+    DeviceRuntime* runtime = nullptr;
+    DeviceStream stream{};
   };
   std::mutex mu;
   std::condition_variable cv;
-  std::vector<DeviceId> devices;
+  std::vector<Device> devices;
   std::vector<void*> comms;
   std::vector<std::optional<Submission>> submissions;
+  std::vector<std::optional<HostMin>> host_mins;
   size_t arrived = 0;
+  uint64_t host_arrived = 0;
   uint64_t generation = 0;
+  uint64_t host_generation = 0;
   Status failure;
 
   ~NcclWorldState() { AbortLocked(absl::CancelledError("NCCL world closed")); }
@@ -255,6 +291,61 @@ struct NcclWorldState {
     return OkStatus();
   }
 
+  /// Host-value minimum: each rank stages its int64 into its own device
+  /// buffer, one grouped all-reduce(min) across every comm, then copies
+  /// back and syncs on each rank's own stream. Mirrors Submit()'s barrier
+  /// protocol with its own generation counter.
+  Status SubmitMinHost(int rank, HostMin item) {
+    std::unique_lock lock(mu);
+    if (!failure.ok()) return failure;
+    const auto current = host_generation;
+    host_mins[static_cast<size_t>(rank)] = std::move(item);
+    if (++host_arrived == comms.size()) {
+      const Status status = DispatchMinHost();
+      if (!status.ok()) AbortLocked(status);
+      host_arrived = 0;
+      ++host_generation;
+      cv.notify_all();
+    } else {
+      cv.wait(lock, [&] { return host_generation != current || !failure.ok(); });
+    }
+    return failure;
+  }
+
+  Status DispatchMinHost() {
+    const auto* api = NcclApi::Load();
+    std::vector<void*> buffers(comms.size(), nullptr);
+    for (size_t rank = 0; rank < comms.size(); ++rank) {
+      const auto& item = *host_mins[rank];
+      INFERX_RETURN_IF_ERROR(item.runtime->Activate());
+      INFERX_ASSIGN_OR_RETURN(buffers[rank], item.runtime->Allocate(sizeof(int64_t)));
+      INFERX_RETURN_IF_ERROR(item.runtime->CopyAsync(
+          buffers[rank], &item.value, sizeof(int64_t), CopyKind::kHostToDevice,
+          item.stream));
+    }
+    INFERX_RETURN_IF_ERROR(NcclCall(api->group_start(), "ncclGroupStart"));
+    Status status;
+    for (size_t rank = 0; rank < comms.size(); ++rank) {
+      const auto& item = *host_mins[rank];
+      status = NcclCall(api->all_reduce(buffers[rank], buffers[rank], 1, kNcclInt64,
+                                        kNcclMin, comms[rank], item.stream.handle),
+                        "ncclAllReduce(min)");
+      if (!status.ok()) break;
+    }
+    const auto end = NcclCall(api->group_end(), "ncclGroupEnd");
+    INFERX_RETURN_IF_ERROR(status);
+    INFERX_RETURN_IF_ERROR(end);
+    for (size_t rank = 0; rank < comms.size(); ++rank) {
+      const auto& item = *host_mins[rank];
+      INFERX_RETURN_IF_ERROR(item.runtime->CopyAsync(
+          item.result, buffers[rank], sizeof(int64_t), CopyKind::kDeviceToHost,
+          item.stream));
+      INFERX_RETURN_IF_ERROR(item.runtime->SynchronizeStream(item.stream));
+      INFERX_RETURN_IF_ERROR(item.runtime->Free(buffers[rank]));
+    }
+    return OkStatus();
+  }
+
   Status Submit(int rank, Submission item) {
     std::unique_lock lock(mu);
     if (!failure.ok()) return failure;
@@ -291,10 +382,17 @@ class NcclWorldRank final : public CommBackend {
     return state_->Submit(
         rank_, {NcclWorldState::Kind::kGather, partial, full, &ctx.Runtime(), ctx.GetStream()});
   }
+  StatusOr<int64_t> AllReduceMin(const ops::OpContext& ctx, int64_t value) override {
+    INFERX_RETURN_IF_ERROR(Validate(ctx, OkStatus()));
+    int64_t result = 0;
+    INFERX_RETURN_IF_ERROR(state_->SubmitMinHost(
+        rank_, NcclWorldState::HostMin{value, &result, &ctx.Runtime(), ctx.GetStream()}));
+    return result;
+  }
 
  private:
   Status Validate(const ops::OpContext& ctx, Status status) {
-    if (status.ok() && ctx.Device() != state_->devices[rank_]) {
+    if (status.ok() && ctx.GetDevice() != state_->devices[rank_]) {
       status = InvalidArgumentError("NCCL rank context uses the wrong device");
     }
     if (!status.ok()) {
@@ -310,17 +408,17 @@ class NcclWorldRank final : public CommBackend {
 
 NcclWorld::NcclWorld(std::shared_ptr<NcclWorldState> state) : state_(std::move(state)) {}
 
-StatusOr<std::shared_ptr<NcclWorld>> NcclWorld::Create(const std::vector<DeviceId>& devices) {
+StatusOr<std::shared_ptr<NcclWorld>> NcclWorld::Create(const std::vector<Device>& devices) {
   if (devices.empty()) return InvalidArgumentError("NCCL world needs at least one device");
   std::vector<int> ordinals;
   for (const auto device : devices) {
     if (!device.IsCuda()) return InvalidArgumentError("NCCL world requires CUDA devices");
     for (const auto ordinal : ordinals) {
-      if (ordinal == device.index) return InvalidArgumentError("NCCL ranks need distinct GPUs");
+      if (ordinal == device.index()) return InvalidArgumentError("NCCL ranks need distinct GPUs");
     }
     INFERX_ASSIGN_OR_RETURN(auto runtime, RuntimeFor(device));
     INFERX_RETURN_IF_ERROR(runtime->Activate());
-    ordinals.push_back(device.index);
+    ordinals.push_back(device.index());
   }
   const auto* api = NcclApi::Load();
   if (!api->Ready() || !api->comm_init_all || !api->comm_abort || !api->get_async_error ||
@@ -330,6 +428,7 @@ StatusOr<std::shared_ptr<NcclWorld>> NcclWorld::Create(const std::vector<DeviceI
   state->devices = devices;
   state->comms.resize(devices.size(), nullptr);
   state->submissions.resize(devices.size());
+  state->host_mins.resize(devices.size());
   INFERX_RETURN_IF_ERROR(
       NcclCall(api->comm_init_all(state->comms.data(), ordinals.size(), ordinals.data()),
                "ncclCommInitAll"));
@@ -361,5 +460,4 @@ Status NcclWorld::CheckHealth() {
   return OkStatus();
 }
 
-}  // namespace dist
 }  // namespace inferx

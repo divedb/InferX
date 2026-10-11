@@ -48,13 +48,13 @@ class HostAllocatorImpl final : public Allocator {
     return OkStatus();
   }
 
-  DeviceId Device() const override { return DeviceId::Cpu(); }
+  Device GetDevice() const override { return Device::Cpu(); }
   std::string_view Name() const override { return "host"; }
 };
 
 class DeviceAllocatorImpl final : public Allocator {
  public:
-  explicit DeviceAllocatorImpl(DeviceId device) : device_(device) {}
+  explicit DeviceAllocatorImpl(Device device) : device_(device) {}
 
   StatusOr<void*> Allocate(size_t bytes, size_t alignment) override {
     if (bytes == 0) return static_cast<void*>(nullptr);
@@ -83,17 +83,17 @@ class DeviceAllocatorImpl final : public Allocator {
     return runtime->Free(ptr);
   }
 
-  DeviceId Device() const override { return device_; }
+  Device GetDevice() const override { return device_; }
   std::string_view Name() const override { return "accelerator"; }
 
  private:
-  DeviceId device_;
+  Device device_;
 };
 
 constexpr int kMaxDevices = 16;
 
-StatusOr<Allocator*> DeviceAllocatorFor(DeviceId device) {
-  const int8_t ordinal = device.index;
+StatusOr<Allocator*> DeviceAllocatorFor(Device device) {
+  const int8_t ordinal = device.index();
   if (ordinal < 0 || ordinal >= kMaxDevices) {
     return InvalidArgumentError("device ordinal ", static_cast<int>(ordinal),
                                 " is outside [0, ", kMaxDevices, ")");
@@ -112,7 +112,7 @@ StatusOr<Allocator*> DeviceAllocatorFor(DeviceId device) {
 
 }  // namespace
 
-StatusOr<Allocator*> AllocatorFor(DeviceId device) {
+StatusOr<Allocator*> AllocatorFor(Device device) {
   if (device.IsCpu()) {
     static Allocator* const kInstance = new HostAllocatorImpl();
 

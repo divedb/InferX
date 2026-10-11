@@ -20,7 +20,6 @@
 #include "inferx/dist/worker_ipc.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief One worker's position in the tensor-parallel world.
 struct WorkerSpec {
@@ -66,7 +65,6 @@ class WorkerPool {
 /// \brief Resolves this process's own executable path (workers re-exec it).
 StatusOr<std::string> SelfExePath();
 
-}  // namespace inferx::dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_WORKER_LAUNCH_H_

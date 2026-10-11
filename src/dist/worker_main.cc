@@ -12,7 +12,6 @@
 #include "inferx/sampling/sampling_params.h"
 
 namespace inferx {
-namespace dist {
 namespace {
 
 /// \brief Controller-side bookkeeping for one live request: how much of the
@@ -51,7 +50,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
   if (checkpoint.eos_token_ids.empty()) {
     return InternalError("checkpoint declares no eos token id");
   }
-  Scheduler scheduler(options.scheduler, runner->kv_pool(), checkpoint.eos_token_ids);
+  Scheduler scheduler(options.scheduler, runner->KvPool(), checkpoint.eos_token_ids);
 
   INFERX_ASSIGN_OR_RETURN(auto commands, MessageChannel::Open(channels.commands));
   INFERX_ASSIGN_OR_RETURN(auto events, MessageChannel::Open(channels.events));
@@ -149,5 +148,4 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
   }
 }
 
-}  // namespace inferx::dist
 }  // namespace inferx

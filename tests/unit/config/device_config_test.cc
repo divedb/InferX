@@ -7,19 +7,19 @@ namespace inferx {
 namespace {
 
 TEST(DeviceConfigTest, PrimaryDeviceResolvesTypeAndFirstId) {
-  EXPECT_EQ(DeviceConfig{}.PrimaryDevice(), DeviceId::Cuda(0));
+  EXPECT_EQ(DeviceConfig{}.PrimaryDevice(), Device::Cuda(0));
 
   DeviceConfig second;
   second.device_ids = {1};
-  EXPECT_EQ(second.PrimaryDevice(), DeviceId::Cuda(1));
+  EXPECT_EQ(second.PrimaryDevice(), Device::Cuda(1));
 
   DeviceConfig ranked;
   ranked.device_ids = {3, 1};  // Multi-id lists arrive with tensor parallelism.
-  EXPECT_EQ(ranked.PrimaryDevice(), DeviceId::Cuda(3));
+  EXPECT_EQ(ranked.PrimaryDevice(), Device::Cuda(3));
 
   DeviceConfig cpu;
   cpu.device_type = "cpu";
-  EXPECT_EQ(cpu.PrimaryDevice(), DeviceId::Cpu());
+  EXPECT_EQ(cpu.PrimaryDevice(), Device::Cpu());
 }
 
 TEST(DeviceConfigTest, ValidateRejectsStructuralErrors) {

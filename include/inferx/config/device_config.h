@@ -43,13 +43,13 @@ struct DeviceConfig {
   /// after Validate() has accepted the type; unbuilt backends still resolve
   /// here so the error stays with Validate().
   ///
-  /// \return The primary DeviceId for this configuration.
-  DeviceId PrimaryDevice() const {
+  /// \return The primary Device for this configuration.
+  Device PrimaryDevice() const {
     const int8_t ordinal = static_cast<int8_t>(device_ids.empty() ? 0 : device_ids.front());
-    if (device_type == "cuda") return DeviceId::Cuda(ordinal);
-    if (device_type == "rocm") return DeviceId::Rocm(ordinal);
-    if (device_type == "ascend") return DeviceId::Ascend(ordinal);
-    return DeviceId::Cpu();
+    if (device_type == "cuda") return Device::Cuda(ordinal);
+    if (device_type == "rocm") return Device::Rocm(ordinal);
+    if (device_type == "ascend") return Device::Ascend(ordinal);
+    return Device::Cpu();
   }
 
   /// \brief Structural validation: known type, backend compiled in,

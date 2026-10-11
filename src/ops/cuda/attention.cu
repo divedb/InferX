@@ -73,7 +73,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
       reinterpret_cast<uintptr_t>(key_cache.Data()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(value_cache.Data()) % 16 == 0) {
     const int64_t count = k.Numel() / 8;
-    WritePagedKvVectorKernel<<<(count + 127) / 128, 128, 0, ctx.GetStream()>>>(
+    WritePagedKvVectorKernel<<<(count + 127) / 128, 128, 0, ctx.GetStream().As<cudaStream_t>()>>>(
         static_cast<const uint4*>(k.Data()), static_cast<const uint4*>(v.Data()),
         positions.DataAs<int32_t>(), batch_indices.DataAs<int32_t>(),
         kv_indptr.DataAs<int32_t>(), kv_indices.DataAs<int32_t>(),
@@ -84,7 +84,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
   }
   const dim3 grid(static_cast<uint32_t>(k.Dim(0)), static_cast<uint32_t>(key_cache.Dim(2)));
   const uint32_t threads = 128;
-  WritePagedKvKernel<<<grid, threads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  WritePagedKvKernel<<<grid, threads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(k.Data()),
       static_cast<const __nv_bfloat16*>(v.Data()),
       static_cast<const int32_t*>(positions.Data()),

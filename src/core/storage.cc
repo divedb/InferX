@@ -9,16 +9,16 @@ StatusOr<StoragePtr> Storage::Allocate(size_t bytes, Allocator* allocator) {
 
   INFERX_ASSIGN_OR_RETURN(void* p, allocator->Allocate(bytes));
 
-  return StoragePtr(new Storage(p, bytes, allocator->Device(), allocator));
+  return StoragePtr(new Storage(p, bytes, allocator->GetDevice(), allocator));
 }
 
-StatusOr<StoragePtr> Storage::Allocate(size_t bytes, DeviceId device) {
+StatusOr<StoragePtr> Storage::Allocate(size_t bytes, Device device) {
   INFERX_ASSIGN_OR_RETURN(Allocator * alloc, AllocatorFor(device));
 
   return Allocate(bytes, alloc);
 }
 
-StoragePtr Storage::Borrow(void* data, size_t bytes, DeviceId device) {
+StoragePtr Storage::Borrow(void* data, size_t bytes, Device device) {
   return StoragePtr(new Storage(data, bytes, device, nullptr));
 }
 

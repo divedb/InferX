@@ -39,7 +39,7 @@ Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_
   const int64_t head_dim = nope + rope;
   const int64_t total = k_rope.Dim(0) * heads * head_dim;
   AssembleMlaKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
-                      static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                      ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(k_rope.Data()),
       static_cast<const __nv_bfloat16*>(up_projected.Data()),
       static_cast<int>(k_rope.Dim(0)), static_cast<int>(heads),

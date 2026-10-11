@@ -14,7 +14,6 @@
 #include "inferx/dist/worker_ipc.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief Everything a worker needs to build its engine.
 struct WorkerOptions {
@@ -36,7 +35,6 @@ struct WorkerOptions {
 /// raw token events in place of detokenized deltas.
 Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels);
 
-}  // namespace inferx::dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_WORKER_MAIN_H_

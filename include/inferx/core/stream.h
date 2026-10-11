@@ -5,65 +5,74 @@
 
 namespace inferx {
 
-/// \brief Runtime-owned execution handles.
+/// \brief A non-owning, type-erased handle to a runtime-native object.
 ///
-/// Core and model code may pass these values around, but only a DeviceRuntime
-/// implementation interprets `handle`.
-struct Stream {
-  /// The runtime's native handle value.
+/// Core and model code may store, copy and compare handles, but only a DeviceRuntime
+/// implementation interprets `handle`. Copying a handle neither copies the object nor extends
+/// its lifetime; the runtime that created it destroys it. The handle does not record which
+/// device it belongs to.
+///
+/// \tparam Tag Distinguishes handle kinds, so a stream cannot be passed
+///             where an event is expected.
+template <typename Tag>
+struct DeviceHandle {
+  /// The runtime's native handle value. Null's meaning is runtime-defined
+  /// (e.g. the default stream on CUDA).
   void* handle = nullptr;
 
-  /// \brief Constructs a null stream.
-  constexpr Stream() = default;
+  /// \brief Constructs a null handle.
+  constexpr DeviceHandle() = default;
 
-  /// \brief Constructs a null stream from nullptr.
-  constexpr Stream(std::nullptr_t) {}
+  /// \brief Constructs a null handle from nullptr.
+  constexpr DeviceHandle(std::nullptr_t) {}
 
-  /// \brief Constructs a stream from a raw handle value.
+  /// \brief Wraps a native pointer handle (e.g. `cudaStream_t`).
   ///
-  /// \param value The native handle.
-  constexpr explicit Stream(void* value) : handle(value) {}
-
-  /// \brief Constructs a stream from a native pointer handle.
+  /// Explicit so that unrelated pointers never become handles by accident.
+  /// Const and function pointers are rejected.
   ///
-  /// Device runtime source files may pass native pointer handles at the boundary
-  /// without exposing their types here. Restricted to pointer types so an
-  /// integer or unrelated value cannot accidentally become a stream.
-  ///
-  /// \param value The native handle as its concrete pointer type.
+  /// \param native The native handle in its concrete pointer type.
   template <typename T>
-    requires std::is_pointer_v<T>
-  constexpr Stream(T value) : handle(static_cast<void*>(value)) {}
+    requires(std::is_pointer_v<T> && std::is_convertible_v<T, void*>)
+  constexpr explicit DeviceHandle(T native) : handle(native) {}
 
-  /// \brief Converts the stream back to its native pointer type.
+  /// \brief Returns the handle as its native pointer type.
   ///
-  /// \return The native handle as `T`.
+  /// \tparam T The concrete native pointer type, e.g. `cudaStream_t`.
   template <typename T>
-    requires std::is_pointer_v<T>
-  constexpr operator T() const {
+    requires(std::is_pointer_v<T> && !std::is_function_v<std::remove_pointer_t<T>>)
+  constexpr T As() const {
     return static_cast<T>(handle);
   }
 
-  /// \brief Compares two streams for equality (same handle).
-  friend constexpr bool operator==(Stream, Stream) = default;
+  /// \brief Converts the handle to a boolean.
+  ///
+  /// \return True if the handle is non-null; otherwise false.
+  constexpr explicit operator bool() const { return handle != nullptr; }
+
+  /// \brief Compares two handles for equality.
+  ///
+  /// \param a The first handle.
+  /// \param b The second handle.
+  /// \return  True if the handles are equal; otherwise false.
+  friend constexpr bool operator==(DeviceHandle, DeviceHandle) = default;
 };
 
-/// \brief Runtime-owned event handle, for timing and synchronization.
-struct DeviceEvent {
-  /// The runtime's native handle value.
-  void* handle = nullptr;
+struct StreamTag;
+struct EventTag;
+struct GraphExecTag;
 
-  /// \brief Compares two events for equality (same handle).
-  friend constexpr bool operator==(DeviceEvent, DeviceEvent) = default;
-};
+/// \brief An execution stream (queue of ordered work).
+using DeviceStream = DeviceHandle<StreamTag>;
 
-/// \brief Runtime-owned instantiated-graph handle.
-struct GraphExec {
-  /// The runtime's native handle value.
-  void* handle = nullptr;
+/// \brief An event, for timing and synchronization.
+using DeviceEvent = DeviceHandle<EventTag>;
 
-  /// \brief Compares two graph handles for equality.
-  friend constexpr bool operator==(GraphExec, GraphExec) = default;
-};
+/// \brief An instantiated graph, ready to launch.
+using DeviceGraphExec = DeviceHandle<GraphExecTag>;
+
+static_assert(std::is_trivially_copyable_v<DeviceStream>);
+static_assert(std::is_standard_layout_v<DeviceStream>);
+static_assert(sizeof(DeviceStream) == sizeof(void*));
 
 }  // namespace inferx

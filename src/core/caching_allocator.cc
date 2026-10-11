@@ -13,7 +13,7 @@ double CachingAllocator::Stats::Fragmentation() const {
   return 1.0 - static_cast<double>(largest_free_block) / static_cast<double>(total_free);
 }
 
-CachingAllocator::CachingAllocator(std::byte* base, size_t capacity, DeviceId device,
+CachingAllocator::CachingAllocator(std::byte* base, size_t capacity, Device device,
                                    size_t alignment)
     : device_(device) {
   if (alignment == 0 || !std::has_single_bit(alignment)) {

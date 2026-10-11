@@ -210,7 +210,7 @@ Status SplitGdnProjection(OpContext& ctx, const Tensor& packed, Tensor& conv_in,
   const int64_t nvg = value_heads / key_heads;
   const int64_t total = packed.Numel();
   SplitGdnKernel<<<static_cast<uint32_t>((total + kThreads - 1) / kThreads), kThreads, 0,
-                   static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                   ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(packed.Data()),
       static_cast<__nv_bfloat16*>(conv_in.Data()), static_cast<__nv_bfloat16*>(z.Data()),
       packed.Dim(0), static_cast<int>(key_heads), static_cast<int>(key_dim),
@@ -225,7 +225,7 @@ Status GdnCausalConv(OpContext& ctx, Tensor& x, const Tensor& weight,
   const int channels = static_cast<int>(x.Dim(1));
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   ConvKernel<<<(channels + kThreads - 1) / kThreads, kThreads, 0,
-               static_cast<cudaStream_t>(ctx.GetStream())>>>(
+               ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<__nv_bfloat16*>(x.Data()),
       static_cast<const __nv_bfloat16*>(weight.Data()),
       static_cast<float*>(state.Data()),
@@ -241,7 +241,7 @@ Status GdnGates(OpContext& ctx, const Tensor& ba, const Tensor& a_log,
   const int64_t heads = beta.Numel() / rows;
   const int64_t nvg = ba.Dim(1) / 2 / heads;  // b/a pairs per head, grouped.
   GatesKernel<<<static_cast<uint32_t>((rows * heads + kThreads - 1) / kThreads), kThreads, 0,
-                static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(ba.Data()), static_cast<const float*>(a_log.Data()),
       static_cast<const float*>(dt_bias.Data()), static_cast<float*>(beta.Data()),
       static_cast<float*>(g.Data()), rows, static_cast<int>(heads), static_cast<int>(nvg));
@@ -262,7 +262,7 @@ Status GdnRecurrent(OpContext& ctx, const Tensor& conv, int64_t query_width,
   dim3 grid(num_seqs, value_heads, tiles);
   const int smem = (dk * kDvTile + 2 * dk) * sizeof(float);
   if (dk > kThreads) return UnimplementedError("gdn recurrent supports key dims up to 256");
-  RecurrentKernel<<<grid, kThreads, smem, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  RecurrentKernel<<<grid, kThreads, smem, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(conv.Data()),
       static_cast<const float*>(beta.Data()), static_cast<const float*>(g.Data()),
       static_cast<float*>(state.Data()), static_cast<const int*>(slot_indices.Data()),

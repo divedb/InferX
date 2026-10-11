@@ -85,7 +85,7 @@ class KvBlockPool {
   /// \return            The pool, or ResourceExhausted if it will not fit.
   static StatusOr<KvBlockPool> Create(int64_t num_layers, int64_t num_blocks,
                                       int64_t block_size, const KvLayout& layout,
-                                      DeviceId device);
+                                      Device device);
 
   /// \brief Same, with one layout per layer.
   ///
@@ -93,7 +93,7 @@ class KvBlockPool {
   /// geometry; the pool keeps one free list across layers and sizes each
   /// layer's region from its own layout.
   static StatusOr<KvBlockPool> Create(int64_t num_blocks, int64_t block_size,
-                                      const std::vector<KvLayout>& layouts, DeviceId device);
+                                      const std::vector<KvLayout>& layouts, Device device);
 
   /// \brief Takes a free block. The contents are whatever was there before.
   ///
@@ -179,7 +179,7 @@ class KvBlockPool {
   int64_t layer_stride_ = 0;
   /// Bytes from a layer's K region to its V region (uniform pools).
   int64_t entry_stride_ = 0;
-  DeviceId device_;
+  Device device_;
 
   /// Free blocks, taken from the back. LIFO rather than FIFO on purpose: the
   /// most recently freed block is the most likely to still be in L2.

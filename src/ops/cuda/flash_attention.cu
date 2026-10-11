@@ -68,7 +68,7 @@ Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv, const Tensor& last,
   if (batch <= 0 || batch > FlashDecodeWorkspace::kMaxBatch ||
       workspace.plan.Numel() < 3 * tiles + batch + 2)
     return InvalidArgumentError("invalid split decode plan capacity");
-  DecodePlan<<<1, 1, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  DecodePlan<<<1, 1, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       Ptr<int>(kv), Ptr<int>(last), batch, block_size, Ptr<int>(workspace.plan));
   return Error(cudaGetLastError());
 }
@@ -77,7 +77,7 @@ Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo, Tensor& plan, int
   if (tiles <= 0 || plan.Numel() < 3 * tiles + 1 || group <= 0 || group > 32 ||
       (tile_rows != 64 && tile_rows != 128))
     return InvalidArgumentError("invalid FlashInfer plan capacity");
-  Plan<<<(tiles + 127) / 128, 128, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  Plan<<<(tiles + 127) / 128, 128, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       Ptr<int>(qo), qo.Numel() - 1, group, tiles, tile_rows, Ptr<int>(plan));
   return Error(cudaGetLastError());
 }
@@ -93,7 +93,7 @@ Status FlashPagedAttentionImpl(OpContext& ctx, const Tensor& q, const Tensor& qo
   const int batch = qo.Numel() - 1;
   paged_kv_t<T, int> cache(p.kv_heads, block_size, HeadDim, batch, QKVLayout::kNHD, Ptr<T>(key),
                            Ptr<T>(value), Ptr<int>(indices), Ptr<int>(kv), Ptr<int>(last));
-  auto stream = static_cast<cudaStream_t>(ctx.GetStream());
+  auto stream = ctx.GetStream().As<cudaStream_t>();
   // Ratios unsupported by the specialized decode dispatcher use FlashInfer
   // prefill with one query per sequence, which implements the same attention.
   const bool decode_group = group == 1 || group == 2 || group == 3 || group == 4 || group == 6 || group == 8;

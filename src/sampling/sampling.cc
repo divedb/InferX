@@ -52,7 +52,7 @@ Sampler::Sampler(std::optional<Tensor> values, std::optional<Tensor> indices, Te
 
 StatusOr<std::unique_ptr<Sampler>> Sampler::Create(int max_num_seqs,
                                                    std::int64_t vocab_size,
-                                                   DeviceId device) {
+                                                   Device device) {
   if (max_num_seqs <= 0 || vocab_size <= 0)
     return InvalidArgumentError("sampler requires positive capacities");
   if (!device.IsCpu() && !device.IsCuda())
@@ -101,7 +101,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::OpContext& ctx, const Tensor& logit
   if (logits.Rank() != 2 ||
       (logits.GetDataType() != DataType::kBFloat16 &&
        logits.GetDataType() != DataType::kFloat32) ||
-      logits.Device() != ctx.Device()) {
+      logits.GetDevice() != ctx.GetDevice()) {
     return InvalidArgumentError("sampler requires a float32/bfloat16 [batch, vocab] matrix");
   }
   const int batch = static_cast<int>(logits.Dim(0));
@@ -112,7 +112,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::OpContext& ctx, const Tensor& logit
   INFERX_ASSIGN_OR_RETURN(Tensor sampled, results_.Slice(0, batch));
   if (batch == 0) return SamplerOutput{std::move(sampled), std::nullopt};
   if (!metadata.all_greedy) {
-    if (ctx.Device().IsCuda()) {
+    if (ctx.GetDevice().IsCuda()) {
       INFERX_RETURN_IF_ERROR(UploadParams(ctx, metadata));
       return cuda::SampleRows(ctx, logits, *params_, *probs_, sampled) -
              Status();  // wrap keeps SamplerOutput assembly below.
@@ -120,7 +120,7 @@ StatusOr<SamplerOutput> Sampler::Sample(ops::OpContext& ctx, const Tensor& logit
     return SampleCpuReference(logits, metadata, sampled);
   }
 
-  if (ctx.Device().IsCuda()) {
+  if (ctx.GetDevice().IsCuda()) {
     INFERX_RETURN_IF_ERROR(
         ops::GreedyArgmax(ctx, logits, *values_, *indices_, sampled));
     return SamplerOutput{std::move(sampled), std::nullopt};

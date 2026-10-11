@@ -21,7 +21,7 @@ Status CudaError(cudaError_t code, const char* what) {
 
 class CudaDeviceRuntime final : public DeviceRuntime {
  public:
-  explicit CudaDeviceRuntime(DeviceId device) : DeviceRuntime(device) {}
+  explicit CudaDeviceRuntime(Device device) : DeviceRuntime(device) {}
 
   int DeviceCount() const override {
     int count = 0;
@@ -30,7 +30,7 @@ class CudaDeviceRuntime final : public DeviceRuntime {
   }
 
   Status Activate() override {
-    return CudaError(cudaSetDevice(device().index), "cudaSetDevice");
+    return CudaError(cudaSetDevice(device().index()), "cudaSetDevice");
   }
 
   StatusOr<DeviceMemoryInfo> GetMemoryInfo() override {
@@ -75,35 +75,35 @@ class CudaDeviceRuntime final : public DeviceRuntime {
   }
 
   Status CopyAsync(void* dst, const void* src, size_t bytes, CopyKind kind,
-                   Stream stream) override {
+                   DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
     return CudaError(
-        cudaMemcpyAsync(dst, src, bytes, ToCudaKind(kind), static_cast<cudaStream_t>(stream)),
+        cudaMemcpyAsync(dst, src, bytes, ToCudaKind(kind), stream.As<cudaStream_t>()),
         "cudaMemcpyAsync");
   }
 
-  Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
-    const cudaError_t err = cudaMemsetAsync(dst, 0, bytes, static_cast<cudaStream_t>(stream));
+  Status MemsetAsync(void* dst, size_t bytes, DeviceStream stream) override {
+    const cudaError_t err = cudaMemsetAsync(dst, 0, bytes, stream.As<cudaStream_t>());
     return err == cudaSuccess
                ? OkStatus()
                : InternalError("cudaMemsetAsync failed: ", cudaGetErrorString(err));
   }
 
-  StatusOr<Stream> CreateStream() override {
+  StatusOr<DeviceStream> CreateStream() override {
     INFERX_RETURN_IF_ERROR(Activate());
     cudaStream_t stream = nullptr;
     INFERX_RETURN_IF_ERROR(CudaError(cudaStreamCreate(&stream), "cudaStreamCreate"));
-    return Stream(stream);
+    return DeviceStream(stream);
   }
 
-  Status DestroyStream(Stream stream) override {
+  Status DestroyStream(DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaStreamDestroy(static_cast<cudaStream_t>(stream)), "cudaStreamDestroy");
+    return CudaError(cudaStreamDestroy(stream.As<cudaStream_t>()), "cudaStreamDestroy");
   }
 
-  Status SynchronizeStream(Stream stream) override {
+  Status SynchronizeStream(DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)),
+    return CudaError(cudaStreamSynchronize(stream.As<cudaStream_t>()),
                      "cudaStreamSynchronize");
   }
 
@@ -118,26 +118,26 @@ class CudaDeviceRuntime final : public DeviceRuntime {
 
   Status DestroyEvent(DeviceEvent event) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaEventDestroy(static_cast<cudaEvent_t>(event.handle)),
+    return CudaError(cudaEventDestroy(event.As<cudaEvent_t>()),
                      "cudaEventDestroy");
   }
 
-  Status RecordEvent(DeviceEvent event, Stream stream) override {
+  Status RecordEvent(DeviceEvent event, DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaEventRecord(static_cast<cudaEvent_t>(event.handle),
-                                     static_cast<cudaStream_t>(stream)),
+    return CudaError(cudaEventRecord(event.As<cudaEvent_t>(),
+                                     stream.As<cudaStream_t>()),
                      "cudaEventRecord");
   }
 
   Status SynchronizeEvent(DeviceEvent event) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaEventSynchronize(static_cast<cudaEvent_t>(event.handle)),
+    return CudaError(cudaEventSynchronize(event.As<cudaEvent_t>()),
                      "cudaEventSynchronize");
   }
 
   StatusOr<bool> QueryEvent(DeviceEvent event) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    const cudaError_t code = cudaEventQuery(static_cast<cudaEvent_t>(event.handle));
+    const cudaError_t code = cudaEventQuery(event.As<cudaEvent_t>());
     if (code == cudaSuccess) return true;
     if (code == cudaErrorNotReady) return false;
     return CudaError(code, "cudaEventQuery");
@@ -147,51 +147,51 @@ class CudaDeviceRuntime final : public DeviceRuntime {
     INFERX_RETURN_IF_ERROR(Activate());
     float ms = 0.0f;
     INFERX_RETURN_IF_ERROR(
-        CudaError(cudaEventElapsedTime(&ms, static_cast<cudaEvent_t>(start.handle),
-                                       static_cast<cudaEvent_t>(end.handle)),
+        CudaError(cudaEventElapsedTime(&ms, start.As<cudaEvent_t>(),
+                                       end.As<cudaEvent_t>()),
                   "cudaEventElapsedTime"));
     return ms;
   }
 
-  StatusOr<bool> IsCapturing(Stream stream) override {
+  StatusOr<bool> IsCapturing(DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     INFERX_RETURN_IF_ERROR(
-        CudaError(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status),
+        CudaError(cudaStreamIsCapturing(stream.As<cudaStream_t>(), &status),
                   "cudaStreamIsCapturing"));
     return status != cudaStreamCaptureStatusNone;
   }
 
-  Status BeginCapture(Stream stream) override {
+  Status BeginCapture(DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaStreamBeginCapture(static_cast<cudaStream_t>(stream),
+    return CudaError(cudaStreamBeginCapture(stream.As<cudaStream_t>(),
                                             cudaStreamCaptureModeThreadLocal),
                      "cudaStreamBeginCapture");
   }
 
-  StatusOr<GraphExec> EndCaptureAndInstantiate(Stream stream) override {
+  StatusOr<DeviceGraphExec> EndCaptureAndInstantiate(DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
     cudaGraph_t graph = nullptr;
     INFERX_RETURN_IF_ERROR(
-        CudaError(cudaStreamEndCapture(static_cast<cudaStream_t>(stream), &graph),
+        CudaError(cudaStreamEndCapture(stream.As<cudaStream_t>(), &graph),
                   "cudaStreamEndCapture"));
     cudaGraphExec_t exec = nullptr;
     const cudaError_t code = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
     cudaGraphDestroy(graph);
     INFERX_RETURN_IF_ERROR(CudaError(code, "cudaGraphInstantiate"));
-    return GraphExec{exec};
+    return DeviceGraphExec{exec};
   }
 
-  Status LaunchGraph(GraphExec graph, Stream stream) override {
+  Status LaunchGraph(DeviceGraphExec graph, DeviceStream stream) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaGraphLaunch(static_cast<cudaGraphExec_t>(graph.handle),
-                                     static_cast<cudaStream_t>(stream)),
+    return CudaError(cudaGraphLaunch(graph.As<cudaGraphExec_t>(),
+                                     stream.As<cudaStream_t>()),
                      "cudaGraphLaunch");
   }
 
-  Status DestroyGraph(GraphExec graph) override {
+  Status DestroyGraph(DeviceGraphExec graph) override {
     INFERX_RETURN_IF_ERROR(Activate());
-    return CudaError(cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(graph.handle)),
+    return CudaError(cudaGraphExecDestroy(graph.As<cudaGraphExec_t>()),
                      "cudaGraphExecDestroy");
   }
 
@@ -215,24 +215,24 @@ class CudaDeviceRuntime final : public DeviceRuntime {
 
 }  // namespace
 
-StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(DeviceId device) {
+StatusOr<DeviceRuntime*> AcceleratorDeviceRuntime(Device device) {
   if (!device.IsCuda()) {
     return FailedPreconditionError("no runtime is built for ", device.ToString());
   }
   static std::mutex mu;
   static std::map<int, std::unique_ptr<CudaDeviceRuntime>> runtimes;
   std::lock_guard<std::mutex> lock(mu);
-  const auto it = runtimes.find(device.index);
+  const auto it = runtimes.find(device.index());
   if (it != runtimes.end()) return it->second.get();
 
   int count = 0;
   INFERX_RETURN_IF_ERROR(CudaError(cudaGetDeviceCount(&count), "cudaGetDeviceCount"));
-  if (device.index < 0 || device.index >= count) {
+  if (device.index() < 0 || device.index() >= count) {
     return InvalidArgumentError("invalid device ordinal for ", device.ToString());
   }
   auto runtime = std::make_unique<CudaDeviceRuntime>(device);
   auto* result = runtime.get();
-  runtimes.emplace(device.index, std::move(runtime));
+  runtimes.emplace(device.index(), std::move(runtime));
   return result;
 }
 

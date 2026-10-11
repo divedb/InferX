@@ -93,7 +93,7 @@ INFERX_ROPE_HD float InverseFrequency(int64_t i, const RotaryParams& p) {
 /// and each multiply/add are rounded to the activation dtype, matching the
 /// reference BF16 cache and rotation. Work is enqueued on the context's stream.
 ///
-/// \param ctx        Execution context; all tensors must live on ctx.Device().
+/// \param ctx        Execution context; all tensors must live on ctx.GetDevice().
 /// \param q          [tokens, query_heads, head_dim] queries; updated in place.
 /// \param k          [tokens, kv_heads, head_dim] keys; updated in place.
 /// \param positions  [tokens] int32 position of each token.

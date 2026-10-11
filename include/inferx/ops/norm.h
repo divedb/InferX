@@ -26,6 +26,12 @@ struct NormConfig {
   /// that already fold the constant into the weight leave this false.
   bool plus_one = false;
 
+  /// Round normalized activations to the input dtype before multiplying by
+  /// the weight, as the Llama/Qwen reference implementations do (and, for
+  /// the fused add form, normalize the dtype-rounded residual sum). The
+  /// default retains the single-rounding fused operator (Gemma lineage).
+  bool round_before_weight = false;
+
   /// LayerNorm-only: a bias tensor is supplied. Must agree with the presence of the bias
   /// argument itself.
   bool bias = false;
@@ -43,7 +49,7 @@ struct NormConfig {
 /// Validation and backend selection live in this entry point; dtype support
 /// is reported per backend and the kernel details stay inside them.
 ///
-/// \param ctx     Execution context; all tensors must live on ctx.Device().
+/// \param ctx     Execution context; all tensors must live on ctx.GetDevice().
 /// \param x       [rows, dim] input activations.
 /// \param weight  [dim] per-channel scale, same dtype as `x`.
 /// \param out     [rows, dim] output tensor, same dtype and shape as `x`.

@@ -10,7 +10,7 @@ kvc::Result<kvc::MemoryRegion> ImportProviderMemory(const kvc::KVCacheData& data
         kvc::Status{KVC_INVALID_ARGUMENT, "Provider import requires owned Storage"});
   }
   const char* runtime;
-  switch (storage->Device().kind) {
+  switch (storage->GetDevice().kind()) {
     case DeviceKind::kCpu:
       runtime = "cpu";
       break;
@@ -27,10 +27,10 @@ kvc::Result<kvc::MemoryRegion> ImportProviderMemory(const kvc::KVCacheData& data
       return std::unexpected(kvc::Status{KVC_UNSUPPORTED, "Unknown device runtime"});
   }
   std::string runtime_name(runtime);
-  std::string identifier = std::to_string(storage->Device().index);
+  std::string identifier = std::to_string(storage->GetDevice().index());
   KvcMemoryInfo info{};
   info.struct_size = sizeof(info);
-  info.memory_type = storage->Device().IsCpu() ? KVC_HOST : KVC_DEVICE;
+  info.memory_type = storage->GetDevice().IsCpu() ? KVC_HOST : KVC_DEVICE;
   info.access = access;
   info.locator_kind = KVC_LOCAL_ADDRESS;
   info.local_address = reinterpret_cast<uintptr_t>(storage->Data());

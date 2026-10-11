@@ -8,18 +8,18 @@
 
 namespace inferx::ops {
 namespace {
-Status CheckTensor(const Tensor& t, DataType dtype, int rank, const DeviceId& device) {
-  if (t.Rank() != rank || t.GetDataType() != dtype || t.Device() != device) {
+Status CheckTensor(const Tensor& t, DataType dtype, int rank, const Device& device) {
+  if (t.Rank() != rank || t.GetDataType() != dtype || t.GetDevice() != device) {
     return InvalidArgumentError("FlashInfer tensor rank, dtype or device mismatch");
   }
   return OkStatus();
 }
 Status CheckDevice(OpContext& ctx) {
-  if (!ctx.Device().IsCuda()) return UnimplementedError("FlashInfer requires CUDA");
+  if (!ctx.GetDevice().IsCuda()) return UnimplementedError("FlashInfer requires CUDA");
   return ctx.Runtime().Activate();
 }
 Status CheckPlan(OpContext& ctx, const Tensor& plan, int tiles, int tile_rows) {
-  INFERX_RETURN_IF_ERROR(CheckTensor(plan, DataType::kInt32, 1, ctx.Device()));
+  INFERX_RETURN_IF_ERROR(CheckTensor(plan, DataType::kInt32, 1, ctx.GetDevice()));
   if (tiles <= 0 || plan.Numel() < 3LL * tiles + 1 || (tile_rows != 64 && tile_rows != 128)) {
     return InvalidArgumentError("invalid FlashInfer plan capacity or tile size");
   }
@@ -31,7 +31,7 @@ Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv, const Tensor& last,
                           int block_size, FlashDecodeWorkspace& workspace) {
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
   for (const Tensor* t : std::initializer_list<const Tensor*>{&kv, &last, &workspace.plan}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.GetDevice()));
   }
   const int64_t batch = last.Numel();
   if (batch <= 0 || batch > FlashDecodeWorkspace::kMaxBatch || kv.Numel() != batch + 1 ||
@@ -45,7 +45,7 @@ Status PrepareFlashDecode(OpContext& ctx, const Tensor& kv, const Tensor& last,
 Status PrepareFlashAttention(OpContext& ctx, const Tensor& qo, Tensor& plan, int group,
                              int tiles, int tile_rows) {
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
-  INFERX_RETURN_IF_ERROR(CheckTensor(qo, DataType::kInt32, 1, ctx.Device()));
+  INFERX_RETURN_IF_ERROR(CheckTensor(qo, DataType::kInt32, 1, ctx.GetDevice()));
   INFERX_RETURN_IF_ERROR(CheckPlan(ctx, plan, tiles, tile_rows));
   if (qo.Numel() < 2 || qo.Numel() > std::numeric_limits<int>::max() || group <= 0 ||
       group > 32) {
@@ -63,13 +63,13 @@ Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
   INFERX_RETURN_IF_ERROR(CheckDevice(ctx));
   INFERX_RETURN_IF_ERROR(CheckPlan(ctx, plan, tiles, tile_rows));
   for (const Tensor* t : {&qo, &kv, &indices, &last}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kInt32, 1, ctx.GetDevice()));
   }
   for (const Tensor* t : std::initializer_list<const Tensor*>{&q, &out}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 2, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 2, ctx.GetDevice()));
   }
   for (const Tensor* t : {&key, &value}) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 4, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(*t, DataType::kBFloat16, 4, ctx.GetDevice()));
     if (t->Dim(0) <= 0 || t->Dim(1) != block_size || t->Dim(2) != p.kv_heads ||
         t->Dim(3) != p.head_dim) {
       return InvalidArgumentError("FlashInfer KV cache geometry mismatch");
@@ -86,9 +86,9 @@ Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
     return InvalidArgumentError("FlashInfer query, cache or ragged batch geometry mismatch");
   }
   if (decode != nullptr) {
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->plan, DataType::kInt32, 1, ctx.Device()));
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->values, DataType::kBFloat16, 1, ctx.Device()));
-    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat32, 1, ctx.Device()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->plan, DataType::kInt32, 1, ctx.GetDevice()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->values, DataType::kBFloat16, 1, ctx.GetDevice()));
+    INFERX_RETURN_IF_ERROR(CheckTensor(decode->scores, DataType::kFloat32, 1, ctx.GetDevice()));
     const int64_t splits = batch * FlashDecodeWorkspace::kPartitions;
     if (batch > FlashDecodeWorkspace::kMaxBatch || q.Dim(0) != batch ||
         decode->plan.Numel() < 3 * splits + batch + 2 ||

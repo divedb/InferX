@@ -1,0 +1,137 @@
+#include "inferx/models/qwen3_moe/qwen3_moe.h"
+
+#include <optional>
+#include <utility>
+
+#include "inferx/ops/elementwise.h"
+#include "inferx/ops/moe.h"
+
+namespace inferx {
+namespace models {
+namespace qwen3_moe {
+
+StatusOr<Qwen3Moe> Qwen3Moe::Create(const Qwen3MoeConfig& config,
+                                    const ParallelConfig& parallel, DataType dtype,
+                                    Device device) {
+  const int64_t tp = parallel.tensor_parallel_size;
+  const int64_t hidden = config.base.hidden_size;
+
+  INFERX_ASSIGN_OR_RETURN(Linear router,
+                          Linear::Create(hidden, config.num_experts, dtype, device));
+  INFERX_ASSIGN_OR_RETURN(
+      FusedExperts experts,
+      FusedExperts::Create(config.num_experts, hidden,
+                                   config.base.intermediate_size, tp,
+                                   parallel.tensor_parallel_rank,
+                                   ops::Activation::kSilu, dtype, device));
+
+  std::optional<MLP> shared;
+  std::optional<Linear> shared_gate;
+  if (config.shared_expert_intermediate > 0) {
+    INFERX_ASSIGN_OR_RETURN(
+        shared, MLP::Create(hidden, config.shared_expert_intermediate, tp,
+                                    parallel.tensor_parallel_rank,
+                                    ops::Activation::kSilu, dtype, device));
+    if (config.shared_expert_gate) {
+      INFERX_ASSIGN_OR_RETURN(shared_gate, Linear::Create(hidden, 1, dtype, device));
+    }
+  }
+
+  return Qwen3Moe(std::move(router), std::move(experts), std::move(shared),
+                  std::move(shared_gate), config.Routing(), hidden,
+                  parallel.tensor_parallel_rank);
+}
+
+Status Qwen3Moe::Forward(ForwardContext& ctx, const Tensor& hidden, Tensor& out) const {
+  const int64_t tokens = hidden.Dim(0);
+  const int64_t topk = routing_.topk;
+
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor topk_indices,
+      Tensor::Empty(DataType::kInt32, Shape({tokens * topk}), &ctx.scratch));
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor topk_weights,
+      Tensor::Empty(DataType::kFloat32, Shape({tokens * topk}), &ctx.scratch));
+  INFERX_RETURN_IF_ERROR(ops::RouteTokens(ctx.op, hidden, router_.Weight(),
+                                          /*router_bias=*/nullptr,
+                                          /*correction_bias=*/nullptr, routing_,
+                                          topk_indices, topk_weights));
+  INFERX_RETURN_IF_ERROR(
+      experts_.Forward(ctx.op, ctx.scratch, ctx.comm, hidden, topk_indices,
+                       topk_weights, out));
+
+  if (!shared_expert_.has_value()) return OkStatus();
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor shared_out,
+      Tensor::Empty(hidden.GetDataType(), Shape({tokens, hidden_}), &ctx.scratch));
+  INFERX_RETURN_IF_ERROR(
+      shared_expert_->Forward(ctx.op, ctx.scratch, ctx.comm, hidden, shared_out));
+  if (shared_expert_gate_.has_value()) {
+    INFERX_ASSIGN_OR_RETURN(Tensor gate,
+                            Tensor::Empty(hidden.GetDataType(), Shape({tokens, 1}),
+                                          &ctx.scratch));
+    INFERX_RETURN_IF_ERROR(shared_expert_gate_->Forward(ctx.op, hidden, gate));
+    INFERX_RETURN_IF_ERROR(ops::MulSigmoidRowGate(ctx.op, shared_out, gate));
+  }
+  return ops::Add(ctx.op, out, shared_out, out);
+}
+
+Status Qwen3Moe::BindWeights(const std::string& prefix, WeightMap& weights) {
+  INFERX_RETURN_IF_ERROR(weights.Add(prefix + ".gate.weight",
+                                     WeightBinding::Replicate(router_.MutableWeight())));
+
+  // Expert stacks are flattened [E * rows_per_expert, width]; each expert's
+  // rank shard lands inside its own slot of the stack. The down shard is
+  // column-sharded per expert, so its spans are spelled out: all source
+  // rows of expert m into dest rows [m * hidden, (m + 1) * hidden).
+  Tensor* gate_up = experts_.MutableGateUpWeight();
+  Tensor* down = experts_.MutableDownWeight();
+  const int64_t shard = experts_.IntermediateShard();
+  const int64_t hidden = hidden_;
+  for (int64_t expert = 0; expert < experts_.NumExperts(); ++expert) {
+    const std::string name = prefix + ".experts." + std::to_string(expert);
+    INFERX_RETURN_IF_ERROR(weights.Add(
+        name + ".gate_proj.weight",
+        WeightBinding::ShardRows(gate_up, shard, tp_rank_,
+                                 expert * 2 * shard)));
+    INFERX_RETURN_IF_ERROR(weights.Add(
+        name + ".up_proj.weight",
+        WeightBinding::ShardRows(gate_up, shard, tp_rank_,
+                                 expert * 2 * shard + shard)));
+    WeightBinding expert_down;
+    expert_down.dest = down;
+    expert_down.src_col = tp_rank_ * shard;
+    expert_down.spans.push_back({0, expert * hidden, hidden});
+    INFERX_RETURN_IF_ERROR(weights.Add(name + ".down_proj.weight",
+                                       std::move(expert_down)));
+  }
+
+  if (!shared_expert_.has_value()) return OkStatus();
+  Linear* shared_gate_up = shared_expert_->MutableGateUp();
+  Linear* shared_down = shared_expert_->MutableDown();
+  const int64_t shared_shard = shared_expert_->IntermediateShard();
+  const std::string shared_name = prefix + ".shared_expert";
+  INFERX_RETURN_IF_ERROR(weights.Add(
+      shared_name + ".gate_proj.weight",
+      WeightBinding::ShardRows(shared_gate_up->MutableWeight(), shared_shard, tp_rank_,
+                               0)));
+  INFERX_RETURN_IF_ERROR(weights.Add(
+      shared_name + ".up_proj.weight",
+      WeightBinding::ShardRows(shared_gate_up->MutableWeight(), shared_shard, tp_rank_,
+                               shared_shard)));
+  INFERX_RETURN_IF_ERROR(
+      weights.Add(shared_name + ".down_proj.weight",
+                  WeightBinding::ShardCols(shared_down->MutableWeight(), shared_shard,
+                                           tp_rank_)));
+  if (shared_expert_gate_.has_value()) {
+    INFERX_RETURN_IF_ERROR(
+        weights.Add(prefix + ".shared_expert_gate.weight",
+                    WeightBinding::Replicate(shared_expert_gate_->MutableWeight())));
+  }
+  return OkStatus();
+}
+
+
+}  // namespace qwen3_moe
+}  // namespace models
+}  // namespace inferx

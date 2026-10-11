@@ -37,8 +37,8 @@ Status ValidateRope(OpContext& ctx, const Tensor& q, const Tensor& k,
   if (!(params.theta > 0.0f)) {
     return InvalidArgumentError("ApplyRope theta must be positive");
   }
-  const DeviceId device = ctx.Device();
-  if (q.Device() != device || k.Device() != device || positions.Device() != device) {
+  const Device device = ctx.GetDevice();
+  if (q.GetDevice() != device || k.GetDevice() != device || positions.GetDevice() != device) {
     return InvalidArgumentError("ApplyRope tensors must live on the context's device ",
                                 device.ToString());
   }
@@ -50,12 +50,12 @@ Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params) {
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   if (q.IsEmpty()) return OkStatus();
-  switch (ctx.Device().kind) {
+  switch (ctx.GetDevice().kind()) {
     case DeviceKind::kCuda:
       return cuda::ApplyRope(ctx, q, k, positions, params);
     default:
       return UnimplementedError("ApplyRope has no implementation for device ",
-                                ctx.Device().ToString());
+                                ctx.GetDevice().ToString());
   }
 }
 
@@ -65,7 +65,7 @@ Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   for (const auto* weight : {&q_weight, &k_weight}) {
     if (weight->Rank() != 1 || weight->Dim(0) != q.Dim(2) ||
-        weight->GetDataType() != q.GetDataType() || weight->Device() != ctx.Device())
+        weight->GetDataType() != q.GetDataType() || weight->GetDevice() != ctx.GetDevice())
       return InvalidArgumentError("NormalizeAndApplyRope requires per-head BF16 weights");
   }
   constexpr int64_t kMaxExtent = std::numeric_limits<int32_t>::max();
@@ -74,7 +74,7 @@ Status NormalizeAndApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
     return InvalidArgumentError("NormalizeAndApplyRope exceeds 32-bit kernel extents");
   }
   if (!std::isfinite(eps) || eps < 0) return InvalidArgumentError("invalid normalization epsilon");
-  if (!ctx.Device().IsCuda())
+  if (!ctx.GetDevice().IsCuda())
     return UnimplementedError("NormalizeAndApplyRope requires CUDA");
   if (q.IsEmpty()) return OkStatus();
   return cuda::NormalizeAndApplyRope(ctx, q, k, q_weight, k_weight, positions, eps, params);

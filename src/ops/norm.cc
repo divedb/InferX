@@ -30,9 +30,9 @@ Status ValidateActivation(OpContext& ctx, const char* op, const char* name, cons
     return InvalidArgumentError(op, " dtype mismatch: x is ", DataTypeName(dtype), " but ",
                                 name, " is ", DataTypeName(t.GetDataType()));
   }
-  if (t.Device() != ctx.Device()) {
+  if (t.GetDevice() != ctx.GetDevice()) {
     return InvalidArgumentError(op, " ", name, " must live on the context's device ",
-                                ctx.Device().ToString());
+                                ctx.GetDevice().ToString());
   }
   // Tensors are contiguous and row-major by construction (core/tensor.h).
   return OkStatus();
@@ -52,9 +52,9 @@ Status ValidateParam(OpContext& ctx, const char* op, const char* name, const Ten
     return InvalidArgumentError(op, " dtype mismatch: x is ", DataTypeName(dtype), " but ",
                                 name, " is ", DataTypeName(t.GetDataType()));
   }
-  if (t.Device() != ctx.Device()) {
+  if (t.GetDevice() != ctx.GetDevice()) {
     return InvalidArgumentError(op, " ", name, " must live on the context's device ",
-                                ctx.Device().ToString());
+                                ctx.GetDevice().ToString());
   }
   // Tensors are contiguous and row-major by construction (core/tensor.h).
   return OkStatus();

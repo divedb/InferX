@@ -4,8 +4,8 @@
 
 namespace inferx {
 
-StatusOr<DeviceRuntime*> RuntimeFor(DeviceId device) {
-  if (device.index < 0 || (device.IsCpu() && device.index != 0)) {
+StatusOr<DeviceRuntime*> RuntimeFor(Device device) {
+  if (device.index() < 0 || (device.IsCpu() && device.index() != 0)) {
     return InvalidArgumentError("invalid device ordinal");
   }
   if (device.IsCpu()) return internal::CpuDeviceRuntime();

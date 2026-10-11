@@ -25,7 +25,7 @@ class DeviceBuffer {
   /// \param bytes  Number of bytes to allocate.
   /// \param device Device to allocate on.
   /// \return       The buffer, or an error status.
-  static StatusOr<DeviceBuffer> Allocate(size_t bytes, DeviceId device);
+  static StatusOr<DeviceBuffer> Allocate(size_t bytes, Device device);
 
   /// \brief Frees the buffer, if it holds one.
   ~DeviceBuffer() { Reset(); }
@@ -60,7 +60,7 @@ class DeviceBuffer {
   /// \brief Returns the buffer's size in bytes.
   size_t size() const { return size_; }
   /// \brief Returns the device the buffer lives on.
-  DeviceId device() const { return device_; }
+  Device device() const { return device_; }
   /// \brief True when the buffer holds an allocation.
   bool valid() const { return data_ != nullptr; }
 
@@ -76,12 +76,12 @@ class DeviceBuffer {
   /// \param data   The allocation's address.
   /// \param size   The allocation's size in bytes.
   /// \param device The device the allocation lives on.
-  DeviceBuffer(std::byte* data, size_t size, DeviceId device)
+  DeviceBuffer(std::byte* data, size_t size, Device device)
       : data_(data), size_(size), device_(device) {}
 
   std::byte* data_ = nullptr;
   size_t size_ = 0;
-  DeviceId device_;
+  Device device_;
 };
 
 }  // namespace inferx

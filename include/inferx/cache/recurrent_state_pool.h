@@ -30,7 +30,7 @@ class RecurrentStatePool {
   /// \param max_slots  Concurrent sequences the pool can serve.
   /// \param device  Where the state lives.
   static StatusOr<RecurrentStatePool> Create(const std::vector<models::RecurrentStateSpec>& specs,
-                                             int64_t max_slots, DeviceId device);
+                                             int64_t max_slots, Device device);
 
   /// \brief The delta-rule state of one layer: [slots, v, dk, dv] float32.
   StatusOr<Tensor> State(int64_t layer) const;
@@ -57,7 +57,7 @@ class RecurrentStatePool {
   int64_t max_slots_ = 0;
   /// Byte offset of each layer's region within the allocation.
   std::vector<int64_t> layer_offsets_;
-  DeviceId device_;
+  Device device_;
 };
 
 }  // namespace inferx

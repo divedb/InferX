@@ -9,7 +9,6 @@ inferx_add_library(
   SRCS
     cpu/device_runtime.cc
     allocator.cc
-    arena.cc
     caching_allocator.cc
     device_buffer.cc
     device_runtime.cc

@@ -42,7 +42,7 @@ class KernelTable {
 /// lvalues so they can be reused across candidates.
 template <typename Fn, typename... Args>
 Status Dispatch(OpContext& ctx, const char* op, const KernelTable<Fn>& table, Args&&... args) {
-  const DeviceKind kind = ctx.Device().kind;
+  const DeviceKind kind = ctx.GetDevice().kind();
 
   for (const auto& entry : table.GetEntries()) {
     if (entry.kind != kind) continue;
@@ -50,7 +50,7 @@ Status Dispatch(OpContext& ctx, const char* op, const KernelTable<Fn>& table, Ar
     return entry.fn(ctx, args...);
   }
 
-  return UnimplementedError(op, " has no implementation for device ", ctx.Device().ToString());
+  return UnimplementedError(op, " has no implementation for device ", ctx.GetDevice().ToString());
 }
 
 }  // namespace inferx::ops

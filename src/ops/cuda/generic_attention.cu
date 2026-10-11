@@ -154,7 +154,7 @@ Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_i
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   dim3 grid(static_cast<uint32_t>(q.Dim(0)), static_cast<uint32_t>(params.query_heads),
             static_cast<uint32_t>(num_seqs));
-  GenericAttentionKernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(ctx.GetStream())>>>(
+  GenericAttentionKernel<<<grid, kThreads, 0, ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const __nv_bfloat16*>(q.Data()), sink_bf16,
       static_cast<const int*>(qo_indptr.Data()), static_cast<const int*>(kv_indptr.Data()),
       static_cast<const int*>(kv_indices.Data()),

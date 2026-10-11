@@ -13,7 +13,7 @@
 
 namespace {
 
-using inferx::DeviceId;
+using inferx::Device;
 using inferx::Status;
 using inferx::Tensor;
 using inferx::ops::OpContext;
@@ -79,14 +79,14 @@ TEST(SamplingMetadataTest, ResolvesPerRequestKnobs) {
 class SamplerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto runtime = inferx::RuntimeFor(DeviceId::Cpu());
+    auto runtime = inferx::RuntimeFor(Device::Cpu());
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     ASSERT_TRUE(runtime_->Activate().ok());
     auto stream = runtime_->CreateStream();
     ASSERT_TRUE(stream.ok()) << stream.status();
     stream_ = *stream;
-    auto cuda = inferx::RuntimeFor(DeviceId::Cuda(0));
+    auto cuda = inferx::RuntimeFor(Device::Cuda(0));
     if (cuda.ok()) {
       cuda_ = *cuda;
       ASSERT_TRUE(cuda_->Activate().ok());
@@ -97,10 +97,10 @@ class SamplerTest : public ::testing::Test {
   }
 
   Tensor MakeLogits(const std::vector<std::vector<float>>& rows,
-                   std::optional<inferx::DeviceId> device = std::nullopt) {
+                   std::optional<inferx::Device> device = std::nullopt) {
     const int batch = static_cast<int>(rows.size());
     const int64_t vocab = static_cast<int64_t>(rows[0].size());
-    const inferx::DeviceId where = device.value_or(inferx::DeviceId::Cpu());
+    const inferx::Device where = device.value_or(inferx::Device::Cpu());
     const inferx::DataType dtype =
         where.IsCuda() ? inferx::DataType::kBFloat16 : inferx::DataType::kFloat32;
     auto tensor = Tensor::Empty(dtype, inferx::Shape({batch, vocab}), where);
@@ -131,13 +131,13 @@ class SamplerTest : public ::testing::Test {
   }
 
   inferx::DeviceRuntime* runtime_ = nullptr;
-  inferx::Stream stream_;
+  inferx::DeviceStream stream_;
   inferx::DeviceRuntime* cuda_ = nullptr;
-  inferx::Stream cuda_stream_;
+  inferx::DeviceStream cuda_stream_;
 };
 
 TEST_F(SamplerTest, GreedyCpuPathPicksArgmaxWithLowestIndexTieBreak) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   // Row 0: clear max at 5. Row 1: tie between 2 and 6 -> lowest index wins.
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6},
@@ -155,7 +155,7 @@ TEST_F(SamplerTest, GreedyCpuPathPicksArgmaxWithLowestIndexTieBreak) {
 }
 
 TEST_F(SamplerTest, TopKOneMatchesGreedy) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6}});
   SamplingParams topk1;
@@ -171,7 +171,7 @@ TEST_F(SamplerTest, TopKOneMatchesGreedy) {
 }
 
 TEST_F(SamplerTest, SeededDrawIsReproducibleAndVariesWithOffset) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{3, 3, 3, 3, 3, 3, 3, 3}});
   SamplingParams random;
@@ -191,7 +191,7 @@ TEST_F(SamplerTest, SeededDrawIsReproducibleAndVariesWithOffset) {
 }
 
 TEST_F(SamplerTest, LogitBiasBansTokens) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6}});
   SamplingParams biased;
@@ -209,7 +209,7 @@ TEST_F(SamplerTest, LogitBiasBansTokens) {
 }
 
 TEST_F(SamplerTest, RepetitionPenaltyPushesOffHistory) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6}});
   SamplingParams penalized;
@@ -225,7 +225,7 @@ TEST_F(SamplerTest, RepetitionPenaltyPushesOffHistory) {
 }
 
 TEST_F(SamplerTest, AllowlistRestrictsToEntries) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6}});
   SamplingParams constrained;
@@ -240,8 +240,8 @@ TEST_F(SamplerTest, AllowlistRestrictsToEntries) {
 }
 
 TEST_F(SamplerTest, CudaPipelineAgreesWithCpuReference) {
-  auto cpu = Sampler::Create(4, 64, DeviceId::Cpu());
-  auto gpu = Sampler::Create(4, 64, DeviceId::Cuda(0));
+  auto cpu = Sampler::Create(4, 64, Device::Cpu());
+  auto gpu = Sampler::Create(4, 64, Device::Cuda(0));
   ASSERT_TRUE(cpu.ok() && gpu.ok());
   std::vector<std::vector<float>> rows;
   for (int r = 0; r < 3; ++r) {
@@ -262,7 +262,7 @@ TEST_F(SamplerTest, CudaPipelineAgreesWithCpuReference) {
       v = rounded;
     }
   }
-  const Tensor logits = MakeLogits(rows, DeviceId::Cuda(0));
+  const Tensor logits = MakeLogits(rows, Device::Cuda(0));
   const Tensor logits_cpu = MakeLogits(rows);
   SamplingParams a;   // Plain.
   a.seed = 7;
@@ -301,7 +301,7 @@ TEST_F(SamplerTest, CudaPipelineAgreesWithCpuReference) {
 }
 
 TEST_F(SamplerTest, RejectsMetadataMismatch) {
-  auto sampler = Sampler::Create(4, 8, DeviceId::Cpu());
+  auto sampler = Sampler::Create(4, 8, Device::Cpu());
   ASSERT_TRUE(sampler.ok()) << sampler.status();
   const Tensor logits = MakeLogits({{0, 1, 2, 3, 4, 9, 5, 6},
                                     {7, 0, 7, 1, 2, 3, 7, 0}});

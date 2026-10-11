@@ -25,7 +25,7 @@ class SchedulerTest : public ::testing::Test {
     layout.dtype = DataType::kBFloat16;
     pool_ = std::make_unique<KvBlockPool>(
         std::move(KvBlockPool::Create(/*num_layers=*/2, blocks, kBlockSize, layout,
-                                      DeviceId::Cpu())
+                                      Device::Cpu())
                       .value()));
   }
 

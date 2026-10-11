@@ -18,7 +18,6 @@
 #include "inferx/ops/op_context.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief Collectives over the worker world, from one worker's view.
 ///
@@ -55,13 +54,18 @@ class CommBackend {
   virtual Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                                   Tensor& full) = 0;
 
+  /// \brief Minimum of one host value across the group; every rank gets
+  ///        the same answer. Used for sizing shared resources (KV blocks)
+  ///        so heterogeneous groups agree on the tightest rank.
+  virtual StatusOr<int64_t> AllReduceMin(const ops::OpContext& ctx, int64_t value) = 0;
+
  protected:
   static Status ValidateTensor(const ops::OpContext& ctx, const Tensor& tensor) {
     if (tensor.GetDataType() != DataType::kBFloat16) {
       return InvalidArgumentError("collectives carry bfloat16, got ",
                                   DataTypeName(tensor.GetDataType()));
     }
-    if (tensor.Device() != ctx.Device()) {
+    if (tensor.GetDevice() != ctx.GetDevice()) {
       return InvalidArgumentError("collective tensors must live on the context's device");
     }
     return OkStatus();
@@ -110,9 +114,13 @@ class SingleRankComm final : public CommBackend {
     return ctx.Runtime().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
                                    CopyKind::kDeviceToDevice, ctx.GetStream());
   }
+
+  StatusOr<int64_t> AllReduceMin(const ops::OpContext& ctx, int64_t value) override {
+    (void)ctx;
+    return value;  // World of one: the identity.
+  }
 };
 
-}  // namespace dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_COMM_H_

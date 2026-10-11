@@ -63,7 +63,7 @@ class Allocator {
   /// \brief Returns the device this allocator allocates on.
   ///
   /// \return The device ID of the allocator.
-  virtual DeviceId Device() const = 0;
+  virtual Device GetDevice() const = 0;
 
   /// \brief Returns a short human-readable name, for diagnostics.
   ///
@@ -73,7 +73,7 @@ class Allocator {
 
 /// \brief Returns the default allocator for `device`, defaulting to the host.
 ///
-/// The sole entry point for obtaining an allocator: `DeviceId` is the only way
+/// The sole entry point for obtaining an allocator: `Device` is the only way
 /// to name a device, and omitting the argument selects the CPU.
 ///
 /// \note The returned allocator is a singleton for the device, and is
@@ -85,6 +85,6 @@ class Allocator {
 /// \return       A pointer to the allocator, or FailedPrecondition when the
 ///               binary was built without CUDA support, or InvalidArgument for
 ///               an out-of-range CUDA ordinal.
-StatusOr<Allocator*> AllocatorFor(DeviceId device = DeviceId::Cpu());
+StatusOr<Allocator*> AllocatorFor(Device device = Device::Cpu());
 
 }  // namespace inferx

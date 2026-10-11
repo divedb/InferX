@@ -118,7 +118,8 @@ uint16_t FloatToF16Bits(float value) {
 ///        `residual`, and the normalization reads the rounded sum.
 Status RmsNormConverted(const uint16_t* x, const uint16_t* w, uint16_t* out, int64_t rows,
                         int64_t dim, float eps, float bias, float (*decode)(uint16_t),
-                        uint16_t (*encode)(float), uint16_t* residual = nullptr) {
+                        uint16_t (*encode)(float), uint16_t* residual = nullptr,
+                        bool round_before_weight = false) {
   std::vector<float> w_row(dim), x_row(dim), out_row(dim);
   for (int64_t j = 0; j < dim; ++j) w_row[j] = decode(w[j]);
   for (int64_t r = 0; r < rows; ++r) {
@@ -132,9 +133,21 @@ Status RmsNormConverted(const uint16_t* x, const uint16_t* w, uint16_t* out, int
     } else {
       for (int64_t j = 0; j < dim; ++j) x_row[j] = decode(x_src[j]);
     }
+    uint16_t* out_dst = out + r * dim;
+    if (round_before_weight) {
+      // Reference rounding: the normalized activation rounds to the input
+      // dtype before the scale multiply, and that product rounds again.
+      float sum_sq = 0.0f;
+      for (int64_t j = 0; j < dim; ++j) sum_sq += x_row[j] * x_row[j];
+      const float inv = 1.0f / std::sqrt(sum_sq / static_cast<float>(dim) + eps);
+      for (int64_t j = 0; j < dim; ++j) {
+        const float normalized = decode(encode(x_row[j] * inv));
+        out_dst[j] = encode(normalized * (w_row[j] + bias));
+      }
+      continue;
+    }
     HWY_DYNAMIC_DISPATCH(RmsNormRowF32)
     (x_row.data(), w_row.data(), out_row.data(), static_cast<size_t>(dim), eps, bias);
-    uint16_t* out_dst = out + r * dim;
     for (int64_t j = 0; j < dim; ++j) out_dst[j] = encode(out_row[j]);
   }
   return OkStatus();
@@ -208,12 +221,14 @@ Status RmsNorm(OpContext& /*ctx*/, const Tensor& x, const Tensor& weight, Tensor
       return RmsNormConverted(static_cast<const uint16_t*>(x.Data()),
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
-                              F16BitsToFloat, FloatToF16Bits);
+                              F16BitsToFloat, FloatToF16Bits, nullptr,
+                              config.round_before_weight);
     case DataType::kBFloat16:
       return RmsNormConverted(static_cast<const uint16_t*>(x.Data()),
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
-                              Bf16BitsToFloat, FloatToBf16Bits);
+                              Bf16BitsToFloat, FloatToBf16Bits, nullptr,
+                              config.round_before_weight);
     default:
       return UnimplementedError("RmsNorm on CPU does not support dtype ",
                                 DataTypeName(x.GetDataType()));
@@ -242,13 +257,15 @@ Status AddRmsNorm(OpContext& ctx, const Tensor& x, Tensor& residual, const Tenso
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
                               F16BitsToFloat, FloatToF16Bits,
-                              static_cast<uint16_t*>(residual.Data()));
+                              static_cast<uint16_t*>(residual.Data()),
+                              config.round_before_weight);
     case DataType::kBFloat16:
       return RmsNormConverted(static_cast<const uint16_t*>(x.Data()),
                               static_cast<const uint16_t*>(weight.Data()),
                               static_cast<uint16_t*>(out.Data()), rows, dim, config.eps, bias,
                               Bf16BitsToFloat, FloatToBf16Bits,
-                              static_cast<uint16_t*>(residual.Data()));
+                              static_cast<uint16_t*>(residual.Data()),
+                              config.round_before_weight);
     default:
       return UnimplementedError("AddRmsNorm on CPU does not support dtype ",
                                 DataTypeName(x.GetDataType()));

@@ -49,7 +49,7 @@ struct EngineGateway::Impl {
     }
     scheduler_config.queue_capacity = std::max(scheduler_config.queue_capacity, 1);
     capacity = scheduler_config.queue_capacity + scheduler_config.max_num_seqs;
-    scheduler = std::make_unique<Scheduler>(scheduler_config, executor->kv_pool(), eos);
+    scheduler = std::make_unique<Scheduler>(scheduler_config, executor->KvPool(), eos);
   }
 
   boost::asio::io_context& io;

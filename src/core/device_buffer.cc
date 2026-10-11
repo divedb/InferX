@@ -3,7 +3,7 @@
 #include "inferx/core/device_runtime.h"
 
 namespace inferx {
-StatusOr<DeviceBuffer> DeviceBuffer::Allocate(size_t bytes, DeviceId device) {
+StatusOr<DeviceBuffer> DeviceBuffer::Allocate(size_t bytes, Device device) {
   if (bytes == 0) {
     return DeviceBuffer(nullptr, 0, device);
   }

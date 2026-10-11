@@ -150,7 +150,7 @@ TEST(ModelConfigArgsTest, ParsesOptionsIntoStruct) {
   const ModelConfig built = args.Build();
   EXPECT_EQ(built.model_dir, "models/foo");
   EXPECT_EQ(built.tokenizer_dir, "tokenizers/foo");
-  EXPECT_EQ(built.device.PrimaryDevice(), DeviceId::Cuda(0));
+  EXPECT_EQ(built.device.PrimaryDevice(), Device::Cuda(0));
   EXPECT_EQ(built.dtype, "float16");
   EXPECT_EQ(built.seed, 7);
   EXPECT_EQ(built.max_model_len, 2048);
@@ -167,7 +167,7 @@ TEST(ModelConfigArgsTest, DefaultsFallBackToModelDirAndName) {
   // The fallback is derived at use, not materialized: empty means "unset".
   EXPECT_TRUE(built.tokenizer_dir.empty());
   EXPECT_EQ(built.ResolvedTokenizerDir(), args.config.model_dir);
-  EXPECT_EQ(built.device.PrimaryDevice(), DeviceId::Cuda(0));
+  EXPECT_EQ(built.device.PrimaryDevice(), Device::Cuda(0));
 }
 
 TEST(ModelConfigArgsTest, RejectsInvalidValues) {

@@ -20,6 +20,14 @@ struct CacheConfig {
   /// instead.
   /// EXAMPLE: --kv-cache-memory-bytes 8589934592
   std::int64_t kv_cache_memory_bytes = 0;
+
+  /// Fraction of device memory the engine may use for weights + KV; when
+  /// positive the runner profiles one max-size step after loading and
+  /// gives the leftover budget to the KV pool (vLLM-style sizing, minimum
+  /// taken across the tensor-parallel group). 0 sizes from the fields
+  /// above, which co-located ranks on one device should prefer.
+  /// EXAMPLE: --gpu-memory-utilization 0.9
+  float gpu_memory_utilization = 0.0f;
 };
 
 }  // namespace inferx

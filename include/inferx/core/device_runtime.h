@@ -42,7 +42,7 @@ class DeviceRuntime {
   DeviceRuntime& operator=(const DeviceRuntime&) = delete;
 
   /// \brief Returns the device this runtime is permanently bound to.
-  DeviceId device() const { return device_; }
+  Device device() const { return device_; }
 
   /// \brief Returns the kind of the bound device.
   DeviceKind kind() const { return device_.kind; }
@@ -101,30 +101,30 @@ class DeviceRuntime {
   /// \param src    Source address.
   /// \param bytes  Number of bytes to copy.
   /// \param kind   Direction of the copy.
-  /// \param stream Stream to enqueue the copy on.
+  /// \param stream DeviceStream to enqueue the copy on.
   /// \return       OK, or an error status.
   virtual Status CopyAsync(void* dst, const void* src, size_t bytes, CopyKind kind,
-                           Stream stream) = 0;
+                           DeviceStream stream) = 0;
 
   /// \brief Fills `bytes` bytes at `dst` with zero, asynchronously on `stream`.
-  virtual Status MemsetAsync(void* dst, size_t bytes, Stream stream) = 0;
+  virtual Status MemsetAsync(void* dst, size_t bytes, DeviceStream stream) = 0;
 
   /// \brief Creates a stream on the bound device.
   ///
   /// \return       The stream, or an error status.
-  virtual StatusOr<Stream> CreateStream() = 0;
+  virtual StatusOr<DeviceStream> CreateStream() = 0;
 
   /// \brief Destroys a stream.
   ///
   /// \param stream The stream to destroy.
   /// \return       OK, or an error status.
-  virtual Status DestroyStream(Stream stream) = 0;
+  virtual Status DestroyStream(DeviceStream stream) = 0;
 
   /// \brief Blocks until all work enqueued on `stream` completes.
   ///
   /// \param stream The stream to wait on.
   /// \return       OK, or an error status.
-  virtual Status SynchronizeStream(Stream stream) = 0;
+  virtual Status SynchronizeStream(DeviceStream stream) = 0;
 
   /// \brief Creates an event, optionally enabled for timing.
   ///
@@ -143,7 +143,7 @@ class DeviceRuntime {
   /// \param event  The event to record.
   /// \param stream The stream to record it on.
   /// \return       OK, or an error status.
-  virtual Status RecordEvent(DeviceEvent event, Stream stream) = 0;
+  virtual Status RecordEvent(DeviceEvent event, DeviceStream stream) = 0;
 
   /// \brief Blocks the host until `event` completes.
   ///
@@ -168,41 +168,41 @@ class DeviceRuntime {
   ///
   /// \param stream The stream to query.
   /// \return       True when capturing, or an error status.
-  virtual StatusOr<bool> IsCapturing(Stream stream) = 0;
+  virtual StatusOr<bool> IsCapturing(DeviceStream stream) = 0;
 
   /// \brief Begins graph capture on `stream`.
   ///
   /// \param stream The stream to capture.
   /// \return       OK, or an error status.
-  virtual Status BeginCapture(Stream stream) = 0;
+  virtual Status BeginCapture(DeviceStream stream) = 0;
 
   /// \brief Ends capture and instantiates the captured graph.
   ///
   /// \param stream The stream whose capture ends.
   /// \return       The instantiated graph, or an error status.
-  virtual StatusOr<GraphExec> EndCaptureAndInstantiate(Stream stream) = 0;
+  virtual StatusOr<DeviceGraphExec> EndCaptureAndInstantiate(DeviceStream stream) = 0;
 
   /// \brief Enqueues the instantiated graph on `stream`.
   ///
   /// \param graph  The graph to launch.
   /// \param stream The stream to launch it on.
   /// \return       OK, or an error status.
-  virtual Status LaunchGraph(GraphExec graph, Stream stream) = 0;
+  virtual Status LaunchGraph(DeviceGraphExec graph, DeviceStream stream) = 0;
 
   /// \brief Destroys an instantiated graph.
   ///
   /// \param graph The graph to destroy.
   /// \return      OK, or an error status.
-  virtual Status DestroyGraph(GraphExec graph) = 0;
+  virtual Status DestroyGraph(DeviceGraphExec graph) = 0;
 
   /// \brief Returns the services this runtime provides.
   virtual const RuntimeCapabilities& capabilities() const = 0;
 
  protected:
-  explicit DeviceRuntime(DeviceId device) : device_(device) {}
+  explicit DeviceRuntime(Device device) : device_(device) {}
 
  private:
-  const DeviceId device_;
+  const Device device_;
 };
 
 /// \brief Returns the process-wide runtime bound to `device`.
@@ -214,6 +214,6 @@ class DeviceRuntime {
 ///
 /// \param device The device whose runtime to return.
 /// \return       The runtime, or an error status for invalid/unsupported devices.
-StatusOr<DeviceRuntime*> RuntimeFor(DeviceId device);
+StatusOr<DeviceRuntime*> RuntimeFor(Device device);
 
 }  // namespace inferx

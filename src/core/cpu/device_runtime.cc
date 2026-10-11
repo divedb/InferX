@@ -32,7 +32,7 @@ void* AlignedHostAlloc(size_t bytes, size_t alignment) {
 
 class CpuRuntime final : public DeviceRuntime {
  public:
-  CpuRuntime() : DeviceRuntime(DeviceId::Cpu()) {}
+  CpuRuntime() : DeviceRuntime(Device::Cpu()) {}
   int DeviceCount() const override { return 1; }
 
   Status Activate() override { return OkStatus(); }
@@ -95,26 +95,26 @@ class CpuRuntime final : public DeviceRuntime {
   }
 
   Status CopyAsync(void* dst, const void* src, size_t bytes, CopyKind kind,
-                   Stream /*stream*/) override {
+                   DeviceStream /*stream*/) override {
     return Copy(dst, src, bytes, kind);
   }
 
-  Status MemsetAsync(void* dst, size_t bytes, Stream stream) override {
+  Status MemsetAsync(void* dst, size_t bytes, DeviceStream stream) override {
     std::memset(dst, 0, bytes);
     return OkStatus();
   }
 
-  StatusOr<Stream> CreateStream() override { return Stream(nullptr); }
+  StatusOr<DeviceStream> CreateStream() override { return DeviceStream(nullptr); }
 
-  Status DestroyStream(Stream /*stream*/) override { return OkStatus(); }
+  Status DestroyStream(DeviceStream /*stream*/) override { return OkStatus(); }
 
-  Status SynchronizeStream(Stream /*stream*/) override { return OkStatus(); }
+  Status SynchronizeStream(DeviceStream /*stream*/) override { return OkStatus(); }
 
   StatusOr<DeviceEvent> CreateEvent(bool /*timing*/) override { return DeviceEvent{nullptr}; }
 
   Status DestroyEvent(DeviceEvent /*event*/) override { return OkStatus(); }
 
-  Status RecordEvent(DeviceEvent /*event*/, Stream /*stream*/) override { return OkStatus(); }
+  Status RecordEvent(DeviceEvent /*event*/, DeviceStream /*stream*/) override { return OkStatus(); }
 
   Status SynchronizeEvent(DeviceEvent /*event*/) override { return OkStatus(); }
 
@@ -124,21 +124,21 @@ class CpuRuntime final : public DeviceRuntime {
     return 0.0f;
   }
 
-  StatusOr<bool> IsCapturing(Stream /*stream*/) override { return false; }
+  StatusOr<bool> IsCapturing(DeviceStream /*stream*/) override { return false; }
 
-  Status BeginCapture(Stream /*stream*/) override {
+  Status BeginCapture(DeviceStream /*stream*/) override {
     return UnimplementedError("CPU graph capture is not supported");
   }
 
-  StatusOr<GraphExec> EndCaptureAndInstantiate(Stream /*stream*/) override {
+  StatusOr<DeviceGraphExec> EndCaptureAndInstantiate(DeviceStream /*stream*/) override {
     return UnimplementedError("CPU graph capture is not supported");
   }
 
-  Status LaunchGraph(GraphExec /*graph*/, Stream /*stream*/) override {
+  Status LaunchGraph(DeviceGraphExec /*graph*/, DeviceStream /*stream*/) override {
     return UnimplementedError("CPU graph launch is not supported");
   }
 
-  Status DestroyGraph(GraphExec /*graph*/) override {
+  Status DestroyGraph(DeviceGraphExec /*graph*/) override {
     return UnimplementedError("CPU graph capture is not supported");
   }
 

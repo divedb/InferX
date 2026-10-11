@@ -52,7 +52,7 @@ Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices, Tens
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t row_bytes = out.Dim(1) * DataTypeByteSize(src.GetDataType(), 1);
   GatherRowsKernel<<<static_cast<uint32_t>(out.Dim(0)), 256, 0,
-                     static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                     ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const char*>(src.Data()), static_cast<const int32_t*>(indices.Data()),
       static_cast<char*>(out.Data()), row_bytes);
   return CudaStatus(cudaGetLastError(), "gather rows launch");
@@ -63,7 +63,7 @@ Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t row_bytes = out.Dim(1) * DataTypeByteSize(src.GetDataType(), 1);
   GatherRowsRangeKernel<<<static_cast<uint32_t>(out.Dim(0)), 256, 0,
-                          static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                          ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const char*>(src.Data()), static_cast<const int32_t*>(indices.Data()),
       static_cast<char*>(out.Data()), row_bytes, row_begin, src.Dim(0));
   return CudaStatus(cudaGetLastError(), "gather rows range launch");
@@ -74,7 +74,7 @@ Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const int64_t elem_bytes = DataTypeByteSize(src.GetDataType(), 1);
   CopyColumnBlockKernel<<<static_cast<uint32_t>(src.Dim(0)), 256, 0,
-                          static_cast<cudaStream_t>(ctx.GetStream())>>>(
+                          ctx.GetStream().As<cudaStream_t>()>>>(
       static_cast<const char*>(src.Data()), static_cast<char*>(dst.Data()), src.Dim(1),
       dst.Dim(1), col_begin, elem_bytes);
   return CudaStatus(cudaGetLastError(), "copy column block launch");

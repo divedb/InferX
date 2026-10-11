@@ -30,12 +30,12 @@ Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out
     return InvalidArgumentError("Linear out is [", out.Dim(0), ", ", out.Dim(1),
                                 "] but should be [", x.Dim(0), ", ", weight.Dim(0), "]");
   }
-  const DeviceId device = ctx.Device();
-  if (x.Device() != device || weight.Device() != device || out.Device() != device) {
+  const Device device = ctx.GetDevice();
+  if (x.GetDevice() != device || weight.GetDevice() != device || out.GetDevice() != device) {
     return InvalidArgumentError("Linear tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind) {
+  switch (device.kind()) {
     case DeviceKind::kCuda:
       return ProfileCall(ctx, "linear", [&] { return cuda::Linear(ctx, x, weight, out); });
     default:

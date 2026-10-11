@@ -31,7 +31,7 @@ void TestBorrowedStorageRejected(const char* path) {
   CHECK(provider.Configure(config.config).Ok());
 
   std::vector<unsigned char> bytes(256);
-  StoragePtr borrowed = Storage::Borrow(bytes.data(), bytes.size(), DeviceId::Cpu());
+  StoragePtr borrowed = Storage::Borrow(bytes.data(), bytes.size(), Device::Cpu());
   auto rejected = ImportProviderMemory(provider.Data(), borrowed);
   CHECK(!rejected);
   CHECK_EQ(rejected.error().code, KVC_INVALID_ARGUMENT);
@@ -46,7 +46,7 @@ void TestHostStorageRoundTrip(const char* path) {
   auto config = builder.Build();
   CHECK(provider.Configure(config.config).Ok());
 
-  auto allocated = Storage::Allocate(4096, DeviceId::Cpu());
+  auto allocated = Storage::Allocate(4096, Device::Cpu());
   CHECK(allocated.ok());
   StoragePtr storage = std::move(*allocated);
   auto* raw_storage = reinterpret_cast<unsigned char*>(storage->Data());
@@ -132,7 +132,7 @@ void TestCudaStorageRoundTrip(const char* path) {
   auto config = builder.Build();
   CHECK(provider.Configure(config.config).Ok());
 
-  auto allocated = Storage::Allocate(4096, DeviceId::Cuda(0));
+  auto allocated = Storage::Allocate(4096, Device::Cuda(0));
   CHECK(allocated.ok());
   StoragePtr storage = std::move(*allocated);
   auto imported = ImportProviderMemory(provider.Data(), storage);

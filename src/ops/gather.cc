@@ -26,15 +26,15 @@ Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices,
     return InvalidArgumentError("GatherRows has ", indices.Dim(0), " indices but ", out.Dim(0),
                                 " output rows");
   }
-  const DeviceId device = ctx.Device();
-  if (src.Device() != device || indices.Device() != device || out.Device() != device) {
+  const Device device = ctx.GetDevice();
+  if (src.GetDevice() != device || indices.GetDevice() != device || out.GetDevice() != device) {
     return InvalidArgumentError("GatherRows tensors must live on the context's device ",
                                 device.ToString());
   }
   if (src.Dim(0) > std::numeric_limits<int32_t>::max()) {
     return InvalidArgumentError("GatherRows src exceeds 32-bit kernel extents");
   }
-  switch (device.kind) {
+  switch (device.kind()) {
     case DeviceKind::kCuda:
       return cuda::GatherRows(ctx, src, indices, out);
     default:
@@ -57,12 +57,12 @@ Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
     return InvalidArgumentError("GatherRowsRange shapes disagree");
   }
   if (out.IsEmpty()) return OkStatus();
-  const DeviceId device = ctx.Device();
-  if (src.Device() != device || indices.Device() != device || out.Device() != device) {
+  const Device device = ctx.GetDevice();
+  if (src.GetDevice() != device || indices.GetDevice() != device || out.GetDevice() != device) {
     return InvalidArgumentError("GatherRowsRange tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind) {
+  switch (device.kind()) {
     case DeviceKind::kCuda:
       return cuda::GatherRowsRange(ctx, src, indices, out, row_begin);
     default:
@@ -79,12 +79,12 @@ Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
     return InvalidArgumentError("CopyColumnBlock shapes disagree");
   }
   if (src.IsEmpty()) return OkStatus();
-  const DeviceId device = ctx.Device();
-  if (src.Device() != device || dst.Device() != device) {
+  const Device device = ctx.GetDevice();
+  if (src.GetDevice() != device || dst.GetDevice() != device) {
     return InvalidArgumentError("CopyColumnBlock tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind) {
+  switch (device.kind()) {
     case DeviceKind::kCuda:
       return cuda::CopyColumnBlock(ctx, src, dst, col_begin);
     default:

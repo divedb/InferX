@@ -19,14 +19,14 @@ Status AssembleMlaCaches(OpContext& ctx, const Tensor& k_rope, const Tensor& up_
   }
   for (const Tensor* t : std::initializer_list<const Tensor*>{
            &k_rope, &up_projected, &k_out, &v_out}) {
-    if (t->Device() != ctx.Device()) {
+    if (t->GetDevice() != ctx.GetDevice()) {
       return InvalidArgumentError("MLA cache assembly must run on the context device");
     }
   }
   if (v_dim > head_dim || rope <= 0 || nope <= 0 || v_dim <= 0) {
     return InvalidArgumentError("MLA dimensions must be positive with v within head_dim");
   }
-  if (!ctx.Device().IsCuda()) return UnimplementedError("MLA cache assembly requires CUDA");
+  if (!ctx.GetDevice().IsCuda()) return UnimplementedError("MLA cache assembly requires CUDA");
   if (k_rope.IsEmpty()) return OkStatus();
   return cuda::AssembleMlaCaches(ctx, k_rope, up_projected, heads, nope, rope, v_dim, k_out, v_out);
 }

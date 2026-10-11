@@ -49,7 +49,7 @@ Status CheckRaggedBatch(const Tensor& positions, const Tensor& batch_indices,
 }
 
 Status CheckCache(const Tensor& key_cache, const Tensor& value_cache, int64_t block_size,
-                  int64_t kv_heads, int64_t head_dim, const DeviceId& device) {
+                  int64_t kv_heads, int64_t head_dim, const Device& device) {
   for (const Tensor* cache : {&key_cache, &value_cache}) {
     if (cache->Rank() != 4 || cache->GetDataType() != DataType::kBFloat16) {
       return InvalidArgumentError("KV caches must be rank-4 bfloat16");
@@ -59,7 +59,7 @@ Status CheckCache(const Tensor& key_cache, const Tensor& value_cache, int64_t bl
                                   ", ", cache->Dim(2), ", ", cache->Dim(3),
                                   "] disagrees with block_size/kv_heads/head_dim");
     }
-    if (cache->Device() != device) {
+    if (cache->GetDevice() != device) {
       return InvalidArgumentError("KV caches must live on the context's device ", device.ToString());
     }
   }
@@ -93,19 +93,19 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
     return InvalidArgumentError("WritePagedKv k width ", k.Dim(1), " disagrees with cache geometry ",
                                 kv_heads * head_dim);
   }
-  const DeviceId device = ctx.Device();
+  const Device device = ctx.GetDevice();
   INFERX_RETURN_IF_ERROR(
       CheckRaggedBatch(positions, batch_indices, kv_indptr, kv_indices, k.Dim(0)));
   INFERX_RETURN_IF_ERROR(CheckCache(key_cache, value_cache, block_size, kv_heads, head_dim, device));
   for (const Tensor* metadata : {&positions, &batch_indices, &kv_indptr, &kv_indices}) {
-    if (metadata->Device() != device)
+    if (metadata->GetDevice() != device)
       return InvalidArgumentError("WritePagedKv metadata must live on the context device");
   }
-  if (k.Device() != device || v.Device() != device) {
+  if (k.GetDevice() != device || v.GetDevice() != device) {
     return InvalidArgumentError("WritePagedKv tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind) {
+  switch (device.kind()) {
     case DeviceKind::kCuda:
       return cuda::WritePagedKv(ctx, k, v, positions, batch_indices, kv_indptr, kv_indices,
                                 key_cache, value_cache, block_size);

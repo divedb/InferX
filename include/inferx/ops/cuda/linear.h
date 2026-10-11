@@ -3,8 +3,8 @@
 
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/ops/op_context.h"
 #include "inferx/ops/linear.h"
+#include "inferx/ops/op_context.h"
 
 namespace inferx::ops::cuda {
 

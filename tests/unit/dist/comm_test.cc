@@ -7,13 +7,13 @@
 #include "inferx/dist/loopback_comm.h"
 #include "inferx/dist/nccl_comm.h"
 
-namespace inferx::dist {
+namespace inferx {
 namespace {
 
 class CommTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto runtime = RuntimeFor(DeviceId::Cpu());
+    auto runtime = RuntimeFor(Device::Cpu());
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     auto stream = runtime_->CreateStream();
@@ -27,14 +27,14 @@ class CommTest : public ::testing::Test {
     }
   }
   DeviceRuntime* runtime_ = nullptr;
-  Stream stream_;
+  DeviceStream stream_;
 };
 
 TEST_F(CommTest, SingleRankReductionAcceptsAllTensorRanks) {
   SingleRankComm comm;
   const ops::OpContext ctx(*runtime_, stream_);
   for (const Shape shape : {Shape{}, Shape{3}, Shape{1, 2, 3}, Shape{0}}) {
-    auto tensor = Tensor::Empty(DataType::kBFloat16, shape, DeviceId::Cpu());
+    auto tensor = Tensor::Empty(DataType::kBFloat16, shape, Device::Cpu());
     ASSERT_TRUE(tensor.ok()) << tensor.status();
     EXPECT_TRUE(comm.AllReduceSum(ctx, *tensor).ok());
   }
@@ -43,9 +43,9 @@ TEST_F(CommTest, SingleRankReductionAcceptsAllTensorRanks) {
 TEST_F(CommTest, GatherValidatesShapeDtypeDeviceAndOverlap) {
   SingleRankComm comm;
   const ops::OpContext ctx(*runtime_, stream_);
-  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
-  auto wrong_shape = Tensor::Empty(DataType::kBFloat16, Shape{3, 2}, DeviceId::Cpu());
-  auto wrong_dtype = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, DeviceId::Cpu());
+  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, Device::Cpu());
+  auto wrong_shape = Tensor::Empty(DataType::kBFloat16, Shape{3, 2}, Device::Cpu());
+  auto wrong_dtype = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, Device::Cpu());
   ASSERT_TRUE(input.ok());
   ASSERT_TRUE(wrong_shape.ok());
   ASSERT_TRUE(wrong_dtype.ok());
@@ -56,16 +56,16 @@ TEST_F(CommTest, GatherValidatesShapeDtypeDeviceAndOverlap) {
 
   // These views exercise metadata validation without accessing a GPU.
   auto wrong_device =
-      Tensor::FromBlob(input->Data(), DataType::kBFloat16, Shape{2, 3}, DeviceId::Cuda(0));
+      Tensor::FromBlob(input->Data(), DataType::kBFloat16, Shape{2, 3}, Device::Cuda(0));
   ASSERT_TRUE(wrong_device.ok());
   EXPECT_EQ(comm.AllGatherLastDim(ctx, *input, *wrong_device).code(),
             absl::StatusCode::kInvalidArgument);
   EXPECT_EQ(comm.AllReduceSum(ctx, *wrong_device).code(), absl::StatusCode::kInvalidArgument);
 
   std::vector<uint16_t> storage(8);
-  auto a = Tensor::FromBlob(storage.data(), DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
+  auto a = Tensor::FromBlob(storage.data(), DataType::kBFloat16, Shape{2, 3}, Device::Cpu());
   auto b =
-      Tensor::FromBlob(storage.data() + 1, DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
+      Tensor::FromBlob(storage.data() + 1, DataType::kBFloat16, Shape{2, 3}, Device::Cpu());
   ASSERT_TRUE(a.ok());
   ASSERT_TRUE(b.ok());
   EXPECT_EQ(comm.AllGatherLastDim(ctx, *a, *b).code(), absl::StatusCode::kInvalidArgument);
@@ -75,8 +75,8 @@ TEST_F(CommTest, GatherValidatesShapeDtypeDeviceAndOverlap) {
 TEST_F(CommTest, LoopbackPropagatesValidationFailureToPeers) {
   auto world = LoopbackWorld::Create(2);
   ASSERT_TRUE(world.ok());
-  auto valid = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
-  auto invalid = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, DeviceId::Cpu());
+  auto valid = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, Device::Cpu());
+  auto invalid = Tensor::Empty(DataType::kFloat32, Shape{2, 3}, Device::Cpu());
   ASSERT_TRUE(valid.ok());
   ASSERT_TRUE(invalid.ok());
   const ops::OpContext ctx(*runtime_, stream_);
@@ -92,8 +92,8 @@ TEST_F(CommTest, LoopbackPropagatesValidationFailureToPeers) {
 TEST_F(CommTest, LoopbackRejectsMismatchedPeerShapes) {
   auto world = LoopbackWorld::Create(2);
   ASSERT_TRUE(world.ok());
-  auto a = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, DeviceId::Cpu());
-  auto b = Tensor::Empty(DataType::kBFloat16, Shape{2, 4}, DeviceId::Cpu());
+  auto a = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, Device::Cpu());
+  auto b = Tensor::Empty(DataType::kBFloat16, Shape{2, 4}, Device::Cpu());
   ASSERT_TRUE(a.ok());
   ASSERT_TRUE(b.ok());
   const ops::OpContext ctx(*runtime_, stream_);
@@ -109,9 +109,9 @@ TEST_F(CommTest, LoopbackEmptyCollectivesPreserveSequence) {
   auto run = [&](int rank) -> Status {
     const ops::OpContext ctx(*runtime_, stream_);
     INFERX_ASSIGN_OR_RETURN(auto partial,
-                            Tensor::Empty(DataType::kBFloat16, Shape{0, 3}, DeviceId::Cpu()));
+                            Tensor::Empty(DataType::kBFloat16, Shape{0, 3}, Device::Cpu()));
     INFERX_ASSIGN_OR_RETURN(auto full,
-                            Tensor::Empty(DataType::kBFloat16, Shape{0, 6}, DeviceId::Cpu()));
+                            Tensor::Empty(DataType::kBFloat16, Shape{0, 6}, Device::Cpu()));
     for (int i = 0; i < 3; ++i) {
       INFERX_RETURN_IF_ERROR((*world)->rank(rank).AllReduceSum(ctx, partial));
       INFERX_RETURN_IF_ERROR((*world)->rank(rank).AllGatherLastDim(ctx, partial, full));
@@ -126,7 +126,7 @@ TEST_F(CommTest, LoopbackEmptyCollectivesPreserveSequence) {
 class CommCudaTest : public CommTest {
  protected:
   void SetUp() override {
-    auto runtime = RuntimeFor(DeviceId::Cuda(0));
+    auto runtime = RuntimeFor(Device::Cuda(0));
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     auto stream = runtime_->CreateStream();
@@ -138,8 +138,8 @@ class CommCudaTest : public CommTest {
 TEST_F(CommCudaTest, SingleRankGatherOrdersCopiesOnTheContextStream) {
   const ops::OpContext ctx(*runtime_, stream_);
   SingleRankComm comm;
-  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device());
-  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device());
+  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.GetDevice());
+  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.GetDevice());
   ASSERT_TRUE(input.ok());
   ASSERT_TRUE(output.ok());
   std::vector<uint16_t> values{0x3f80, 0x4000, 0x4040, 0x4080}, result(4);
@@ -167,7 +167,7 @@ TEST_F(CommCudaTest, LoopbackReducesAllShapesAndGathersInRankOrder) {
       // Repeated leading dimensions with different tails exercise slot reuse.
       for (const Shape shape : {Shape{}, Shape{5}, Shape{1, 2, 3}, Shape{1, 2, 4}}) {
         INFERX_ASSIGN_OR_RETURN(auto input,
-                                Tensor::Empty(DataType::kBFloat16, shape, ctx.Device()));
+                                Tensor::Empty(DataType::kBFloat16, shape, ctx.GetDevice()));
         const uint16_t value = rank == 0 ? 0x3f80 : rank == 1 ? 0x4000 : 0x4040;
         std::vector<uint16_t> values(input.Numel(), value);
         INFERX_RETURN_IF_ERROR(runtime_->CopyAsync(input.Data(), values.data(), input.NBytes(),
@@ -179,9 +179,9 @@ TEST_F(CommCudaTest, LoopbackReducesAllShapesAndGathersInRankOrder) {
         EXPECT_EQ(values, std::vector<uint16_t>(input.Numel(), 0x40c0));  // 1 + 2 + 3 = 6.
       }
       INFERX_ASSIGN_OR_RETURN(auto input,
-                              Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.Device()));
+                              Tensor::Empty(DataType::kBFloat16, Shape{2, 2}, ctx.GetDevice()));
       INFERX_ASSIGN_OR_RETURN(auto full,
-                              Tensor::Empty(DataType::kBFloat16, Shape{2, 6}, ctx.Device()));
+                              Tensor::Empty(DataType::kBFloat16, Shape{2, 6}, ctx.GetDevice()));
       const uint16_t value = rank == 0 ? 0x3f80 : rank == 1 ? 0x4000 : 0x4040;
       std::vector<uint16_t> values(4, value), result(12);
       for (int i = 0; i < 3; ++i) {
@@ -216,8 +216,8 @@ TEST_F(CommCudaTest, NcclSingleRankUsesBfloat16AndCopiesGatherOutput) {
   auto comm = NcclComm::Join(0, 1, *id, runtime_->device());
   ASSERT_TRUE(comm.ok()) << comm.status();
   const ops::OpContext ctx(*runtime_, stream_);
-  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.Device());
-  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.Device());
+  auto input = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.GetDevice());
+  auto output = Tensor::Empty(DataType::kBFloat16, Shape{2, 3}, ctx.GetDevice());
   ASSERT_TRUE(input.ok());
   ASSERT_TRUE(output.ok());
   std::vector<uint16_t> values{0x3f80, 0x4000, 0x4040, 0xc000, 0x0000, 0x3f80}, result(6);
@@ -236,4 +236,4 @@ TEST_F(CommCudaTest, NcclSingleRankUsesBfloat16AndCopiesGatherOutput) {
 }
 
 }  // namespace
-}  // namespace inferx::dist
+}  // namespace inferx

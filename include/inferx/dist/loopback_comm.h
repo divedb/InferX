@@ -24,7 +24,6 @@
 #include "inferx/dist/comm.h"
 
 namespace inferx {
-namespace dist {
 
 /// \brief N loopback ranks sharing one device; create once, hand each rank
 ///        its CommBackend.
@@ -67,6 +66,7 @@ class LoopbackComm final : public CommBackend {
   Status AllReduceSum(const ops::OpContext& ctx, Tensor& partial) override;
   Status AllGatherLastDim(const ops::OpContext& ctx, const Tensor& partial,
                           Tensor& full) override;
+  StatusOr<int64_t> AllReduceMin(const ops::OpContext& ctx, int64_t value) override;
 
   ~LoopbackComm() override;
 
@@ -77,7 +77,7 @@ class LoopbackComm final : public CommBackend {
   /// \brief This rank's contribution slot of the given shape, on the
   ///        context device; one slot per distinct shape keeps embedding,
   ///        hidden, and logit collectives from reallocating.
-  StatusOr<Tensor*> Slot(const Shape& shape, DeviceId device);
+  StatusOr<Tensor*> Slot(const Shape& shape, Device device);
 
   Status Publish(const ops::OpContext& ctx, const Tensor& contribution);
   Status Meet();                 ///< Barrier over the shared generation.
@@ -88,7 +88,6 @@ class LoopbackComm final : public CommBackend {
   std::map<std::tuple<DeviceKind, int, std::vector<int64_t>>, Tensor> slots_;
 };
 
-}  // namespace dist
 }  // namespace inferx
 
 #endif  // INFERX_DIST_LOOPBACK_COMM_H_

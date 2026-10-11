@@ -1,200 +1,117 @@
-#include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstdio>
-#include <filesystem>
-#include <map>
+// Tensor-parallel sharding, end to end on one GPU: two ModelRunners over a
+// LoopbackWorld produce the executor's samples, and those samples must
+// match the single-rank generation exactly. Exercising ModelExecutor's rank
+// group path this way covers weight sharding, collectives, and the
+// rank-zero-samples protocol.
+#include <fstream>
 #include <memory>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "inferx/dist/loopback_comm.h"
-#include "inferx/dist/nccl_comm.h"
-#include "inferx/engine/scheduler.h"
 #include "inferx/engine/model_executor.h"
+#include "inferx/engine/scheduler.h"
+#include "inferx/models/model_runner.h"
 
 namespace inferx {
 namespace {
 
-class ObservedModel final : public models::CausalLanguageModel {
- public:
-  explicit ObservedModel(std::unique_ptr<models::CausalLanguageModel> model)
-      : model_(std::move(model)) {}
-  const models::ModelSpec& GetModelSpec() const override { return model_->GetModelSpec(); }
-  const models::ModelRequirements& GetRequirements() const override {
-    return model_->GetRequirements();
+std::vector<TokenId> ReadCsv(const std::string& path) {
+  std::ifstream input(path);
+  std::string line;
+  std::getline(input, line);
+  std::vector<TokenId> tokens;
+  std::stringstream cells(line);
+  std::string cell;
+  while (std::getline(cells, cell, ',')) {
+    if (!cell.empty()) tokens.push_back(std::stoi(cell));
   }
-  Status Prepare(const models::ExecutionLimits& limits, models::ForwardContext& ctx) override {
-    return model_->Prepare(limits, ctx);
-  }
-  StatusOr<models::StepPreparation> PrepareStep(const models::ModelInputs& inputs,
-      const models::OutputRequest& outputs, models::ForwardContext& ctx) override {
-    return model_->PrepareStep(inputs, outputs, ctx);
-  }
-  StatusOr<models::ModelOutput> Forward(const models::ModelInputs& input,
-      const models::OutputRequest& outputs, models::ForwardContext& fctx) override {
-    INFERX_ASSIGN_OR_RETURN(auto result, model_->Forward(input, outputs, fctx));
-    if (!result.logits.has_value()) return result;
-    const auto& logits = *result.logits;
-    std::vector<uint16_t> bits(logits.values.Numel());
-    INFERX_RETURN_IF_ERROR(fctx.ops.Runtime().CopyAsync(
-        bits.data(), logits.values.Data(), logits.values.NBytes(), CopyKind::kDeviceToHost,
-        fctx.ops.GetStream()));
-    INFERX_RETURN_IF_ERROR(fctx.ops.Runtime().SynchronizeStream(fctx.ops.GetStream()));
-    std::vector<float> values;
-    for (uint16_t value : bits) values.push_back(std::bit_cast<float>(uint32_t(value) << 16));
-    steps.push_back(std::move(values));
-    return result;
-  }
-  std::vector<std::vector<float>> steps;
-
- private:
-  std::unique_ptr<models::CausalLanguageModel> model_;
-};
-
-class TensorParallelTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    model_.model_dir = "models/Qwen3-0.6B";
-    if (!std::filesystem::exists(model_.model_dir + "/model.safetensors")) {
-      GTEST_SKIP() << "local Qwen3-0.6B checkpoint is absent";
-    }
-    auto runtime = RuntimeFor(DeviceId::Cuda(0));
-    ASSERT_TRUE(runtime.ok()) << runtime.status();
-    runtime_ = *runtime;
-    cache_.num_kv_blocks = 32;
-    cache_.block_size = 2;  // Exercise page transitions during both prefill and decode.
-    scheduler_.max_num_seqs = 2;
-    scheduler_.max_num_batched_tokens = 4;
-  }
-
-  StatusOr<std::unique_ptr<models::ModelRunner>> MakeRank(int rank, int size,
-                                                  std::unique_ptr<dist::CommBackend> comm,
-                                                  ObservedModel** observed) {
-    models::ModelLoadOptions options;
-    options.directory = model_.model_dir;
-    options.device = DeviceId::Cuda(0);
-
-
-    options.parallel = ParallelConfig{.tensor_parallel_size = size, .tensor_parallel_rank = rank};
-    INFERX_ASSIGN_OR_RETURN(auto model, models::LoadModel(options));
-    // The public specification stays global while state requirements are sharded.
-    EXPECT_EQ(model->GetModelSpec().num_attention_heads, 16);
-    EXPECT_EQ(model->GetModelSpec().num_key_value_heads, 8);
-    EXPECT_EQ(model->GetModelSpec().vocab_size, 151936);
-    for (const auto& state : model->GetRequirements().layers) {
-      EXPECT_EQ(std::get<models::PagedKvStateSpec>(state).layout.kv_heads, 8 / size);
-    }
-    auto wrapper = std::make_unique<ObservedModel>(std::move(model));
-    *observed = wrapper.get();
-    return models::ModelRunner::Create(model_, cache_, scheduler_, ExecutionConfig{},
-                               std::move(wrapper), std::move(comm));
-  }
-
-  template <class ExecutorT>
-  static StatusOr<ModelRunnerOutput> Step(ExecutorT& ex, const SchedulerOutput& plan) {
-    return ex.Execute(plan);
-  }
-  static StatusOr<ModelRunnerOutput> Step(models::ModelRunner& rank, const SchedulerOutput& plan) {
-    return rank.Run(plan);
-  }
-
-  template <class ExecutorT>
-  StatusOr<std::map<RequestId, std::vector<TokenId>>> Generate(ExecutorT& runner) {
-    Scheduler scheduler(scheduler_, runner.kv_pool(), runner.GetModelSpec().eos_token_ids);
-    sampling::SamplingParams params;
-    params.temperature = 0;
-    params.ignore_eos = true;
-    params.max_tokens = 4;
-    // Tokens span both halves of the vocabulary. Unequal prompt lengths test
-    // chunked prefill, mixed prefill/decode, and gathering multiple logit rows.
-    INFERX_RETURN_IF_ERROR(
-        scheduler.AddRequest(Request(1, {151644, 9707, 11, 80000, 13}, params)));
-    INFERX_RETURN_IF_ERROR(scheduler.AddRequest(Request(2, {90000, 42, 151643}, params)));
-    std::map<RequestId, std::vector<TokenId>> generated;
-    int steps = 0;
-    while (scheduler.HasRequests()) {
-      if (++steps > 20) return InternalError("generation did not finish");
-      INFERX_ASSIGN_OR_RETURN(auto plan, scheduler.Schedule());
-      INFERX_ASSIGN_OR_RETURN(auto result, Step(runner, plan));
-      INFERX_RETURN_IF_ERROR(scheduler.UpdateFromOutput(plan, result));
-      while (auto done = scheduler.PopFinished()) generated[done->id()] = done->output();
-    }
-    INFERX_ASSIGN_OR_RETURN(auto removals, scheduler.Schedule());
-    INFERX_RETURN_IF_ERROR(Step(runner, removals).status());
-    return generated;
-  }
-
-  DeviceRuntime* runtime_ = nullptr;
-  ModelConfig model_;
-  CacheConfig cache_;
-  SchedulerConfig scheduler_;
-};
-
-TEST_F(TensorParallelTest, Qwen3TwoRanksMatchSingleRankPrefillAndDecode) {
-  ObservedModel* reference = nullptr;
-  auto baseline = MakeRank(0, 1, std::make_unique<dist::SingleRankComm>(), &reference);
-  ASSERT_TRUE(baseline.ok()) << baseline.status();
-  auto expected = Generate(**baseline);
-  ASSERT_TRUE(expected.ok()) << expected.status();
-  const auto expected_logits = reference->steps;
-  baseline->reset();
-
-  auto created = dist::LoopbackWorld::Create(2);
-  ASSERT_TRUE(created.ok());
-  std::shared_ptr<dist::LoopbackWorld> world = *std::move(created);
-  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
-  std::vector<ObservedModel*> observed(2);
-  for (int rank = 0; rank < 2; ++rank) {
-    auto runner = MakeRank(rank, 2, world->TakeRank(rank), &observed[rank]);
-    ASSERT_TRUE(runner.ok()) << runner.status();
-    ranks.push_back(*std::move(runner));
-  }
-  auto parallel = ModelExecutor::CreateGroup(
-      std::move(ranks), [world](const Status& status) { world->Abort(status); });
-  ASSERT_TRUE(parallel.ok()) << parallel.status();
-  auto actual = Generate(**parallel);
-  ASSERT_TRUE(actual.ok()) << actual.status();
-  EXPECT_EQ(*actual, *expected);
-  ASSERT_EQ(observed[0]->steps.size(), expected_logits.size());
-  EXPECT_EQ(observed[0]->steps, observed[1]->steps);
-  for (size_t step = 0; step < expected_logits.size(); ++step) {
-    SCOPED_TRACE(step);
-    const auto& want = expected_logits[step];
-    const auto& got = observed[0]->steps[step];
-    ASSERT_EQ(got.size(), want.size());
-    double error = 0, scale = 0;
-    for (size_t i = 0; i < want.size(); ++i) {
-      ASSERT_TRUE(std::isfinite(got[i]));
-      error += std::pow(double(got[i]) - want[i], 2);
-      scale += double(want[i]) * want[i];
-    }
-    // Unlike TP=1's full FP32 GEMM accumulation, each sharded projection
-    // rounds its partial to BF16 before reduction. Across 28 layers this is
-    // approximate parity; also require exact rank agreement and generated ids.
-    const double relative_l2 = std::sqrt(error / std::max(scale, 1e-12));
-    std::printf("Qwen3 TP=2 step %zu relative logit L2: %.5f\n", step, relative_l2);
-    EXPECT_LT(relative_l2, 0.05);
-  }
+  return tokens;
 }
 
-TEST_F(TensorParallelTest, Qwen3MultiGpuServingRunnerMatchesSingleRank) {
-  if (runtime_->DeviceCount() < 2) GTEST_SKIP() << "two CUDA GPUs are required";
-  auto id = dist::NcclComm::NewUniqueId();
-  if (absl::IsNotFound(id.status())) GTEST_SKIP() << "NCCL is not installed";
-  ASSERT_TRUE(id.ok()) << id.status();
-  auto baseline = ModelExecutor::Create(model_, cache_, scheduler_, ExecutionConfig{});
-  ASSERT_TRUE(baseline.ok()) << baseline.status();
-  auto expected = Generate(**baseline);
-  ASSERT_TRUE(expected.ok()) << expected.status();
-  baseline->reset();
-  model_.device.device_ids = {0, 1};
-  auto parallel =
-      ModelExecutor::Create(model_, cache_, scheduler_, ExecutionConfig{}, ParallelConfig{.tensor_parallel_size = 2});
-  ASSERT_TRUE(parallel.ok()) << parallel.status();
-  auto actual = Generate(**parallel);
-  ASSERT_TRUE(actual.ok()) << actual.status();
-  EXPECT_EQ(*actual, *expected);
+StatusOr<std::unique_ptr<ModelExecutor>> MakeExecutor(int world) {
+  ModelConfig model;
+  model.model_dir = "models/Qwen3-0.6B";
+  model.device.device_type = "cuda";
+  CacheConfig cache;
+  cache.block_size = 16;
+  cache.num_kv_blocks = 512;
+  SchedulerConfig scheduler_config;
+  ExecutionConfig execution;
+
+  if (world == 1) {
+    return ModelExecutor::Create(model, cache, scheduler_config, execution);
+  }
+
+  auto comm_world = LoopbackWorld::Create(world);
+  if (!comm_world.ok()) return comm_world.status();
+  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
+  for (int rank = 0; rank < world; ++rank) {
+    ParallelConfig parallel;
+    parallel.tensor_parallel_size = world;
+    parallel.tensor_parallel_rank = rank;
+    INFERX_ASSIGN_OR_RETURN(
+        auto runner, models::ModelRunner::Create(model, cache, scheduler_config, execution,
+                                                 parallel, (*comm_world)->TakeRank(rank)));
+    ranks.push_back(std::move(runner));
+  }
+  // The rank-owned comm backends keep the loopback state alive; the world
+  // itself only needs to outlive CreateGroup, so the abort hook holds it.
+  LoopbackWorld* world_ptr = comm_world->release();
+  return ModelExecutor::CreateGroup(
+      std::move(ranks),
+      [world_ptr](const Status& status) { world_ptr->Abort(status); });
+}
+
+StatusOr<std::vector<TokenId>> Generate(ModelExecutor& executor,
+                                        const SchedulerConfig& config,
+                                        const std::vector<TokenId>& prompt, int max_tokens,
+                                        TokenId eos) {
+  Scheduler scheduler(config, executor.KvPool(), {eos});
+  sampling::SamplingParams params;
+  params.temperature = 0;
+  params.max_tokens = max_tokens;
+  INFERX_RETURN_IF_ERROR(scheduler.AddRequest(Request(7, prompt, params)));
+
+  std::vector<TokenId> output;
+  while (scheduler.HasRequests()) {
+    INFERX_ASSIGN_OR_RETURN(SchedulerOutput plan, scheduler.Schedule());
+    if (plan.IsEmpty()) continue;
+    INFERX_ASSIGN_OR_RETURN(ModelRunnerOutput result, executor.Execute(plan));
+    INFERX_RETURN_IF_ERROR(scheduler.UpdateFromOutput(plan, result));
+    for (const SampledTokens& sample : result.samples) {
+      for (TokenId token : sample.token_ids) output.push_back(token);
+    }
+  }
+  return output;
+}
+
+TEST(TensorParallelTest, TwoRanksMatchSingleRank) {
+  const std::vector<TokenId> prompt = ReadCsv("tests/testdata/qwen3_0_6b/prompt_tokens.txt");
+  const std::vector<TokenId> expected =
+      ReadCsv("tests/testdata/qwen3_0_6b/expected_tokens.txt");
+  ASSERT_EQ(expected.size(), 24u);
+
+  SchedulerConfig config;
+  auto single = MakeExecutor(1);
+  ASSERT_TRUE(single.ok()) << single.status();
+  const TokenId eos = (*single)->GetModelSpec().eos_token_ids.front();
+
+  auto reference =
+      Generate(**single, config, prompt, static_cast<int>(expected.size()), eos);
+  ASSERT_TRUE(reference.ok()) << reference.status();
+  ASSERT_EQ(reference->size(), expected.size());
+  // The golden trace itself is checked (tie-tolerantly) by model_test;
+  // here the sharded ranks must reproduce THIS build's single-rank
+  // decisions exactly, ties included.
+  auto sharded = MakeExecutor(2);
+  ASSERT_TRUE(sharded.ok()) << sharded.status();
+  auto sharded_output =
+      Generate(**sharded, config, prompt, static_cast<int>(expected.size()), eos);
+  ASSERT_TRUE(sharded_output.ok()) << sharded_output.status();
+  EXPECT_EQ(*sharded_output, *reference);
 }
 
 }  // namespace

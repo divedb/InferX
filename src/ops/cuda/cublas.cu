@@ -24,7 +24,7 @@ StatusOr<cublasHandle_t> AcquireCublas(OpContext& ctx) {
   // concurrent tensor-parallel ranks on one device would hit immediately.
   static std::map<std::pair<int, void*>, cublasHandle_t> handles;
   const std::lock_guard<std::mutex> lock(mutex);
-  const auto key = std::make_pair(ctx.Device().index, static_cast<void*>(ctx.GetStream()));
+  const auto key = std::make_pair(ctx.GetDevice().index(), ctx.GetStream().handle);
   auto it = handles.find(key);
   if (it == handles.end()) {
     cublasHandle_t handle = nullptr;
@@ -32,7 +32,7 @@ StatusOr<cublasHandle_t> AcquireCublas(OpContext& ctx) {
     it = handles.emplace(key, handle).first;
   }
   INFERX_RETURN_IF_ERROR(
-      CublasError(cublasSetStream(it->second, static_cast<cudaStream_t>(ctx.GetStream())),
+      CublasError(cublasSetStream(it->second, ctx.GetStream().As<cudaStream_t>()),
                   "cublasSetStream"));
   return it->second;
 }
