@@ -123,9 +123,9 @@ StatusOr<Tensor> Tensor::Bitcast(DataType new_dtype) const {
 }
 
 StatusOr<Tensor> Tensor::To(Device device) const {
-  if (Device() == device) return *this;
+  if (GetDevice() == device) return *this;
 
-  if (!IsCpu() && !device.IsCpu() && Device() != device) {
+  if (!IsCpu() && !device.IsCpu() && GetDevice() != device) {
     return UnimplementedError("cross-device copy requires an explicit transfer");
   }
 
@@ -140,7 +140,7 @@ StatusOr<Tensor> Tensor::To(Device device) const {
   const auto kind = IsCpu()       ? CopyKind::kHostToDevice
                     : out.IsCpu() ? CopyKind::kDeviceToHost
                                   : CopyKind::kDeviceToDevice;
-  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.GetDevice() : Device()));
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.GetDevice() : GetDevice()));
   INFERX_RETURN_IF_ERROR(
       runtime->Memory().Copy(out.Data(), Data(), static_cast<size_t>(NBytes()), kind));
 
@@ -170,7 +170,7 @@ Status Tensor::CopyTo(Tensor& dst) const {
   const CopyKind kind = IsCpu()       ? CopyKind::kHostToDevice
                         : dst.IsCpu() ? CopyKind::kDeviceToHost
                                       : CopyKind::kDeviceToDevice;
-  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.GetDevice() : Device()));
+  INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.GetDevice() : GetDevice()));
   INFERX_RETURN_IF_ERROR(
       runtime->Memory().Copy(dst.Data(), Data(), static_cast<size_t>(NBytes()), kind));
   return OkStatus();
@@ -178,7 +178,7 @@ Status Tensor::CopyTo(Tensor& dst) const {
 
 std::string Tensor::ToString() const {
   return absl::StrCat("Tensor(", DataTypeName(GetDataType()), ", ",
-                      impl_->GetShape().ToString(), ", ", Device().ToString(), ", ", NBytes(),
+                      impl_->GetShape().ToString(), ", ", GetDevice().ToString(), ", ", NBytes(),
                       "B, refs=", UseCount(), ", ", impl_->GetStorage()->ToString(), ")");
 }
 

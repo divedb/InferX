@@ -45,6 +45,14 @@ set(DNNL_ENABLE_ITT_TASKS OFF CACHE BOOL "")
 add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/onednn"
                  "${PROJECT_BINARY_DIR}/third_party/onednn" EXCLUDE_FROM_ALL)
 
+# yaml-cpp: `logging:` section parsing for INFERX_CONFIG_FILE files.
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "")
+set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "")
+set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "")
+set(YAML_CPP_INSTALL OFF CACHE BOOL "")
+add_subdirectory("${PROJECT_SOURCE_DIR}/third_party/yaml-cpp"
+                 "${PROJECT_BINARY_DIR}/third_party/yaml-cpp" EXCLUDE_FROM_ALL)
+
 # CLI11: command-line parsing for the `inferx` app (header-only).
 set(CLI11_BUILD_TESTS OFF CACHE BOOL "")
 set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "")

@@ -34,3 +34,6 @@
 [submodule "third_party/rapidfuzz"]
 	path = third_party/rapidfuzz
 	url = https://github.com/rapidfuzz/rapidfuzz-cpp.git
+[submodule "third_party/yaml-cpp"]
+	path = third_party/yaml-cpp
+	url = https://github.com/jbeder/yaml-cpp.git

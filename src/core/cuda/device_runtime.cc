@@ -1,3 +1,5 @@
+#include "inferx/core/device_runtime.h"
+
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -10,8 +12,6 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-
-#include "inferx/core/device_runtime.h"
 
 namespace inferx {
 namespace {
@@ -118,10 +118,6 @@ cudaStreamCaptureMode ToNative(CaptureMode mode) {
   return cudaStreamCaptureModeGlobal;
 }
 
-// -----------------------------------------------------------------------------
-// MemoryApi
-// -----------------------------------------------------------------------------
-
 class CudaMemory final : public MemoryApi {
  public:
   explicit CudaMemory(int ordinal) : ordinal_(ordinal) {}
@@ -203,10 +199,6 @@ class CudaMemory final : public MemoryApi {
  private:
   const int ordinal_;
 };
-
-// -----------------------------------------------------------------------------
-// StreamApi
-// -----------------------------------------------------------------------------
 
 class CudaStreams final : public StreamApi {
  public:

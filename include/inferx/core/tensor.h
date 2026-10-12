@@ -183,10 +183,10 @@ class Tensor {
   int64_t StorageOffset() const { return impl_->StorageOffset(); }
 
   /// \brief True when the tensor's bytes live in host memory.
-  bool IsCpu() const { return Device().IsCpu(); }
+  bool IsCpu() const { return GetDevice().IsCpu(); }
 
   /// \brief True when the tensor's bytes live on a CUDA device.
-  bool IsCuda() const { return Device().IsCuda(); }
+  bool IsCuda() const { return GetDevice().IsCuda(); }
 
   /// \brief Typed access, checked against the tensor's dtype.
   ///

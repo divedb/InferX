@@ -24,7 +24,7 @@ inferx_add_library(
     absl::inlined_vector
     absl::span
     absl::strings
-  PRIVATE_DEPS absl::log_initialize mimalloc-static
+  PRIVATE_DEPS absl::log_initialize mimalloc-static yaml-cpp
 )
 
 if(INFERX_ENABLE_CUDA)
