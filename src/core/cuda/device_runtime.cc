@@ -11,6 +11,8 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 
+#include "inferx/core/device_runtime.h"
+
 namespace inferx {
 namespace {
 
@@ -461,10 +463,10 @@ class CudaRuntime final : public DeviceRuntime {
     return absl::OkStatus();
   }
 
-  MemoryApi& memory() override { return memory_; }
-  StreamApi& streams() override { return streams_; }
-  GraphApi* graphs() override { return &graphs_; }
-  PeerApi* peer() override { return &peer_; }
+  MemoryApi& Memory() override { return memory_; }
+  StreamApi& Streams() override { return streams_; }
+  GraphApi* Graphs() override { return &graphs_; }
+  PeerApi* Peer() override { return &peer_; }
 
  private:
   const int ordinal_;
@@ -489,7 +491,7 @@ StatusOr<int> QueryDeviceCount() {
 
 class CudaProvider final : public RuntimeProvider {
  public:
-  DeviceType type() const override { return DeviceType::kCuda; }
+  DeviceType GetDeviceType() const override { return DeviceType::kCuda; }
 
   StatusOr<int> DeviceCount() override { return QueryDeviceCount(); }
 

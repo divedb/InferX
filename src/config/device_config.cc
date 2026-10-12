@@ -73,9 +73,12 @@ Status CheckAvailable(Device device) {
 
 std::optional<Device> PickAccelerator() {
   for (DeviceType type : kAcceleratorPreference) {
-    const StatusOr<int> count = GetDeviceCount(type);
+    const StatusOr<RuntimeProvider*> provider = ProviderFor(type);
+    if (!provider.ok()) continue;  // Backend not built; try the next one.
+
+    const StatusOr<int> count = (*provider)->DeviceCount();
     if (!count.ok()) {
-      LOG(WARNING) << "auto: could not probe " << DeviceTypeName(type)
+      LOG(WARNING) << "auto: could not probe " << DeviceTypeToString(type)
                    << " devices: " << count.status();
       continue;
     }

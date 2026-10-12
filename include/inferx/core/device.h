@@ -8,6 +8,17 @@
 
 namespace inferx {
 
+/// \brief The alignment of anything a kernel reads.
+///
+/// 128 B is the L1/L2 cache line, so a row start maps a warp's 128 B request
+/// onto exactly four 32 B sectors. The hard floor is 16 B, the widest
+/// vectorized load.
+///
+/// This is a default for callers, not a property of any allocator: alignment is
+/// a per-call parameter, since pinned memory destined for cudaHostRegister
+/// wants page alignment instead.
+inline constexpr size_t kTensorAlignment = 128;
+
 /// \brief Enumeration of supported device types.
 enum class DeviceType : uint8_t {
   kCpu = 0,   ///< CPU device.

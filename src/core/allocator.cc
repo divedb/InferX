@@ -62,12 +62,12 @@ class DeviceAllocatorImpl final : public Allocator {
     INFERX_RETURN_IF_ERROR(CheckAlignment(alignment));
 
     INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device_));
-    INFERX_ASSIGN_OR_RETURN(void* p, runtime->Allocate(bytes));
+    INFERX_ASSIGN_OR_RETURN(void* p, runtime->Memory().Allocate(bytes, kTensorAlignment));
 
     const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
 
     if (addr % alignment != 0) {
-      (void)runtime->Free(p);
+      (void)runtime->Memory().Free(p);
 
       return InternalError("cudaMalloc returned 0x", absl::Hex(addr),
                            " which is not aligned to ", alignment, " bytes");
@@ -80,7 +80,7 @@ class DeviceAllocatorImpl final : public Allocator {
     if (ptr == nullptr) return OkStatus();
 
     INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device_));
-    return runtime->Free(ptr);
+    return runtime->Memory().Free(ptr);
   }
 
   Device GetDevice() const override { return device_; }

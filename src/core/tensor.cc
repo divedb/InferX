@@ -142,7 +142,7 @@ StatusOr<Tensor> Tensor::To(Device device) const {
                                   : CopyKind::kDeviceToDevice;
   INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? out.GetDevice() : Device()));
   INFERX_RETURN_IF_ERROR(
-      runtime->Copy(out.Data(), Data(), static_cast<size_t>(NBytes()), kind));
+      runtime->Memory().Copy(out.Data(), Data(), static_cast<size_t>(NBytes()), kind));
 
   return out;
 }
@@ -172,7 +172,7 @@ Status Tensor::CopyTo(Tensor& dst) const {
                                       : CopyKind::kDeviceToDevice;
   INFERX_ASSIGN_OR_RETURN(auto* runtime, RuntimeFor(IsCpu() ? dst.GetDevice() : Device()));
   INFERX_RETURN_IF_ERROR(
-      runtime->Copy(dst.Data(), Data(), static_cast<size_t>(NBytes()), kind));
+      runtime->Memory().Copy(dst.Data(), Data(), static_cast<size_t>(NBytes()), kind));
   return OkStatus();
 }
 

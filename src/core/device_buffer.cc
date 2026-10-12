@@ -9,7 +9,7 @@ StatusOr<DeviceBuffer> DeviceBuffer::Allocate(size_t bytes, Device device) {
   }
 
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
-  INFERX_ASSIGN_OR_RETURN(void* p, runtime->Allocate(bytes));
+  INFERX_ASSIGN_OR_RETURN(void* p, runtime->Memory().Allocate(bytes, kTensorAlignment));
   const size_t allocated_bytes =
       device.IsCpu()
           ? (bytes + kTensorAlignment - 1) / kTensorAlignment * kTensorAlignment
@@ -21,7 +21,7 @@ void DeviceBuffer::Reset() {
   if (data_ == nullptr) return;
 
   auto runtime = RuntimeFor(device_);
-  if (runtime.ok()) (void)(*runtime)->Free(data_);
+  if (runtime.ok()) (void)(*runtime)->Memory().Free(data_);
   data_ = nullptr;
   size_ = 0;
 }

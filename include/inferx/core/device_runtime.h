@@ -509,4 +509,13 @@ Status RegisterProvider(std::unique_ptr<RuntimeProvider> provider);
 /// \return     The provider, or a "not built" error status if none registered.
 StatusOr<RuntimeProvider*> ProviderFor(DeviceType type);
 
+/// \brief Returns the runtime bound to `device`.
+///
+/// Shorthand for ProviderFor(device.Type())->GetRuntime(device.Index());
+/// fails when the backend is not built or the ordinal is out of range.
+///
+/// \param device The device to resolve.
+/// \return       The runtime, or an error status.
+StatusOr<DeviceRuntime*> RuntimeFor(Device device);
+
 }  // namespace inferx

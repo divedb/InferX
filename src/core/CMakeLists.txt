@@ -7,7 +7,6 @@
 inferx_add_library(
   NAME core
   SRCS
-    cpu/device_runtime.cc
     allocator.cc
     caching_allocator.cc
     device_buffer.cc
@@ -34,6 +33,4 @@ if(INFERX_ENABLE_CUDA)
   # CLI option validation, config checks -- sees the compile-time capability.
   target_compile_definitions(inferx_core PUBLIC INFERX_WITH_CUDA=1)
   target_link_libraries(inferx_core PRIVATE CUDA::cudart)
-else()
-  target_sources(inferx_core PRIVATE accelerator_runtime_stub.cc)
 endif()
