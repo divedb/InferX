@@ -70,9 +70,6 @@ class ScratchArena final : public Allocator {
 
   // Allocator interface.
   StatusOr<void*> Allocate(size_t bytes, size_t alignment) override;
-  /// The alignment-defaulting overload lives on the base; re-expose it so
-  /// callers of the concrete type see both.
-  using Allocator::Allocate;
   Status Deallocate(void* ptr) override;
   Device GetDevice() const override;
   std::string_view Name() const override { return "scratch-arena"; }

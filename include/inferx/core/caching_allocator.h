@@ -90,11 +90,6 @@ class CachingAllocator final : public Allocator {
   /// \return          A pointer to the allocated block, or an error status.
   StatusOr<void*> Allocate(size_t bytes, size_t alignment) override;
 
-  /// Re-exposes the base's one-argument Allocate: declaring the override above
-  /// would otherwise hide it for anyone holding a CachingAllocator by its
-  /// concrete type.
-  using Allocator::Allocate;
-
   /// \brief Allocates a Tensor with the specified TensorSpec.
   ///
   /// The returned Tensor borrows the allocator's bytes: it keeps no reference,

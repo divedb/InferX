@@ -223,7 +223,7 @@ StatusOr<Tensor> CachingAllocator::AllocateTensor(const TensorSpec& spec) {
   INFERX_RETURN_IF_ERROR(spec.Verify());
 
   const int64_t bytes = spec.NBytes();
-  INFERX_ASSIGN_OR_RETURN(void* p, Allocate(static_cast<size_t>(bytes)));
+  INFERX_ASSIGN_OR_RETURN(void* p, Allocate(static_cast<size_t>(bytes), alignment_));
 
   return Tensor::FromBlob(p, spec.GetDataType(), spec.GetShape(), device_);
 }

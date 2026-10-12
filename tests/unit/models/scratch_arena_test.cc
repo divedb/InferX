@@ -34,11 +34,11 @@ TEST_F(ScratchArenaTest, ReuseNeverOverlaps) {
   ScratchArena arena = ScratchArena::Measuring(kDevice);
 
   // A(1M) B(2M) C(1M); free A; D(1M) must land somewhere disjoint from B/C.
-  auto* a = *arena.Allocate(1u << 20);
-  auto* b = *arena.Allocate(2u << 20);
-  auto* c = *arena.Allocate(1u << 20);
+  auto* a = *arena.Allocate(1u << 20, kTensorAlignment);
+  auto* b = *arena.Allocate(2u << 20, kTensorAlignment);
+  auto* c = *arena.Allocate(1u << 20, kTensorAlignment);
   ASSERT_TRUE(arena.Deallocate(a).ok());
-  auto* d = *arena.Allocate(1u << 20);
+  auto* d = *arena.Allocate(1u << 20, kTensorAlignment);
 
   const auto write = [&](void* ptr, size_t bytes, uint8_t value) {
     std::vector<uint8_t> pattern(bytes, value);
@@ -81,7 +81,7 @@ TEST_F(ScratchArenaTest, StressPatternsHold) {
       continue;
     }
     const size_t bytes = 1024 * (1 + rng() % 512);
-    auto ptr = arena.Allocate(bytes);
+    auto ptr = arena.Allocate(bytes, kTensorAlignment);
     ASSERT_TRUE(ptr.ok()) << ptr.status();
     if (*ptr == nullptr) continue;
     const uint8_t value = 1 + static_cast<uint8_t>(round % 255);
@@ -110,7 +110,7 @@ TEST_F(ScratchArenaTest, FreezeThenServeDeterministically) {
   {
     ScratchArena arena = ScratchArena::Measuring(kDevice);
     for (int i = 0; i < 8; ++i) {
-      auto* p = *arena.Allocate(1u << 20);
+      auto* p = *arena.Allocate(1u << 20, kTensorAlignment);
       ASSERT_TRUE(arena.Deallocate(p).ok());
     }
     high_water = arena.high_water_bytes();
@@ -119,12 +119,12 @@ TEST_F(ScratchArenaTest, FreezeThenServeDeterministically) {
     // Freeze replaces the backing allocation. Address stability is only
     // promised between executions using the same frozen backing.
     for (int i = 0; i < 8; ++i) {
-      auto* p = *arena.Allocate(1u << 20);
+      auto* p = *arena.Allocate(1u << 20, kTensorAlignment);
       first_run.push_back(p);
       ASSERT_TRUE(arena.Deallocate(p).ok());
     }
     for (int i = 0; i < 8; ++i) {
-      auto* p = *arena.Allocate(1u << 20);
+      auto* p = *arena.Allocate(1u << 20, kTensorAlignment);
       ASSERT_EQ(p, first_run[i]);
       ASSERT_TRUE(arena.Deallocate(p).ok());
     }

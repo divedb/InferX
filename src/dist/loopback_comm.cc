@@ -83,7 +83,7 @@ int LoopbackComm::size() const { return static_cast<int>(state_->published.size(
 int LoopbackComm::rank() const { return rank_; }
 
 StatusOr<Tensor*> LoopbackComm::Slot(const Shape& shape, Device device) {
-  const auto key = std::make_tuple(device.kind(), static_cast<int>(device.index()),
+  const auto key = std::make_tuple(device.Type(), static_cast<int>(device.Index()),
                                    std::vector<int64_t>(shape.begin(), shape.end()));
   auto found = slots_.find(key);
   if (found == slots_.end()) {

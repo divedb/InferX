@@ -93,7 +93,7 @@ class DeviceAllocatorImpl final : public Allocator {
 constexpr int kMaxDevices = 16;
 
 StatusOr<Allocator*> DeviceAllocatorFor(Device device) {
-  const int8_t ordinal = device.index();
+  const int8_t ordinal = device.Index();
   if (ordinal < 0 || ordinal >= kMaxDevices) {
     return InvalidArgumentError("device ordinal ", static_cast<int>(ordinal),
                                 " is outside [0, ", kMaxDevices, ")");

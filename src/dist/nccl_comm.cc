@@ -414,11 +414,11 @@ StatusOr<std::shared_ptr<NcclWorld>> NcclWorld::Create(const std::vector<Device>
   for (const auto device : devices) {
     if (!device.IsCuda()) return InvalidArgumentError("NCCL world requires CUDA devices");
     for (const auto ordinal : ordinals) {
-      if (ordinal == device.index()) return InvalidArgumentError("NCCL ranks need distinct GPUs");
+      if (ordinal == device.Index()) return InvalidArgumentError("NCCL ranks need distinct GPUs");
     }
     INFERX_ASSIGN_OR_RETURN(auto runtime, RuntimeFor(device));
     INFERX_RETURN_IF_ERROR(runtime->Activate());
-    ordinals.push_back(device.index());
+    ordinals.push_back(device.Index());
   }
   const auto* api = NcclApi::Load();
   if (!api->Ready() || !api->comm_init_all || !api->comm_abort || !api->get_async_error ||

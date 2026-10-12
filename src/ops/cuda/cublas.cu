@@ -24,7 +24,7 @@ StatusOr<cublasHandle_t> AcquireCublas(OpContext& ctx) {
   // concurrent tensor-parallel ranks on one device would hit immediately.
   static std::map<std::pair<int, void*>, cublasHandle_t> handles;
   const std::lock_guard<std::mutex> lock(mutex);
-  const auto key = std::make_pair(ctx.GetDevice().index(), ctx.GetStream().handle);
+  const auto key = std::make_pair(ctx.GetDevice().Index(), ctx.GetStream().handle);
   auto it = handles.find(key);
   if (it == handles.end()) {
     cublasHandle_t handle = nullptr;

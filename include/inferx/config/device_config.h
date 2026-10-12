@@ -1,8 +1,6 @@
 #ifndef INFERX_CONFIG_DEVICE_CONFIG_H_
 #define INFERX_CONFIG_DEVICE_CONFIG_H_
 
-#include <algorithm>
-#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,78 +10,74 @@
 
 namespace inferx {
 
-struct BackendInfo {
-  std::string_view name;
-  bool built;
+/// \brief The typed form of the device flags. Produced by ParseDeviceSpec().
+///
+/// Invariant: `automatic` is true exactly when `devices` is empty. When
+/// explicit, `devices` is non-empty, duplicate-free, of one device type, and
+/// every ordinal is in [0, 127] (CPU is always ordinal 0).
+struct DeviceSpec {
+  bool automatic = true;        ///< Let the engine pick; see ResolveDevices().
+  std::vector<Device> devices;  ///< The requested devices, in the order given.
 };
 
-/// One source of truth: every backend inferx knows about, and whether
-/// this build actually links its runtime.
-static constexpr std::array<BackendInfo, 4> kBackends = {{
-    {"cpu", true},
-    {"cuda", kCudaBuilt},
-    {"rocm", kRocmBuilt},
-    {"ascend", kAscendBuilt},
-}};
+/// \brief Parses the `--device` and `--device-ids` values. Syntax only: it
+/// never touches a runtime.
+///
+/// Rules:
+///  - `device` is "auto" or one of the device type names (case-insensitive).
+///  - `device_ids` lists logical ordinals; empty means "the first device".
+///  - `auto` cannot be combined with ids, because the ids would have no
+///    device type to refer to.
+///  - `cpu` has a single device, so its ids must be empty or {0}.
+///  - Ids must be unique, non-negative, and at most 127.
+///
+/// \param device     The `--device` value.
+/// \param device_ids The `--device-ids` values.
+/// \return           The parsed spec, or an error describing the problem.
+StatusOr<DeviceSpec> ParseDeviceSpec(std::string_view device,
+                                     const std::vector<int>& device_ids);
 
-/// \brief Which device type and ordinals the engine executes on.
+/// \brief Turns a spec into concrete devices that exist and can be used.
+///
+/// - Explicit spec: every device must have a built backend and a valid
+///   ordinal. Fails otherwise; it never falls back to another device.
+/// - Auto spec: the first accelerator (CUDA, ROCm, Ascend, in that order) that
+///   is built, has hardware, and creates a working runtime; otherwise CPU.
+///   The choice is logged.
+///
+/// \param spec The parsed spec.
+/// \return     One or more devices, or an error status.
+StatusOr<std::vector<Device>> ResolveDevices(const DeviceSpec& spec);
+
+/// \brief Which devices the engine executes on.
+///
+/// The library never reads argv or the environment: the application fills
+/// these from the flags, then INFERX_DEVICE / INFERX_DEVICE_IDS, then a config
+/// file, in that order of precedence, and the library only sees the result.
 struct DeviceConfig {
-  /// The device type to execute on; "cpu" or "cuda" or "rocm" or "ascend". Defaults to "cuda".
+  /// The device type to execute on: "auto", "cpu", "cuda", "rocm" or "ascend".
+  /// "auto" picks the best usable accelerator and falls back to CPU.
   /// EXAMPLE: --device cuda
-  std::string device_type = "cuda";
+  std::string device = "auto";
 
-  /// The logical device ordinals to execute on, after filtering by CUDA_VISIBLE_DEVICES.
-  /// Empty means "default" (the first ordinal).
+  /// The logical device ordinals to execute on, after filtering by
+  /// CUDA_VISIBLE_DEVICES. Empty means the first device. Requires an explicit
+  /// `device`. The engine may reject more than one id until multi-device
+  /// execution is supported.
   /// EXAMPLE: --device-ids 0,1,2
   std::vector<int> device_ids;
 
-  /// \brief The device the engine executes on.
+  /// \brief Checks that the flags parse and that the backend is built in.
   ///
-  /// The first requested ordinal, or ordinal 0 when none is given. Only valid
-  /// after Validate() has accepted the type; unbuilt backends still resolve
-  /// here so the error stays with Validate().
-  ///
-  /// \return The primary Device for this configuration.
-  Device PrimaryDevice() const {
-    const int8_t ordinal = static_cast<int8_t>(device_ids.empty() ? 0 : device_ids.front());
-    if (device_type == "cuda") return Device::Cuda(ordinal);
-    if (device_type == "rocm") return Device::Rocm(ordinal);
-    if (device_type == "ascend") return Device::Ascend(ordinal);
-    return Device::Cpu();
-  }
-
-  /// \brief Structural validation: known type, backend compiled in,
-  ///        non-negative unique ids.
+  /// Does not look for hardware; Resolve() does.
   ///
   /// \return OK if the config is valid; otherwise an error status.
-  Status Validate() const {
-    auto it = std::find_if(kBackends.begin(), kBackends.end(),
-                           [&](const BackendInfo& b) { return b.name == device_type; });
-    if (it == kBackends.end()) {
-      return InvalidArgumentError("unknown device type '", device_type,
-                                  "' (want one of cpu/cuda/rocm/ascend)");
-    }
+  Status Validate() const;
 
-    if (!it->built) {
-      return UnimplementedError("device type '", device_type,
-                                "' requested, but this build carries no ", device_type,
-                                " runtime");
-    }
-
-    if (std::any_of(device_ids.begin(), device_ids.end(), [](int id) { return id < 0; })) {
-      return InvalidArgumentError("device ids must be non-negative");
-    }
-
-    for (size_t i = 0; i < device_ids.size(); ++i) {
-      for (size_t j = i + 1; j < device_ids.size(); ++j) {
-        if (device_ids[i] == device_ids[j]) {
-          return InvalidArgumentError("duplicate device id ", device_ids[i]);
-        }
-      }
-    }
-
-    return OkStatus();
-  }
+  /// \brief Parses and resolves the flags. See ResolveDevices().
+  ///
+  /// \return The devices to execute on, or an error status.
+  StatusOr<std::vector<Device>> Resolve() const;
 };
 
 }  // namespace inferx

@@ -139,7 +139,7 @@ Status Add(OpContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
                                 device.ToString());
   }
   if (a.IsEmpty()) return OkStatus();
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::Add(ctx, a, b, out);
     default:
@@ -155,7 +155,7 @@ Status SiluAndMul(OpContext& ctx, const Tensor& gate, const Tensor& up, Tensor& 
                                 device.ToString());
   }
   if (gate.IsEmpty()) return OkStatus();
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::SiluAndMul(ctx, gate, up, out);
     default:

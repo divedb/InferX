@@ -7,7 +7,7 @@ namespace inferx {
 StatusOr<StoragePtr> Storage::Allocate(size_t bytes, Allocator* allocator) {
   if (allocator == nullptr) return InvalidArgumentError("null allocator");
 
-  INFERX_ASSIGN_OR_RETURN(void* p, allocator->Allocate(bytes));
+  INFERX_ASSIGN_OR_RETURN(void* p, allocator->Allocate(bytes, kTensorAlignment));
 
   return StoragePtr(new Storage(p, bytes, allocator->GetDevice(), allocator));
 }

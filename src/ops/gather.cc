@@ -34,7 +34,7 @@ Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices,
   if (src.Dim(0) > std::numeric_limits<int32_t>::max()) {
     return InvalidArgumentError("GatherRows src exceeds 32-bit kernel extents");
   }
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::GatherRows(ctx, src, indices, out);
     default:
@@ -62,7 +62,7 @@ Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
     return InvalidArgumentError("GatherRowsRange tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::GatherRowsRange(ctx, src, indices, out, row_begin);
     default:
@@ -84,7 +84,7 @@ Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
     return InvalidArgumentError("CopyColumnBlock tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::CopyColumnBlock(ctx, src, dst, col_begin);
     default:

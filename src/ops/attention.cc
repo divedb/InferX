@@ -105,7 +105,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
     return InvalidArgumentError("WritePagedKv tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return cuda::WritePagedKv(ctx, k, v, positions, batch_indices, kv_indptr, kv_indices,
                                 key_cache, value_cache, block_size);

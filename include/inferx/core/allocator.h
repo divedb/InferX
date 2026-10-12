@@ -31,20 +31,6 @@ class Allocator {
   ///                  A zero-byte request yields a null pointer and OK.
   virtual StatusOr<void*> Allocate(size_t bytes, size_t alignment) = 0;
 
-  /// \brief Allocates `bytes` aligned for tensor data.
-  ///
-  /// Non-virtual on purpose. Expressing the default as `alignment =
-  /// kTensorAlignment` on the virtual above would bind it from the *static*
-  /// type of the caller's pointer, so an override that declared a different
-  /// default would silently change what a caller got depending on which type it
-  /// held the allocator by. A separate overload has one meaning everywhere.
-  ///
-  /// \param bytes The size of the memory block to allocate, in bytes.
-  /// \return      A pointer to the allocated block, or an error status.
-  StatusOr<void*> Allocate(size_t bytes) {
-    return Allocate(bytes, kTensorAlignment);
-  }
-
   /// \brief Deallocates a block previously returned by this allocator.
   ///
   /// Returns InvalidArgument for a pointer this allocator did not hand out or

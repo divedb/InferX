@@ -42,7 +42,7 @@ class KernelTable {
 /// lvalues so they can be reused across candidates.
 template <typename Fn, typename... Args>
 Status Dispatch(OpContext& ctx, const char* op, const KernelTable<Fn>& table, Args&&... args) {
-  const DeviceKind kind = ctx.GetDevice().kind();
+  const DeviceKind kind = ctx.GetDevice().Type();
 
   for (const auto& entry : table.GetEntries()) {
     if (entry.kind != kind) continue;

@@ -35,7 +35,7 @@ Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out
     return InvalidArgumentError("Linear tensors must live on the context's device ",
                                 device.ToString());
   }
-  switch (device.kind()) {
+  switch (device.Type()) {
     case DeviceKind::kCuda:
       return ProfileCall(ctx, "linear", [&] { return cuda::Linear(ctx, x, weight, out); });
     default:

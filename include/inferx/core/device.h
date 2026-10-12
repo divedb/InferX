@@ -40,19 +40,13 @@ constexpr const char* DeviceTypeToString(DeviceType kind) {
 /// allocator backs a Storage, which stream a kernel launches on, which copy
 /// path moves bytes between two buffers.
 ///
-///   CPU    the single host address space. There is no notion of NUMA affinity,
-///          so the ordinal is always 0 and `Cpu()` is a constant.
-///   CUDA   one GPU, addressed by its runtime ordinal (0..N-1). The ordinal
-///          pins a primary context and therefore a device-side allocator;
-///          cross-device copies are explicit, never implicit.
+///   CPU       The single host address space. There is no notion of NUMA affinity,
+///             so the ordinal is always 0 and `Cpu()` is a constant.
+///   CUDA/HIP  One GPU, addressed by its runtime ordinal (0..N-1). The ordinal
+///             pins a primary context and therefore a device-side allocator;
+///             cross-device copies are explicit, never implicit.
 class Device {
  public:
-  /// \brief The default device, which is the host. Equal to `Cpu()`.
-  ///
-  /// Public because a Device is a member of nearly every buffer and view in
-  /// the engine, and a private default constructor would delete theirs.
-  constexpr Device() = default;
-
   /// \brief The canonical CPU device. Always (kCpu, 0).
   static constexpr Device Cpu() { return Device(DeviceType::kCpu, 0); }
 
@@ -68,14 +62,17 @@ class Device {
   /// \return        The corresponding Device.
   static constexpr Device Hip(int8_t ordinal) { return Device(DeviceType::kHip, ordinal); }
 
-  /// \brief Names a device of `kind` at `ordinal`, normalizing CPU to `Cpu()`.
+  /// \brief Returns a Device for the given type and ordinal.
   ///
-  /// \param kind    The device class.
-  /// \param ordinal The device ordinal; ignored for CPU.
+  /// \param type    The device type (CPU, CUDA, HIP).
+  /// \param ordinal The device ordinal (0..N-1) for CUDA/HIP, or 0 for CPU.
   /// \return        The corresponding Device.
-  static constexpr Device For(DeviceType kind, int8_t ordinal = 0) {
-    return kind == DeviceType::kCpu ? Cpu() : Device(kind, ordinal);
+  static constexpr Device For(DeviceType type, int8_t ordinal = 0) {
+    return type == DeviceType::kCpu ? Cpu() : Device(type, ordinal);
   }
+
+  /// \brief Default constructor. Constructs a Device with type kCpu and index 0.
+  constexpr Device() = default;
 
   /// \brief Check if this device is a CPU.
   ///
@@ -92,18 +89,31 @@ class Device {
   /// \return True if this device is a HIP GPU; otherwise false.
   constexpr bool IsHip() const noexcept { return device_type_ == DeviceType::kHip; }
 
-  /// \brief The device class. See `DeviceType`.
-  constexpr DeviceType kind() const noexcept { return device_type_; }
+  /// \brief Returns the device type (CPU, CUDA, HIP).
+  ///
+  /// \return The device type.
+  constexpr DeviceType Type() const noexcept { return device_type_; }
 
-  /// \brief The runtime device ordinal (0..N-1); always 0 for CPU.
-  constexpr int8_t index() const noexcept { return index_; }
+  /// \brief Returns the device ordinal (0..N-1) for CUDA/HIP, or 0 for CPU.
+  ///
+  /// \return The device ordinal.
+  constexpr int8_t Index() const noexcept { return index_; }
 
-  /// \brief Compares two device ids for equality (same kind and ordinal).
+  /// \brief Compares two devices for equality. Two devices are equal if they have the same type
+  ///        and ordinal.
+  ///
+  /// \param a The first device.
+  /// \param b The second device.
+  /// \return  True if the devices are equal; otherwise false.
   friend constexpr bool operator==(const Device& a, const Device& b) {
     return a.device_type_ == b.device_type_ && a.index_ == b.index_;
   }
 
-  /// \brief Compares two device ids for inequality.
+  /// \brief Compares two devices for inequality.
+  ///
+  /// \param a The first device.
+  /// \param b The second device.
+  /// \return  True if the devices are not equal; otherwise false.
   friend constexpr bool operator!=(const Device& a, const Device& b) { return !(a == b); }
 
   /// \brief Returns a string representation of the device ID.
@@ -113,23 +123,28 @@ class Device {
     return absl::StrCat(DeviceTypeToString(device_type_), ":", static_cast<int>(index_));
   }
 
-  /// \brief Extends an absl hash to cover Device, for use as a map key.
+  /// \brief Hashes a Device for use in Abseil hash containers.
+  ///
+  /// \tparam H The hash state type.
+  /// \param h  The hash state.
+  /// \param d  The device to hash.
+  /// \return   The updated hash state.
   template <typename H>
   friend H AbslHashValue(H h, const Device& d) {
     return H::combine(std::move(h), d.device_type_, d.index_);
   }
 
  private:
-  /// \brief Constructs a (kind, ordinal) pair.
+  /// \brief Constructs a Device with the given type and index.
   ///
-  /// Private so that a device is always named through Cpu() or Cuda(): a bare
-  /// (kind, ordinal) pair at a call site reads as two unrelated numbers.
+  /// \param dtype The device type (CPU, CUDA, HIP).
+  /// \param index The device ordinal (0..N-1) for CUDA/HIP, or 0 for CPU.
   constexpr Device(DeviceType dtype, int8_t index) : device_type_(dtype), index_(index) {}
 
-  /// The device class. See `DeviceType`.
+  /// The device type (CPU, CUDA, HIP).
   DeviceType device_type_ = DeviceType::kCpu;
 
-  /// For CUDA, the runtime device ordinal (0..N-1). Always 0 for CPU.
+  /// The device ordinal (0..N-1) for CUDA/HIP, or 0 for CPU.
   int8_t index_ = 0;
 };
 

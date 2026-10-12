@@ -50,7 +50,7 @@ Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
                  const Tensor& positions, const RotaryParams& params) {
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   if (q.IsEmpty()) return OkStatus();
-  switch (ctx.GetDevice().kind()) {
+  switch (ctx.GetDevice().Type()) {
     case DeviceKind::kCuda:
       return cuda::ApplyRope(ctx, q, k, positions, params);
     default:

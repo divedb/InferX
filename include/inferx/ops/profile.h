@@ -9,7 +9,7 @@ namespace inferx::ops {
 template <class F>
 Status ProfileCall(OpContext& ctx, const char* name, F&& f) {
   static const bool enabled = std::getenv("INFERX_PROFILE_OPS") != nullptr;
-  if (!enabled || ctx.GetDevice().kind() != DeviceKind::kCuda) return f();
+  if (!enabled || ctx.GetDevice().Type() != DeviceKind::kCuda) return f();
   INFERX_ASSIGN_OR_RETURN(auto start, ctx.Runtime().CreateEvent(true));
   INFERX_ASSIGN_OR_RETURN(auto end, ctx.Runtime().CreateEvent(true));
   auto status = ctx.Runtime().RecordEvent(start, ctx.GetStream());
