@@ -93,6 +93,9 @@ struct Read {
 struct Write {
   Header header{};
   TxPtr tx;
+  // Set by abandon_write so the final release does not double-drop the
+  // transaction alias.
+  bool abandoned = false;
 };
 
 struct Region {
@@ -114,6 +117,10 @@ struct TxRecord {
   // Per-block coverage bitmap over layers * components; session mutex.
   std::vector<std::vector<bool>> covered;
   uint64_t bytes = 0;
+  // Live write handles aliasing this transaction: the founding handle plus
+  // concurrent identical writers that attached instead of conflicting
+  // (in-flight dedup). Abandonment aborts only when the last alias drops.
+  uint64_t aliases = 1;
 };
 
 class Session {

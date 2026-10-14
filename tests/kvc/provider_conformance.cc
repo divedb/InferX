@@ -308,13 +308,22 @@ void TestCommitAndTransactionSemantics() {
   request.blocks = blocks.data();
   CHECK_EQ(harness.control().BeginWrite(request).error().code, KVC_ALREADY_EXISTS);
 
-  // A live reservation also blocks the key.
+  // A live reservation blocks a different manifest touching the key...
   std::vector<KvcBlock> reserved{BlockAt(0, 6, tokens, tokens, 33)};
   request.transaction = TxIdOf(7003);
   request.blocks = reserved.data();
   auto writer = harness.control().BeginWrite(request);
   CHECK(writer);
+  // ...but a concurrent identical writer attaches instead of conflicting:
+  // in-flight dedup with shared coverage and one shared receipt.
   request.transaction = TxIdOf(7004);
+  auto attached = harness.control().BeginWrite(request);
+  CHECK(attached);
+  std::vector<KvcBlock> conflicting{BlockAt(0, 6, tokens, tokens, 33),
+                                    BlockAt(0, 7, tokens, tokens, 34)};
+  request.transaction = TxIdOf(7005);
+  request.blocks = conflicting.data();
+  request.block_count = conflicting.size();
   CHECK_EQ(harness.control().BeginWrite(request).error().code, KVC_ALREADY_EXISTS);
   // Storing into a foreign session's write handle is stale.
   auto second = Harness::Make();
@@ -322,10 +331,86 @@ void TestCommitAndTransactionSemantics() {
   KvcTransferRequest foreign{};
   foreign.struct_size = sizeof(foreign);
   CHECK_EQ((*second)->data().Store(*writer, foreign).error().code, KVC_STALE_HANDLE);
+  // Dropping an attached handle does not abandon the shared transaction;
+  // only the last alias out does.
+  attached = std::unexpected(Status{});
+  auto alive = harness.control().QueryWrite(TxIdOf(7003));
+  CHECK(alive);
+  CHECK_EQ(alive->state, KVC_ALLOCATED);
   writer = std::unexpected(Status{});
   auto aborted = harness.control().QueryWrite(TxIdOf(7003));
   CHECK(aborted);
   CHECK_EQ(aborted->state, KVC_WRITE_ABORTED);
+  auto alias = harness.control().QueryWrite(TxIdOf(7004));
+  CHECK(alias);
+  CHECK_EQ(alias->state, KVC_WRITE_ABORTED);
+}
+
+// Concurrent identical writers coalesce onto one publication: either may
+// store the shared slots (overlap conflicts), and every commit observes
+// the same receipt.
+void TestInFlightDedup() {
+  auto made = Harness::Make();
+  CHECK(made);
+  Harness& harness = **made;
+  const uint64_t tokens = harness.builder.tokens_per_block;
+  std::vector<KvcBlock> blocks{BlockAt(0, 0, tokens, tokens, 50),
+                               BlockAt(0, 1, tokens, tokens, 50)};
+  KvcWriteRequest request{};
+  request.struct_size = sizeof(request);
+  request.transaction = TxIdOf(7101);
+  request.blocks = blocks.data();
+  request.block_count = blocks.size();
+  auto primary = harness.control().BeginWrite(request);
+  CHECK(primary);
+  request.transaction = TxIdOf(7102);
+  auto attached = harness.control().BeginWrite(request);
+  CHECK(attached);
+
+  const auto& components = harness.builder.components;
+  const auto& layers = harness.builder.layers;
+  uint64_t row = 0;
+  for (const auto& component : components) row += component.bytes_per_block;
+  auto source = HostBuffer::Import(harness.data(), blocks.size() * layers.size() * row);
+  CHECK(source);
+  uint64_t offset = 0;
+  for (const auto& block : blocks) {
+    for (uint32_t layer : layers) {
+      for (const auto& component : components) {
+        FillPattern(source->bytes.data() + offset, block, layer, component.id,
+                    component.bytes_per_block);
+        offset += component.bytes_per_block;
+      }
+    }
+  }
+  BindingBuilder builder;
+  for (const auto& block : blocks) builder.AddBlock(block);
+  for (uint32_t layer : layers) builder.AddLayer(layer);
+  builder.Bind(source->region, harness.builder);
+  auto store_request = builder.Request();
+  store_request.selection.group = harness.builder.group_id;
+
+  // The primary stores everything; the attacher's identical store overlaps
+  // and conflicts through the shared coverage bitmap.
+  auto stored = harness.data().Store(*primary, store_request);
+  CHECK(stored);
+  CHECK(harness.WaitGood(*stored).Ok());
+  auto overlap = harness.data().Store(*attached, store_request);
+  CHECK_EQ(overlap.error().code, KVC_CONFLICT);
+
+  // Either commit order converges on one receipt for both aliases.
+  auto committed = harness.control().Commit(*attached);
+  CHECK(committed);
+  CHECK_EQ(committed->blocks.size(), blocks.size());
+  auto again = harness.control().Commit(*primary);
+  CHECK(again);
+  CHECK_EQ(again->state, KVC_COMMITTED);
+  CHECK_EQ(again->blocks.size(), blocks.size());
+
+  // One publication exists: a lookup finds it, and a third identical
+  // writer now takes the committed-dedup path (AlreadyExists).
+  request.transaction = TxIdOf(7103);
+  CHECK_EQ(harness.control().BeginWrite(request).error().code, KVC_ALREADY_EXISTS);
 }
 
 void TestLookupSemantics() {
@@ -1205,6 +1290,7 @@ int main(int argc, char** argv) {
   TEST(TestPublicationRoundTrip);
   TEST(TestLayerwiseStoresAndIncomplete);
   TEST(TestCommitAndTransactionSemantics);
+  TEST(TestInFlightDedup);
   TEST(TestLookupSemantics);
   TEST(TestRemoveAndPinnedGenerations);
   TEST(TestAbortSemantics);

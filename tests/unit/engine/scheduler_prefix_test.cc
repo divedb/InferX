@@ -67,6 +67,8 @@ class SchedulerPrefixTest : public ::testing::Test {
 
   std::unique_ptr<KvBlockPool> pool_;
   std::unique_ptr<Scheduler> scheduler_;
+  SchedulerOutput last_plan_;
+  std::vector<int> last_chunks_;
 };
 
 std::vector<TokenId> Tokens(int64_t count, int64_t base = 100) {
@@ -171,8 +173,9 @@ TEST_F(SchedulerPrefixTest, PrefillChunksEndOnBlockBoundariesWhenCached) {
     if (!last_chunks_.empty()) chunk_sizes.push_back(last_chunks_.back());
   }
   // Budget 6 would cut 12 into 6+6; block alignment cuts 4+4+4 so each
-  // chunk's blocks are publishable the moment it completes.
-  EXPECT_EQ(chunk_sizes, (std::vector<int>{4, 4, 4}));
+  // chunk's blocks are publishable the moment it completes. The final 1 is
+  // the first decode step.
+  EXPECT_EQ(chunk_sizes, (std::vector<int>{4, 4, 4, 1}));
 }
 
 TEST_F(SchedulerPrefixTest, ChunkAlignmentOffWithoutCaching) {
@@ -196,7 +199,7 @@ TEST_F(SchedulerPrefixTest, ChunkAlignmentOffWithoutCaching) {
     ASSERT_TRUE(ScheduleOnce());
     if (!last_chunks_.empty()) chunk_sizes.push_back(last_chunks_.back());
   }
-  EXPECT_EQ(chunk_sizes, (std::vector<int>{6, 6}));  // Pure budget cutting.
+  EXPECT_EQ(chunk_sizes, (std::vector<int>{6, 6, 1}));  // Budget + decode.
 }
 
 TEST_F(SchedulerPrefixTest, HitAccountingIsTokenGranular) {

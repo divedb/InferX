@@ -76,6 +76,7 @@ struct Read {
 struct Write {
   Header header{};
   TxPtr tx;
+  bool abandoned = false;  // abandon_write already dropped the alias.
 };
 
 struct TxRecord {
@@ -86,6 +87,7 @@ struct TxRecord {
   std::vector<std::vector<bool>> covered;
   std::vector<Header*> transfers;  // Pending store transfers.
   uint64_t bytes = 0;
+  uint64_t aliases = 1;  // Live write handles sharing this transaction.
 };
 
 // One enqueued copy: fixed host addresses captured at submission.
@@ -300,6 +302,10 @@ void AbortLocked(Session& session, const TxPtr& tx) {
   tx->blocks.clear();
 }
 
+void DropAliasLocked(Session& session, const TxPtr& tx) {
+  if (tx->aliases > 0 && --tx->aliases == 0) AbortLocked(session, tx);
+}
+
 void Release(KvcObject* object) {
   if (!object) return;
   auto* header = AsHeader(object);
@@ -318,7 +324,7 @@ void Release(KvcObject* object) {
       auto* write = reinterpret_cast<Write*>(object);
       if (write->tx) {
         std::lock_guard<std::mutex> lock(session->mutex);
-        AbortLocked(*session, write->tx);
+        if (!write->abandoned) DropAliasLocked(*session, write->tx);
         write->tx.reset();
       }
       delete write;
@@ -632,20 +638,58 @@ KvcStatus KVC_CALL BeginWrite(KvcObject* object, const KvcWriteRequest* request,
     uint64_t bytes = 0;
     auto tx = std::make_shared<TxRecord>();
     tx->id = request->transaction;
+    bool all_reserved = request->block_count > 0;
+    bool any_reserved = false;
     for (uint64_t i = 0; i < request->block_count; ++i) {
       KvcStatus error;
       const Session::GroupCopy* group = ValidateBlock(session, request->blocks[i], &error);
       if (!group) return error;
-      if (!keys.insert(KeyId(request->blocks[i].key)).second)
+      const uint64_t key = KeyId(request->blocks[i].key);
+      if (!keys.insert(key).second)
         return ErrorStatus(KVC_INVALID_ARGUMENT, "manifest keys must be unique");
-      if (session->index.count(KeyId(request->blocks[i].key)) ||
-          session->reserved_keys.count(KeyId(request->blocks[i].key)))
-        return ErrorStatus(KVC_ALREADY_EXISTS, "block key is already published or reserved");
+      if (session->index.count(key))
+        return ErrorStatus(KVC_ALREADY_EXISTS, "block key is already published");
+      if (session->reserved_keys.count(key)) {
+        any_reserved = true;
+      } else {
+        all_reserved = false;
+      }
       bytes += group->payload_bytes;
       tx->manifest.push_back(request->blocks[i]);
       tx->covered.emplace_back(
           static_cast<size_t>(group->group.layer_count) * group->group.component_count, false);
     }
+    // In-flight dedup: an identical concurrent writer attaches instead of
+    // conflicting (mirrors the host reference provider).
+    if (all_reserved) {
+      for (const auto& [_, live] : session->transactions) {
+        if (live->state != KVC_ALLOCATED && live->state != KVC_WRITING) continue;
+        if (live->manifest.size() != tx->manifest.size()) continue;
+        bool same = true;
+        for (size_t i = 0; i < tx->manifest.size() && same; ++i) {
+          same = std::memcmp(live->manifest[i].key.bytes, tx->manifest[i].key.bytes,
+                             sizeof(KvcDigest)) == 0 &&
+                 live->manifest[i].group == tx->manifest[i].group &&
+                 live->manifest[i].logical_index == tx->manifest[i].logical_index;
+        }
+        if (!same) continue;
+        auto* attached = new (std::nothrow) Write();
+        if (!attached) return ErrorStatus(KVC_RESOURCE_EXHAUSTED, "allocation failed");
+        attached->tx = live;
+        attached->header.kind = KVC_WRITE;
+        attached->header.session = session;
+        ++live->aliases;
+        session->transactions.emplace(id, live);
+        session->objects_.fetch_add(1, std::memory_order_relaxed);
+        *out = reinterpret_cast<KvcObject*>(attached);
+        return OkStatus();
+      }
+      return ErrorStatus(KVC_ALREADY_EXISTS,
+                         "block key is reserved by a different transaction");
+    }
+    if (any_reserved)
+      return ErrorStatus(KVC_ALREADY_EXISTS,
+                         "block key is reserved by a different transaction");
     if (session->bytes_used + bytes > kBudgetBytes)
       return ErrorStatus(KVC_RESOURCE_EXHAUSTED, "payload budget exceeded");
     tx->bytes = bytes;
@@ -791,7 +835,8 @@ void KVC_CALL Abandon(KvcObject* object) {
   if (!Owns(object, KVC_WRITE)) return;
   auto* write = reinterpret_cast<Write*>(object);
   std::lock_guard<std::mutex> lock(write->header.session->mutex);
-  AbortLocked(*write->header.session, write->tx);
+  write->abandoned = true;
+  DropAliasLocked(*write->header.session, write->tx);
 }
 
 // ---------------------------------------------------------------------------

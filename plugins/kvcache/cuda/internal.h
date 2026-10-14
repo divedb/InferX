@@ -115,6 +115,7 @@ struct Read {
 struct Write {
   Header header{};
   TxPtr tx;
+  bool abandoned = false;  // abandon_write already dropped the alias.
 };
 
 struct Region {
@@ -135,6 +136,7 @@ struct TxRecord {
   std::vector<Header*> transfers;          // Store transfers; session mutex.
   uint64_t bytes = 0;
   uint64_t reserved_remainder = 0;  // Reserved bytes without a slot yet.
+  uint64_t aliases = 1;  // Live write handles sharing this transaction.
 };
 
 // One accepted transfer. state is atomic: PENDING until exactly one

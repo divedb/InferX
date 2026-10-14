@@ -194,7 +194,12 @@ Ordered by the plan's gap analysis; each is provider-side work first in the
 host reference provider, plus conformance tests in `tests/kvc`.
 
 ### P2-7. In-flight write dedup (catalog 28/29; §28.6)
-**Status: open**
+**Status: done (single-session)** — all three bundled providers (host, CUDA
+tiered, async fixture): identical concurrent manifests attach to the founding
+transaction with shared coverage (disjoint stores coalesce, overlaps
+conflict), one shared commit receipt for every alias, and abandonment that
+aborts only when the last alias drops; mixed/partial key overlap still gets
+AlreadyExists. Cross-process subscribe-on-publish remains open under P2.
 
 vLLM/SGLang dedup concurrent identical publications in-process (append-only
 hash maps / radix insert splits). Across processes both engines currently

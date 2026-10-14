@@ -29,6 +29,20 @@ bool SameRecord(const KvcBlock& a, const KvcBlock& b) {
          std::memcmp(a.dependency.bytes, b.dependency.bytes, sizeof(a.dependency.bytes)) == 0;
 }
 
+// Field-wise manifest equality. memcmp over KvcBlock would compare padding.
+bool SameManifest(const std::vector<KvcBlock>& a, const std::vector<KvcBlock>& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::memcmp(a[i].key.bytes, b[i].key.bytes, sizeof(KvcDigest)) != 0 ||
+        std::memcmp(a[i].dependency.bytes, b[i].dependency.bytes, sizeof(KvcDigest)) != 0)
+      return false;
+    if (a[i].group != b[i].group || a[i].logical_index != b[i].logical_index ||
+        a[i].first_token != b[i].first_token || a[i].token_count != b[i].token_count)
+      return false;
+  }
+  return true;
+}
+
 // Frees storage of an unfinished transaction. The session mutex is held.
 void AbortLocked(Session& session, const TxPtr& tx) {
   if (tx->state == KVC_COMMITTED || tx->state == KVC_WRITE_ABORTED) return;
@@ -37,6 +51,12 @@ void AbortLocked(Session& session, const TxPtr& tx) {
   tx->state = KVC_WRITE_ABORTED;
   tx->covered.clear();
   tx->blocks.clear();  // Payload destructors return the reserved bytes.
+}
+
+// Drops one live alias of a transaction, aborting it only when the last
+// one leaves. The session mutex is held.
+void DropAliasLocked(Session& session, const TxPtr& tx) {
+  if (tx->aliases > 0 && --tx->aliases == 0) AbortLocked(session, tx);
 }
 
 }  // namespace
@@ -428,13 +448,15 @@ KvcStatus BeginWrite(KvcObject* object, const KvcWriteRequest* request, uint64_t
     if (session->transactions.count(id))
       return ErrorStatus(KVC_CONFLICT, "transaction id is already in use");
 
-    // Validate the manifest and reserve budget. Payloads are allocated
-    // eagerly so that stores cannot fail with resources mid-transaction.
+    // Validate the manifest first; reservation follows once we know whether
+    // this is a fresh transaction or an attach to an identical in-flight one.
     std::unordered_set<uint64_t> keys;
     uint64_t bytes = 0;
     TxPtr tx = std::make_shared<TxRecord>();
     tx->id = request->transaction;
     tx->manifest.reserve(request->block_count);
+    bool all_reserved = request->block_count > 0;
+    bool any_reserved = false;
     for (uint64_t i = 0; i < request->block_count; ++i) {
       const KvcBlock& record = request->blocks[i];
       KvcStatus error;
@@ -443,13 +465,51 @@ KvcStatus BeginWrite(KvcObject* object, const KvcWriteRequest* request, uint64_t
       const uint64_t key = Session::KeyId(record.key);
       if (!keys.insert(key).second)
         return ErrorStatus(KVC_INVALID_ARGUMENT, "manifest keys must be unique");
-      if (session->index.count(key) || session->reserved_keys.count(key))
-        return ErrorStatus(KVC_ALREADY_EXISTS, "block key is already published or reserved");
+      if (session->index.count(key))
+        return ErrorStatus(KVC_ALREADY_EXISTS, "block key is already published");
+      if (session->reserved_keys.count(key)) {
+        any_reserved = true;
+      } else {
+        all_reserved = false;
+      }
       bytes += group->payload_bytes;
       tx->manifest.push_back(record);
       tx->covered.emplace_back(
           static_cast<size_t>(group->group.layer_count) * group->group.component_count, false);
     }
+
+    // In-flight dedup: a concurrent writer recomputing the identical prefix
+    // attaches to the founding transaction instead of conflicting. The
+    // aliases share coverage -- disjoint stores coalesce, overlapping ones
+    // conflict through the coverage bitmap -- and any alias's commit sees
+    // the shared receipt. A different manifest touching any reserved key
+    // still fails with AlreadyExists.
+    if (all_reserved) {
+      for (const auto& [_, live] : session->transactions) {
+        if (live->state != KVC_ALLOCATED && live->state != KVC_WRITING) continue;
+        if (!SameManifest(live->manifest, tx->manifest)) continue;
+        auto* attached = new (std::nothrow) Write();
+        if (!attached) return ErrorStatus(KVC_RESOURCE_EXHAUSTED, "write handle allocation failed");
+        attached->tx = live;
+        attached->header.kind = KVC_WRITE;
+        attached->header.session = session;
+        ++live->aliases;
+        session->transactions.emplace(id, live);
+        session->stats_tx_begun.fetch_add(1, std::memory_order_relaxed);
+        session->ObjectCreated();
+        *out = reinterpret_cast<KvcObject*>(attached);
+        return OkStatus();
+      }
+      return ErrorStatus(KVC_ALREADY_EXISTS,
+                         "block key is reserved by a different transaction");
+    }
+    if (any_reserved) {
+      // A manifest mixing reserved and unreserved keys matches no whole
+      // transaction; a fresh reservation over a live key never dedups.
+      return ErrorStatus(KVC_ALREADY_EXISTS,
+                         "block key is reserved by a different transaction");
+    }
+
     if (session->bytes_used.load(std::memory_order_relaxed) + bytes > kBudgetBytes)
       return ErrorStatus(KVC_RESOURCE_EXHAUSTED, "payload budget exceeded");
     tx->bytes = bytes;
@@ -591,7 +651,7 @@ void ReleaseObject(KvcObject* object) {
       auto* write = reinterpret_cast<Write*>(object);
       if (write->tx) {
         std::lock_guard<std::mutex> lock(session->mutex);
-        AbortLocked(*session, write->tx);
+        if (!write->abandoned) DropAliasLocked(*session, write->tx);
       }
       delete write;
       break;
@@ -669,7 +729,10 @@ void AbandonWrite(KvcObject* object) {
   auto* write = reinterpret_cast<Write*>(object);
   Session* session = write->header.session;
   std::lock_guard<std::mutex> lock(session->mutex);
-  AbortLocked(*session, write->tx);
+  // Attached handles alias one transaction: only the last one out abandons
+  // it. The release that eventually deletes this object will not drop again.
+  write->abandoned = true;
+  DropAliasLocked(*session, write->tx);
 }
 
 }  // namespace kvc_host

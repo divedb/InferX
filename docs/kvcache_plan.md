@@ -466,7 +466,7 @@ The seventh responsibility—metadata access—is satisfied by immutable configu
 
 Exact existence checks use a lookup containing one candidate. This also allows callers to acquire the object instead of relying on a potentially stale boolean.
 
-`begin_write` against an already-committed key fails with `AlreadyExists`. The adapter treats that outcome as success and skips storing — the committed-dedup fast path for deterministic recomputation. It does not attach to another writer's in-flight transaction; concurrent first-publication is catalog item 28.
+`begin_write` against an already-committed key fails with `AlreadyExists`. The adapter treats that outcome as success and skips storing — the committed-dedup fast path for deterministic recomputation. A second writer whose manifest is field-identical to a live transaction's now attaches to it instead of conflicting (in-flight dedup; catalog item 28, shipped in the reference providers): aliases share coverage — disjoint stores coalesce, overlapping ones conflict — every alias's commit observes one shared receipt, and abandonment aborts only when the last alias drops. A different manifest touching a reserved key still fails with `AlreadyExists`.
 
 ## 12. Data-plane interface
 
@@ -1956,7 +1956,7 @@ vLLM and SGLang implement it.
 | 25 | Automatic prefix caching in the serving loop | engine-side (scheduler does not consult providers) |
 | 26 | Storage ownership bridge into engine allocations | solved at unit level, engine-side wiring |
 | 27 | CUDA-graph-stable decode over provider-loaded blocks | engine-side |
-| 28 | Concurrent writers of the same prefix (dedup/attach) | gap |
+| 28 | Concurrent writers of the same prefix (dedup/attach) | solved (reference providers; committed-dedup + in-flight attach) |
 | 29 | In-flight write coalescing across processes | gap |
 | 30 | Cross-block-size reuse (16-token provider serving 32-token consumer) | gap |
 | 31 | Recurrent/linear-attention state beyond checkpoint granularity | gap |
@@ -2036,11 +2036,12 @@ acknowledges the limitation; the rest are newly identified here.
    for shared or persistent deployments where consumers need different
    policies over one cache.
 
-6. **In-flight write dedup (new).** Concurrent writers of the same prefix
-   race: the second `begin_write` returns Conflict and must recompute or
-   poll. There is no attach-to-in-flight-transaction or
-   subscribe-on-publish. A single-process scheduler can dedup; cross-process
-   deployments cannot.
+6. **In-flight write dedup (resolved in the reference providers).**
+   Concurrent identical writers now attach to the founding transaction
+   (shared coverage, one receipt, last-alias abandonment) instead of
+   conflicting; a different manifest touching a reserved key still gets
+   `AlreadyExists`. Cross-process coalescing (subscribe-on-publish across
+   sessions) remains future work.
 
 7. **Format conversion on load (intentional).** Stored FP8 cannot be loaded
    as BF16: bindings carry bytes with no conversion negotiation. Excluded
