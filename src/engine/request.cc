@@ -21,4 +21,17 @@ Status Request::Finish(FinishReason reason) {
   return OkStatus();
 }
 
+Status Request::Preempt() {
+  if (status_ != RequestStatus::kRunning) {
+    return FailedPreconditionError("request ", id_, " is not running");
+  }
+  status_ = RequestStatus::kPreempted;
+  num_computed_tokens_ = 0;
+  return OkStatus();
+}
+
+void Request::MarkWaiting() {
+  if (status_ == RequestStatus::kPreempted) status_ = RequestStatus::kWaiting;
+}
+
 }  // namespace inferx

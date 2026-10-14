@@ -17,3 +17,9 @@ inferx_add_test(
   DEPS inferx::engine
   LABELS unit
 )
+inferx_add_test(
+  NAME scheduler_preempt_test
+  SRCS scheduler_preempt_test.cc
+  DEPS inferx::engine
+  LABELS unit
+)

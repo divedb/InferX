@@ -25,6 +25,7 @@ struct SchedulerStats {
   int scheduled_tokens_total = 0;  ///< Tokens scheduled across all steps.
   int num_finished = 0;            ///< Requests finished, any reason.
   int num_rejected = 0;            ///< Admissions refused (queue full).
+  int num_preempted = 0;           ///< Running requests preempted for KV space.
 };
 
 /// \brief Owns request scheduling.
@@ -108,6 +109,19 @@ class Scheduler {
   /// Running requests in admission order.
   std::vector<Request> running_;
   absl::flat_hash_map<RequestId, size_t> running_index_;
+
+  /// \brief Preempts the newest running request after `keep` so the request
+  ///        at `keep` can grow.
+  ///
+  /// vLLM V1 semantics: victims are newest-first (lowest priority under
+  /// FCFS), only requests not yet scheduled this step, and their cached
+  /// prefix blocks survive in the index -- resumption re-adopts them. The
+  /// victim requeues at the waiting head with a zeroed watermark.
+  ///
+  /// \param keep     The index of the request that needs the space.
+  /// \param preempted Output ids of this step's victims, appended here.
+  /// \return          True when a victim was preempted.
+  bool PreemptNewestAfter(size_t keep, std::vector<RequestId>* preempted);
 
   /// Finished requests awaiting pickup, oldest first.
   std::deque<Request> finished_;

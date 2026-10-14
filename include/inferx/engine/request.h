@@ -74,6 +74,16 @@ class Request {
   /// \return       OK, or FailedPrecondition when already finished.
   Status Finish(FinishReason reason);
 
+  /// \brief Preempts a running request (scheduler-only): its KV blocks are
+  ///        released and its computed-token watermark resets, so it recomputes
+  ///        from its prefix-cache hits when rescheduled.
+  ///
+  /// \return OK, or FailedPrecondition when not running.
+  Status Preempt();
+
+  /// \brief Returns a preempted request to the waiting pool (scheduler-only).
+  void MarkWaiting();
+
   /// \brief Why the request ended; meaningful once finished.
   FinishReason finish_reason() const { return finish_reason_; }
 

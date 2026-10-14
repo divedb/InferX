@@ -63,9 +63,16 @@ struct SchedulerOutput {
   /// \brief Requests finished since the last step; the runner frees its
   /// per-request state for these.
   std::vector<RequestId> finished_request_ids;
+  /// \brief Requests preempted while building this step; the model runner
+  /// drops their state too -- they come back later as fresh requests whose
+  /// prefix-cache hits stand in for the recomputation they avoid.
+  std::vector<RequestId> preempted_request_ids;
 
-  /// \brief True when the step neither runs work nor reports finishes.
-  bool IsEmpty() const { return scheduled.empty() && finished_request_ids.empty(); }
+  /// \brief True when the step neither runs work nor reports state changes.
+  bool IsEmpty() const {
+    return scheduled.empty() && finished_request_ids.empty() &&
+           preempted_request_ids.empty();
+  }
 };
 
 /// \brief Tokens sampled for one scheduled request.

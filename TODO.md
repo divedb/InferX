@@ -102,7 +102,13 @@ changes the chain from that point on; empty-sequence seed.
 ## P1 — engine behaviors the engines consider table stakes
 
 ### P1-3. Preemption: recompute path
-**Status: open**
+**Status: done** — vLLM-V1 semantics: a running request that cannot grow
+preempts the newest not-yet-scheduled running request (released blocks keep
+their prefix-cache entries, so victims re-adopt their own prefixes — often
+in the very step that preempted them); `SchedulerOutput::preempted_request_ids`
+drives runner state cleanup; `RequestStatus::kPreempted` + `SchedulerStats::
+num_preempted` surface it; impossible requests (sequence larger than the
+whole pool) now finish with an error at admission instead of deadlocking.
 
 vLLM V1 is recompute-only (V0 swap is gone): when a running request cannot
 get blocks, the scheduler preempts the *newest* running request (`running[-1]`

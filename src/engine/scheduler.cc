@@ -29,7 +29,8 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
 
   // Running requests first: each gets one token per step, or the next prompt
   // chunk when its prompt is longer than what earlier steps computed. A
-  // request the pool cannot cover is skipped this step, not preempted.
+  // request the pool cannot cover preempts newer requests to make room
+  // (vLLM V1 recompute preemption); when no victim can help it waits a step.
   for (size_t i = 0; i < running_.size() && budget > 0; ++i) {
     Request& request = running_[i];
     const int remaining_prompt =
@@ -37,6 +38,9 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     const int chunk = remaining_prompt > 0 ? std::min(budget, remaining_prompt) : 1;
 
     auto granted = cache_manager_.Reserve(request.id(), request.num_computed_tokens() + chunk);
+    while (!granted.ok() && PreemptNewestAfter(i, &output.preempted_request_ids)) {
+      granted = cache_manager_.Reserve(request.id(), request.num_computed_tokens() + chunk);
+    }
     if (!granted.ok()) {
       continue;
     }
@@ -186,6 +190,31 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
     ++stats_.num_finished;
   }
   return OkStatus();
+}
+
+bool Scheduler::PreemptNewestAfter(size_t keep, std::vector<RequestId>* preempted) {
+  if (keep + 1 >= running_.size()) return false;  // Nothing newer to yield.
+
+  const size_t victim_index = running_.size() - 1;
+  const RequestId victim_id = running_[victim_index].id();
+  Request victim = std::move(running_[victim_index]);
+  running_.pop_back();
+  running_index_.erase(victim.id());
+
+  // Cached prefix blocks survive the release: preemption costs the private
+  // tail, not the shared prefix, and resumption re-adopts what it can.
+  const Status released = cache_manager_.Release(victim.id());
+  assert(released.ok());
+  (void)released;
+  const Status transition = victim.Preempt();
+  assert(transition.ok());
+  (void)transition;
+  victim.MarkWaiting();
+  waiting_.PushFront(std::move(victim));
+
+  preempted->push_back(victim_id);
+  ++stats_.num_preempted;
+  return true;
 }
 
 std::optional<Request> Scheduler::PopFinished() {
