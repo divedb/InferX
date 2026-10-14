@@ -150,7 +150,9 @@ Tests: counters distinguish fresh admission from post-preemption re-admission
 hits; token-granular (a 5-block hit on a 20-block prompt counts 80 tokens).
 
 ### P1-5. Block-boundary-aligned chunked prefill under caching
-**Status: open**
+**Status: done** — prefill chunks clip to block boundaries when prefix
+caching is on (final chunk excepted), so each chunk's blocks publish on
+completion; budget-cut behavior is unchanged with caching off.
 
 Both engines stop prefill chunks at block/page boundaries when caching is on
 (vLLM `_mamba_block_aligned_split` clips chunks to the next block boundary

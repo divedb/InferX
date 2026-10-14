@@ -93,6 +93,9 @@ class CacheManager {
   /// Whether the prefix index is active for this manager.
   bool prefix_caching_enabled() const { return prefix_ != nullptr; }
 
+  /// Tokens per block; the publication granularity of the prefix index.
+  int64_t block_size() const { return pool_->BlockSize(); }
+
   int64_t free_blocks() const { return pool_->FreeBlocks(); }
   int64_t total_blocks() const { return pool_->NumBlocks(); }
   float usage() const;

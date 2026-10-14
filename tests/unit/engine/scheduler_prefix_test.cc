@@ -47,6 +47,10 @@ class SchedulerPrefixTest : public ::testing::Test {
     auto plan = scheduler_->Schedule();
     EXPECT_TRUE(plan.ok()) << plan.status();
     if (!plan.ok()) return false;
+    last_chunks_.clear();
+    for (const ScheduledRequest& sr : plan->scheduled) {
+      last_chunks_.push_back(sr.num_new_tokens);
+    }
     ModelRunnerOutput result;
     for (const ScheduledRequest& sr : plan->scheduled) {
       result.samples.push_back({sr.request_id, {kTok}});
@@ -143,6 +147,56 @@ TEST_F(SchedulerPrefixTest, SaltedRequestSharesNothing) {
   // Unsalted prompt sees no salted cache: full recompute.
   EXPECT_EQ(plan->scheduled_new_reqs[0].num_computed_tokens, 0);
   EXPECT_EQ(plan->scheduled[0].num_new_tokens, 12);
+}
+
+TEST_F(SchedulerPrefixTest, PrefillChunksEndOnBlockBoundariesWhenCached) {
+  SchedulerConfig config;
+  config.max_num_batched_tokens = 6;  // Deliberately block-unaligned.
+  CacheConfig cache;                  // Prefix caching on by default.
+  cache.enable_prefix_caching = true;
+  KvLayout layout;
+  layout.entries_per_token = 2;
+  layout.kv_heads = 1;
+  layout.head_dim = 8;
+  layout.dtype = DataType::kBFloat16;
+  pool_ = std::make_unique<KvBlockPool>(std::move(
+      KvBlockPool::Create(2, 64, kBlockSize, layout, Device::Cpu()).value()));
+  scheduler_ = std::make_unique<Scheduler>(config, cache, pool_.get(),
+                                           std::vector<TokenId>{kEos});
+
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, Tokens(12), ShortParams())).ok());
+  std::vector<int> chunk_sizes;
+  while (scheduler_->HasRequests()) {
+    ASSERT_TRUE(ScheduleOnce());
+    if (!last_chunks_.empty()) chunk_sizes.push_back(last_chunks_.back());
+  }
+  // Budget 6 would cut 12 into 6+6; block alignment cuts 4+4+4 so each
+  // chunk's blocks are publishable the moment it completes.
+  EXPECT_EQ(chunk_sizes, (std::vector<int>{4, 4, 4}));
+}
+
+TEST_F(SchedulerPrefixTest, ChunkAlignmentOffWithoutCaching) {
+  SchedulerConfig config;
+  config.max_num_batched_tokens = 6;
+  CacheConfig cache;
+  cache.enable_prefix_caching = false;
+  KvLayout layout;
+  layout.entries_per_token = 2;
+  layout.kv_heads = 1;
+  layout.head_dim = 8;
+  layout.dtype = DataType::kBFloat16;
+  pool_ = std::make_unique<KvBlockPool>(std::move(
+      KvBlockPool::Create(2, 64, kBlockSize, layout, Device::Cpu()).value()));
+  scheduler_ = std::make_unique<Scheduler>(config, cache, pool_.get(),
+                                           std::vector<TokenId>{kEos});
+
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, Tokens(12), ShortParams())).ok());
+  std::vector<int> chunk_sizes;
+  while (scheduler_->HasRequests()) {
+    ASSERT_TRUE(ScheduleOnce());
+    if (!last_chunks_.empty()) chunk_sizes.push_back(last_chunks_.back());
+  }
+  EXPECT_EQ(chunk_sizes, (std::vector<int>{6, 6}));  // Pure budget cutting.
 }
 
 TEST_F(SchedulerPrefixTest, HitAccountingIsTokenGranular) {

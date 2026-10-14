@@ -27,6 +27,18 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
   pending_finish_notifications_.clear();
   int budget = config_.max_num_batched_tokens;
 
+  // Prefill chunks end on block boundaries while prefix caching is on, so
+  // every chunk publishes complete blocks immediately instead of stranding
+  // KV in an unhashable partial block until the prompt finishes (vLLM's
+  // block-aligned split; SGLang page-aligns chunk ends the same way).
+  const auto clip_chunk = [this](int64_t base, int chunk, int prompt_len) -> int {
+    if (!cache_manager_.prefix_caching_enabled()) return chunk;
+    const int64_t end = base + chunk;
+    if (end >= prompt_len) return chunk;  // The final chunk may end anywhere.
+    const int64_t aligned = end / cache_manager_.block_size() * cache_manager_.block_size();
+    return aligned > base ? static_cast<int>(aligned - base) : chunk;
+  };
+
   // Running requests first: each gets one token per step, or the next prompt
   // chunk when its prompt is longer than what earlier steps computed. A
   // request the pool cannot cover preempts newer requests to make room
@@ -35,7 +47,11 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     Request& request = running_[i];
     const int remaining_prompt =
         static_cast<int>(request.prompt().size()) - request.num_computed_tokens();
-    const int chunk = remaining_prompt > 0 ? std::min(budget, remaining_prompt) : 1;
+    const int chunk = remaining_prompt > 0
+                          ? clip_chunk(request.num_computed_tokens(),
+                                       std::min(budget, remaining_prompt),
+                                       static_cast<int>(request.prompt().size()))
+                          : 1;
 
     auto granted = cache_manager_.Reserve(request.id(), request.num_computed_tokens() + chunk);
     while (!granted.ok() && PreemptNewestAfter(i, &output.preempted_request_ids)) {
@@ -81,7 +97,9 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
         stats_.prefix_hit_tokens += adoption.cached_tokens;
       }
     }
-    const int chunk = std::min(budget, prompt_len - static_cast<int>(adoption.cached_tokens));
+    const int chunk = clip_chunk(adoption.cached_tokens,
+                                 std::min(budget, prompt_len - static_cast<int>(adoption.cached_tokens)),
+                                 prompt_len);
 
     auto granted = cache_manager_.Reserve(request.id(),
                                           adoption.cached_tokens + chunk);
