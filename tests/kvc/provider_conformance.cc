@@ -1003,6 +1003,49 @@ void TestManagementExtension() {
   CHECK(!hit.read.Valid());
 }
 
+// Required-extension negotiation: the served extensions can be required at
+// configure time; unknown schemas still fail configuration.
+void TestRequiredExtensionNegotiation() {
+  auto made = Harness::Make();
+  CHECK(made);
+  auto& harness = **made;
+  std::vector<unsigned char> payload;
+
+  KvcSchema stats{};
+  stats.name = {KVC_STATS_SCHEMA_NAME, KVC_STATS_SCHEMA_NAME_LEN};
+  stats.major = KVC_STATS_SCHEMA_MAJOR;
+  KvcSchema management{};
+  management.name = {KVC_MANAGEMENT_SCHEMA_NAME, KVC_MANAGEMENT_SCHEMA_NAME_LEN};
+  management.major = KVC_MANAGEMENT_SCHEMA_MAJOR;
+  KvcSchema unknown{};
+  unknown.name = {"kvc.telepathy", 14};
+  unknown.major = 1;
+  const KvcSchema bogus[1] = {unknown};
+
+  // A failed configure leaves the session unconfigured, so one fresh
+  // provider serves both probes (a second concurrent CUDA session is not
+  // something every provider grants).
+  auto fresh = OpenProvider({g_provider_path, OpenOptions(payload)});
+  CHECK(fresh);
+  auto config = harness.builder.Build();
+  config.config.required_extensions = bogus;
+  config.config.required_extension_count = 1;
+  CHECK_EQ((*fresh)->Configure(config.config).code, KVC_UNSUPPORTED);
+
+  // Requiring the extensions the provider actually serves must succeed;
+  // requiring one it does not serve must fail with Unsupported.
+  const bool serves = (*fresh)->QueryExtension(stats).has_value() &&
+                      (*fresh)->QueryExtension(management).has_value();
+  const KvcSchema required[2] = {stats, management};
+  config.config.required_extensions = required;
+  config.config.required_extension_count = 2;
+  if (serves) {
+    CHECK((*fresh)->Configure(config.config).Ok());
+  } else {
+    CHECK_EQ((*fresh)->Configure(config.config).code, KVC_UNSUPPORTED);
+  }
+}
+
 void TestConcurrentReaders() {
   auto made = Harness::Make();
   CHECK(made);
@@ -1353,6 +1396,7 @@ int main(int argc, char** argv) {
   TEST(TestTransferPollWait);
   TEST(TestStatsExtension);
   TEST(TestManagementExtension);
+  TEST(TestRequiredExtensionNegotiation);
   TEST(TestConcurrentReaders);
   if (g_mode == Mode::kAsync) {
     TEST(async::TestPendingDeadlineAndCompletion);

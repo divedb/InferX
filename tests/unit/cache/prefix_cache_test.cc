@@ -163,6 +163,32 @@ TEST(PrefixCacheTest, PinnedBlocksAreNeverEvictionVictims) {
   EXPECT_EQ(cache.Evict(3), 0);
 }
 
+TEST(PrefixCacheTest, ClearWithLiveAdoptionKeepsPinnedBlocksAllocated) {
+  auto pool = MakePool(8);
+  PrefixCache cache(pool.get());
+
+  const auto hashes = HashBlocks({{1, 2, 3, 4}, {5, 6, 7, 8}});
+  const int32_t b0 = pool->AllocateBlock().value();
+  const int32_t b1 = pool->AllocateBlock().value();
+  cache.Publish(hashes[0], b0);
+  cache.Publish(hashes[1], b1);
+  cache.Release({b0, b1});  // Publishers done; both evictable.
+  ASSERT_EQ(cache.evictable_blocks(), 2);
+
+  // An adoption pins b0; Clear() forgets every entry but must not free the
+  // adopted block -- its bytes are still a request's page table.
+  const std::vector<int32_t> adopted = cache.Adopt(hashes);
+  ASSERT_EQ(adopted, (std::vector<int32_t>{b0, b1}));
+  cache.Clear();
+  EXPECT_EQ(cache.cached_blocks(), 0);
+  EXPECT_EQ(pool->FreeBlocks(), 6);  // Both pinned blocks stay allocated.
+
+  // The adoption's later release finds no entries: the blocks return to
+  // the pool through the plain free path, not double-freed here.
+  cache.Release(adopted);
+  EXPECT_EQ(cache.cached_blocks(), 0);
+}
+
 TEST(PrefixCacheTest, DuplicateRegistrationsCoexist) {
   auto pool = MakePool(8);
   PrefixCache cache(pool.get());

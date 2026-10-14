@@ -415,8 +415,22 @@ KvcStatus SessionConfigure(KvcObject* object, const KvcConfig* request, uint64_t
     if (session->closing) return ErrorStatus(KVC_SHUTTING_DOWN, "session is closing");
     if (request->required_features & ~static_cast<uint64_t>(KVC_FEATURE_LAYERWISE))
       return ErrorStatus(KVC_UNSUPPORTED, "a required feature is not supported");
-    if (request->required_extension_count)
-      return ErrorStatus(KVC_UNSUPPORTED, "no extensions are supported");
+    // Extensions served through query_extension may be required up front;
+    // anything else is genuinely unsupported.
+    for (uint64_t i = 0; i < request->required_extension_count; ++i) {
+      const KvcSchema& wanted = request->required_extensions[i];
+      const bool stats = wanted.name.size == KVC_STATS_SCHEMA_NAME_LEN &&
+                         std::memcmp(wanted.name.data, KVC_STATS_SCHEMA_NAME,
+                                     KVC_STATS_SCHEMA_NAME_LEN) == 0 &&
+                         wanted.major <= KVC_STATS_SCHEMA_MAJOR;
+      const bool management = wanted.name.size == KVC_MANAGEMENT_SCHEMA_NAME_LEN &&
+                              std::memcmp(wanted.name.data, KVC_MANAGEMENT_SCHEMA_NAME,
+                                          KVC_MANAGEMENT_SCHEMA_NAME_LEN) == 0 &&
+                              wanted.major <= KVC_MANAGEMENT_SCHEMA_MAJOR;
+      if (!stats && !management)
+        return ErrorStatus(KVC_UNSUPPORTED, "extension is not supported");
+    }
+
     if (!request->groups || request->group_count == 0)
       return ErrorStatus(KVC_INVALID_ARGUMENT, "at least one group is required");
 

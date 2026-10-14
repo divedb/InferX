@@ -262,25 +262,18 @@ flush makes the next identical prompt recompute.
 ## P2 — provider/ABI work
 
 ### P2-8. Management surface: enumeration, bulk clear, namespace reset
-**Status: in flight (uncommitted WIP)**
+**Status: done (providers; engine surface under P1-11)**
 
-WIP in tree: `kvc.management` v1.0 (`enumerate` with null-out sizing,
-idempotent `clear` with pinned generations surviving) in
-`include/kvc/extensions/management.h`, both bundled providers, and
-`TestManagementExtension` in the conformance suite; plus the unrelated
-`ModelRunner` fix erasing preempted request state (pinned by
-`SchedulerPreemptTest`). Remaining:
-
-- `SessionConfigure` in both providers still rejects any
-  `required_extension_count` ("no extensions are supported") — a client
-  cannot *require* `kvc.management`/`kvc.stats` at configure time even
-  though both are served via `query_extension`. Negotiate properly.
-- Engine surface: flush/reset endpoint (P1-11), `enumerate` paging
-  semantics at scale, docs (`docs/extensions/kvcache.md` doesn't mention
-  the extension).
-- Audit `PrefixCache::Clear()` under live adoptions: it wipes `by_block_`
-  wholesale while pinned blocks stay allocated (release-after-clear frees
-  them via the empty owning map — correct but untested; pin it).
+`kvc.management` v1.0 landed: `enumerate` (null-out sizing, record
+fidelity) and idempotent `clear` (pinned generations survive; the CUDA
+provider reclaims sole-owner storage under the session lock so block
+destruction cannot re-take it), in both bundled providers, with
+conformance tests. `SessionConfigure` now negotiates
+`required_extensions` properly (stats/management acceptable, unknown
+schemas `Unsupported`), pinned by `TestRequiredExtensionNegotiation`.
+`PrefixCache::Clear()` under live adoptions is pinned by a unit test
+(pinned blocks stay allocated; release-after-clear frees them). Engine
+flush/reset endpoint remains under P1-11.
 
 Prior art for semantics: vLLM `reset_prefix_cache` refuses while running
 requests wait on remote transfers and can optionally preempt-first;
