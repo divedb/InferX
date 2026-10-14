@@ -75,7 +75,10 @@ cached); LRU eviction under pressure; salt isolation; `n−1` cap; eviction
 respects pinned blocks.
 
 ### P0-2. Canonical identity helper for the kvc SDK
-**Status: open**
+**Status: done** — `kvc/identity.h` in `kvc::runtime`: domain-separated
+SHA-256 records (length-prefixed canonical encoding, versioned through
+domain tags), token-level prefix chain with salt-bearing seed, block keys
+binding group/partition/extent/dependency; golden vectors pin the profile.
 
 `docs/kvcache_plan.md` §8 specifies portable identities: SHA-256 over
 domain-separated, canonically encoded records; a token-level prefix chain

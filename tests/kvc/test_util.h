@@ -3,8 +3,7 @@
 // Test identities are derived from a fixed digest function over the block
 // record fields. That is sufficient for conformance testing against any
 // provider implementing the opaque profile; production callers must derive
-// identities from the canonical identity scheme instead (see
-// docs/extensions/kvcache.md).
+// identities from kvc/identity.h instead (see docs/extensions/kvcache.md).
 
 #ifndef KVC_TESTS_TEST_UTIL_H_
 #define KVC_TESTS_TEST_UTIL_H_

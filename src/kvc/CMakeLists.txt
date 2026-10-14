@@ -9,7 +9,7 @@ target_include_directories(kvc_abi INTERFACE
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-add_library(kvc_runtime STATIC runtime.cc)
+add_library(kvc_runtime STATIC runtime.cc identity.cc)
 add_library(kvc::runtime ALIAS kvc_runtime)
 set_target_properties(kvc_runtime PROPERTIES EXPORT_NAME runtime POSITION_INDEPENDENT_CODE ON)
 target_compile_features(kvc_runtime PUBLIC cxx_std_23)

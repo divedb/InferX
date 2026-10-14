@@ -16,6 +16,11 @@ target_link_libraries(kvc_bad_abi PRIVATE kvc::abi)
 add_library(kvc_missing_entry MODULE missing_entry.c)
 target_link_libraries(kvc_missing_entry PRIVATE kvc::abi)
 
+add_executable(kvc_identity_test identity_test.cc)
+target_link_libraries(kvc_identity_test PRIVATE kvc::runtime)
+set_target_properties(kvc_identity_test PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+add_test(NAME kvc_identity COMMAND kvc_identity_test)
+
 add_executable(kvc_loader_test loader_test.cc)
 target_link_libraries(kvc_loader_test PRIVATE kvc::runtime Threads::Threads)
 if(TARGET kvc_host)

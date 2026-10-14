@@ -162,11 +162,16 @@ uncertain begin/commit. Lookup evaluates all supplied candidates without assumin
 availability is monotonic and returns the longest available candidate or a normal
 miss. It rejects key matches whose block metadata differs.
 
-Portable identity generation and numerical/schema compatibility remain adapter
-responsibilities. This SDK does not yet implement the plan's proposed canonical
-CBOR/SHA-256 identity helper or standard attention/MLA schema registry; callers
-must not use pointer values, tensor shapes alone, or the test fixture keys as
-production identities.
+Numerical/schema compatibility remains an adapter responsibility, as does
+assembling complete model fingerprints. The SDK now ships the canonical
+identity construction (`kvc/identity.h`, linked from `kvc::runtime`):
+domain-separated SHA-256 records with length-prefixed fields, the
+token-level prefix chain (seed binds namespace, model identity, and
+invariant context such as a cache salt), and block keys binding group,
+partition, logical extent, and dependency digest. The encoding profile is
+versioned through its domain tags; golden vectors in `tests/kvc` pin it.
+Callers must not use pointer values, tensor shapes alone, or the test
+fixture keys as production identities.
 
 ## CUDA tiered provider
 
