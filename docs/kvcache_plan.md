@@ -172,6 +172,8 @@ Custom:
 
 Unknown semantic schemas must be explicitly negotiated. They must never silently fall back to ordinary attention semantics.
 
+Derived or auxiliary state rides as ordinary components: sparse-attention index keys, attention-sink state, and compressor buffers (vLLM's DSA index cache, circular-buffer specs) are schema-defined components with schema-defined dependency rules. State that cannot resume execution — per-request scratch, ephemeral hot caches — is simply never published.
+
 ## 6. CacheGroup design
 
 A `CacheGroupSpec` contains:
@@ -211,6 +213,11 @@ Layers with incompatible component shapes or block semantics use different group
 
 A layer may participate in multiple groups when it has different kinds of state, such as self-attention and cross-attention. Its identity within a payload is therefore `(group, layer, component)`.
 
+Two degenerate cases are intentional:
+
+- Layers without reusable state — encoder-only layers, attention-free blocks — belong to no group. A configuration covers exactly the layers that carry publishable state.
+- Cross-layer KV sharing (vLLM `kv_sharing`, YOCO-style): a group lists only the KV-source layers. Reader layers that alias the source tensors are an engine mapping concern and never appear in bindings or manifests.
+
 ## 7. ModelFingerprint
 
 `ModelFingerprint` must cover everything that can change the meaning or values of reusable state.
@@ -243,6 +250,8 @@ Request-dependent influences belong in input identity:
 - Prompt embeddings.
 - Attention masks and segment boundaries.
 - Per-token positions.
+- Per-request cache salt or tenant-scoped namespace selection.
+- Request-scoped adapter (LoRA) selection within the negotiated adapter set.
 - Other conditioning that changes cached state.
 
 A human-readable model name, repository revision label, or matching shape is insufficient.
@@ -321,6 +330,14 @@ Appending to an engine’s mutable tail produces a new cache object identity. It
 
 This distinction keeps identity, control-plane coverage, and data-plane selection separate.
 
+### Identity edge cases
+
+- The seed `P0` identifies the empty prefix, so empty prompts and prompts shorter than one block participate in lookup without any published block.
+- Per-request salts and request-scoped adapter selections extend `invariant_context`. A salt therefore invalidates from the seed, matching vLLM's block-0 salt key.
+- Multimodal placeholders are auxiliary-input digests at their token positions; the position keeps the same item at different offsets distinct, which is why vLLM hashes `("mm", identifier, offset_in_block)` into block keys.
+- Positions beyond plain causal offsets — packed segments, jump-forward decoding — are carried by `TokenIdentity.position`.
+- Encoding is deterministic and cryptographic. Independent processes must compute identical keys for sharing to work, which rules out vLLM's per-process seeding of its non-crypto hash algorithms; SHA-256 collision resistance carries that defense instead.
+
 ## 9. Prefix lookup API
 
 The provider receives **candidate reuse plans**, not engine request objects.
@@ -355,6 +372,8 @@ The adapter or a reusable semantic planner constructs these requirements. The pr
 The API contract requires plans to include **all state needed for the claimed resume point**. Providers validate structural consistency and the semantic rules they implement. Custom-schema planners are responsible for their schema-specific completeness rules.
 
 Lookup must not assume candidate availability is monotonic. With windowed or checkpointed state, a longer candidate can be available while a shorter one is absent.
+
+Hybrid models make multi-group candidates concrete. Resuming a full-plus-window hybrid, or a full-plus-recurrent hybrid, at one boundary needs the full-attention prefix, the windowed suffix state, and a recurrent checkpoint simultaneously. A candidate's `required` ranges may therefore reference catalog records from several groups, and lookup still returns one boundary whose complete requirement is satisfied. The engines already reconcile divergent per-type hit lengths this way — vLLM's hybrid manager shrinks candidate lengths to a fixed point and repins the uncached junction, SGLang truncates to the shallowest component validator — and the candidate structure carries that reconciliation without a dedicated API.
 
 ### PrefixIndex decision
 
@@ -446,6 +465,8 @@ The seventh responsibility—metadata access—is satisfied by immutable configu
 `begin_write` combines reservation and provider allocation. A separate allocator API would expose unnecessary backend structure.
 
 Exact existence checks use a lookup containing one candidate. This also allows callers to acquire the object instead of relying on a potentially stale boolean.
+
+`begin_write` against an already-committed key fails with `AlreadyExists`. The adapter treats that outcome as success and skips storing — the committed-dedup fast path for deterministic recomputation. It does not attach to another writer's in-flight transaction; concurrent first-publication is catalog item 28.
 
 ## 12. Data-plane interface
 
@@ -539,6 +560,8 @@ A transaction manifest declares every block to be published. Commit requires:
 Commit atomically publishes the entire manifest. A provider whose backend lacks transactions must supply a manifest/publication mechanism above it.
 
 Large requests can use multiple small transactions. Request-wide publication is not mandatory.
+
+Unpublished transactions are also the rollback mechanism for compute that must never become visible: discarded speculative-draft tokens, preempted requests, and failed verification abandon their transactions instead of publishing.
 
 ### Read lifecycle
 
@@ -871,6 +894,12 @@ The connector lifecycle distinguishes prefix matching, load initiation, layer re
 | `save_kv_layer` | Establish compute completion; submit that layer’s bindings to `store` |
 | `wait_for_save` | Wait for store completion; commit only when the transaction is complete |
 | `request_finished` | Finalize or abort writes; release request-owned references after outstanding uses are safe |
+| `update_state_after_alloc`, `build_connector_meta` | Adapter-internal planning; no provider call |
+| Async-load indication, `get_transfer_results` | The async boolean maps to polling `TransferHandle` completion; upstream removed the older `async_lookup` entry points in favor of this state machine |
+| `get_block_ids_with_load_errors` | Failed loads keep their failure status (never a miss, section 17); the adapter removes the corrupted key and recomputes or rejects per its load-failure policy |
+| `handle_preemptions` | Abort or abandon affected transactions and release read references before pages are reused |
+| `request_finished_all_groups` (hybrid manager) | Per-group finalization; a group whose state is not publishable is never written |
+| `get_required_kvcache_layout`, `register_kv_caches` | Negotiated transfer formats and imported regions |
 
 The adapter must distinguish:
 
@@ -882,6 +911,10 @@ The adapter must distinguish:
 It must not simply return the entire cached prefix as “newly matched.”
 
 For SGLang, token-pool slots and page indices become buffer bindings. They never become `BlockKey` values. Its distinct MLA token-pool representation further supports keeping component schemas independent of an assumed K/V pair. [SGLang memory-pool source](https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/mem_cache/memory_pool.py)
+
+SGLang's serving hooks map just as directly: `match_prefix` is one lookup, per-finished-chunk `checkpoint` is a store-plus-commit per completed block, `retract_decode` releases pins and may back rows up through host-tier transfers, HiCache write-through is block-granular commit, and the disaggregation bootstrap queue exchanges exactly the portable identities of Scenario C.
+
+Role-based composition (vLLM `MultiConnector` loads from the first connector reporting a hit and saves to all of them) is adapter policy over several provider sessions. The ABI needs no composition operator; cross-provider dedup does not exist and is not implied.
 
 ## 21. LMCache/Mooncake provider mapping
 
@@ -912,6 +945,8 @@ LMCache’s architecture separates engine integration, indexing, allocation, and
 Mooncake’s Transfer Engine supports asynchronous movement between non-contiguous memory spaces. That fits the binding model; its segment and transport details stay inside the provider. [Mooncake Transfer Engine](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html)
 
 A transfer engine alone is not a complete cache provider. It still needs identity, publication, discovery, and lifetime management.
+
+The same mapping covers the rest of the current connector and storage ecosystem: NIXL pull and push, the Mooncake transfer engine and object store, LMCache including its out-of-process daemon, filesystem backends (HF3FS, SGLang `file`), FlexKV, and MoRI. Pull-mode decode is `load`; push-mode prefill — writing into pre-imported decode-side memory — is `store` over the same published identities. SGLang's pluggable storage-backend factory shows how these live behind one provider boundary.
 
 ## 22. Sequence diagrams
 
@@ -1859,6 +1894,8 @@ Four less obvious tradeoffs remain deliberate:
 - Portable CUDA stream/event objects.
 - Public RDMA connection or registration structures.
 - Callback-based completion.
+- Push-style event and notification channels.
+- Runtime storage attach/detach and bulk cache administration.
 - Cross-session transaction recovery guarantees.
 - General variable-size opaque records.
 - A public allocator for engine physical pages.
@@ -1877,6 +1914,8 @@ Before standardization, resolve:
 6. **Custom-state reuse planning:** how independently developed schema modules communicate complete resume requirements.
 7. **Resharding:** whether to add feature-axis slices or a separate redistribution extension.
 8. **C ABI packaging:** finalized platform conventions, complete C record mirrors, extension registry, and ownership conformance requirements.
+9. **Management and notification extension:** enumeration, bulk clear, runtime storage attach/detach, retention hints, and a publication event feed for cache-aware routers (catalog items 34, 35, 37, 54, 55, 57; section 28 items 5, 9, 11).
+10. **Fine-grained prefix boundaries:** whether sub-block resume points — vLLM's partial-block hashing and its hash/scheduler granularity split — justify an extension beyond group `tokens_per_block` (section 28 item 10).
 
 ## 27. Use-case catalog
 
@@ -1884,7 +1923,9 @@ Status legend: **solved** = ABI, reference provider, and conformance tests all
 cover it; **designed** = expressible through the current ABI with no provider
 implementation yet; **gap** = not expressible without ABI or semantic changes;
 **engine-side** = the ABI can carry it but InferX's serving path does not use
-it yet; **intentional** = deliberately excluded (see section 25).
+it yet; **intentional** = deliberately excluded (see section 25). Compound
+statuses combine these. Section 29 reviews each case one at a time against how
+vLLM and SGLang implement it.
 
 | # | Use case | Status |
 |---|---|---|
@@ -1928,6 +1969,34 @@ it yet; **intentional** = deliberately excluded (see section 25).
 | 38 | Cross-format reuse (FP8 producer, BF16 consumer) | intentional exclusion |
 | 39 | Native GPU stream/event interop for readiness | intentional exclusion (tracked, section 26.5) |
 | 40 | Zero-copy provider-to-provider transfer | gap |
+| 41 | Copy-on-write extension of shared or partial tail blocks (parallel sampling, beam) | engine-side (immutability keeps COW out of the ABI) |
+| 42 | Preemption: recompute path | solved (abort/abandon); engine-side loop |
+| 43 | Preemption swap / decode retraction with host backup | designed (host-tier round trip); engine-side |
+| 44 | Chunked prefill, partial-block publication, prefix-invariant chunking | designed; engine-side |
+| 45 | Speculative decoding: draft KV, verification, rollback | designed; engine-side |
+| 46 | Hybrid multi-group hit reconciliation (fixed-point shrink) | designed |
+| 47 | Cross-layer shared KV payload (kv_sharing, YOCO) | designed; engine-side reader mapping |
+| 48 | Zero-KV, encoder-only, attention-free layers | designed (vacuous: no groups) |
+| 49 | Encoder-output cache with cross-request sharing | designed |
+| 50 | Multimodal placeholder identity (offset-sensitive) | designed |
+| 51 | Per-request cache salt | designed (invariant context) |
+| 52 | Request-scoped LoRA selection | designed |
+| 53 | Load-failure policy and corrupt-block eviction | designed; engine-side |
+| 54 | Publication event feed for cache-aware routers | gap (polled stats only) |
+| 55 | Session-affinity retention (soft references) | gap (pins only) |
+| 56 | Pluggable eviction policies (LRU/LFU/priority/…) | intentional (policy stays provider-internal) |
+| 57 | Tiering policies and runtime storage attach/detach | tiering designed (provider-internal); attach/detach gap |
+| 58 | Decode-side prefix cache in P/D | engine-side |
+| 59 | P/D admission, reservation, bootstrap, rebootstrap | designed + engine-side |
+| 60 | Retraction KV backup round trip through host tier | designed |
+| 61 | Transfer integrity verification (checksums) | designed (provider-internal) |
+| 62 | Role-based multi-provider composition | designed + engine-side |
+| 63 | Streaming-input sessions | designed + engine-side |
+| 64 | Fine-grained sub-block boundaries and last-token recompute | gap (sub-block reuse); rules adapter-side |
+| 65 | Position-sharded (DCP) partitions | designed (exact partition match) |
+| 66 | TP-replicated KV and replica publication dedup | designed; dedup gap |
+| 67 | Destination zeroing and in-flight write protection | engine-side (buffer contract) |
+| 68 | Derived-state caches (index keys, compressor/sink state) | designed (opaque components) |
 
 ## 28. Gap analysis: what the current design cannot solve
 
@@ -1982,7 +2051,505 @@ acknowledges the limitation; the rest are newly identified here.
    host-visible fence with no stream/event interop, forcing extra sync
    points for future GPU-native providers.
 
+9. **Runtime administration (new; extends item 5).** SGLang attaches and
+   detaches L3 storage backends mid-session over HTTP and exposes
+   `/flush_cache`; vLLM exposes `reset_prefix_cache` for weight updates and
+   benchmarks. The ABI configures once per session and removes keys one
+   digest at a time: bulk clear, namespace reset, and storage reattachment
+   are not expressible. Fix direction: a management extension or an explicit
+   session-recreation protocol.
+
+10. **Sub-block prefix boundaries (new; sharpens catalog items 30 and 31).**
+    vLLM separates hash granularity from scheduler block size and registers
+    partial-block prefix boundaries inside a full block; SGLang truncates
+    radix keys at page size. The immutable full-block publication rule
+    leaves adapters only the coarse lever of smaller `tokens_per_block`,
+    which amplifies metadata and per-block transfer overhead.
+
+11. **Publication events for routing (new; extends catalog items 16 and 36).**
+    Cache-aware routers in both engines consume event feeds — vLLM's
+    `KVEventsConfig` ZMQ publisher with replay, SGLang's `kv-events` feeding
+    `sgl-kv-indexer`. The ABI offers polled lifetime counters only. Fix
+    direction: an event extension with namespaced filtering that buffers
+    behind polling instead of callbacks.
+
+12. **Replica publication dedup (new; extends catalog item 28).**
+    TP-replicated KV — MLA ranks holding identical partitions, vLLM
+    `kv_tp_replicas` — makes several sessions publish identical keys.
+    Concurrent first publication degenerates into Conflict/AlreadyExists
+    retries: benign but wasteful. SGLang dedups by letting one rank write
+    the host tier. Fix direction: single-writer election in the adapter or
+    an attach-to-committed fast path.
+
 Two blockers outside the ABI compound all sharing and persistence cases
 (17-20): the engine does not yet call providers from its serving loop, and
 the canonical CBOR/SHA-256 identity helper does not exist, so callers
 cannot safely generate the stable digests those cases require.
+
+## 29. Use-case walkthroughs
+
+One-at-a-time review of every section-27 catalog entry against how vLLM and
+SGLang implement it, how this design covers it (or why it does not), and the
+edge cases the engines have already met. Engine API names are precedents as of
+late 2026, not normative references; both projects rename these surfaces often.
+
+### 1. Shared system-prompt reuse across requests, one session
+
+**Engines:** vLLM automatic prefix caching over a per-block hash chain; SGLang radix tree `match_prefix` with LRU touch.
+**Mapping:** token-chain prefix identity (section 8), lookup returning a pinned read handle (section 9), block-by-block commit (section 14).
+**Edge cases:** the last prompt token is recomputed for logits, so the resume boundary sits at n−1 tokens; identical finished prefixes collapse onto identical block keys.
+**Status holds:** solved by the host provider, the CUDA provider, and conformance tests.
+
+### 2. Non-monotonic candidate availability
+
+**Engines:** vLLM sliding-window sparse retention and Mamba align checkpoints publish only some boundaries; SGLang component validators truncate a match to the shallowest component.
+**Mapping:** explicit candidates with `required` ranges; lookup never assumes monotonic availability (section 9).
+**Edge cases:** a longer candidate available while a shorter one is absent — window state retained while its checkpoint was evicted.
+**Status holds:** solved by contract and tested.
+
+### 3. Incremental publication during decode
+
+**Engines:** vLLM registers each completed block's hash during decode; SGLang `checkpoint` inserts each finished chunk into the radix tree.
+**Mapping:** one transaction per completed block; commit is the publication point (section 14).
+**Edge cases:** a request finishing mid-block never publishes the tail; re-inserted prefixes must not double-count hits (SGLang `inserted_len`).
+**Status holds:** solved.
+
+### 4. Prefix retirement and recomputation with pinned old generations
+
+**Engines:** vLLM `unpin_blocks`, `evict_blocks`, and reuse watchers let readers finish before reuse; SGLang `evict` respects per-node `lock_ref`.
+**Mapping:** `remove` retires discoverability; read handles pin exact generations; recreating a key never redirects existing handles (section 14).
+**Edge cases:** eviction under pressure skips pinned blocks — the CUDA provider mirrors this exactly, failing reservations rather than dropping pinned data.
+**Status holds:** solved.
+
+### 5. Multi-tenant namespace isolation
+
+**Engines:** vLLM keys blocks by hash plus group id and supports per-request `cache_salt` against timing side channels; SGLang namespaces radix keys through `extra_key` and `cache_salt`.
+**Mapping:** `NamespaceId` participates in every identity level (sections 7–8); salt is invariant context, so it invalidates from the seed.
+**Edge cases:** salted and unsalted versions of one prefix share nothing, by design.
+**Status holds:** solved.
+
+### 6. Abandoning in-flight compute/store pipelines
+
+**Engines:** vLLM preemption frees blocks and `handle_preemptions` acts before overwrite; SGLang retraction frees whole rows immediately.
+**Mapping:** write-handle destruction abandons nonblocking; accepted transfers drain without publishing (sections 14, 18).
+**Edge cases:** abandonment after commit is a no-op and never rolls back a completed commit.
+**Status holds:** solved and conformance-tested with failure injection.
+
+### 7. GQA/MQA attention K and V components
+
+**Engines:** both engines store `[tokens, kv_heads, dim]` per K and V; SGLang supports asymmetric value head dimensions.
+**Mapping:** attention schema carries head organization, kv-head count, and independent K/V dimensions (section 5); the shipped opaque profile carries the bytes whole.
+**Edge cases:** asymmetric `v_head_dim` is representable in the schema but not in any packed engine layout assumption.
+**Status holds:** solved for the opaque profile; the tensor profile remains future work.
+
+### 8. MLA latent + RoPE components
+
+**Engines:** DeepSeek `MLATokenToKVPool` stores one fused latent+rope buffer; vLLM `MLAAttentionSpec`; SGLang DSA pools add index-key state.
+**Mapping:** `MLACacheSpec` latent and positional components (section 5); kernels stay engine-side by rule 5.
+**Edge cases:** FP8/FP4 latent variants ride the quantization-schema rules; DSA index state is catalog item 68.
+**Status holds:** designed; schema-carried, engine kernels exist outside the ABI.
+
+### 9. Sliding-window and hybrid layer groups
+
+**Engines:** vLLM's hybrid coordinator runs per-type managers and shrinks hit lengths to a fixed point; SGLang's unified radix cache keeps FULL and SWA component subtrees with cascade eviction.
+**Mapping:** one group per semantics, window size in the spec; block identity keeps the full dependency chain even for windowed blocks (section 8).
+**Edge cases:** window rotation below the window; extra tokens retained below the window for speculative re-prefill; all-SWA models need only window state.
+**Status holds:** designed.
+
+### 10. Cross-attention / encoder-side cache (multimodal)
+
+**Engines:** vLLM `CrossAttentionManager` (never prefix-cached) plus a separate mm-hash-keyed encoder cache; SGLang disaggregates encoder outputs over mooncake/zmq.
+**Mapping:** cross-domain attention spec; the dependency digest covers the complete encoder/source identity (section 8); encoder outputs can also ride as an opaque group (item 49).
+**Edge cases:** encoder cache freed on preemption and finish; vLLM currently disallows encoder-decoder together with KV connectors.
+**Status holds:** designed.
+
+### 11. Layer-streamed transfer readiness (pipelined loads)
+
+**Engines:** vLLM `wait_for_layer_load` gates each layer; SGLang `LayerDoneCounter` overlaps layer transfers with compute.
+**Mapping:** per-layer transfers with independent completion; Scenario D (section 22).
+**Edge cases:** partial-layer completion must not be mistaken for partial-block completion; `Incomplete` versus `Busy` keeps them distinct at commit.
+**Status holds:** designed (layerwise negotiation exists); engine wiring absent.
+
+### 12. CPU offload of cold KV with reload on hit
+
+**Engines:** vLLM OffloadingConnector CPU tier and native `kv_offloading`; SGLang HiCache L2 host tier.
+**Mapping:** the `kvc.cuda` tiered provider implements exactly this — LRU write-back to host, promotion on load, pin-aware victim selection.
+**Edge cases:** host budget smaller than device pool; write failures under host pressure must not lose device data.
+**Status holds:** solved.
+
+### 13. NVMe tiering
+
+**Engines:** vLLM `fs` and object-store offload tiers, HF3FS connector; SGLang L3 storage backends (file, mooncake, nixl, hf3fs, …).
+**Mapping:** asynchronous transfers plus opaque payloads suffice; the storage layout is provider-internal.
+**Edge cases:** SGLang's storage format tags make cross-layout pages miss rather than load corrupt — block compatibility already embeds format (section 7), giving the same behavior by construction.
+**Status holds:** designed; async transfers specified, no disk provider yet.
+
+### 14. Copy-free paged-KV bindings
+
+**Engines:** both engines expose paged pools with page sizes from 1 to 64 tokens.
+**Mapping:** strided/scattered bindings map external blocks directly onto engine pages (section 10) — a 64-token provider block onto four 16-token pages.
+**Edge cases:** sub-page token slices within a binding; head-axis subdivision is excluded in v1; the shipped profile requires whole components, so this needs the tensor profile.
+**Status holds:** designed.
+
+### 15. Prefill-to-decode handoff via engine staging buffer
+
+**Engines:** NIXL pull registers decode-side destination buffers; SGLang `staging_buffer` mediates when direct placement is impossible.
+**Mapping:** import destination memory then `load`; push mode is `store` into pre-imported decode memory (section 21).
+**Edge cases:** destination slots reserved before prefill completes (SGLang early admission) must be released on failure.
+**Status holds:** designed.
+
+### 16. KV-aware request routing to the worker holding a prefix
+
+**Engines:** vLLM's production stack consumes KV events; SGLang's router `cache_aware` policy ranks workers through `sgl-kv-indexer`.
+**Mapping:** identities are portable, so an external index can route — Scenario C (section 22); the feed itself is item 54.
+**Edge cases:** minimum matched-token and load-fallback gates are router policy.
+**Status holds:** designed + engine-side.
+
+### 17. Cross-session sharing through a common backend
+
+**Engines:** LMCache shared store; Mooncake metadata authority.
+**Mapping:** provider-side shared metadata; remote memory kinds and opaque locators (sections 10, 21). Blocked on the identity helper and engine integration (section 28 tail).
+**Edge cases:** two sessions committing the same key converge through `AlreadyExists`, not merge.
+**Status holds:** designed; the reference provider is session-local.
+
+### 18. Cross-process sharing (daemon or shared memory)
+
+**Engines:** vLLM `LMCacheMPConnector` talks to an out-of-process LMCache daemon; SGLang lists a `shm` storage backend.
+**Mapping:** the provider multiplexes processes behind one daemon; handles remain process-local, so the daemon must key by portable identity only.
+**Edge cases:** process crash must fence leases before allocation reuse (section 18 shutdown rules).
+**Status holds:** designed, unimplemented.
+
+### 19. Cross-machine sharing (LMCache/Mooncake-style)
+
+**Engines:** Mooncake transfer engine and store; NIXL RDMA peer sharing (`p2p` offload tier with `remote_prefiller`/`remote_decoder` roles).
+**Mapping:** remote/fabric memory kinds, opaque locators (section 10); publication through a metadata authority (section 21). Zero-copy between two providers is item 40.
+**Edge cases:** unbound-store timeouts, registration leases, and partial-network failure map to `TransportError` and `OutcomeUnknown` resolution.
+**Status holds:** designed vocabulary, unimplemented.
+
+### 20. Persistence across engine restart
+
+**Engines:** vLLM's deterministic sha256 seed lets independent instances share offload files; SGLang persists L3 storage across restarts.
+**Mapping:** deterministic canonical identity (section 8) makes stored keys stable across processes and time; the canonical helper is the blocker.
+**Edge cases:** weights changed between runs (RLHF) must invalidate — the weights digest in the fingerprint does this without a cache clear, though bulk clear would help (item 37).
+**Status holds:** designed, unimplemented, blocked on the identity helper.
+
+### 21. TP with per-rank providers and exact partition match
+
+**Engines:** vLLM TP-keyed connector handshakes with rank-0 output aggregation; SGLang keeps a pipeline-parallel consensus store.
+**Mapping:** canonical tensor-slice partition descriptors in the identity (section 7); one session per rank; no cross-partition transaction (section 22 C).
+**Edge cases:** ranks must agree on the partition set before any publication.
+**Status holds:** designed.
+
+### 22. Quantized KV storage (FP8 and similar)
+
+**Engines:** vLLM `KVQuantMode` family (per-tensor, per-token-head, NVFP4, TurboQuant) with mixed per-layer precision; SGLang fp8/fp4/MXFP8 pools where scale factors move with the data.
+**Mapping:** quantized representation is an explicit component schema including scales; implicit lossy conversion is forbidden by the conversion-ownership rule (section 16).
+**Edge cases:** mixed precision across groups is per-group schema selection; blocks reused across reinterpretations need engine zeroing (item 67).
+**Status holds:** designed; dtype codes await the tensor profile.
+
+### 23. Crash recovery within a session
+
+**Engines:** engines restart requests on worker failure; connectors track pending sends/receives.
+**Mapping:** `QueryWrite` by transaction id resolves `OutcomeUnknown` (section 14); transaction metadata is retained for the session lifetime.
+**Edge cases:** duplicate commit returns the same receipt; `NotFound` after session loss is not proof of anything (why item 24 is excluded).
+**Status holds:** solved.
+
+### 24. Cross-session transaction recovery
+
+**Engines:** both handle this out-of-band (bootstrap re-issue, request retry) rather than in the cache layer.
+**Mapping:** deliberately excluded (section 25); reconnect and fencing remain an open question (26.4).
+**Status holds:** intentional.
+
+### 25. Automatic prefix caching in the serving loop
+
+**Engines:** vLLM's scheduler consults the block hash map every step; SGLang's `lpm`/`dfs-weight` policies pre-match the waiting queue and touch matched nodes to keep LRU fresh, switching policies on queue state.
+**Mapping:** the adapter calls lookup before admission (section 20); scheduling policy itself is out of scope by design principle 5.
+**Edge cases:** pre-touching affects eviction recency — the provider sees lookups, so hits double as recency signals (a provider policy choice).
+**Status holds:** engine-side; scheduler does not consult providers yet.
+
+### 26. Storage ownership bridge into engine allocations
+
+**Mapping:** `KvCacheBridge` imports owned `Storage`, binds per-layer K/V tensors, publishes prompt KV block-by-block, and resumes on hits; unit-tested, serving loop pending (extensions doc).
+**Edge cases:** borrowed storage is rejected — allocation ownership must be retained across regions and transfers (section 10).
+**Status holds:** solved at unit level, engine-side wiring.
+
+### 27. CUDA-graph-stable decode over provider-loaded blocks
+
+**Engines:** vLLM marks connectors that require piecewise capture (`requires_piecewise_for_cudagraph`); SGLang captures graphs over its static pools.
+**Mapping:** loads target engine-owned, graph-stable addresses; the provider only ever sees imported regions.
+**Edge cases:** loads overlapping captured compute need piecewise capture — an engine decision the ABI does not influence.
+**Status holds:** engine-side.
+
+### 28. Concurrent writers of the same prefix (dedup/attach)
+
+**Engines:** SGLang's in-process radix insert naturally dedups concurrent identical prefixes; nothing dedups across processes.
+**Mapping:** second `begin_write` gets `Conflict`; the committed-dedup fast path (section 11) only helps after publication. No attach-to-in-flight or subscribe-on-publish exists.
+**Edge cases:** a single-process scheduler can serialize writers itself; distributed deployments cannot.
+**Status holds:** gap, confirmed by both engines' behavior.
+
+### 29. In-flight write coalescing across processes
+
+Same deficiency as item 28 at multiprocess scope: no subscriber can wait on another process's open transaction.
+**Status holds:** gap.
+
+### 30. Cross-block-size reuse
+
+**Engines:** vLLM re-views hash chains at coarser group block sizes (`BlockHashListWithBlockSize`); SGLang page-truncates keys.
+**Mapping:** token-level prefix identity is size-independent, but publication units are not re-blockable: a 16-token provider cannot serve a 32-token consumer.
+**Status holds:** gap (section 28 item 2).
+
+### 31. Recurrent/linear-attention state beyond checkpoint granularity
+
+**Engines:** vLLM `MambaSpec` "align" mode checkpoints state only at block boundaries; SGLang `MambaPool` keeps state slots with a checkpoint pool and ping-pong decode slots.
+**Mapping:** recurrent state rides as an opaque component at block boundaries, but the dependency-digest chain assumes prefix structure, so finer-grained reuse is undefined.
+**Edge cases:** inserting an unfinished request's state would fork it — SGLang asserts against exactly that.
+**Status holds:** gap (section 28 item 3).
+
+### 32. TP with one shared remote provider, consistent multi-rank lookup
+
+**Engines:** vLLM aggregates connector output at rank 0; SGLang reaches min-consensus for storage prefetch.
+**Mapping:** each rank holds its own session; ranks can disagree on hits and nothing publishes atomically across partitions; rank-0-decides is the adapter approximation.
+**Status holds:** gap (tracked, 26.3).
+
+### 33. Elastic resharding / rebalancing between ranks
+
+**Mapping:** v1 requires exact logical-partition match; redistribution would be an extension.
+**Status holds:** gap (tracked, 26.7).
+
+### 34. Entry expiry (TTL) requested by the consumer
+
+**Engines:** neither engine exposes consumer-requested TTL over a shared cache; SGLang's T-LRU is recency-based, not time-based.
+**Mapping:** pins are the only lifetime control; no expiry hint exists.
+**Status holds:** gap.
+
+### 35. Eviction priority or cost hints beyond pinning
+
+**Engines:** SGLang ships pluggable eviction policies including per-request `priority` ordering, T-LRU, and SLRU; vLLM uses LRU free lists with tail-first ordering.
+**Mapping:** not expressible — the ABI carries no priority or cost signals; engines that need them keep the policy engine-side.
+**Status holds:** gap.
+
+### 36. Hit-rate and byte metrics through the ABI
+
+**Engines:** vLLM `PrefixCacheStats` and per-`CacheHitSource` counters; SGLang Prometheus hit-rate gauges.
+**Mapping:** the `kvc.stats` extension exposes lifetime counters (lookups, hits, blocks, bytes, tier movement) — both bundled providers implement it.
+**Edge cases:** per-request and per-source splits (device/host/p2p/disk) are adapter-computed, not provider-reported.
+**Status holds:** solved for single sessions.
+
+### 37. Administrative enumeration and inspection of stored state
+
+**Engines:** SGLang exposes hicache storage attach/detach/list endpoints and `/flush_cache`; vLLM exposes `reset_prefix_cache`.
+**Mapping:** `remove` works per exact digest only; there is no enumeration, bulk clear, or namespace reset (section 28 item 9).
+**Status holds:** gap.
+
+### 38. Cross-format reuse (FP8 producer, BF16 consumer)
+
+**Engines:** SGLang storage format tags make mismatched pages miss rather than load corrupt.
+**Mapping:** excluded deliberately (section 25); block compatibility embeds format, so a mismatched load is a miss by construction, never a corrupt load.
+**Status holds:** intentional.
+
+### 39. Native GPU stream/event interop for readiness
+
+**Mapping:** portable host-visible fences only; native synchronization is an extension (26.5, section 28 item 8).
+**Status holds:** intentional.
+
+### 40. Zero-copy provider-to-provider transfer
+
+**Mapping:** mapping from session A cannot feed a store into session B; no region-grant or peer-transfer path exists (section 28 item 1).
+**Edge cases:** disaggregated prefill-to-decode between two different provider implementations costs an engine-mediated staging copy today.
+**Status holds:** gap.
+
+### 41. Copy-on-write extension of shared or partial tail blocks
+
+**Engines:** vLLM `_apply_cow` copies a shared block when `n>1` parallel sampling children diverge; SGLang beam groups share prefixes the same way.
+**Mapping:** provider blocks are immutable, so extension never mutates anything: the shared prefix stays a pinned read or a committed block, and the diverging tail is new private state with a new identity (section 8). COW of engine pages remains engine-side by rule 5.
+**Edge cases:** a partial last block shared between cache and local writes is either republished as a longer block or kept private; vLLM truncates the local sub-block tail when a remote hit exceeds it, precisely to avoid COW racing an async load.
+**Status holds:** engine-side; immutability removes COW from the ABI entirely.
+
+### 42. Preemption: recompute path
+
+**Engines:** vLLM V1 preempts by recompute only — free blocks, reset computed tokens, requeue; requests with pending connector transfers are skipped as victims, and a waiting queue for block-holders drains first. SGLang `retract_decode` keeps at least one request, aborts beam groups rather than retracting them, and evicts tree tokens immediately.
+**Mapping:** abort or abandon affected transactions and release read references before pages are reused (section 14); recomputation naturally republishes identical keys, which the committed-dedup fast path absorbs (section 11).
+**Edge cases:** deferred block frees under async scheduling; in-flight output tokens delivered but not yet counted.
+**Status holds:** solved (abort semantics); engine-side loop.
+
+### 43. Preemption swap / decode retraction with host backup
+
+**Engines:** vLLM V0 CPU-swap preemption is gone in V1; the live precedent is SGLang's retraction backup (`cpu_tensor` or `host_pool`, else abort) with resume reloading from host.
+**Mapping:** store rows to host-destination bindings before freeing device pages, then `load` them back on resume — a host-tier round trip the CUDA provider already performs for its own tiers.
+**Edge cases:** host exhaustion aborts the request; pure-SWA and Mamba state are unsupported in SGLang's backup today.
+**Status holds:** designed; engine-side.
+
+### 44. Chunked prefill, partial-block publication, prefix-invariant chunking
+
+**Engines:** vLLM stops chunks at block boundaries ("a refused junction costs a forward pass"), fences frees on processed tokens, reserves blocks for async loads, and gates admission on the whole sequence fitting; SGLang checks truncation alignment against chunk size (a mis-set alignment starves long prompts forever) and offers mixed chunks.
+**Mapping:** only completed blocks publish; the partial tail stays private to the running request (section 8); the adapter plans resume at chunk boundaries through candidates.
+**Edge cases:** prefix-invariant versus prefix-aware chunking — non-causal local attention (Prefix-LM) breaks prefix invariance, and both engines disable caching/chunking there; the adapter must likewise never publish non-causal segments.
+**Status holds:** designed; engine-side publication policy.
+
+### 45. Speculative decoding: draft KV, verification, rollback
+
+**Engines:** vLLM gives EAGLE groups their own flag, never caches draft tokens, and counts only verified tokens as computed; SGLang shares one radix tree between draft and target through a bigram key view, keeps K-only draft pools, and ping-pongs Mamba state slots.
+**Mapping:** draft KV lives in unpublished private transactions or a separate group; the verified suffix publishes only after verification; discarding wrong drafts is transaction abandonment (section 14).
+**Edge cases:** draft and target key spaces must never collide — separate groups or namespaces; look-ahead token slots must not leak into published extents.
+**Status holds:** designed; engine-side.
+
+### 46. Hybrid multi-group hit reconciliation
+
+**Engines:** vLLM's hybrid manager shrinks candidate lengths iteratively to a fixed point and returns the uncached common-prefix junction to pin; SGLang's `best_match_node` truncates to the minimum across FULL, SWA, and MAMBA component validators.
+**Mapping:** one candidate's `required` ranges span catalog records of several groups; lookup returns the longest candidate whose complete multi-group requirement is satisfied (section 9).
+**Edge cases:** divergent per-type hit lengths must shrink to a common boundary; junction tokens are recomputed; more than two attention types participate in the same loop.
+**Status holds:** designed.
+
+### 47. Cross-layer shared KV payload
+
+**Engines:** vLLM `kv_sharing` lets sharing layers alias KV-source-layer tensors — the manager allocates only for source layers, and a fast-prefill mode skips computing readers; SGLang has adjacent K-only pools.
+**Mapping:** the group lists only KV-source layers (section 6); reader-layer aliasing is an engine mapping concern that never appears in bindings or manifests, so identity and transfer stay per source layer.
+**Edge cases:** publication covers only source layers — reader layers contribute no stores and no coverage obligations.
+**Status holds:** designed; engine-side reader mapping.
+
+### 48. Zero-KV, encoder-only, attention-free layers
+
+**Engines:** vLLM `EncoderOnlyAttentionSpec` reports zero memory usage; attention-free models run a coordinator with no prefix cache at all.
+**Mapping:** layers without reusable state belong to no group; a model whose layers all lack state configures zero groups and never opens transactions.
+**Edge cases:** none — vacuous by construction.
+**Status holds:** designed (vacuously).
+
+### 49. Encoder-output cache with cross-request sharing
+
+**Engines:** vLLM `EncoderCacheManager` keys encoder outputs by mm hash, shares them across requests, frees them per step and on preemption; SGLang `MultimodalCache` (LRU) and paged embedding offload, with a mooncake-backed cross-encoder cache for disaggregation.
+**Mapping:** encoder outputs ride as a hidden-state or opaque group whose dependency digest covers the complete source identity (sections 5, 8); per-item eviction is `remove`; sharing is ordinary key identity.
+**Edge cases:** encoder compute budget scheduling is engine-side; read of a corrupt external copy falls back to re-encoding (vLLM's cross-encoder-cache behavior), consistent with retaining failure information rather than converting it to a miss (section 17).
+**Status holds:** designed.
+
+### 50. Multimodal placeholder identity
+
+**Engines:** vLLM hashes `("mm", identifier, offset_in_block)` into the block hash for every block containing placeholders, and hashes prompt embeddings per block; SGLang keys the mm cache by combined and per-item hashes.
+**Mapping:** placeholders are auxiliary-input digests at their token positions, and the position inside the chain keeps the same item at different offsets distinct (section 8).
+**Edge cases:** prompt-embedding inputs (`prompt_embeds`) are the same mechanism — digest the embeddings into `auxiliary_input`.
+**Status holds:** designed.
+
+### 51. Per-request cache salt
+
+**Engines:** vLLM adds `("cache_salt", salt)` to the first block's hash to defeat cross-tenant timing side channels; SGLang carries `cache_salt` inside the radix key namespace.
+**Mapping:** salt extends `invariant_context`, invalidating identity from the seed (section 8) — strictly stronger than vLLM's block-0 key, with the same sharing consequence.
+**Edge cases:** p2p sharing handshakes must agree on the empty-prefix seed; deterministic encoding makes salted prefixes share nothing across tenants, which is the point.
+**Status holds:** designed.
+
+### 52. Request-scoped LoRA selection
+
+**Engines:** vLLM adds `("lora", name, path)` to every block of a LoRA request — the path so rebinding a name invalidates; SGLang isolates adapters through the radix `extra_key`.
+**Mapping:** the session fingerprint pins the negotiated adapter set (`active_adapters`, section 7); which adapter a request selected is input identity, not model identity.
+**Edge cases:** include enough of the adapter binding (weights digest or path) that renaming or rebinding invalidates.
+**Status holds:** designed.
+
+### 53. Load-failure policy and corrupt-block eviction
+
+**Engines:** vLLM `kv_load_failure_policy` picks recompute-versus-reject; failed receives are reported per block, evicted, and the span re-zeroed; the cross-encoder cache falls back to encode on read error.
+**Mapping:** a failed load keeps its failure status — never converted to a miss (section 17); the adapter then removes the corrupted key and recomputes or rejects per policy; destination validity after failure follows section 12.
+**Edge cases:** partial success is not exposed, so the whole loaded destination is invalid until overwritten; engine re-zeroing is item 67.
+**Status holds:** designed; engine-side policy.
+
+### 54. Publication event feed for cache-aware routers
+
+**Engines:** vLLM `KVEventsConfig` publishes BlockStored/BlockRemoved/AllBlocksCleared events over ZMQ with a replay endpoint — the production-stack router's input; SGLang `kv-events` feeds `sgl-kv-indexer` for its `cache_aware` routing.
+**Mapping:** the ABI has only polled `kvc.stats` counters; no push or buffered feed exists. Callbacks are excluded (section 25), but a polling-buffered event extension fits the model.
+**Edge cases:** event replay after router restart; per-group and per-namespace filtering.
+**Status holds:** gap (section 28 item 11).
+
+### 55. Session-affinity retention
+
+**Engines:** SGLang session radix cache keeps soft per-session references — evictable under pressure, preferred per component, released on close but still reusable; vLLM tags events with `session_id`.
+**Mapping:** pins are hard and lookup-scoped only; a soft retention preference (evict last, not never) is not expressible.
+**Edge cases:** soft references must decay or close explicitly, or they quietly become pins.
+**Status holds:** gap, adjacent to items 34–35.
+
+### 56. Pluggable eviction policies
+
+**Engines:** SGLang ships lru, lfu, fifo, mru, filo, per-request `priority`, T-LRU, and SLRU; vLLM uses LRU free lists with tail-first ordering and LIFO reuse for locality.
+**Mapping:** eviction policy is provider-internal by design (section 25); the ABI is deliberately silent, and engines keep policy where it belongs.
+**Edge cases:** none at the ABI level — but priority inputs to those policies are item 35's gap.
+**Status holds:** intentional.
+
+### 57. Tiering policies and runtime storage attach/detach
+
+**Engines:** SGLang HiCache selects write-back / write-through / write-through-selective, buffer-only host mode, host layouts, and attaches/detaches L3 storage backends at runtime over HTTP; vLLM OffloadingConnector configures tier chains (fs, object store, p2p), eviction (lru/arc), store thresholds, prompt-only offload, and per-request load/offload caps.
+**Mapping:** all policies are provider-internal — `kvc.cuda` implements one fixed LRU write-back pair. Per-request load/offload limits are adapter planning over candidate lengths. Runtime attach/detach conflicts with once-per-session `Configure` and is inexpressible (section 28 item 9).
+**Edge cases:** write-back must not drop a subtree whose backup failed; unbacked evictions tracked under write-through.
+**Status holds:** tiering designed (provider-internal); runtime attach/detach gap.
+
+### 58. Decode-side prefix cache in P/D
+
+**Engines:** SGLang `--disaggregation-decode-enable-radix-cache` caches received prefixes on decode workers to avoid re-transfer for repeated prompts.
+**Mapping:** identical to item 25 on the decode role — the decode worker's adapter publishes what it loads.
+**Edge cases:** decode-side admission must not evict entries mid-transfer (pins cover it).
+**Status holds:** engine-side.
+
+### 59. P/D admission, reservation, bootstrap, rebootstrap
+
+**Engines:** vLLM producer/consumer roles with deferred frees for pending transfers; SGLang bootstrap rooms with timeouts and failure handling, optimistic prefill attempts, early-versus-complete decode allocation (matching on both sides), reserved decode slots for in-transfer requests, and rebootstrap that re-prefills only the missing part.
+**Mapping:** Scenario C (section 22): bootstrap exchanges portable identities, never handles; reserved destinations are imported before commit visibility; rebootstrap is a lookup of the subset that actually arrived.
+**Edge cases:** bootstrap failure aborts; room reuse across retraction recovery; requests exceeding decode KV capacity are rejected, not transferred.
+**Status holds:** designed + engine-side.
+
+### 60. Retraction KV backup round trip through host tier
+
+**Engines:** SGLang `--disaggregation-decode-retraction-backup cpu_tensor|host_pool|none`, aborting with 503 when host memory is exhausted; vLLM has no V1 swap path.
+**Mapping:** store to host bindings, reclaim device pages, and reload on resume — the same movements the CUDA provider performs between tiers, exercised by `run-bench` under pressure.
+**Edge cases:** backup failure must not destroy the request's ability to recompute.
+**Status holds:** designed.
+
+### 61. Transfer integrity verification
+
+**Engines:** SGLang `--disaggregation-enable-kv-checksum` computes Adler-32 per page during P/D transfer and aborts on mismatch.
+**Mapping:** verification is provider-internal; a detected mismatch surfaces as a terminal `TransportError`/`DataLoss` and follows item 53's recovery. Note `BlockKey` hashes identity, not payload — end-to-end payload verification is a provider guarantee, not a key property.
+**Edge cases:** cross-provider verification (two implementations agreeing on a checksum) would need a negotiated extension.
+**Status holds:** designed.
+
+### 62. Role-based multi-provider composition
+
+**Engines:** vLLM `MultiConnector` loads from the first configured connector reporting a hit and saves to all of them; hybrid-manager support must hold for every child.
+**Mapping:** adapter policy over several provider sessions (section 20): try lookups in configured order, publish to all. Per-session atomicity only; cross-provider dedup does not exist.
+**Edge cases:** providers may disagree on the longest match — the adapter reconciles exactly like hybrid groups (item 46); double-store of identical keys converges via `AlreadyExists`.
+**Status holds:** designed + engine-side.
+
+### 63. Streaming-input sessions
+
+**Engines:** vLLM streaming-input sessions recompute block hashes as chunks arrive, truncating to the computed prefix; SGLang streaming sessions use virtual nodes and let a session claim its KV row without freeing.
+**Mapping:** recompute identities at each chunk boundary, look up at the new boundary, publish each newly completed block; the never-complete tail stays private until the session closes.
+**Edge cases:** a multimodal item arriving in a later chunk changes earlier auxiliary digests only where it actually lands — the per-token chain keeps unaffected blocks reusable.
+**Status holds:** designed + engine-side.
+
+### 64. Fine-grained sub-block boundaries and last-token recompute
+
+**Engines:** vLLM caps hits at `num_tokens − 1` (logits need the last token), separates hash granularity from scheduler block size (`--prefix-match-unit`), and registers partial-block boundaries inside a full block; SGLang truncates keys at page size.
+**Mapping:** the n−1 rule and granularity choice are adapter planning — candidates simply stop at the right boundary. Sub-block resume points are not expressible: publication is whole-block, so a provider cannot serve a boundary inside its `tokens_per_block`.
+**Edge cases:** fine-grained hashing raises metadata cost; engines judged the tradeoff worth it for short prompts.
+**Status holds:** gap for sub-block reuse (section 28 item 10); boundary rules are adapter-side.
+
+### 65. Position-sharded (DCP) partitions
+
+**Engines:** vLLM decode-context-parallel shards token positions across ranks with scaled block sizes; SGLang packs DeepSeek context-parallel transfers (`dcp_pack`).
+**Mapping:** canonical tensor-slice partition descriptors express which positions a shard owns (section 7); v1 requires exact partition match, so cross-shape reuse is item 33.
+**Edge cases:** SWA under DCP is unsupported upstream; shards must agree on the partition set.
+**Status holds:** designed.
+
+### 66. TP-replicated KV and replica publication dedup
+
+**Engines:** vLLM `kv_tp_replicas` holds identical KV on consecutive TP ranks (MLA is TP-replicated); SGLang dedups host write-back by letting a single rank write the tier.
+**Mapping:** replicated ranks compute identical partitions and therefore identical keys — identity just works. Simultaneous publication from N sessions produces Conflict/AlreadyExists storms that the dedup fast path eventually resolves, wastefully.
+**Edge cases:** elect one publishing rank, or accept retry convergence; nothing in the ABI coordinates the election.
+**Status holds:** designed; dedup policy gap (section 28 item 12).
+
+### 67. Destination zeroing and in-flight write protection
+
+**Engines:** vLLM zeroes reused blocks for Mamba and mixed-precision KV (`needs_kv_cache_zeroing`) and excludes groups an async connector load is about to write from concurrent zeroing (`skip_zeroing_group_ids`); failed loads re-zero their span.
+**Mapping:** engine-side; the provider contract that matters is section 12's — after any failed or cancelled load the destination is invalid until overwritten, and terminal status means the transfer no longer touches the buffer. The adapter orders zeroing before submission and consumes only after a successful wait (section 15).
+**Edge cases:** stale-block reads after rejected spec tokens are fenced by processed-token accounting, engine-side.
+**Status holds:** engine-side.
+
+### 68. Derived-state caches: index keys, compressor and sink state
+
+**Engines:** vLLM IndexCache reuses DeepSeek sparse-attention top-k indices across layers; its circular-buffer compressor state is per-request and explicitly not prefix-cacheable; SGLang maintains DSA index-key caches and compression-tail buffers alongside the latent pool.
+**Mapping:** derived state rides as schema-defined components with schema-defined dependency rules (sections 5, 8). Replayable state (index keys) chains on its own dependency rule and can publish; non-replayable state (per-request scratch, compressor rings) is simply never published.
+**Edge cases:** index-state validity depends on the retrieval pattern that produced it — publish only under the conservative rule the schema defines.
+**Status holds:** designed.
