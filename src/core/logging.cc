@@ -42,18 +42,6 @@ Status WithContext(const Status& status, std::string_view context) {
   return InvalidArgumentError(absl::StrCat(context, ": ", status.message()));
 }
 
-absl::LogSeverityAtLeast ToAbslSeverity(LogLevel level) {
-  switch (level) {
-    case LogLevel::kInfo:
-      return absl::LogSeverityAtLeast::kInfo;
-    case LogLevel::kWarning:
-      return absl::LogSeverityAtLeast::kWarning;
-    case LogLevel::kError:
-      return absl::LogSeverityAtLeast::kError;
-  }
-  return absl::LogSeverityAtLeast::kInfo;
-}
-
 StatusOr<int> ParseVerbosity(std::string_view text) {
   int value = 0;
   if (!absl::SimpleAtoi(text, &value) || value < 0) {
@@ -68,7 +56,7 @@ StatusOr<int> ParseVerbosity(std::string_view text) {
 /// Applies one key of the `logging:` section to `config`.
 Status ApplyYamlKey(const std::string& key, const YAML::Node& value, LoggingConfig* config) {
   if (key == "level") {
-    StatusOr<LogLevel> level = ParseLogLevel(value.Scalar());
+    StatusOr<absl::LogSeverityAtLeast> level = ParseLogLevel(value.Scalar());
     if (!level.ok()) return level.status();
     config->min_level = *level;
     return OkStatus();
@@ -156,6 +144,9 @@ class FileLogSink final : public absl::LogSink {
 };
 
 Status ValidateConfig(const LoggingConfig& config) {
+  if (config.min_level > absl::LogSeverityAtLeast::kError) {
+    return InvalidArgumentError("min_level must be kInfo, kWarning, or kError");
+  }
   if (config.vlog_verbosity < 0) {
     return InvalidArgumentError("vlog_verbosity must be >= 0");
   }
@@ -173,10 +164,10 @@ bool g_initialized = false;
 
 }  // namespace
 
-StatusOr<LogLevel> ParseLogLevel(std::string_view name) {
-  if (name == "info") return LogLevel::kInfo;
-  if (name == "warning") return LogLevel::kWarning;
-  if (name == "error") return LogLevel::kError;
+StatusOr<absl::LogSeverityAtLeast> ParseLogLevel(std::string_view name) {
+  if (name == "info") return absl::LogSeverityAtLeast::kInfo;
+  if (name == "warning") return absl::LogSeverityAtLeast::kWarning;
+  if (name == "error") return absl::LogSeverityAtLeast::kError;
   return InvalidArgumentError(
       absl::StrCat("invalid log level '", name, "' (expected info, warning, or error)"));
 }
@@ -190,7 +181,7 @@ StatusOr<LoggingConfig> LoggingConfigFromEnvironment() {
   }
 
   if (const std::optional<std::string> value = GetEnv(kLogLevelEnv)) {
-    StatusOr<LogLevel> level = ParseLogLevel(*value);
+    StatusOr<absl::LogSeverityAtLeast> level = ParseLogLevel(*value);
     if (!level.ok()) return WithContext(level.status(), kLogLevelEnv);
     config.min_level = *level;
   }
@@ -229,9 +220,8 @@ Status InitializeLogging(const LoggingConfig& config) {
   // Abseil's stderr threshold defaults to ERROR, so it is set explicitly to
   // make min_level mean "what you see". VLOG messages are emitted at INFO
   // severity, so min_level above info also hides them.
-  const absl::LogSeverityAtLeast severity = ToAbslSeverity(config.min_level);
-  absl::SetMinLogLevel(severity);
-  absl::SetStderrThreshold(severity);
+  absl::SetMinLogLevel(config.min_level);
+  absl::SetStderrThreshold(config.min_level);
 
   absl::SetGlobalVLogLevel(config.vlog_verbosity);
   for (const auto& [pattern, verbosity] : config.vlog_modules) {

@@ -10,6 +10,7 @@
 #include "cli/error.h"
 #include "inferx/config/model_config.h"
 #include "inferx/core/device.h"
+#include "inferx/core/device_runtime.h"
 
 namespace inferx::cli {
 
@@ -43,9 +44,9 @@ struct ModelConfigArgs {
         ->capture_default_str();
     // The choice set is the compile-time capability: a build without the
     // CUDA runtime cannot honor "cuda", so it is not offered.
-    std::set<std::string> device_types = {"cpu"};
-    if (kCudaBuilt) device_types.insert("cuda");
-    g->add_option("--device", config.device.device_type, "Device type")
+    std::set<std::string> device_types = {"cpu", "auto"};
+    if (ProviderFor(DeviceType::kCuda).ok()) device_types.insert("cuda");
+    g->add_option("--device", config.device.device, "Device type")
         ->type_name("TYPE")
         ->capture_default_str()
         ->check(CLI::IsMember(device_types));

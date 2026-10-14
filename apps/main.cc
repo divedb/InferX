@@ -6,7 +6,8 @@
 int main(int argc, char** argv) {
   // Thresholds from INFERX_LOG_LEVEL / INFERX_VLOG; the env-derived config
   // is always valid, so this only fails on direct misuse.
-  if (!inferx::core::InitializeLogging(inferx::core::LoggingConfigFromEnv()).ok()) {
+  auto logging = inferx::core::LoggingConfigFromEnvironment();
+  if (!logging.ok() || !inferx::core::InitializeLogging(*logging).ok()) {
     std::fprintf(stderr, "inferx: logging left at Abseil defaults\n");
   }
 

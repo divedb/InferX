@@ -42,7 +42,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
                               bool capture_logits) {
   ModelConfig model;
   model.model_dir = "models/Qwen3-0.6B";
-  model.device.device_type = "cuda";
+  model.device.device = "cuda";
 
   CacheConfig cache;
   cache.block_size = 16;
@@ -82,7 +82,7 @@ StatusOr<uint16_t> LogitBits(const Tensor& logits, int64_t row, int64_t vocab_en
   }
   uint16_t bits = 0;
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime* runtime, RuntimeFor(logits.GetDevice()));
-  INFERX_RETURN_IF_ERROR(runtime->Copy(
+  INFERX_RETURN_IF_ERROR(runtime->Memory().Copy(
       &bits, static_cast<const std::byte*>(logits.Data()) +
                  (row * logits.Dim(1) + vocab_entry) * 2,
       sizeof(bits), CopyKind::kDeviceToHost));

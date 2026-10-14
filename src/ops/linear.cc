@@ -36,7 +36,7 @@ Status Linear(OpContext& ctx, const Tensor& x, const Tensor& weight, Tensor& out
                                 device.ToString());
   }
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return ProfileCall(ctx, "linear", [&] { return cuda::Linear(ctx, x, weight, out); });
     default:
       return UnimplementedError("Linear has no implementation for device ", device.ToString());

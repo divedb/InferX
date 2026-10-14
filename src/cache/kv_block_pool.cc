@@ -51,6 +51,7 @@ StatusOr<KvBlockPool> KvBlockPool::Create(int64_t num_layers, int64_t num_blocks
   // Descending, so that popping from the back hands out block 0 first. Only
   // cosmetic, but it makes a fresh pool's allocations readable in a dump.
   pool.free_list_.resize(static_cast<size_t>(num_blocks));
+  pool.in_use_.assign(static_cast<size_t>(num_blocks), 0);
   for (int64_t i = 0; i < num_blocks; ++i) {
     pool.free_list_[static_cast<size_t>(i)] = static_cast<int32_t>(num_blocks - 1 - i);
   }
@@ -99,6 +100,7 @@ StatusOr<int32_t> KvBlockPool::AllocateBlock() {
 
   const int32_t block = free_list_.back();
   free_list_.pop_back();
+  in_use_[static_cast<size_t>(block)] = 1;
 
   return block;
 }
@@ -108,15 +110,14 @@ Status KvBlockPool::FreeBlock(int32_t block) {
     return InvalidArgumentError("block ", block, " is outside [0, ", num_blocks_, ")");
   }
 
-  // Linear, and deliberately so: the free list is at most `num_blocks` long and
-  // this only runs when a sequence finishes, not per step. Catching a double
-  // free is worth far more here than the scan costs -- the failure it prevents
-  // is two sequences writing to the same KV block, which surfaces as garbled
-  // output from an unrelated request.
-  if (std::find(free_list_.begin(), free_list_.end(), block) != free_list_.end()) {
+  // O(1) through the in-use side table. Catching a double free is worth any
+  // cost here -- the failure it prevents is two sequences writing to the same
+  // KV block, which surfaces as garbled output from an unrelated request.
+  if (!in_use_[static_cast<size_t>(block)]) {
     return InvalidArgumentError("block ", block, " is already free");
   }
 
+  in_use_[static_cast<size_t>(block)] = 0;
   free_list_.push_back(block);
   return OkStatus();
 }

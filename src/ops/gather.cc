@@ -35,7 +35,7 @@ Status GatherRows(OpContext& ctx, const Tensor& src, const Tensor& indices,
     return InvalidArgumentError("GatherRows src exceeds 32-bit kernel extents");
   }
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::GatherRows(ctx, src, indices, out);
     default:
       return UnimplementedError("GatherRows has no implementation for device ",
@@ -63,7 +63,7 @@ Status GatherRowsRange(OpContext& ctx, const Tensor& src, const Tensor& indices,
                                 device.ToString());
   }
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::GatherRowsRange(ctx, src, indices, out, row_begin);
     default:
       return UnimplementedError("GatherRowsRange has no implementation for device ",
@@ -85,7 +85,7 @@ Status CopyColumnBlock(OpContext& ctx, const Tensor& src, Tensor& dst,
                                 device.ToString());
   }
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::CopyColumnBlock(ctx, src, dst, col_begin);
     default:
       return UnimplementedError("CopyColumnBlock has no implementation for device ",

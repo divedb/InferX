@@ -5,6 +5,8 @@ namespace inferx {
 
 /// \brief Tuning knobs of the scheduling policy.
 struct SchedulerConfig {
+  enum class Policy { kFCFS, kPriority, kFair, kWeightedFair };
+
   /// Token budget per step, across all scheduled requests.
   /// EXAMPLE: --max-num-batched-tokens 8192
   int max_num_batched_tokens = 4096;
@@ -20,7 +22,11 @@ struct SchedulerConfig {
   /// Whether a long prompt may be split across steps within the token budget. If false, a
   /// request with a prompt longer than the token budget is rejected.
   /// EXAMPLE: --no-enable-chunked-prefill
-  bool chunked_prefill = true;
+  bool enable_chunked_prefill = true;
+
+  Policy policy = Policy::kFCFS;
+
+  int64_t long_prefill_token_threshold = 0;
 };
 
 }  // namespace inferx

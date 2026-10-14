@@ -24,13 +24,12 @@ Status LoadWeightMapInto(Model& model, WeightMap& weights,
   const Device device = model.GetModelSpec().device;
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime* runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->Activate());
-  INFERX_ASSIGN_OR_RETURN(DeviceStream stream, runtime->CreateStream());
-  const Status loaded = LoadWeightsInto(checkpoint, weights, *runtime, stream);
-  const Status synced = runtime->SynchronizeStream(stream);
-  const Status destroyed = runtime->DestroyStream(stream);
+  auto stream = runtime->Streams().CreateStream(StreamPriority::kNormal);
+  INFERX_RETURN_IF_ERROR(stream.status());
+  const Status loaded = LoadWeightsInto(checkpoint, weights, *runtime, stream->Get());
+  const Status synced = runtime->Streams().SynchronizeStream(stream->Get());
   INFERX_RETURN_IF_ERROR(loaded);
-  INFERX_RETURN_IF_ERROR(synced);
-  return destroyed;
+  return synced;
 }
 
 Status LoadModelWeights(Model& model, CheckpointReader& checkpoint) {
@@ -48,16 +47,16 @@ Status FillModelWeightsWithZeros(Model& model) {
   const Device device = model.GetModelSpec().device;
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime* runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->Activate());
-  INFERX_ASSIGN_OR_RETURN(DeviceStream stream, runtime->CreateStream());
+  auto stream = runtime->Streams().CreateStream(StreamPriority::kNormal);
+  INFERX_RETURN_IF_ERROR(stream.status());
   for (const auto& [name, binding] : weights.Bindings()) {
     (void)name;
     if (binding.dest != nullptr && !binding.dest->IsEmpty()) {
-      INFERX_RETURN_IF_ERROR(
-          runtime->MemsetAsync(binding.dest->Data(), binding.dest->NBytes(), stream));
+      INFERX_RETURN_IF_ERROR(runtime->Memory().MemsetAsync(
+          binding.dest->Data(), uint8_t{0}, binding.dest->NBytes(), stream->Get()));
     }
   }
-  INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
-  return runtime->DestroyStream(stream);
+  return runtime->Streams().SynchronizeStream(stream->Get());
 }
 
 }  // namespace models

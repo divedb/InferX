@@ -39,6 +39,7 @@ inferx_add_library(
     llama/llama_causal_lm.cc
   DEPS
     inferx::core
+    inferx::config
     inferx::ops
     inferx::cache
     inferx::comm

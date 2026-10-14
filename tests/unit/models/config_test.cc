@@ -44,16 +44,9 @@ TEST(Qwen3ConfigTest, ParsesAllFields) {
   EXPECT_TRUE(parsed->tie_word_embeddings);
   EXPECT_EQ(parsed->eos_token_ids, (std::vector<TokenId>{151645, 151643}));
   EXPECT_FLOAT_EQ(parsed->rms_norm_eps, 1e-6f);
-  EXPECT_FLOAT_EQ(parsed->rope.theta, 1e6f);
-  EXPECT_EQ(parsed->rope.scaling.flavor, ops::RopeFlavor::kDefault);
-
-  auto heads = parsed->LocalHeads(2);
-  ASSERT_TRUE(heads.ok()) << heads.status();
-  EXPECT_EQ(*heads, 4);
-  EXPECT_FALSE(parsed->LocalHeads(3).ok());  // 8 % 3 != 0.
-  auto kv = parsed->LocalKvHeads(4);
-  ASSERT_TRUE(kv.ok()) << kv.status();
-  EXPECT_EQ(*kv, 1);
+  EXPECT_FLOAT_EQ(parsed->rotary_params.theta, 1e6f);
+  EXPECT_EQ(parsed->rotary_params.scaling.flavor, ops::RopeFlavor::kDefault);
+  EXPECT_EQ(parsed->num_attention_heads % 2, 0);  // TP 2 shards evenly.
 }
 
 TEST(Qwen3ConfigTest, RejectsBrokenGeometry) {

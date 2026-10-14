@@ -32,9 +32,8 @@ namespace models {
 /// live in the model; everything request-specific lives here.
 class ForwardContext {
  public:
-  ForwardContext(ops::OpContext& op, const AttentionMetadata& attn,
-                 const KvBlockPool& kv, CommBackend& comm, Allocator& scratch,
-                 ops::AttentionPlanWorkspace& plan)
+  ForwardContext(ops::OpContext& op, const AttentionMetadata& attn, const KvBlockPool& kv,
+                 CommBackend& comm, Allocator& scratch, ops::AttentionPlanWorkspace& plan)
       : op(op), attn(attn), kv(kv), comm(comm), scratch(scratch), plan(plan) {}
 
   /// Device, stream, and runtime the step executes on.
@@ -103,9 +102,9 @@ class Model {
   /// \brief Runs the stack: embed (or take `inputs.input_embeds`), decode
   ///        layers, final norm.
   ///
-  /// \param ctx     The step's execution context.
-  /// \param inputs  Tokens and positions for this step.
-  /// \param hidden  [num_tokens, hidden_size] final-norm activations.
+  /// \param ctx    The step's execution context.
+  /// \param inputs Tokens and positions for this step.
+  /// \param hidden [num_tokens, hidden_size] final-norm activations.
   virtual Status Forward(ForwardContext& ctx, const StepInputs& inputs,
                          Tensor& hidden) const = 0;
 
@@ -115,9 +114,8 @@ class Model {
   /// \param rows    [sample_rows] int32 token-stream rows whose logits are
   ///                needed (one per sequence: its last new token).
   /// \param logits  [sample_rows, vocab] output, allocated by the caller.
-  virtual Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden,
-                               const Tensor& rows, Tensor& logits) const = 0;
-
+  virtual Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden, const Tensor& rows,
+                               Tensor& logits) const = 0;
 };
 
 /// \brief Stages one binding map into the model's tensors.

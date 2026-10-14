@@ -63,7 +63,8 @@ TEST(EngineArgsTest, ParsesTensorParallelDevicesAndTopology) {
   CLI::App app{"test"};
   model.AddOptions(app);
   engine.AddOptions(app);
-  Parse(app, {"--tensor-parallel-size", "2", "--device-ids", "0,1"});
+  Parse(app, {"--tensor-parallel-size", "2", "--device", "cuda",
+              "--device-ids", "0,1"});
   EXPECT_EQ(engine.BuildParallelConfig().tensor_parallel_size, 2);
   EXPECT_EQ(engine.BuildParallelConfig().tensor_parallel_rank, 0);
   EXPECT_EQ(model.Build().device.device_ids, (std::vector<int>{0, 1}));
@@ -85,7 +86,7 @@ TEST(EngineArgsTest, ParsesVllmParityOptions) {
   EXPECT_EQ(cache.kv_cache_memory_bytes, 3758096384);
   EXPECT_EQ(execution.cudagraph_capture_sizes, (std::vector<int>{1, 2, 4}));
   EXPECT_EQ(execution.max_cudagraph_capture_size, 8);
-  EXPECT_FALSE(scheduler.chunked_prefill);
+  EXPECT_FALSE(scheduler.enable_chunked_prefill);
 }
 
 
@@ -96,7 +97,7 @@ TEST(EngineArgsTest, ChunkedPrefillDefaultsOn) {
     args.AddOptions(app);
     EXPECT_NO_THROW(Parse(app, {}));
     EXPECT_TRUE(args.chunked_prefill);
-    EXPECT_TRUE(args.BuildSchedulerConfig().chunked_prefill);
+    EXPECT_TRUE(args.BuildSchedulerConfig().enable_chunked_prefill);
   }
   {
     inferx::cli::EngineArgs args;
@@ -150,7 +151,8 @@ TEST(ModelConfigArgsTest, ParsesOptionsIntoStruct) {
   const ModelConfig built = args.Build();
   EXPECT_EQ(built.model_dir, "models/foo");
   EXPECT_EQ(built.tokenizer_dir, "tokenizers/foo");
-  EXPECT_EQ(built.device.PrimaryDevice(), Device::Cuda(0));
+  ASSERT_TRUE(built.device.Resolve().ok()) << built.device.Resolve().status();
+  EXPECT_EQ(built.device.Resolve()->front(), Device::Cuda(0));
   EXPECT_EQ(built.dtype, "float16");
   EXPECT_EQ(built.seed, 7);
   EXPECT_EQ(built.max_model_len, 2048);
@@ -167,7 +169,8 @@ TEST(ModelConfigArgsTest, DefaultsFallBackToModelDirAndName) {
   // The fallback is derived at use, not materialized: empty means "unset".
   EXPECT_TRUE(built.tokenizer_dir.empty());
   EXPECT_EQ(built.ResolvedTokenizerDir(), args.config.model_dir);
-  EXPECT_EQ(built.device.PrimaryDevice(), Device::Cuda(0));
+  ASSERT_TRUE(built.device.Resolve().ok()) << built.device.Resolve().status();
+  EXPECT_EQ(built.device.Resolve()->front(), Device::Cuda(0));
 }
 
 TEST(ModelConfigArgsTest, RejectsInvalidValues) {

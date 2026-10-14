@@ -106,7 +106,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                                 device.ToString());
   }
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::WritePagedKv(ctx, k, v, positions, batch_indices, kv_indptr, kv_indices,
                                 key_cache, value_cache, block_size);
     default:

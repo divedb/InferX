@@ -12,6 +12,10 @@
 #endif
 
 namespace inferx {
+
+std::unique_ptr<RuntimeProvider> MakeCudaProvider();
+std::unique_ptr<RuntimeProvider> MakeCpuProvider();
+
 namespace {
 
 struct Registry {
@@ -30,6 +34,8 @@ Registry& GetRegistry() {
 // Returns null when `type` is not built into this binary.
 std::unique_ptr<RuntimeProvider> MakeBuiltinProvider(DeviceType type) {
   switch (type) {
+    case DeviceType::kCpu:
+      return MakeCpuProvider();
 #ifdef INFERX_WITH_CUDA
     case DeviceType::kCuda:
       return MakeCudaProvider();

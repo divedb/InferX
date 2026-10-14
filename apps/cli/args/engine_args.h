@@ -121,7 +121,7 @@ struct EngineArgs {
     SchedulerConfig cfg;
     cfg.max_num_seqs = max_num_seqs;
     cfg.max_num_batched_tokens = max_num_batched_tokens;
-    cfg.chunked_prefill = chunked_prefill;
+    cfg.enable_chunked_prefill = chunked_prefill;
     return cfg;
   }
 

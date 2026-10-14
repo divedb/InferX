@@ -129,6 +129,7 @@ class ConfigView {
   // `convert` has the shape of the As* helpers in config_view.cc.
   template <typename T, typename Convert>
   StatusOr<T> RequireAs(std::string_view key, Convert convert) const;
+
   template <typename T, typename Convert>
   StatusOr<T> GetAs(std::string_view key, T default_value, Convert convert) const;
 

@@ -225,7 +225,7 @@ Status LoadWeightsInto(const CheckpointReader& reader, WeightMap& weights,
         ConvertRow(src_base + (span.src_row + row) * src_row_bytes, src_dtype,
                    staged.data() + row * dst_row_bytes, dst_dtype, dst_width);
       }
-      INFERX_RETURN_IF_ERROR(runtime.CopyAsync(
+      INFERX_RETURN_IF_ERROR(runtime.Memory().CopyAsync(
           dest.Bytes() + span.dst_row * static_cast<int64_t>(dst_row_bytes),
           staged.data(), staged.size(), CopyKind::kHostToDevice, stream));
     }
@@ -240,7 +240,7 @@ Status LoadWeightsInto(const CheckpointReader& reader, WeightMap& weights,
     return InvalidArgumentError("checkpoint is missing parameters: ",
                                 absl::StrJoin(missing, ", "));
   }
-  return runtime.SynchronizeStream(stream);
+  return runtime.Streams().SynchronizeStream(stream);
 }
 
 }  // namespace models

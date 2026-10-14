@@ -163,7 +163,7 @@ Status Tensor::CopyTo(Tensor& dst) const {
     std::memmove(dst.Data(), Data(), static_cast<size_t>(NBytes()));
     return OkStatus();
   }
-  if (!IsCpu() && !dst.IsCpu() && Device() != dst.GetDevice()) {
+  if (!IsCpu() && !dst.IsCpu() && GetDevice() != dst.GetDevice()) {
     return UnimplementedError("cross-device copy requires an explicit transfer");
   }
 

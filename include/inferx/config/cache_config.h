@@ -28,6 +28,14 @@ struct CacheConfig {
   /// above, which co-located ranks on one device should prefer.
   /// EXAMPLE: --gpu-memory-utilization 0.9
   float gpu_memory_utilization = 0.0f;
+
+  /// When true, the scheduler will cache the prefix KV blocks of each
+  /// sequence and re-use them across steps. When false, the scheduler will
+  /// always re-fill the KV cache from the input tokens. This is only relevant
+  /// for multi-step sequences (prefill + decode) and is ignored for pure
+  /// decode sequences. The default is true, which is the most common use case.
+  /// EXAMPLE: --enable-prefix-caching true
+  bool enable_prefix_caching = true;
 };
 
 }  // namespace inferx

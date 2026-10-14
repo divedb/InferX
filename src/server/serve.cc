@@ -101,8 +101,8 @@ class InferxDispatcher : public RequestDispatcher {
  public:
   InferxDispatcher(const ServeParams& params, EngineGateway& gateway,
                    TokenizerPool& tokenizer_pool)
-      : model_(params.model.ServedName()),
-        defaults_(params.default_sampling),
+      : model_(params.engine.model.ServedName()),
+        defaults_(params.frontend.default_sampling),
         gateway_(gateway),
         pool_(tokenizer_pool),
         created_(static_cast<std::int64_t>(std::time(nullptr))) {}
@@ -323,10 +323,16 @@ void MergeGenerationConfig(const GenerationConfig& gen,
   }
 }
 
+Status EngineConfig::Validate() const {
+  INFERX_RETURN_IF_ERROR(model.device.Validate());
+  INFERX_RETURN_IF_ERROR(parallel.Validate());
+  return OkStatus();
+}
+
 Status RunServe(const ServeParams& params) {
   return Guarded([&]() -> Status {
     const std::string tokenizer_path =
-        params.model.ResolvedTokenizerDir() + "/tokenizer.json";
+        params.engine.model.ResolvedTokenizerDir() + "/tokenizer.json";
     // Decode side only: the engine thread owns this instance exclusively;
     // prompt encoding lives in the pool's worker threads.
     auto decode_tokenizer = Take(Tokenizer::FromFile(tokenizer_path));
@@ -335,7 +341,7 @@ Status RunServe(const ServeParams& params) {
     // The pool's workers load their tokenizer instances in parallel while
     // the gateway loads weights below; the startup gate then verifies both
     // finished before any request is accepted.
-    TokenizerPoolConfig pool_config = params.tokenizer;
+    TokenizerPoolConfig pool_config = params.frontend.tokenizer;
     pool_config.tokenizer_path = tokenizer_path;
     TokenizerPool pool(io, pool_config);
 
@@ -348,16 +354,17 @@ Status RunServe(const ServeParams& params) {
     }
 
     try {
-      EngineGateway gateway(io, params.model, params.cache, params.scheduler,
-                            params.execution, decode_tokenizer, params.parallel);
+      EngineGateway gateway(io, params.engine.model, params.engine.cache,
+                            params.engine.scheduler, params.engine.execution,
+                            decode_tokenizer, params.engine.parallel);
       // Startup gate: refuse to serve rather than fall back to encoding on
       // an I/O thread (docs/tokenizer_process_pool.md).
       const Status ready = pool.WaitUntilReady(pool_config.startup_timeout);
       if (!ready.ok()) throw std::runtime_error(std::string(ready.message()));
 
       InferxDispatcher dispatcher(params, gateway, pool);
-      HttpServer server(io, params.host, static_cast<std::uint16_t>(params.port),
-                        dispatcher);
+      HttpServer server(io, params.frontend.host,
+                        static_cast<std::uint16_t>(params.frontend.port), dispatcher);
       server.Listen();
 
       // SIGINT/SIGTERM: stop accepting, reject new preprocessing, let

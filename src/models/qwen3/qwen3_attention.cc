@@ -15,8 +15,16 @@ StatusOr<Qwen3Attention> Qwen3Attention::Create(const Qwen3Config& config,
                                                 const ParallelConfig& parallel,
                                                 DataType dtype, Device device) {
   const int64_t tp = parallel.tensor_parallel_size;
-  INFERX_ASSIGN_OR_RETURN(const int64_t local_heads, config.LocalHeads(tp));
-  INFERX_ASSIGN_OR_RETURN(const int64_t local_kv_heads, config.LocalKvHeads(tp));
+  if (tp <= 0 || config.num_attention_heads % tp != 0) {
+    return InvalidArgumentError("attention heads (", config.num_attention_heads,
+                                ") must divide tensor-parallel size ", tp);
+  }
+  if (config.num_key_value_heads % tp != 0) {
+    return InvalidArgumentError("kv heads (", config.num_key_value_heads,
+                                ") must divide tensor-parallel size ", tp);
+  }
+  const int64_t local_heads = config.num_attention_heads / tp;
+  const int64_t local_kv_heads = config.num_key_value_heads / tp;
   const int64_t hidden = config.hidden_size;
   const int64_t head_dim = config.head_dim;
 
@@ -30,7 +38,7 @@ StatusOr<Qwen3Attention> Qwen3Attention::Create(const Qwen3Config& config,
   geometry.num_kv_heads = local_kv_heads;
   geometry.head_dim = head_dim;
   geometry.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-  geometry.sliding_window = config.sliding_window;
+  geometry.sliding_window = config.sliding_window.value_or(0);
   INFERX_ASSIGN_OR_RETURN(Attention core, Attention::Create(geometry));
 
   INFERX_ASSIGN_OR_RETURN(RMSNorm q_norm,
@@ -39,7 +47,7 @@ StatusOr<Qwen3Attention> Qwen3Attention::Create(const Qwen3Config& config,
                           RMSNorm::Create(head_dim, config.rms_norm_eps, dtype, device));
 
   return Qwen3Attention(std::move(qkv_proj), std::move(q_norm), std::move(k_norm),
-                        RotaryEmbedding(config.rope), std::move(o_proj), std::move(core),
+                        RotaryEmbedding(config.rotary_params), std::move(o_proj), std::move(core),
                         local_heads, local_kv_heads, head_dim, parallel.tensor_parallel_rank);
 }
 

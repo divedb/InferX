@@ -111,7 +111,7 @@ class SingleRankComm final : public CommBackend {
                           Tensor& full) override {
     INFERX_RETURN_IF_ERROR(ValidateGather(ctx, partial, full));
     if (full.Data() == partial.Data() || partial.IsEmpty()) return OkStatus();
-    return ctx.Runtime().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
+    return ctx.Runtime().Memory().CopyAsync(full.Data(), partial.Data(), partial.NBytes(),
                                    CopyKind::kDeviceToDevice, ctx.GetStream());
   }
 

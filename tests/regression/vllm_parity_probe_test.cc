@@ -99,7 +99,7 @@ class SteppingSession {
                                             Shape({static_cast<int64_t>(values.size())}),
                                             spec.device));
       if (!values.empty()) {
-        INFERX_RETURN_IF_ERROR(runtime_.CopyAsync(
+        INFERX_RETURN_IF_ERROR(runtime_.Memory().CopyAsync(
             tensor.Data(), values.data(), values.size() * sizeof(int32_t),
             CopyKind::kHostToDevice, stream_));
       }
@@ -163,13 +163,13 @@ class SteppingSession {
       return {};
     }
     std::vector<uint16_t> bits(spec.vocab_size);
-    if (auto read = runtime_.Copy(bits.data(), logits->Data(), bits.size() * 2,
+    if (auto read = runtime_.Memory().Copy(bits.data(), logits->Data(), bits.size() * 2,
                                   CopyKind::kDeviceToHost);
         !read.ok()) {
       ADD_FAILURE() << read;
       return {};
     }
-    (void)runtime_.SynchronizeStream(stream_);
+    (void)runtime_.Streams().SynchronizeStream(stream_);
     computed_ = kv_len;
     return bits;
   }
@@ -193,7 +193,10 @@ class VllmParityProbeTest : public ::testing::Test {
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     ASSERT_TRUE(runtime_->Activate().ok());
-    stream_ = *runtime_->CreateStream();
+    auto owned = runtime_->Streams().CreateStream(StreamPriority::kNormal);
+    ASSERT_TRUE(owned.ok()) << owned.status();
+    owned_stream_ = std::move(*owned);
+    stream_ = owned_stream_.Get();
 
     auto tokenizer = Tokenizer::FromFile("models/Qwen3-0.6B/tokenizer.json");
     ASSERT_TRUE(tokenizer.ok()) << tokenizer.status();
@@ -213,6 +216,7 @@ class VllmParityProbeTest : public ::testing::Test {
   }
 
   DeviceRuntime* runtime_ = nullptr;
+  OwnedStream owned_stream_{};
   DeviceStream stream_{};
   std::shared_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<Model> model_;

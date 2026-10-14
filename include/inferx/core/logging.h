@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/log_severity.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/absl_log.h"
 #include "inferx/core/status.h"
@@ -31,22 +32,15 @@
 
 namespace inferx::core {
 
-/// \brief Minimum severity that reaches the log. FATAL is not listed
-///        because it is never filtered.
-enum class LogLevel {
-  kInfo = 0,
-  kWarning = 1,
-  kError = 2,
-};
-
-/// \brief Parses "info" | "warning" | "error" (lowercase) into a level.
-///        Used by the environment/file loader and by CLI flag handling.
-StatusOr<LogLevel> ParseLogLevel(std::string_view name);
+/// \brief Parses "info" | "warning" | "error" (lowercase) into a minimum
+///        severity. Used by the environment/file loader and by CLI flag
+///        handling. FATAL is not accepted: it is never filtered.
+StatusOr<absl::LogSeverityAtLeast> ParseLogLevel(std::string_view name);
 
 /// \brief Logging thresholds and sinks.
 struct LoggingConfig {
-  /// Severities below this are dropped.
-  LogLevel min_level = LogLevel::kInfo;
+  /// Severities below this are dropped. Must be kInfo, kWarning, or kError.
+  absl::LogSeverityAtLeast min_level = absl::LogSeverityAtLeast::kInfo;
 
   /// Global INFERX_VLOG threshold; 0 silences all VLOG sites that have no
   /// module override. Must be >= 0.

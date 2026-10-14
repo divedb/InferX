@@ -43,13 +43,13 @@ TEST_F(ScratchArenaTest, ReuseNeverOverlaps) {
   const auto write = [&](void* ptr, size_t bytes, uint8_t value) {
     std::vector<uint8_t> pattern(bytes, value);
     EXPECT_TRUE(runtime_
-                    ->Copy(ptr, pattern.data(), bytes, CopyKind::kHostToDevice)
+                    ->Memory().Copy(ptr, pattern.data(), bytes, CopyKind::kHostToDevice)
                     .ok());
   };
   const auto verify = [&](void* ptr, size_t bytes, uint8_t value) {
     std::vector<uint8_t> read(bytes, 0);
     EXPECT_TRUE(runtime_
-                    ->Copy(read.data(), ptr, bytes, CopyKind::kDeviceToHost)
+                    ->Memory().Copy(read.data(), ptr, bytes, CopyKind::kDeviceToHost)
                     .ok());
     for (size_t i = 0; i < bytes; ++i) {
       ASSERT_EQ(read[i], value) << "byte " << i << " of a neighbor changed";
@@ -87,7 +87,7 @@ TEST_F(ScratchArenaTest, StressPatternsHold) {
     const uint8_t value = 1 + static_cast<uint8_t>(round % 255);
     std::vector<uint8_t> pattern(bytes, value);
     ASSERT_TRUE(
-        runtime_->Copy(*ptr, pattern.data(), bytes, CopyKind::kHostToDevice).ok());
+        runtime_->Memory().Copy(*ptr, pattern.data(), bytes, CopyKind::kHostToDevice).ok());
     live.push_back({*ptr, bytes, value});
   }
   // Every live block still holds exactly its own pattern: any overlap or
@@ -95,7 +95,7 @@ TEST_F(ScratchArenaTest, StressPatternsHold) {
   for (const Live& block : live) {
     std::vector<uint8_t> read(block.bytes, 0);
     ASSERT_TRUE(runtime_
-                    ->Copy(read.data(), block.ptr, block.bytes,
+                    ->Memory().Copy(read.data(), block.ptr, block.bytes,
                            CopyKind::kDeviceToHost)
                     .ok());
     for (size_t i = 0; i < block.bytes; ++i) {
@@ -147,13 +147,13 @@ TEST_F(ScratchArenaTest, AttentionPlanSurvivesBlockListGrowth) {
     auto qo = Tensor::Empty(DataType::kInt32, Shape({2}), kDevice);
     ASSERT_TRUE(qo.ok()) << qo.status();
     const int32_t offsets[] = {0, 128};
-    ASSERT_TRUE(runtime_->Copy(qo->Data(), offsets, sizeof(offsets),
+    ASSERT_TRUE(runtime_->Memory().Copy(qo->Data(), offsets, sizeof(offsets),
                                CopyKind::kHostToDevice).ok());
     ops::OpContext ctx(*runtime_, DeviceStream{});
     ASSERT_TRUE(ops::PrepareFlashAttention(ctx, *qo, *plan, 2, 4, 64).ok());
-    ASSERT_TRUE(runtime_->SynchronizeStream(DeviceStream{}).ok());
+    ASSERT_TRUE(runtime_->Streams().SynchronizeStream(DeviceStream{}).ok());
     std::vector<int32_t> actual(13);
-    ASSERT_TRUE(runtime_->Copy(actual.data(), plan->Data(), plan->NBytes(),
+    ASSERT_TRUE(runtime_->Memory().Copy(actual.data(), plan->Data(), plan->NBytes(),
                                CopyKind::kDeviceToHost).ok());
     const std::vector<int32_t> expected{
         0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0, 0, 0x3fffffff};

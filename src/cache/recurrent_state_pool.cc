@@ -90,7 +90,8 @@ Status RecurrentStatePool::ResetSlot(ops::OpContext& ctx, int64_t slot) {
     // cudaMemsetAsync per region per slot; slots are rare (per admission).
     auto* base = const_cast<std::byte*>(storage_.data()) + offset +
                  slot * bytes;
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().MemsetAsync(base, bytes, ctx.GetStream()));
+    INFERX_RETURN_IF_ERROR(
+        ctx.Runtime().Memory().MemsetAsync(base, uint8_t{0}, bytes, ctx.GetStream()));
     offset += max_slots_ * bytes;
   }
   return OkStatus();

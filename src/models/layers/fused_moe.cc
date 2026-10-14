@@ -44,7 +44,7 @@ Status FusedExperts::Forward(ops::OpContext& ctx, Allocator& scratch,
   // Scatter-add accumulates every (token, expert) pair onto its row, so the
   // output starts zeroed on the stream.
   INFERX_RETURN_IF_ERROR(
-      ctx.Runtime().MemsetAsync(out.Data(), out.NBytes(), ctx.GetStream()));
+      ctx.Runtime().Memory().MemsetAsync(out.Data(), uint8_t{0}, out.NBytes(), ctx.GetStream()));
   if (total == 0) return OkStatus();
 
   const DataType act_dtype = hidden_states.GetDataType();

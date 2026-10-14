@@ -34,7 +34,7 @@ std::vector<TokenId> ReadCsv(const std::string& path) {
 StatusOr<std::unique_ptr<ModelExecutor>> MakeExecutor(int world) {
   ModelConfig model;
   model.model_dir = "models/Qwen3-0.6B";
-  model.device.device_type = "cuda";
+  model.device.device = "cuda";
   CacheConfig cache;
   cache.block_size = 16;
   cache.num_kv_blocks = 512;

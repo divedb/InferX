@@ -85,7 +85,7 @@ class LoopbackComm final : public CommBackend {
 
   int rank_;
   std::shared_ptr<struct LoopbackState> state_;
-  std::map<std::tuple<DeviceKind, int, std::vector<int64_t>>, Tensor> slots_;
+  std::map<std::tuple<DeviceType, int, std::vector<int64_t>>, Tensor> slots_;
 };
 
 }  // namespace inferx

@@ -5,13 +5,13 @@
 #include <string>
 
 #include "inferx/config/cache_config.h"
-#include "inferx/core/status.h"
 #include "inferx/config/execution_config.h"
+#include "inferx/config/model_config.h"
 #include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
-#include "inferx/config/model_config.h"
-#include "inferx/server/generation_config.h"
+#include "inferx/core/status.h"
 #include "inferx/sampling/sampling_params.h"
+#include "inferx/server/generation_config.h"
 #include "inferx/server/tokenizer_pool.h"
 
 namespace inferx::server {
@@ -23,16 +23,25 @@ namespace inferx::server {
 /// SchedulerConfig (batching), ExecutionConfig (CUDA graphs, attention
 /// backend). TokenizerPoolConfig governs the prompt-preparation worker
 /// pool; its tokenizer_path is filled from the model dirs by RunServe.
-struct ServeParams {
+struct EngineConfig {
   ModelConfig model;
   CacheConfig cache;
   SchedulerConfig scheduler;
   ExecutionConfig execution;
   ParallelConfig parallel;
-  sampling::SamplingParams default_sampling;  ///< Defaults for requests that omit them.
-  TokenizerPoolConfig tokenizer;              ///< Prompt-preparation worker pool.
+  Status Validate() const;
+};
+
+struct FrontendConfig {
   std::string host = "127.0.0.1";
   int port = 8000;
+  TokenizerPoolConfig tokenizer;
+  sampling::SamplingParams default_sampling;
+};
+
+struct ServeParams {
+  EngineConfig engine;
+  FrontendConfig frontend;
 };
 
 /// \brief Merges checkpoint generation defaults into `sampling`.
@@ -40,8 +49,7 @@ struct ServeParams {
 /// A field named in `skip` keeps the caller's value -- used for fields the
 /// user set explicitly, which must win over the checkpoint file. HF top_k
 /// <= 0 means "disabled" and maps to 0.
-void MergeGenerationConfig(const GenerationConfig& gen,
-                           sampling::SamplingParams* sampling,
+void MergeGenerationConfig(const GenerationConfig& gen, sampling::SamplingParams* sampling,
                            const std::set<std::string>& skip = {});
 
 /// \brief Runs the server until shutdown.

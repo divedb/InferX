@@ -36,8 +36,14 @@ StatusOr<std::unique_ptr<Qwen3MoeForCausalLM>> Qwen3MoeForCausalLM::Create(
   spec.tie_word_embeddings = config.base.tie_word_embeddings;
   spec.dtype = dtype;
   spec.device = device;
-  spec.state.paged_kv.assign(config.base.num_hidden_layers,
-                             config.base.KvLayoutFor(tp));
+  if (config.base.num_key_value_heads % tp != 0) {
+    return InvalidArgumentError("kv heads (", config.base.num_key_value_heads,
+                                ") must divide tensor-parallel size ", tp);
+  }
+  inferx::KvLayout layout;
+  layout.kv_heads = config.base.num_key_value_heads / tp;
+  layout.head_dim = config.base.head_dim;
+  spec.state.paged_kv.assign(config.base.num_hidden_layers, layout);
 
   return std::unique_ptr<Qwen3MoeForCausalLM>(new Qwen3MoeForCausalLM(
       std::move(embed_tokens), std::move(model), std::move(lm_head),

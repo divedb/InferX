@@ -49,7 +49,7 @@ StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
   if (parallel.tensor_parallel_rank != 0) {
     return InvalidArgumentError("the tensor-parallel coordinator must have rank zero");
   }
-  if (model.device.device_type != "cuda") {
+  if (model.device.device != "cuda") {
     return InvalidArgumentError("multi-GPU tensor parallelism requires CUDA");
   }
   if (execution.enable_cuda_graphs) {

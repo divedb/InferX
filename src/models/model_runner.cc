@@ -17,7 +17,7 @@ StatusOr<Tensor> UploadInt32(DeviceRuntime& runtime, DeviceStream stream,
       Tensor::Empty(DataType::kInt32,
                     Shape({static_cast<int64_t>(values.size())}), runtime.device()));
   if (values.empty()) return tensor;
-  INFERX_RETURN_IF_ERROR(runtime.CopyAsync(tensor.Data(), values.data(),
+  INFERX_RETURN_IF_ERROR(runtime.Memory().CopyAsync(tensor.Data(), values.data(),
                                            values.size() * sizeof(int32_t),
                                            CopyKind::kHostToDevice, stream));
   return tensor;
@@ -40,7 +40,8 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
     const ParallelConfig& parallel, std::unique_ptr<CommBackend> comm) {
   INFERX_RETURN_IF_ERROR(parallel.Validate());
   INFERX_RETURN_IF_ERROR(model_config.device.Validate());
-  const Device device = model_config.device.PrimaryDevice();
+  INFERX_ASSIGN_OR_RETURN(const std::vector<Device> devices, model_config.device.Resolve());
+  const Device device = devices.front();
   if (!device.IsCuda()) {
     return InvalidArgumentError("the model layer executes on CUDA, requested ",
                                 device.ToString());
@@ -55,7 +56,9 @@ StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
 
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime* runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->Activate());
-  INFERX_ASSIGN_OR_RETURN(DeviceStream stream, runtime->CreateStream());
+  auto owned_stream = runtime->Streams().CreateStream(StreamPriority::kNormal);
+  INFERX_RETURN_IF_ERROR(owned_stream.status());
+  const DeviceStream stream = owned_stream->Release();
 
   std::unique_ptr<ModelRunner> runner(
       new ModelRunner(std::move(model), std::move(comm), runtime, stream));
@@ -82,8 +85,8 @@ ModelRunner::~ModelRunner() {
   attention_plan_ = ops::AttentionPlanWorkspace{};
   scratch_.reset();  // Tensors carved from the region are gone by now.
   if (runtime_ != nullptr && stream_.handle != nullptr) {
-    (void)runtime_->SynchronizeStream(stream_);
-    (void)runtime_->DestroyStream(stream_);
+    (void)runtime_->Streams().SynchronizeStream(stream_);
+    OwnedStream(stream_, &runtime_->Streams()).Reset();
   }
 }
 
@@ -145,8 +148,8 @@ Status ModelRunner::Initialize(const CacheConfig& cache, const SchedulerConfig& 
   // minimum across the tensor-parallel group keeps block counts uniform.
   int64_t kv_bytes = -1;
   if (cache.gpu_memory_utilization > 0.0f) {
-    INFERX_RETURN_IF_ERROR(runtime_->SynchronizeStream(stream_));
-    INFERX_ASSIGN_OR_RETURN(const DeviceMemoryInfo after, runtime_->GetMemoryInfo());
+    INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_));
+    INFERX_ASSIGN_OR_RETURN(const DeviceMemoryInfo after, runtime_->Memory().GetMemoryInfo());
     const int64_t used = static_cast<int64_t>(after.total_bytes) -
                          static_cast<int64_t>(after.free_bytes);
     kv_bytes = static_cast<int64_t>(static_cast<double>(after.total_bytes) *
@@ -253,7 +256,7 @@ Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens,
     (void)sampled;
     (void)logits;
   }
-  return runtime_->SynchronizeStream(stream_);
+  return runtime_->Streams().SynchronizeStream(stream_);
   // `pool` dies here: its bytes return to the device before AllocateKvPool.
 }
 
@@ -436,13 +439,13 @@ Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out)
         sampling::SamplingMetadata::Build(spec.vocab_size, absl::MakeConstSpan(rows));
     INFERX_ASSIGN_OR_RETURN(sampling::SamplerOutput result,
                             sampler_->Sample(*op_, logits, metadata));
-    INFERX_RETURN_IF_ERROR(runtime_->CopyAsync(
-        sampled.data(), result.sampled_token_ids.Data(), sampled.size() * sizeof(int32_t),
-        CopyKind::kDeviceToHost, stream_));
+    INFERX_RETURN_IF_ERROR(runtime_->Memory().CopyAsync(
+      sampled.data(), result.sampled_token_ids.Data(), sampled.size() * sizeof(int32_t),
+      CopyKind::kDeviceToHost, stream_));
   }
 
   // Everything downstream reads host values; one sync retires the step.
-  INFERX_RETURN_IF_ERROR(runtime_->SynchronizeStream(stream_));
+  INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_));
 
   out->samples.reserve(batch.size());
   for (size_t i = 0; i < batch.size(); ++i) {

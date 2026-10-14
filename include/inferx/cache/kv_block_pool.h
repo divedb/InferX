@@ -184,6 +184,11 @@ class KvBlockPool {
   /// Free blocks, taken from the back. LIFO rather than FIFO on purpose: the
   /// most recently freed block is the most likely to still be in L2.
   std::vector<int32_t> free_list_;
+  /// One byte per block: 1 while handed out, 0 while on the free list. Makes
+  /// double-free detection O(1) instead of a free-list scan, which matters
+  /// once prefix caching frees and reuses blocks every step rather than once
+  /// per finished sequence.
+  std::vector<uint8_t> in_use_;
 };
 
 /// \brief Per-sequence block table: which blocks hold which part of a sequence.

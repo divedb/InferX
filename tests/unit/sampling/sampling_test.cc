@@ -83,16 +83,17 @@ class SamplerTest : public ::testing::Test {
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     ASSERT_TRUE(runtime_->Activate().ok());
-    auto stream = runtime_->CreateStream();
+    auto stream = runtime_->Streams().CreateStream(inferx::StreamPriority::kNormal);
     ASSERT_TRUE(stream.ok()) << stream.status();
-    stream_ = *stream;
+    stream_ = stream->Get();
     auto cuda = inferx::RuntimeFor(Device::Cuda(0));
     if (cuda.ok()) {
       cuda_ = *cuda;
       ASSERT_TRUE(cuda_->Activate().ok());
-      auto cuda_stream = cuda_->CreateStream();
+      auto cuda_stream = cuda_->Streams().CreateStream(inferx::StreamPriority::kNormal);
       ASSERT_TRUE(cuda_stream.ok()) << cuda_stream.status();
-      cuda_stream_ = *cuda_stream;
+      cuda_owned_stream_ = std::move(*cuda_stream);
+      cuda_stream_ = cuda_owned_stream_.Get();
     }
   }
 
@@ -124,7 +125,7 @@ class SamplerTest : public ::testing::Test {
     }
     EXPECT_NE(cuda_, nullptr) << "CUDA runtime unavailable";
     if (cuda_ != nullptr) {
-      EXPECT_TRUE(cuda_->Copy((*tensor).Data(), bf16.data(), bf16.size() * 2,
+      EXPECT_TRUE(cuda_->Memory().Copy((*tensor).Data(), bf16.data(), bf16.size() * 2,
                               inferx::CopyKind::kHostToDevice).ok());
     }
     return *std::move(tensor);
@@ -133,6 +134,7 @@ class SamplerTest : public ::testing::Test {
   inferx::DeviceRuntime* runtime_ = nullptr;
   inferx::DeviceStream stream_;
   inferx::DeviceRuntime* cuda_ = nullptr;
+  inferx::OwnedStream cuda_owned_stream_{};
   inferx::DeviceStream cuda_stream_;
 };
 
@@ -165,7 +167,7 @@ TEST_F(SamplerTest, TopKOneMatchesGreedy) {
   OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   const int32_t id = *output->sampled_token_ids.DataAs<int32_t>();
   EXPECT_EQ(id, 5);
 }
@@ -183,7 +185,7 @@ TEST_F(SamplerTest, SeededDrawIsReproducibleAndVariesWithOffset) {
   const auto repeat = (*sampler)->Sample(ctx, logits, SamplingMetadata::Build(8, a));
   const auto next = (*sampler)->Sample(ctx, logits, SamplingMetadata::Build(8, b));
   ASSERT_TRUE(first.ok() && repeat.ok() && next.ok());
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   const int32_t draw = *first->sampled_token_ids.DataAs<int32_t>();
   EXPECT_EQ(draw, *repeat->sampled_token_ids.DataAs<int32_t>());  // Reproducible.
   EXPECT_GE(draw, 0);
@@ -202,7 +204,7 @@ TEST_F(SamplerTest, LogitBiasBansTokens) {
   OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   EXPECT_EQ(*output->sampled_token_ids.DataAs<int32_t>(), 2);
   ASSERT_EQ(metadata.device.bias_entries.size(), 2u)
       << "bias payload not packed";
@@ -220,7 +222,7 @@ TEST_F(SamplerTest, RepetitionPenaltyPushesOffHistory) {
   OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   EXPECT_EQ(*output->sampled_token_ids.DataAs<int32_t>(), 7);  // Logit 6 survives.
 }
 
@@ -235,7 +237,7 @@ TEST_F(SamplerTest, AllowlistRestrictsToEntries) {
   OpContext ctx(*runtime_, stream_);
   const auto output = (*sampler)->Sample(ctx, logits, metadata);
   ASSERT_TRUE(output.ok()) << output.status();
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   EXPECT_EQ(*output->sampled_token_ids.DataAs<int32_t>(), 6);
 }
 
@@ -289,11 +291,11 @@ TEST_F(SamplerTest, CudaPipelineAgreesWithCpuReference) {
   OpContext cpu_ctx(*runtime_, stream_);
   const auto cpu_out = (*cpu)->Sample(cpu_ctx, logits_cpu, metadata);
   ASSERT_TRUE(cpu_out.ok()) << cpu_out.status();
-  ASSERT_TRUE(runtime_->SynchronizeStream(stream_).ok());
+  ASSERT_TRUE(runtime_->Streams().SynchronizeStream(stream_).ok());
   std::vector<int32_t> g(3);
-  ASSERT_TRUE(cuda_->Copy(g.data(), gpu_out->sampled_token_ids.Data(), 3 * 4,
+  ASSERT_TRUE(cuda_->Memory().Copy(g.data(), gpu_out->sampled_token_ids.Data(), 3 * 4,
                           inferx::CopyKind::kDeviceToHost).ok());
-  ASSERT_TRUE(cuda_->SynchronizeStream(cuda_stream_).ok());
+  ASSERT_TRUE(cuda_->Streams().SynchronizeStream(cuda_stream_).ok());
   const int32_t* h = cpu_out->sampled_token_ids.DataAs<int32_t>();
   for (int i = 0; i < 3; ++i) {
     EXPECT_EQ(g[i], h[i]) << "row " << i << " gpu=" << g[i] << " cpu=" << h[i];

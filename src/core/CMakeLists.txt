@@ -7,6 +7,7 @@
 inferx_add_library(
   NAME core
   SRCS
+    cpu/device_runtime.cc
     allocator.cc
     caching_allocator.cc
     device_buffer.cc

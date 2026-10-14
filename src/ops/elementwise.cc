@@ -140,7 +140,7 @@ Status Add(OpContext& ctx, const Tensor& a, const Tensor& b, Tensor& out) {
   }
   if (a.IsEmpty()) return OkStatus();
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::Add(ctx, a, b, out);
     default:
       return UnimplementedError("Add has no implementation for device ", device.ToString());
@@ -156,7 +156,7 @@ Status SiluAndMul(OpContext& ctx, const Tensor& gate, const Tensor& up, Tensor& 
   }
   if (gate.IsEmpty()) return OkStatus();
   switch (device.Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::SiluAndMul(ctx, gate, up, out);
     default:
       return UnimplementedError("SiluAndMul has no implementation for device ",

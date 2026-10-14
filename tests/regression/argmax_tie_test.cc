@@ -23,13 +23,7 @@ class GreedyArgmaxTieTest : public ::testing::Test {
     ASSERT_TRUE(runtime.ok()) << runtime.status();
     runtime_ = *runtime;
     ASSERT_TRUE(runtime_->Activate().ok());
-    stream_ = *runtime_->CreateStream();
-  }
-
-  void TearDown() override {
-    if (runtime_ != nullptr && stream_.handle != nullptr) {
-      (void)runtime_->DestroyStream(stream_);
-    }
+    stream_ = *runtime_->Streams().CreateStream(StreamPriority::kNormal);
   }
 
   /// Runs GreedyArgmax over one bf16 row where `tied` pairs all share
@@ -45,21 +39,23 @@ class GreedyArgmaxTieTest : public ::testing::Test {
     auto values = Tensor::Empty(DataType::kFloat32, Shape({1, 40}), Device::Cuda(0));
     auto indices = Tensor::Empty(DataType::kInt32, Shape({1, 40}), Device::Cuda(0));
     auto out = Tensor::Empty(DataType::kInt32, Shape({1}), Device::Cuda(0));
-    EXPECT_TRUE(runtime_->Copy(logits->Data(), bits.data(), bits.size() * 2,
-                               CopyKind::kHostToDevice)
+    EXPECT_TRUE(runtime_->Memory()
+                    .Copy(logits->Data(), bits.data(), bits.size() * 2, CopyKind::kHostToDevice)
                     .ok());
-    OpContext ctx(*runtime_, stream_);
+    OpContext ctx(*runtime_, stream_.Get());
     EXPECT_TRUE(GreedyArgmax(ctx, *logits, *values, *indices, *out).ok());
+    // The compute stream is non-blocking, so the host read must wait for it
+    // explicitly before the synchronous default-stream copy below.
+    EXPECT_TRUE(runtime_->Streams().SynchronizeStream(stream_.Get()).ok());
     int32_t result = -1;
-    EXPECT_TRUE(runtime_->Copy(&result, out->Data(), sizeof(result),
-                               CopyKind::kDeviceToHost)
+    EXPECT_TRUE(runtime_->Memory()
+                    .Copy(&result, out->Data(), sizeof(result), CopyKind::kDeviceToHost)
                     .ok());
-    EXPECT_TRUE(runtime_->SynchronizeStream(stream_).ok());
     return result;
   }
 
   DeviceRuntime* runtime_ = nullptr;
-  DeviceStream stream_{};
+  OwnedStream stream_{};
 };
 
 TEST_F(GreedyArgmaxTieTest, ExactTiesResolveToLowestIndex) {

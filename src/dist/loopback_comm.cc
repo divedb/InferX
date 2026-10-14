@@ -97,7 +97,7 @@ Status LoopbackComm::Publish(const ops::OpContext& ctx, const Tensor& contributi
   INFERX_RETURN_IF_ERROR(ValidateTensor(ctx, contribution));
   INFERX_ASSIGN_OR_RETURN(Tensor * slot, Slot(contribution.GetShape(), ctx.GetDevice()));
   if (!contribution.IsEmpty() && slot->Data() != contribution.Data()) {
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(slot->Data(), contribution.Data(),
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().CopyAsync(slot->Data(), contribution.Data(),
                                                    contribution.NBytes(),
                                                    CopyKind::kDeviceToDevice, ctx.GetStream()));
   }
@@ -107,7 +107,7 @@ Status LoopbackComm::Publish(const ops::OpContext& ctx, const Tensor& contributi
   }
   // The slot must hold EXECUTED data before peers read it; stream order
   // alone does not cross streams.
-  return ctx.Runtime().SynchronizeStream(ctx.GetStream());
+  return ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream());
 }
 
 Status LoopbackComm::Meet() { return state_->Wait(size()); }
@@ -156,7 +156,7 @@ Status LoopbackComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
     }
     // Every rank uses the same summation order, including BF16 rounding.
     if (!partial.IsEmpty()) {
-      INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(partial.Data(), published.front()->Data(),
+      INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().CopyAsync(partial.Data(), published.front()->Data(),
                                                      partial.NBytes(),
                                                      CopyKind::kDeviceToDevice, ctx.GetStream()));
     }
@@ -164,7 +164,7 @@ Status LoopbackComm::AllReduceSum(const ops::OpContext& ctx, Tensor& partial) {
     for (int r = 1; r < size(); ++r) {
       INFERX_RETURN_IF_ERROR(ops::Add(op_ctx, partial, *published[r], partial));
     }
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream()));
     return Meet();
   }());
 }
@@ -185,7 +185,7 @@ Status LoopbackComm::AllGatherLastDim(const ops::OpContext& ctx, const Tensor& p
       INFERX_RETURN_IF_ERROR(ops::CopyColumnBlock(op_ctx, *published[r], full,
                                                   static_cast<int64_t>(r) * partial.Dim(1)));
     }
-    INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
+    INFERX_RETURN_IF_ERROR(ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream()));
     return Meet();
   }());
 }

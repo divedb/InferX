@@ -159,8 +159,9 @@ StatusOr<int64_t> NcclComm::AllReduceMin(const ops::OpContext& ctx, int64_t valu
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
   const NcclApi* api = NcclApi::Load();
   if (!api->Ready()) return Unavailable();
-  INFERX_ASSIGN_OR_RETURN(void* buffer, ctx.Runtime().Allocate(sizeof(int64_t)));
-  Status staged = ctx.Runtime().CopyAsync(buffer, &value, sizeof(int64_t),
+  INFERX_ASSIGN_OR_RETURN(void* buffer,
+                           ctx.Runtime().Memory().Allocate(sizeof(int64_t), kTensorAlignment));
+  Status staged = ctx.Runtime().Memory().CopyAsync(buffer, &value, sizeof(int64_t),
                                           CopyKind::kHostToDevice, ctx.GetStream());
   if (staged.ok()) {
     staged = NcclCall(api->all_reduce(buffer, buffer, 1, kNcclInt64, kNcclMin, comm_,
@@ -169,11 +170,11 @@ StatusOr<int64_t> NcclComm::AllReduceMin(const ops::OpContext& ctx, int64_t valu
   }
   int64_t result = 0;
   if (staged.ok()) {
-    staged = ctx.Runtime().CopyAsync(&result, buffer, sizeof(int64_t),
+    staged = ctx.Runtime().Memory().CopyAsync(&result, buffer, sizeof(int64_t),
                                      CopyKind::kDeviceToHost, ctx.GetStream());
   }
-  if (staged.ok()) staged = ctx.Runtime().SynchronizeStream(ctx.GetStream());
-  const Status freed = ctx.Runtime().Free(buffer);
+  if (staged.ok()) staged = ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream());
+  const Status freed = ctx.Runtime().Memory().Free(buffer);
   INFERX_RETURN_IF_ERROR(staged);
   INFERX_RETURN_IF_ERROR(freed);
   return result;
@@ -318,8 +319,9 @@ struct NcclWorldState {
     for (size_t rank = 0; rank < comms.size(); ++rank) {
       const auto& item = *host_mins[rank];
       INFERX_RETURN_IF_ERROR(item.runtime->Activate());
-      INFERX_ASSIGN_OR_RETURN(buffers[rank], item.runtime->Allocate(sizeof(int64_t)));
-      INFERX_RETURN_IF_ERROR(item.runtime->CopyAsync(
+      INFERX_ASSIGN_OR_RETURN(buffers[rank],
+                             item.runtime->Memory().Allocate(sizeof(int64_t), kTensorAlignment));
+      INFERX_RETURN_IF_ERROR(item.runtime->Memory().CopyAsync(
           buffers[rank], &item.value, sizeof(int64_t), CopyKind::kHostToDevice,
           item.stream));
     }
@@ -337,11 +339,11 @@ struct NcclWorldState {
     INFERX_RETURN_IF_ERROR(end);
     for (size_t rank = 0; rank < comms.size(); ++rank) {
       const auto& item = *host_mins[rank];
-      INFERX_RETURN_IF_ERROR(item.runtime->CopyAsync(
+      INFERX_RETURN_IF_ERROR(item.runtime->Memory().CopyAsync(
           item.result, buffers[rank], sizeof(int64_t), CopyKind::kDeviceToHost,
           item.stream));
-      INFERX_RETURN_IF_ERROR(item.runtime->SynchronizeStream(item.stream));
-      INFERX_RETURN_IF_ERROR(item.runtime->Free(buffers[rank]));
+      INFERX_RETURN_IF_ERROR(item.runtime->Streams().SynchronizeStream(item.stream));
+      INFERX_RETURN_IF_ERROR(item.runtime->Memory().Free(buffers[rank]));
     }
     return OkStatus();
   }

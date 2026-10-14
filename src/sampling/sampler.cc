@@ -119,7 +119,7 @@ Status Sampler::UploadParams(ops::OpContext& ctx, const SamplingMetadata& metada
     return ResourceExhaustedError("sampling CSR payload exceeds capacity");
   }
   auto upload = [&](const void* src, Tensor& dst, int64_t bytes) {
-    return ctx.Runtime().CopyAsync(dst.Data(), src, bytes, CopyKind::kHostToDevice,
+    return ctx.Runtime().Memory().CopyAsync(dst.Data(), src, bytes, CopyKind::kHostToDevice,
                                    ctx.GetStream());
   };
   INFERX_RETURN_IF_ERROR(upload(d.temperature.data(), *params_->temperature, batch * 4));
@@ -187,12 +187,12 @@ StatusOr<SamplerOutput> Sampler::SampleCpuReference(ops::OpContext& ctx,
                                                     const Tensor& logits,
                                                     const SamplingMetadata& metadata,
                                                     Tensor sampled) {
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream()));
   const std::int64_t vocab = logits.Dim(1);
   const bool is_bf16 = logits.GetDataType() == DataType::kBFloat16;
   const size_t elem = is_bf16 ? sizeof(uint16_t) : sizeof(float);
   std::vector<std::byte> host(static_cast<size_t>(logits.NBytes()));
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().Copy(host.data(), logits.Data(), host.size(),
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().Copy(host.data(), logits.Data(), host.size(),
                                             CopyKind::kDeviceToHost));
   auto value_at = [&](int64_t row, int64_t col) -> float {
     const std::byte* p = host.data() + (row * vocab + col) * elem;

@@ -104,7 +104,7 @@ class ReplaySession {
     Tensor tensor = Take(Tensor::Empty(
         DataType::kInt32, Shape({static_cast<int64_t>(values.size())}), runtime_.device()));
     if (!values.empty()) {
-      Check(runtime_.CopyAsync(tensor.Data(), values.data(), values.size() * sizeof(int32_t),
+      Check(runtime_.Memory().CopyAsync(tensor.Data(), values.data(), values.size() * sizeof(int32_t),
                                CopyKind::kHostToDevice, stream_));
     }
     return tensor;
@@ -131,12 +131,8 @@ void Replay(const ReplayLogitsParams& params) {
   const Device device = Device::Cuda(0);
   auto* runtime = Take(RuntimeFor(device));
   Check(runtime->Activate());
-  const DeviceStream stream = Take(runtime->CreateStream());
-  struct StreamGuard {
-    DeviceRuntime* runtime;
-    DeviceStream stream;
-    ~StreamGuard() { (void)runtime->DestroyStream(stream); }
-  } guard{runtime, stream};
+  const OwnedStream owned_stream = Take(runtime->Streams().CreateStream(StreamPriority::kNormal));
+  const DeviceStream stream = owned_stream.Get();
 
   models::ModelLoadOptions options;
   options.directory = params.model_dir;
@@ -188,7 +184,7 @@ void Replay(const ReplayLogitsParams& params) {
                             : 1;
       logits = session.Forward(tokens, start, count);
       // Keep all step allocations alive until the forward has finished.
-      Check(runtime->SynchronizeStream(stream));
+      Check(runtime->Streams().SynchronizeStream(stream));
       start += count;
     }
     if (logits->GetDataType() != DataType::kBFloat16 ||
@@ -196,7 +192,7 @@ void Replay(const ReplayLogitsParams& params) {
       throw std::runtime_error("unexpected replay logit dtype or shape");
     }
     std::vector<uint16_t> bits(info.vocab_size);
-    Check(runtime->Copy(bits.data(), logits->Data(), bits.size() * sizeof(uint16_t),
+    Check(runtime->Memory().Copy(bits.data(), logits->Data(), bits.size() * sizeof(uint16_t),
                         CopyKind::kDeviceToHost));
     std::vector<float> values(bits.size());
     for (size_t i = 0; i < bits.size(); ++i) {
@@ -215,7 +211,7 @@ void Replay(const ReplayLogitsParams& params) {
           Tensor cache = Take(key ? session.Pool().KeyCache(layer)
                                   : session.Pool().ValueCache(layer));
           std::vector<uint16_t> raw(cache.Numel());
-          Check(runtime->Copy(raw.data(), cache.Data(), cache.NBytes(),
+          Check(runtime->Memory().Copy(raw.data(), cache.Data(), cache.NBytes(),
                               CopyKind::kDeviceToHost));
           std::ofstream dump(dir / ("layer_" + std::to_string(layer) +
                                     (key ? ".k.bf16" : ".v.bf16")),

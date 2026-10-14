@@ -24,9 +24,9 @@ namespace {
 // -- ParseLogLevel ------------------------------------------------------------
 
 TEST(ParseLogLevel, ParsesTheThreeLevels) {
-  EXPECT_EQ(ParseLogLevel("info").value(), LogLevel::kInfo);
-  EXPECT_EQ(ParseLogLevel("warning").value(), LogLevel::kWarning);
-  EXPECT_EQ(ParseLogLevel("error").value(), LogLevel::kError);
+  EXPECT_EQ(ParseLogLevel("info").value(), absl::LogSeverityAtLeast::kInfo);
+  EXPECT_EQ(ParseLogLevel("warning").value(), absl::LogSeverityAtLeast::kWarning);
+  EXPECT_EQ(ParseLogLevel("error").value(), absl::LogSeverityAtLeast::kError);
 }
 
 TEST(ParseLogLevel, RejectsUnknownNames) {
@@ -70,7 +70,7 @@ class LoggingEnvTest : public ::testing::Test {
 TEST_F(LoggingEnvTest, DefaultsWhenEnvironmentIsClean) {
   const StatusOr<LoggingConfig> config = LoggingConfigFromEnvironment();
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_EQ(config->min_level, LogLevel::kInfo);
+  EXPECT_EQ(config->min_level, absl::LogSeverityAtLeast::kInfo);
   EXPECT_EQ(config->vlog_verbosity, 0);
   EXPECT_TRUE(config->vlog_modules.empty());
   EXPECT_TRUE(config->log_file.empty());
@@ -81,7 +81,7 @@ TEST_F(LoggingEnvTest, EnvironmentVariablesApply) {
   setenv("INFERX_VLOG", "3", 1);
   const StatusOr<LoggingConfig> config = LoggingConfigFromEnvironment();
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_EQ(config->min_level, LogLevel::kWarning);
+  EXPECT_EQ(config->min_level, absl::LogSeverityAtLeast::kWarning);
   EXPECT_EQ(config->vlog_verbosity, 3);
 }
 
@@ -114,7 +114,7 @@ TEST_F(LoggingEnvTest, ReadsYamlConfigFile) {
 
   const StatusOr<LoggingConfig> config = LoggingConfigFromEnvironment();
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_EQ(config->min_level, LogLevel::kError);
+  EXPECT_EQ(config->min_level, absl::LogSeverityAtLeast::kError);
   EXPECT_EQ(config->vlog_verbosity, 2);
   EXPECT_EQ(config->vlog_modules,
             (std::vector<std::pair<std::string, int>>{{"model_runner", 3}, {"core", 1}}));
@@ -129,7 +129,7 @@ TEST_F(LoggingEnvTest, EnvironmentLevelOverridesFile) {
 
   const StatusOr<LoggingConfig> config = LoggingConfigFromEnvironment();
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_EQ(config->min_level, LogLevel::kInfo);
+  EXPECT_EQ(config->min_level, absl::LogSeverityAtLeast::kInfo);
 }
 
 TEST_F(LoggingEnvTest, EmptyFileYieldsDefaults) {
@@ -137,7 +137,7 @@ TEST_F(LoggingEnvTest, EmptyFileYieldsDefaults) {
   setenv("INFERX_CONFIG_FILE", path.c_str(), 1);
   const StatusOr<LoggingConfig> config = LoggingConfigFromEnvironment();
   ASSERT_TRUE(config.ok()) << config.status();
-  EXPECT_EQ(config->min_level, LogLevel::kInfo);
+  EXPECT_EQ(config->min_level, absl::LogSeverityAtLeast::kInfo);
 }
 
 TEST_F(LoggingEnvTest, MissingConfigFileIsRejected) {
@@ -203,6 +203,14 @@ TEST(InitializeLogging, RejectsNegativeVerbosity) {
   EXPECT_FALSE(InitializeLogging(config).ok());
 }
 
+TEST(InitializeLogging, RejectsFatalMinLevel) {
+  LoggingConfig config;
+  config.min_level = absl::LogSeverityAtLeast::kFatal;  // Never a threshold.
+  const Status status = InitializeLogging(config);
+  ASSERT_FALSE(status.ok());
+  EXPECT_TRUE(absl::StrContains(status.message(), "min_level"));
+}
+
 TEST(InitializeLogging, RejectsBadModuleEntries) {
   LoggingConfig empty_pattern;
   empty_pattern.vlog_modules = {{"", 1}};
@@ -228,7 +236,7 @@ TEST(InitializeLogging, InitializesOnceAppliesVlogThresholdsAndWritesFile) {
   std::remove(log_path.c_str());
 
   LoggingConfig config;
-  config.min_level = LogLevel::kInfo;
+  config.min_level = absl::LogSeverityAtLeast::kInfo;
   config.vlog_verbosity = 1;
   // Raises just this file above the global threshold, exercising the
   // per-module path; the pattern matches this file's basename.

@@ -28,20 +28,20 @@ struct ServeArgs {
 
   server::ServeParams Build() const {
     server::ServeParams p;
-    p.model = model.Build();
-    p.cache = engine.BuildCacheConfig();
-    p.scheduler = engine.BuildSchedulerConfig();
-    p.execution = engine.BuildExecutionConfig();
-    p.parallel = engine.BuildParallelConfig();
-    p.default_sampling = sampling.Build();
-    ApplyGenerationConfig(&p.default_sampling);
-    p.host = host;
-    p.port = port;
-    p.tokenizer.workers = tokenizer_workers;
-    p.tokenizer.queue_max_requests = static_cast<std::size_t>(tokenizer_queue_max_requests);
-    p.tokenizer.queue_max_bytes = static_cast<std::size_t>(tokenizer_queue_max_mb) << 20;
-    p.tokenizer.request_timeout = std::chrono::milliseconds(tokenizer_request_timeout_ms);
-    p.tokenizer.startup_timeout = std::chrono::milliseconds(tokenizer_startup_timeout_ms);
+    p.engine.model = model.Build();
+    p.engine.cache = engine.BuildCacheConfig();
+    p.engine.scheduler = engine.BuildSchedulerConfig();
+    p.engine.execution = engine.BuildExecutionConfig();
+    p.engine.parallel = engine.BuildParallelConfig();
+    p.frontend.default_sampling = sampling.Build();
+    ApplyGenerationConfig(&p.frontend.default_sampling);
+    p.frontend.host = host;
+    p.frontend.port = port;
+    p.frontend.tokenizer.workers = tokenizer_workers;
+    p.frontend.tokenizer.queue_max_requests = static_cast<std::size_t>(tokenizer_queue_max_requests);
+    p.frontend.tokenizer.queue_max_bytes = static_cast<std::size_t>(tokenizer_queue_max_mb) << 20;
+    p.frontend.tokenizer.request_timeout = std::chrono::milliseconds(tokenizer_request_timeout_ms);
+    p.frontend.tokenizer.startup_timeout = std::chrono::milliseconds(tokenizer_startup_timeout_ms);
     return p;
   }
 

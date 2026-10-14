@@ -11,17 +11,14 @@ kvc::Result<kvc::MemoryRegion> ImportProviderMemory(const kvc::KVCacheData& data
   }
   const char* runtime;
   switch (storage->GetDevice().Type()) {
-    case DeviceKind::kCpu:
+    case DeviceType::kCpu:
       runtime = "cpu";
       break;
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       runtime = "cuda";
       break;
-    case DeviceKind::kRocm:
+    case DeviceType::kHip:
       runtime = "hip";
-      break;
-    case DeviceKind::kAscend:
-      runtime = "ascend";
       break;
     default:
       return std::unexpected(kvc::Status{KVC_UNSUPPORTED, "Unknown device runtime"});

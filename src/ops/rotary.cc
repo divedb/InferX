@@ -51,7 +51,7 @@ Status ApplyRope(OpContext& ctx, const Tensor& q, const Tensor& k,
   INFERX_RETURN_IF_ERROR(ValidateRope(ctx, q, k, positions, params));
   if (q.IsEmpty()) return OkStatus();
   switch (ctx.GetDevice().Type()) {
-    case DeviceKind::kCuda:
+    case DeviceType::kCuda:
       return cuda::ApplyRope(ctx, q, k, positions, params);
     default:
       return UnimplementedError("ApplyRope has no implementation for device ",

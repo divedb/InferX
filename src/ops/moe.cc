@@ -80,10 +80,10 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
   // writes through those offsets, so ordering is load-bearing.
   INFERX_RETURN_IF_ERROR(cuda::ExpertHistogram(ctx, topk_indices, num_experts, counts));
   std::vector<int32_t> host(num_experts);
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().CopyAsync(
       host.data(), counts.Data(), num_experts * sizeof(int32_t), CopyKind::kDeviceToHost,
       ctx.GetStream()));
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().SynchronizeStream(ctx.GetStream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream()));
   std::vector<int64_t> host_offsets(num_experts + 1);
   host_offsets[0] = 0;
   for (int64_t e = 0; e < num_experts; ++e) {
@@ -96,9 +96,10 @@ StatusOr<std::vector<int64_t>> BuildExpertDispatch(
   for (int64_t e = 0; e <= num_experts; ++e) {
     device_offsets[e] = static_cast<int32_t>(host_offsets[e]);
   }
-  INFERX_RETURN_IF_ERROR(ctx.Runtime().CopyAsync(offsets.Data(), device_offsets.data(),
-                                                 device_offsets.size() * sizeof(int32_t),
-                                                 CopyKind::kHostToDevice, ctx.GetStream()));
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().CopyAsync(offsets.Data(), device_offsets.data(),
+                                                          device_offsets.size() * sizeof(int32_t),
+                                                          CopyKind::kHostToDevice,
+                                                          ctx.GetStream()));
   INFERX_RETURN_IF_ERROR(cuda::ScatterSlots(ctx, topk_indices, topk_weights, offsets, cursor,
                                             token_rows, weights_by_slot));
   return host_offsets;

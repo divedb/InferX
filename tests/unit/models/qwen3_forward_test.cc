@@ -289,10 +289,12 @@ class Reference {
 
 struct DeviceStep {
   DeviceRuntime* runtime = nullptr;
-  DeviceStream stream{};
+  OwnedStream stream = OwnedStream(DeviceStream{}, nullptr);
   std::unique_ptr<ops::OpContext> op;
   std::unique_ptr<ScratchArena> scratch;
   ops::AttentionPlanWorkspace plan;
+
+  DeviceStream raw_stream() const { return stream.Get(); }
 };
 
 StatusOr<Tensor> Upload(DeviceRuntime& runtime, DeviceStream stream,
@@ -300,7 +302,7 @@ StatusOr<Tensor> Upload(DeviceRuntime& runtime, DeviceStream stream,
   Tensor tensor = *Tensor::Empty(
       DataType::kInt32, Shape({static_cast<int64_t>(values.size())}), runtime.device());
   if (!values.empty()) {
-    EXPECT_TRUE(runtime.CopyAsync(tensor.Data(), values.data(),
+    EXPECT_TRUE(runtime.Memory().CopyAsync(tensor.Data(), values.data(),
                                   values.size() * sizeof(int32_t),
                                   CopyKind::kHostToDevice, stream)
                     .ok());
@@ -313,12 +315,12 @@ std::vector<float> RunSingleRank(const std::string& dir, const std::vector<int32
   EXPECT_TRUE(RuntimeFor(Device::Cuda(0)).ok());
   step.runtime = *RuntimeFor(Device::Cuda(0));
   EXPECT_TRUE(step.runtime->Activate().ok());
-  step.stream = *step.runtime->CreateStream();
+  step.stream = *step.runtime->Streams().CreateStream(StreamPriority::kNormal);
   ModelLoadOptions options;
   options.directory = dir;
   options.device = Device::Cuda(0);
   std::unique_ptr<Model> model = *LoadModel(options);
-  step.op = std::make_unique<ops::OpContext>(*step.runtime, step.stream);
+  step.op = std::make_unique<ops::OpContext>(*step.runtime, step.raw_stream());
 
   const ModelSpec& spec = model->GetModelSpec();
   const int64_t T = static_cast<int64_t>(ids.size());
@@ -337,7 +339,7 @@ std::vector<float> RunSingleRank(const std::string& dir, const std::vector<int32
   for (int64_t i = 0; i < T; ++i) positions[i] = static_cast<int32_t>(i);
   for (int i = 0; i < pages; ++i) pages_out[i] = i;
   auto uploaded = [&](const std::vector<int32_t>& values) -> Tensor {
-    auto tensor = Upload(*step.runtime, step.stream, values);
+    auto tensor = Upload(*step.runtime, step.raw_stream(), values);
     if (!tensor.ok()) {
       ADD_FAILURE() << tensor.status();
       std::abort();
@@ -370,12 +372,13 @@ std::vector<float> RunSingleRank(const std::string& dir, const std::vector<int32
   Tensor logits = *Tensor::Empty(spec.dtype, Shape({1, spec.vocab_size}), step.scratch.get());
   { const auto got = model->ComputeLogits(ctx, hidden, sample_rows, logits);
     EXPECT_TRUE(got.ok()) << got; }
-  EXPECT_TRUE(step.runtime->SynchronizeStream(step.stream).ok());
+  EXPECT_TRUE(step.runtime->Streams().SynchronizeStream(step.raw_stream()).ok());
 
   std::vector<uint16_t> bits(spec.vocab_size);
   EXPECT_TRUE(step.runtime
-                  ->Copy(bits.data(), logits.Data(), bits.size() * 2,
-                         CopyKind::kDeviceToHost)
+                  ->Memory()
+                  .Copy(bits.data(), logits.Data(), bits.size() * 2,
+                        CopyKind::kDeviceToHost)
                   .ok());
   std::vector<float> out(bits.size());
   for (size_t i = 0; i < bits.size(); ++i) {
@@ -428,7 +431,8 @@ Status RunShardedRank(const std::string& dir, const std::vector<int32_t>& ids,
   const Device device = Device::Cuda(0);
   INFERX_ASSIGN_OR_RETURN(DeviceRuntime * runtime, RuntimeFor(device));
   INFERX_RETURN_IF_ERROR(runtime->Activate());
-  INFERX_ASSIGN_OR_RETURN(DeviceStream stream, runtime->CreateStream());
+  const OwnedStream owned_stream = *runtime->Streams().CreateStream(StreamPriority::kNormal);
+  const DeviceStream stream = owned_stream.Get();
 
   ParallelConfig parallel;
   parallel.tensor_parallel_size = 2;
@@ -458,7 +462,7 @@ Status RunShardedRank(const std::string& dir, const std::vector<int32_t>& ids,
                                           Shape({static_cast<int64_t>(values.size())}),
                                           device));
     if (!values.empty()) {
-      INFERX_RETURN_IF_ERROR(runtime->CopyAsync(
+      INFERX_RETURN_IF_ERROR(runtime->Memory().CopyAsync(
           tensor.Data(), values.data(), values.size() * sizeof(int32_t),
           CopyKind::kHostToDevice, stream));
     }
@@ -498,16 +502,17 @@ Status RunShardedRank(const std::string& dir, const std::vector<int32_t>& ids,
   const std::vector<int32_t> last_row{static_cast<int32_t>(T) - 1};
   INFERX_ASSIGN_OR_RETURN(Tensor sample_rows, upload_filled(last_row));
   INFERX_RETURN_IF_ERROR(model->ComputeLogits(ctx, hidden, sample_rows, logits));
-  INFERX_RETURN_IF_ERROR(runtime->SynchronizeStream(stream));
+  INFERX_RETURN_IF_ERROR(runtime->Streams().SynchronizeStream(stream));
 
   std::vector<uint16_t> bits(spec.vocab_size);
   INFERX_RETURN_IF_ERROR(
-      runtime->Copy(bits.data(), logits.Data(), bits.size() * 2, CopyKind::kDeviceToHost));
+      runtime->Memory().Copy(bits.data(), logits.Data(), bits.size() * 2,
+                             CopyKind::kDeviceToHost));
   out->resize(bits.size());
   for (size_t i = 0; i < bits.size(); ++i) {
     (*out)[i] = std::bit_cast<float>(static_cast<uint32_t>(bits[i]) << 16);
   }
-  return runtime->DestroyStream(stream);
+  return OkStatus();
 }
 
 }  // namespace

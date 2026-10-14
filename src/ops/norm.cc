@@ -96,8 +96,8 @@ using LayerNormFn = Status (*)(OpContext&, const Tensor&, const Tensor&,
 
 const KernelTable<RmsNormFn>& RmsNormBackends() {
   static const KernelTable<RmsNormFn> table{
-      {DeviceKind::kCuda, &cuda::RmsNorm},
-      {DeviceKind::kCpu, &cpu::RmsNorm},
+      {DeviceType::kCuda, &cuda::RmsNorm},
+      {DeviceType::kCpu, &cpu::RmsNorm},
   };
 
   return table;
@@ -105,8 +105,8 @@ const KernelTable<RmsNormFn>& RmsNormBackends() {
 
 const KernelTable<AddRmsNormFn>& AddRmsNormBackends() {
   static const KernelTable<AddRmsNormFn> table{
-      {DeviceKind::kCuda, &cuda::AddRmsNorm},
-      {DeviceKind::kCpu, &cpu::AddRmsNorm},
+      {DeviceType::kCuda, &cuda::AddRmsNorm},
+      {DeviceType::kCpu, &cpu::AddRmsNorm},
   };
 
   return table;
@@ -114,8 +114,8 @@ const KernelTable<AddRmsNormFn>& AddRmsNormBackends() {
 
 const KernelTable<LayerNormFn>& LayerNormBackends() {
   static const KernelTable<LayerNormFn> table{
-      {DeviceKind::kCuda, &cuda::LayerNorm},
-      {DeviceKind::kCpu, &cpu::LayerNorm},
+      {DeviceType::kCuda, &cuda::LayerNorm},
+      {DeviceType::kCpu, &cpu::LayerNorm},
   };
 
   return table;
