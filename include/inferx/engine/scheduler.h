@@ -26,6 +26,14 @@ struct SchedulerStats {
   int num_finished = 0;            ///< Requests finished, any reason.
   int num_rejected = 0;            ///< Admissions refused (queue full).
   int num_preempted = 0;           ///< Running requests preempted for KV space.
+
+  /// Token-granular prefix-cache accounting, recorded at admission (vLLM
+  /// PrefixCacheStats analog). Queried tokens are the prompts of admissions
+  /// that consulted the cache; hit tokens are what an adoption returned.
+  int prefix_queries = 0;          ///< Admissions that consulted the cache.
+  int prefix_hits = 0;             ///< Admissions with a non-empty adoption.
+  int64_t prefix_queried_tokens = 0;  ///< Prompt tokens behind prefix_queries.
+  int64_t prefix_hit_tokens = 0;      ///< Prompt tokens served from cache.
 };
 
 /// \brief Owns request scheduling.

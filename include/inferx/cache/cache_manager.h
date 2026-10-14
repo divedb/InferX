@@ -90,6 +90,9 @@ class CacheManager {
   /// Entries currently discoverable by hash; zero without prefix caching.
   int64_t cached_prefix_blocks() const;
 
+  /// Whether the prefix index is active for this manager.
+  bool prefix_caching_enabled() const { return prefix_ != nullptr; }
+
   int64_t free_blocks() const { return pool_->FreeBlocks(); }
   int64_t total_blocks() const { return pool_->NumBlocks(); }
   float usage() const;

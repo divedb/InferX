@@ -145,6 +145,24 @@ TEST_F(SchedulerPrefixTest, SaltedRequestSharesNothing) {
   EXPECT_EQ(plan->scheduled[0].num_new_tokens, 12);
 }
 
+TEST_F(SchedulerPrefixTest, HitAccountingIsTokenGranular) {
+  MakeScheduler(true);
+  const std::vector<TokenId> prompt = Tokens(12);
+
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, prompt, ShortParams())).ok());
+  RunToCompletion();
+  ASSERT_TRUE(scheduler_->PopFinished().has_value());
+
+  ASSERT_TRUE(scheduler_->AddRequest(Request(2, prompt, ShortParams())).ok());
+  RunToCompletion();
+
+  const SchedulerStats stats = scheduler_->Stats();
+  EXPECT_EQ(stats.prefix_queries, 2);
+  EXPECT_EQ(stats.prefix_hits, 1);           // Only the second saw a cache.
+  EXPECT_EQ(stats.prefix_queried_tokens, 24);
+  EXPECT_EQ(stats.prefix_hit_tokens, 8);     // Two of three blocks.
+}
+
 TEST_F(SchedulerPrefixTest, DisabledCachingRecomputesEverything) {
   MakeScheduler(false);
   const std::vector<TokenId> prompt = Tokens(12);

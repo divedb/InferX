@@ -73,6 +73,14 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     const int prompt_len = static_cast<int>(request.prompt().size());
     const CacheManager::PrefixAdoption adoption = cache_manager_.AdoptPrefix(
         request.id(), request.prompt(), request.cache_salt(), prompt_len - 1);
+    if (cache_manager_.prefix_caching_enabled()) {
+      ++stats_.prefix_queries;
+      stats_.prefix_queried_tokens += prompt_len;
+      if (adoption.cached_tokens > 0) {
+        ++stats_.prefix_hits;
+        stats_.prefix_hit_tokens += adoption.cached_tokens;
+      }
+    }
     const int chunk = std::min(budget, prompt_len - static_cast<int>(adoption.cached_tokens));
 
     auto granted = cache_manager_.Reserve(request.id(),

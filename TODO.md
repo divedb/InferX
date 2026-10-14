@@ -133,7 +133,9 @@ minimum (never preempt the only request into unrunnable state) holds;
 `preempted_req_ids` surface in stats.
 
 ### P1-4. Prefix-cache hit accounting
-**Status: open**
+**Status: done** — token-granular `SchedulerStats` counters
+(prefix_queries/hits, prefix_queried/hit_tokens) recorded at admission,
+where CacheManager::prefix_caching_enabled gates the recording.
 
 vLLM tracks `PrefixCacheStats` (requests/queries/hits, token-granular,
 recorded at admission; separate counters for post-preemption re-hits) and
