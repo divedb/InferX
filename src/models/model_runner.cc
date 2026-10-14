@@ -301,6 +301,7 @@ Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out)
   };
 
   for (const RequestId id : step.finished_request_ids) requests_.erase(id);
+  for (const RequestId id : step.preempted_request_ids) requests_.erase(id);
 
   // New requests first: the batch walk below needs their state to exist.
   for (const NewRequestData& fresh : step.scheduled_new_reqs) {
