@@ -4,6 +4,11 @@ inferx_add_library(
   SRCS
     cache_manager.cc
     kv_block_pool.cc
+    prefix_cache.cc
     recurrent_state_pool.cc
-  DEPS inferx::core
+    sha256.cc
+  DEPS
+    inferx::core
+    absl::flat_hash_map
+    absl::span
 )

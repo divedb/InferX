@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/types/span.h"
@@ -55,6 +56,15 @@ class Request {
   /// \brief Updates the computed-token watermark. Scheduler-only.
   void set_num_computed_tokens(int computed) { num_computed_tokens_ = computed; }
 
+  /// \brief Tenant-scoped prefix-cache salt (vLLM `cache_salt` analog).
+  ///
+  /// Salted and unsalted versions of one prompt share no cached blocks: the
+  /// salt is folded into the hash chain's seed, defeating cross-tenant
+  /// timing side channels. Empty means unsalted.
+  const std::string& cache_salt() const { return cache_salt_; }
+  /// \brief Sets the salt; only meaningful before admission.
+  void set_cache_salt(std::string salt) { cache_salt_ = std::move(salt); }
+
   /// \brief Appends sampled tokens; refuses when finished.
   Status AppendOutput(absl::Span<const int> token_ids);
 
@@ -78,6 +88,7 @@ class Request {
 
   int max_new_tokens_ = 0;
   int num_computed_tokens_ = 0;
+  std::string cache_salt_;
 };
 
 }  // namespace inferx

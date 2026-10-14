@@ -56,7 +56,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
   const models::ModelSpec& spec = runner->GetModelSpec();
   if (spec.eos_token_ids.empty()) return InternalError("checkpoint declares no eos");
 
-  Scheduler scheduler(scheduler_config, runner->KvPool(), spec.eos_token_ids);
+  Scheduler scheduler(scheduler_config, cache, runner->KvPool(), spec.eos_token_ids);
   sampling::SamplingParams params;
   params.temperature = 0;  // Greedy: the trace was recorded greedily.
   params.max_tokens = max_tokens;

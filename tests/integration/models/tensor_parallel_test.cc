@@ -69,7 +69,7 @@ StatusOr<std::vector<TokenId>> Generate(ModelExecutor& executor,
                                         const SchedulerConfig& config,
                                         const std::vector<TokenId>& prompt, int max_tokens,
                                         TokenId eos) {
-  Scheduler scheduler(config, executor.KvPool(), {eos});
+  Scheduler scheduler(config, CacheConfig{}, executor.KvPool(), {eos});
   sampling::SamplingParams params;
   params.temperature = 0;
   params.max_tokens = max_tokens;

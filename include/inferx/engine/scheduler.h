@@ -8,6 +8,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "inferx/cache/cache_manager.h"
+#include "inferx/config/cache_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/engine/request.h"
 #include "inferx/engine/request_queue.h"
@@ -46,12 +47,15 @@ class Scheduler {
   /// \brief Wires the scheduler to the KV block pool.
   ///
   /// \param config       Policy knobs.
+  /// \param cache        Cache policy; enables prefix caching when
+  ///                     cache.enable_prefix_caching is set.
   /// \param pool         The KV block pool to allocate from; must outlive the
   ///                     scheduler.
   /// \param eos_token_ids Model's declared end-of-sequence tokens used for
   ///                     finish detection; generation halts on any (requests
   ///                     may override via ignore_eos).
-  Scheduler(SchedulerConfig config, KvBlockPool* pool, std::vector<TokenId> eos_token_ids);
+  Scheduler(SchedulerConfig config, const CacheConfig& cache, KvBlockPool* pool,
+            std::vector<TokenId> eos_token_ids);
 
   /// \brief Admits a request to the waiting queue.
   ///

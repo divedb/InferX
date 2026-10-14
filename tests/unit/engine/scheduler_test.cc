@@ -31,7 +31,8 @@ class SchedulerTest : public ::testing::Test {
 
   void MakeScheduler(SchedulerConfig config) {
     if (pool_ == nullptr) MakePool(64);
-    scheduler_ = std::make_unique<Scheduler>(config, pool_.get(), std::vector<TokenId>{kEos});
+    scheduler_ = std::make_unique<Scheduler>(config, CacheConfig{}, pool_.get(),
+                                          std::vector<TokenId>{kEos});
   }
 
   std::unique_ptr<KvBlockPool> pool_;

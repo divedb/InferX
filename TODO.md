@@ -30,7 +30,12 @@ P1-* independent
 ## P0 — engine core
 
 ### P0-1. Automatic prefix caching in the serving loop
-**Status: done** (commit: engine prefix cache)
+**Status: done** — vLLM-style block-hash prefix cache landed: `BlockHashChain`
+(SHA-256, salt-in-seed, deterministic across processes), `PrefixCache`
+(refcounted hash index with LRU eviction and duplicate coexistence),
+`CacheManager::AdoptPrefix`/`PublishComputed` (n−1 cap, whole-block
+publication of prompt and decode blocks), scheduler adoption at admission
+and publication after each completed step, `Request::cache_salt`.
 
 The engines' central cache feature; vLLM V1 keys every block by a hash chain
 (`hash_block_tokens`: `h = H(prev, tuple(token_ids), extra_keys)`, extra keys =
@@ -70,7 +75,7 @@ cached); LRU eviction under pressure; salt isolation; `n−1` cap; eviction
 respects pinned blocks.
 
 ### P0-2. Canonical identity helper for the kvc SDK
-**Status: done** (commit: kvc identity helper)
+**Status: open**
 
 `docs/kvcache_plan.md` §8 specifies portable identities: SHA-256 over
 domain-separated, canonically encoded records; a token-level prefix chain
@@ -94,7 +99,7 @@ changes the chain from that point on; empty-sequence seed.
 ## P1 — engine behaviors the engines consider table stakes
 
 ### P1-3. Preemption: recompute path
-**Status: done** (commit: scheduler preemption)
+**Status: open**
 
 vLLM V1 is recompute-only (V0 swap is gone): when a running request cannot
 get blocks, the scheduler preempts the *newest* running request (`running[-1]`
@@ -119,7 +124,7 @@ minimum (never preempt the only request into unrunnable state) holds;
 `preempted_req_ids` surface in stats.
 
 ### P1-4. Prefix-cache hit accounting
-**Status: done** (commit: prefix cache stats)
+**Status: open**
 
 vLLM tracks `PrefixCacheStats` (requests/queries/hits, token-granular,
 recorded at admission; separate counters for post-preemption re-hits) and
@@ -134,7 +139,7 @@ Tests: counters distinguish fresh admission from post-preemption re-admission
 hits; token-granular (a 5-block hit on a 20-block prompt counts 80 tokens).
 
 ### P1-5. Block-boundary-aligned chunked prefill under caching
-**Status: done** (commit: block-aligned chunking)
+**Status: open**
 
 Both engines stop prefill chunks at block/page boundaries when caching is on
 (vLLM `_mamba_block_aligned_split` clips chunks to the next block boundary

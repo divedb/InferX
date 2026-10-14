@@ -6,9 +6,10 @@
 
 namespace inferx {
 
-Scheduler::Scheduler(SchedulerConfig config, KvBlockPool* pool,
-                     std::vector<TokenId> eos_token_ids)
-    : config_(config), cache_manager_(pool), eos_token_ids_(std::move(eos_token_ids)),
+Scheduler::Scheduler(SchedulerConfig config, const CacheConfig& cache,
+                     KvBlockPool* pool, std::vector<TokenId> eos_token_ids)
+    : config_(config), cache_manager_(pool, cache.enable_prefix_caching),
+      eos_token_ids_(std::move(eos_token_ids)),
       waiting_(static_cast<size_t>(config.queue_capacity)) {}
 
 Status Scheduler::AddRequest(Request request) {
@@ -62,13 +63,23 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
       return popped.status();
     }
     Request request = std::move(*popped);
-    const int chunk =
-        std::min(budget, static_cast<int>(request.prompt().size()));
+    // Adopt the cached prefix first: its blocks are pinned and its tokens
+    // count as computed, so the first chunk only schedules the uncached
+    // tail. The cap keeps the last prompt token recomputing for logits.
+    const int prompt_len = static_cast<int>(request.prompt().size());
+    const CacheManager::PrefixAdoption adoption = cache_manager_.AdoptPrefix(
+        request.id(), request.prompt(), request.cache_salt(), prompt_len - 1);
+    const int chunk = std::min(budget, prompt_len - static_cast<int>(adoption.cached_tokens));
 
-    auto granted = cache_manager_.Reserve(request.id(), chunk);
+    auto granted = cache_manager_.Reserve(request.id(),
+                                          adoption.cached_tokens + chunk);
     if (!granted.ok()) {
       // Not enough KV for even the first chunk: stop admitting this step and
-      // put the request back at the head of the queue.
+      // put the request back at the head of the queue. The adoption must
+      // come with it, so release the pinned blocks first.
+      const Status released = cache_manager_.Release(request.id());
+      assert(released.ok());
+      (void)released;
       waiting_.PushFront(std::move(request));
       break;
     }
@@ -77,14 +88,15 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     data.request_id = request.id();
     data.prompt_token_ids = absl::MakeConstSpan(request.prompt());
     data.sampling_params = request.sampling_params();
-    data.block_ids = std::move(*granted);
-    data.num_computed_tokens = 0;
+    data.block_ids.assign(cache_manager_.Blocks(request.id()).begin(),
+                         cache_manager_.Blocks(request.id()).end());
+    data.num_computed_tokens = static_cast<int>(adoption.cached_tokens);
     output.scheduled_new_reqs.push_back(std::move(data));
 
     output.scheduled.push_back({request.id(), chunk});
     output.total_num_scheduled_tokens += chunk;
     budget -= chunk;
-    request.set_num_computed_tokens(chunk);
+    request.set_num_computed_tokens(static_cast<int>(adoption.cached_tokens) + chunk);
 
     running_index_[request.id()] = running_.size();
     running_.push_back(std::move(request));
@@ -111,6 +123,16 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
       return InternalError("sampled request ", id, " is not running");
     }
     Request& request = running_[it->second];
+
+    // The scheduled chunk just completed: every full block below the
+    // watermark now holds computed KV and can join the prefix index. Tokens
+    // are the prompt plus the output accepted before this step -- the token
+    // sampled below has no KV yet and must stay out of the hashed range.
+    {
+      const Status published = cache_manager_.PublishComputed(
+          id, absl::MakeConstSpan(request.prompt()), absl::MakeConstSpan(request.output()));
+      if (!published.ok()) return published;
+    }
 
     // Samples answer the last token of each allocation, but only allocations
     // that completed the prompt (or continued decode) produce a usable
