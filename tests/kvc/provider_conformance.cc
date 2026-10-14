@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "kvc/cache.h"
+#include "kvc/extensions/management.h"
 #include "kvc/extensions/stats.h"
 #include "test_util.h"
 
@@ -951,6 +952,57 @@ void TestStatsExtension() {
   CHECK(record.gpu_bytes_in_use + record.host_bytes_in_use > 0);
 }
 
+// Administrative surface: enumeration sizes and reports committed blocks,
+// clear() retires them all (pinned generations survive), and the cache
+// misses afterwards.
+void TestManagementExtension() {
+  auto made = Harness::Make();
+  CHECK(made);
+  auto& harness = **made;
+  const uint64_t tokens = harness.builder.tokens_per_block;
+  std::vector<KvcBlock> blocks{BlockAt(0, 0, tokens, tokens, 171),
+                               BlockAt(0, 1, tokens, tokens, 171)};
+  CHECK(Publish(harness, blocks, 17001));
+
+  KvcSchema schema{};
+  schema.name = {KVC_MANAGEMENT_SCHEMA_NAME, KVC_MANAGEMENT_SCHEMA_NAME_LEN};
+  schema.major = KVC_MANAGEMENT_SCHEMA_MAJOR;
+  auto extension = harness.provider->QueryExtension(schema);
+  if (!extension) return;  // Optional per provider.
+  auto* api = static_cast<const KvcManagementApi*>(extension->Table());
+  CHECK(api && api->enumerate && api->clear);
+
+  uint64_t total = 0;
+  CHECK_EQ(api->enumerate(extension->NativeHandle(), nullptr, 0, &total).code, KVC_OK);
+  CHECK_EQ(total, blocks.size());
+
+  std::vector<KvcStoredBlock> listed(total);
+  CHECK_EQ(api->enumerate(extension->NativeHandle(), listed.data(), listed.size(), &total).code,
+           KVC_OK);
+  CHECK_EQ(total, blocks.size());
+  for (const auto& entry : listed) {
+    bool found = false;
+    for (const auto& block : blocks) {
+      if (std::memcmp(entry.record.key.bytes, block.key.bytes, sizeof(KvcDigest)) == 0)
+        found = true;
+    }
+    CHECK(found);
+  }
+
+  uint64_t removed = 0;
+  CHECK_EQ(api->clear(extension->NativeHandle(), &removed).code, KVC_OK);
+  CHECK_EQ(removed, blocks.size());
+  CHECK_EQ(api->clear(extension->NativeHandle(), &removed).code, KVC_OK);  // Idempotent.
+  CHECK_EQ(removed, 0);
+  CHECK_EQ(api->enumerate(extension->NativeHandle(), nullptr, 0, &total).code, KVC_OK);
+  CHECK_EQ(total, 0);
+
+  // Post-clear lookups miss, exactly as if every key had been removed one
+  // by one (weight-change invalidation, the vLLM reset_prefix_cache case).
+  auto hit = LookupAll(harness, blocks, tokens);
+  CHECK(!hit.read.Valid());
+}
+
 void TestConcurrentReaders() {
   auto made = Harness::Make();
   CHECK(made);
@@ -1300,6 +1352,7 @@ int main(int argc, char** argv) {
   TEST(TestShutdownLifecycle);
   TEST(TestTransferPollWait);
   TEST(TestStatsExtension);
+  TEST(TestManagementExtension);
   TEST(TestConcurrentReaders);
   if (g_mode == Mode::kAsync) {
     TEST(async::TestPendingDeadlineAndCompletion);

@@ -552,16 +552,73 @@ KvcStatus SessionConfiguration(KvcObject* object, const KvcConfig** out) {
 KvcStatus SessionQueryExtension(KvcObject* object, const KvcSchema* schema, KvcExtension* out) {
   return Guard([&]() -> KvcStatus {
     if (!schema || !out) return ErrorStatus(KVC_INVALID_ARGUMENT, "query is malformed");
-    if (schema->name.size != KVC_STATS_SCHEMA_NAME_LEN ||
-        std::memcmp(schema->name.data, KVC_STATS_SCHEMA_NAME, KVC_STATS_SCHEMA_NAME_LEN) != 0 ||
-        schema->major != KVC_STATS_SCHEMA_MAJOR)
-      return ErrorStatus(KVC_UNSUPPORTED, "unknown extension schema");
-    static const KvcStatsApi stats_api = {sizeof(KvcStatsApi), KVC_ABI_MAJOR, KVC_ABI_MINOR,
-                                          SessionStats};
-    out->struct_size = sizeof(*out);
-    out->table = &stats_api;
-    RetainObject(object);  // The caller releases this reference.
-    out->owner = object;
+    if (schema->name.size == KVC_STATS_SCHEMA_NAME_LEN &&
+        std::memcmp(schema->name.data, KVC_STATS_SCHEMA_NAME, KVC_STATS_SCHEMA_NAME_LEN) == 0 &&
+        schema->major == KVC_STATS_SCHEMA_MAJOR) {
+      static const KvcStatsApi stats_api = {sizeof(KvcStatsApi), KVC_ABI_MAJOR, KVC_ABI_MINOR,
+                                            SessionStats};
+      out->struct_size = sizeof(*out);
+      out->table = &stats_api;
+      RetainObject(object);
+      out->owner = object;
+      return OkStatus();
+    }
+    if (schema->name.size == KVC_MANAGEMENT_SCHEMA_NAME_LEN &&
+        std::memcmp(schema->name.data, KVC_MANAGEMENT_SCHEMA_NAME,
+                    KVC_MANAGEMENT_SCHEMA_NAME_LEN) == 0 &&
+        schema->major == KVC_MANAGEMENT_SCHEMA_MAJOR) {
+      static const KvcManagementApi management_api = {sizeof(KvcManagementApi), KVC_ABI_MAJOR,
+                                                      KVC_ABI_MINOR, ManagementEnumerate,
+                                                      ManagementClear};
+      out->struct_size = sizeof(*out);
+      out->table = &management_api;
+      RetainObject(object);
+      out->owner = object;
+      return OkStatus();
+    }
+    return ErrorStatus(KVC_UNSUPPORTED, "unknown extension schema");
+  });
+}
+
+KvcStatus ManagementEnumerate(KvcObject* object, KvcStoredBlock* out, uint64_t max,
+                              uint64_t* out_total) {
+  return Guard([&]() -> KvcStatus {
+    auto* session = reinterpret_cast<Session*>(object);
+    if (!out_total) return ErrorStatus(KVC_INVALID_ARGUMENT, "total output is null");
+    if (max && !out) return ErrorStatus(KVC_INVALID_ARGUMENT, "entries output is null");
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->closing) return ErrorStatus(KVC_SHUTTING_DOWN, "session is closing");
+    *out_total = session->index.size();
+    uint64_t filled = 0;
+    if (out != nullptr) {
+      for (const auto& [_, block] : session->index) {
+        if (filled == max) break;
+        KvcStoredBlock entry{};
+        entry.struct_size = sizeof(entry);
+        entry.record = block->record;
+        out[filled++] = entry;
+      }
+    }
+    return OkStatus();
+  });
+}
+
+KvcStatus ManagementClear(KvcObject* object, uint64_t* out_removed) {
+  return Guard([&]() -> KvcStatus {
+    auto* session = reinterpret_cast<Session*>(object);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->closing) return ErrorStatus(KVC_SHUTTING_DOWN, "session is closing");
+    const uint64_t removed = session->index.size();
+    // Reclaim sole-owner storage under this lock so block destruction stays
+    // trivial: a Block destructor re-takes the session mutex and would
+    // deadlock here. Pinned generations (read handles, live transactions)
+    // keep their storage until their last reference drops.
+    for (auto& [_, block] : session->index) {
+      if (block.use_count() == 1) session->ReclaimLocked(block);
+    }
+    session->index.clear();
+    session->stats_blocks_retired.fetch_add(removed, std::memory_order_relaxed);
+    if (out_removed) *out_removed = removed;
     return OkStatus();
   });
 }

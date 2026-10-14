@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "kvc/abi/provider.h"
+#include "kvc/extensions/management.h"
 #include "kvc/extensions/stats.h"
 
 namespace kvc_host {
@@ -200,6 +201,9 @@ KvcStatus SessionConfiguration(KvcObject* object, const KvcConfig** out);
 KvcStatus SessionShutdown(KvcObject* object, uint64_t timeout);
 KvcStatus SessionQueryExtension(KvcObject* object, const KvcSchema* schema, KvcExtension* out);
 KvcStatus SessionStats(KvcObject* object, KvcStatsRecord* out);
+KvcStatus ManagementEnumerate(KvcObject* object, KvcStoredBlock* out, uint64_t max,
+                              uint64_t* out_total);
+KvcStatus ManagementClear(KvcObject* object, uint64_t* out_removed);
 
 // Control plane (provider.cc).
 KvcStatus Lookup(KvcObject* session, const KvcLookupRequest* request, uint64_t timeout,

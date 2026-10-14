@@ -219,6 +219,18 @@ free/4 and 2 GiB at configure time), `u64 host_budget` (0 = 1 GiB default),
 memory (`cpu`/`0`, pageable or pinned) and device memory (`cuda`/ordinal)
 matching the session's device. Mapping and cancellation are not advertised.
 
+## Management extension
+
+Providers may implement the optional `kvc.management` extension (version
+1.0, declared in `kvc/extensions/management.h`): `enumerate` reports the
+records of committed blocks (fill-up-to-max plus a total count, so callers
+size a second pass), and `clear` retires every committed block of the
+session idempotently — pinned generations survive exactly as single-key
+`remove` lets them. This is the surface both engines expose out-of-band
+(vLLM `reset_prefix_cache` after weight updates; SGLang `/flush_cache` and
+its hicache storage list endpoints). The host and CUDA providers implement
+it; the async fixture does not (extensions are optional).
+
 ## Statistics extension
 
 Providers may implement the optional `kvc.stats` extension (version 1.0,
