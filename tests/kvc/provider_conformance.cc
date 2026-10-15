@@ -84,12 +84,15 @@ struct Harness {
 };
 
 // Publishes blocks with deterministic patterns through one transaction.
-bool Publish(Harness& harness, const std::vector<KvcBlock>& blocks, uint64_t seed_base = 0) {
-  const auto& components = harness.builder.components;
-  const auto& layers = harness.builder.layers;
+bool PublishTo(KVCacheProvider& provider, const ConfigBuilder& builder,
+               const std::vector<KvcBlock>& blocks, uint64_t seed_base) {
+  const auto& components = builder.components;
+  const auto& layers = builder.layers;
+  auto data = provider.Data();
+  auto control = provider.Control();
   uint64_t row = 0;
   for (const auto& component : components) row += component.bytes_per_block;
-  auto source = HostBuffer::Import(harness.data(), blocks.size() * layers.size() * row);
+  auto source = HostBuffer::Import(data, blocks.size() * layers.size() * row);
   CHECK(source);
   uint64_t offset = 0;
   for (const auto& block : blocks) {
@@ -103,25 +106,30 @@ bool Publish(Harness& harness, const std::vector<KvcBlock>& blocks, uint64_t see
   }
   KvcWriteRequest request{};
   request.struct_size = sizeof(request);
-  request.transaction = TxIdOf(seed_base ? seed_base : blocks.front().logical_index + 100);
+  request.transaction = TxIdOf(seed_base);
   request.blocks = blocks.data();
   request.block_count = blocks.size();
-  auto write = harness.control().BeginWrite(request);
+  auto write = control.BeginWrite(request);
   CHECK(write);
   CHECK(write->Valid());
-  BindingBuilder builder;
-  for (const auto& block : blocks) builder.AddBlock(block);
-  for (uint32_t layer : layers) builder.AddLayer(layer);
-  builder.Bind(source->region, harness.builder);
-  auto transfer_request = builder.Request();
-  transfer_request.selection.group = harness.builder.group_id;
-  auto stored = harness.data().Store(*write, transfer_request);
+  BindingBuilder bindings;
+  for (const auto& block : blocks) bindings.AddBlock(block);
+  for (uint32_t layer : layers) bindings.AddLayer(layer);
+  bindings.Bind(source->region, builder);
+  auto transfer_request = bindings.Request();
+  transfer_request.selection.group = builder.group_id;
+  auto stored = data.Store(*write, transfer_request);
   CHECK(stored);
-  CHECK(harness.WaitGood(*stored).Ok());
-  auto committed = harness.control().Commit(*write);
+  CHECK(stored->Wait().Ok());
+  auto committed = control.Commit(*write);
   CHECK(committed);
   CHECK_EQ(committed->blocks.size(), blocks.size());
   return true;
+}
+
+bool Publish(Harness& harness, const std::vector<KvcBlock>& blocks, uint64_t seed_base = 0) {
+  return PublishTo(*harness.provider, harness.builder, blocks,
+                   seed_base ? seed_base : blocks.front().logical_index + 100);
 }
 
 // Looks up the longest candidate covering [0, catalog_count).
@@ -191,11 +199,11 @@ void TestPublicationRoundTrip() {
   for (const auto& component : components) row += component.bytes_per_block;
   auto destination = HostBuffer::Import(harness.data(), blocks.size() * layers.size() * row);
   CHECK(destination);
-  BindingBuilder builder;
-  for (const auto& block : blocks) builder.AddBlock(block);
-  for (uint32_t layer : layers) builder.AddLayer(layer);
-  builder.Bind(destination->region, harness.builder);
-  auto request = builder.Request();
+  BindingBuilder bindings;
+  for (const auto& block : blocks) bindings.AddBlock(block);
+  for (uint32_t layer : layers) bindings.AddLayer(layer);
+  bindings.Bind(destination->region, harness.builder);
+  auto request = bindings.Request();
   request.selection.group = harness.builder.group_id;
   auto loaded = harness.data().Load(result.read, request);
   CHECK(loaded);
@@ -384,11 +392,11 @@ void TestInFlightDedup() {
       }
     }
   }
-  BindingBuilder builder;
-  for (const auto& block : blocks) builder.AddBlock(block);
-  for (uint32_t layer : layers) builder.AddLayer(layer);
-  builder.Bind(source->region, harness.builder);
-  auto store_request = builder.Request();
+  BindingBuilder bindings;
+  for (const auto& block : blocks) bindings.AddBlock(block);
+  for (uint32_t layer : layers) bindings.AddLayer(layer);
+  bindings.Bind(source->region, harness.builder);
+  auto store_request = bindings.Request();
   store_request.selection.group = harness.builder.group_id;
 
   // The primary stores everything; the attacher's identical store overlaps
@@ -826,6 +834,57 @@ void TestBudgetExhaustion() {
     CHECK(write);
   }
   CHECK(provider.Shutdown().Ok());
+}
+
+// Budget pressure evicts committed unpinned blocks LRU-first instead of
+// failing; pins survive; evicted keys miss afterwards.
+void TestBudgetEviction() {
+  // 32 MiB blocks against the host provider's 64 MiB budget. The async
+  // fixture hard-fails at its budget and the CUDA profile has tiered
+  // eviction of its own, so this is a host-mode behavior.
+  if (g_mode != Mode::kDefault) return;
+  ConfigBuilder builder;
+  builder.layers = {0};
+  builder.components = {{0, 32ull << 20}};
+  std::vector<unsigned char> payload;
+  auto opened = OpenProvider({g_provider_path, OpenOptions(payload)});
+  CHECK(opened);
+  KVCacheProvider& provider = **opened;
+  auto config = builder.Build();
+  CHECK(provider.Configure(config.config).Ok());
+  auto control = provider.Control();
+
+  const uint64_t tokens = builder.tokens_per_block;
+  std::vector<KvcBlock> first{BlockAt(0, 0, tokens, tokens, 201)};
+  std::vector<KvcBlock> second{BlockAt(0, 1, tokens, tokens, 202)};
+  CHECK(PublishTo(provider, builder, first, 20001));
+  CHECK(PublishTo(provider, builder, second, 20002));
+
+  // Pin the newest block; pressure must then evict the older, unpinned one.
+  auto pinned = LookupOne(second, tokens);
+  auto pin = control.Lookup(pinned.request);
+  CHECK(pin);
+  CHECK(pin->read.Valid());
+
+  std::vector<KvcBlock> third{BlockAt(0, 2, tokens, tokens, 203)};
+  KvcWriteRequest request{};
+  request.struct_size = sizeof(request);
+  request.transaction = TxIdOf(20003);
+  request.blocks = third.data();
+  request.block_count = third.size();
+  auto write = control.BeginWrite(request);
+  CHECK(write);  // Evicted the oldest unpinned block rather than failing.
+
+  // The evicted key misses; the pinned one still hits.
+  auto miss = LookupOne(first, tokens);
+  auto gone = control.Lookup(miss.request);
+  CHECK(gone);
+  CHECK(!gone->read.Valid());
+  auto still = LookupOne(second, tokens);
+  auto hit = control.Lookup(still.request);
+  CHECK(hit);
+  CHECK(hit->read.Valid());
+  write = std::unexpected(Status{});
 }
 
 void TestShutdownLifecycle() {
@@ -1392,6 +1451,7 @@ int main(int argc, char** argv) {
   TEST(TestBindingValidation);
   TEST(TestImportValidation);
   TEST(TestBudgetExhaustion);
+  TEST(TestBudgetEviction);
   TEST(TestShutdownLifecycle);
   TEST(TestTransferPollWait);
   TEST(TestStatsExtension);
