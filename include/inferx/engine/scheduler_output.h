@@ -34,12 +34,14 @@ struct ScheduledRequest {
 ///
 /// `prompt_token_ids` borrows from the Request: the scheduler holds the
 /// Request until UpdateFromOutput returns, so the borrow outlives the step.
+/// For a resumed preemption victim this is prompt plus retained accepted
+/// output -- the replay sequence whose KV must be (re)computed.
 struct NewRequestData {
   RequestId request_id = 0;  ///< The request being introduced.
-  absl::Span<const TokenId> prompt_token_ids;  ///< Prompt tokens, borrowed.
+  absl::Span<const TokenId> prompt_token_ids;  ///< Replay sequence, borrowed.
   sampling::SamplingParams sampling_params;  ///< The request's sampling parameters.
   std::vector<int32_t> block_ids;  ///< Initial KV block table, logical order.
-  int num_computed_tokens = 0;     ///< Prompt tokens already computed.
+  int num_computed_tokens = 0;     ///< Sequence tokens already computed.
 };
 
 /// \brief The diff for a request the model runner has seen before.

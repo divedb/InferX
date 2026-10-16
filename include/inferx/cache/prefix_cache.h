@@ -40,7 +40,7 @@ class BlockHashChain {
   BlockHash Extend(absl::Span<const TokenId> tokens);
 
   /// \brief The chain tip; the digest of the last hashed block.
-  const BlockHash& tip() const { return tip_; }
+  const BlockHash& Tip() const { return tip_; }
 
  private:
   BlockHash tip_{};
@@ -55,9 +55,12 @@ class BlockHashChain {
 /// released blocks with live hash entries stay cached and evictable rather
 /// than returning to the pool's free list; eviction reclaims the
 /// least-recently-used unpinned entries first and happens lazily, on
-/// allocation pressure. Duplicate registrations of one hash coexist, as in
-/// vLLM — concurrent writers of an identical prefix each keep their block
-/// and adoption picks the first entry.
+/// allocation pressure. Clear() separates ownership from discoverability:
+/// every entry becomes undiscoverable at once, but blocks that live requests
+/// still reference keep their ownership record here until the last holder
+/// releases. Duplicate registrations of one hash coexist, as in vLLM —
+/// concurrent writers of an identical prefix each keep their block and
+/// adoption picks the first entry.
 ///
 /// Not thread-safe: single-threaded with the scheduler, like the pool.
 class PrefixCache {
@@ -83,8 +86,13 @@ class PrefixCache {
   /// \brief Drops one reference per block previously adopted or published.
   ///
   /// Entries whose reference count reaches zero stay discoverable and become
-  /// LRU eviction candidates; their bytes are not freed.
-  void Release(absl::Span<const int32_t> blocks);
+  /// LRU eviction candidates; their bytes are not freed. Entries a Clear()
+  /// already made undiscoverable return their bytes to the pool together
+  /// with their ledger entry when the last holder lets go.
+  ///
+  /// \param blocks Blocks previously handed out by Adopt or Publish.
+  /// \return       The first pool error, if freeing a block fails.
+  Status Release(absl::Span<const int32_t> blocks);
 
   /// \brief Evicts up to `count` cached blocks, least-recently-used first.
   ///
@@ -95,16 +103,23 @@ class PrefixCache {
   /// \return      The number actually evicted.
   int64_t Evict(int64_t count);
 
-  /// \brief Forgets every entry, freeing evictable blocks to the pool.
+  /// \brief Makes every entry undiscoverable and reclaims what it can.
+  ///
+  /// Evictable entries own their bytes outright and return to the pool
+  /// immediately. Entries still pinned by live requests become ownership-only
+  /// tombstones: no hash lookup can find them, but the cache keeps tracking
+  /// their holders so the last Release frees each block exactly once.
   void Clear();
 
-  /// \brief True while `block` has a live cache entry (pinned or evictable).
+  /// \brief True while the cache tracks `block`: a discoverable entry
+  ///        (pinned or evictable) or a tombstone held through a Clear.
   bool Contains(int32_t block) const { return by_block_.contains(block); }
 
-  /// \brief Entries currently discoverable by hash.
-  int64_t cached_blocks() const { return static_cast<int64_t>(by_block_.size()); }
+  /// \brief Entries currently discoverable by hash. Tombstones held through
+  ///        a Clear still own blocks but are not discoverable.
+  int64_t CachedBlocks() const { return discoverable_entries_; }
   /// \brief Cached entries with no references; the eviction pool's depth.
-  int64_t evictable_blocks() const { return static_cast<int64_t>(lru_.size()); }
+  int64_t EvictableBlocks() const { return static_cast<int64_t>(lru_.size()); }
 
  private:
   struct Entry {
@@ -113,6 +128,9 @@ class PrefixCache {
     uint64_t refs = 0;
     /// Position in the LRU list; meaningful only while refs == 0.
     std::list<int32_t>::iterator lru;
+    /// False once Clear() made this entry undiscoverable; the block then
+    /// returns to the pool with the entry when the last holder releases.
+    bool discoverable = true;
   };
 
   /// Forgets `entry`'s mappings without touching the pool. The caller
@@ -126,6 +144,8 @@ class PrefixCache {
   absl::flat_hash_map<int32_t, std::unique_ptr<Entry>> by_block_;
   /// Unpinned entries, least-recently-released first.
   std::list<int32_t> lru_;
+  /// Entries still reachable through by_hash_; tombstones do not count.
+  int64_t discoverable_entries_ = 0;
 };
 
 }  // namespace inferx

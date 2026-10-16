@@ -126,8 +126,8 @@ TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
 
   std::optional<Request> finished = scheduler_->PopFinished();
   ASSERT_TRUE(finished.has_value());
-  EXPECT_EQ(finished->output(), std::vector<TokenId>({7, 8}));
-  EXPECT_EQ(finished->finish_reason(), FinishReason::kLengthCapped);
+  EXPECT_EQ(finished->Output(), std::vector<TokenId>({7, 8}));
+  EXPECT_EQ(finished->GetFinishReason(), FinishReason::kLengthCapped);
 
   // The finish is reported to the runner on the next step, and the blocks
   // are back on the pool's free list.
@@ -147,7 +147,7 @@ TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
   ASSERT_TRUE(prefill.ok());
   ASSERT_TRUE(scheduler_->UpdateFromOutput(*prefill, ResultFor(*prefill, kEos)).ok());
   EXPECT_FALSE(scheduler_->HasRequests());
-  EXPECT_EQ(scheduler_->PopFinished()->finish_reason(), FinishReason::kStopped);
+  EXPECT_EQ(scheduler_->PopFinished()->GetFinishReason(), FinishReason::kStopped);
 
   // ignore_eos keeps the request running through the EOS token.
   sampling::SamplingParams ignoring;
@@ -228,7 +228,7 @@ TEST_F(SchedulerTest, AbortFreesBlocksAndFinishesRequest) {
   EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
   std::optional<Request> aborted = scheduler_->PopFinished();
   ASSERT_TRUE(aborted.has_value());
-  EXPECT_EQ(aborted->finish_reason(), FinishReason::kAborted);
+  EXPECT_EQ(aborted->GetFinishReason(), FinishReason::kAborted);
 }
 
 }  // namespace

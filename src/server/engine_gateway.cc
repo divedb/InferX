@@ -9,19 +9,19 @@
 // lambda per step.
 #include "inferx/server/engine_gateway.h"
 
-#include "absl/base/thread_annotations.h"
-#include "absl/container/flat_hash_map.h"
-#include "inferx/engine/scheduler.h"
-
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "inferx/core/status_util.h"
+#include "inferx/engine/scheduler.h"
 #include "inferx/server/completion_signal.h"
 #include "inferx/server/text_delta.h"
 
@@ -155,8 +155,11 @@ struct EngineGateway::Impl {
       std::vector<Outbound> batch;
       for (Pending& submit : submits) {
         const int prompt_len = static_cast<int>(submit.spec.prompt.size());
+        const double arrival =
+            std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
         const Status admitted = scheduler->AddRequest(
-            Request(submit.id, std::move(submit.spec.prompt), submit.spec.params));
+            Request(submit.id, std::move(submit.spec.prompt), submit.spec.params, arrival));
         if (!admitted.ok()) {
           CompletionEvent event;
           event.kind = CompletionEvent::Kind::kError;
@@ -240,10 +243,10 @@ struct EngineGateway::Impl {
       AbortSlowConsumers();
 
       while (auto finished = scheduler->PopFinished()) {
-        const std::uint64_t id = finished->id();
+        const std::uint64_t id = finished->GetRequestId();
         auto it = live.find(id);
         if (it == live.end()) continue;
-        const FinishReason reason = finished->finish_reason();
+        const FinishReason reason = finished->GetFinishReason();
         CompletionEvent event;
         if (reason == FinishReason::kAborted || reason == FinishReason::kError) {
           event.kind = CompletionEvent::Kind::kError;
@@ -263,8 +266,8 @@ struct EngineGateway::Impl {
           }
           event.kind = CompletionEvent::Kind::kFinish;
           event.reason = reason;
-          event.prompt_tokens = static_cast<int>(finished->prompt().size());
-          event.completion_tokens = static_cast<int>(finished->output().size());
+          event.prompt_tokens = static_cast<int>(finished->Prompt().size());
+          event.completion_tokens = static_cast<int>(finished->Output().size());
         }
         batch.push_back({id, it->second.events, std::move(event)});
         live.erase(it);

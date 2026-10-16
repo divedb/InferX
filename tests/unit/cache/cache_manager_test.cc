@@ -37,7 +37,7 @@ TEST_F(CacheManagerTest, GrowthReturnsOnlyNewBlocksAndKeepsLogicalOrder) {
   ASSERT_TRUE(smaller.ok());
   EXPECT_TRUE(smaller->empty());
   EXPECT_EQ(cache.Blocks(1).size(), 3);
-  EXPECT_FLOAT_EQ(cache.usage(), 1.0f);
+  EXPECT_FLOAT_EQ(cache.Usage(), 1.0f);
 }
 
 TEST_F(CacheManagerTest, FailedGrowthPreservesMappingAndFreeBlocks) {
@@ -47,7 +47,7 @@ TEST_F(CacheManagerTest, FailedGrowthPreservesMappingAndFreeBlocks) {
   EXPECT_EQ(cache.Reserve(1, 16).status().code(), absl::StatusCode::kResourceExhausted);
   ASSERT_EQ(cache.Blocks(1).size(), 1);
   EXPECT_EQ(cache.Blocks(1)[0], original);
-  EXPECT_EQ(cache.free_blocks(), 2);
+  EXPECT_EQ(cache.FreeBlocks(), 2);
   // Another request can still consume every remaining block.
   auto other = cache.Reserve(2, 8);
   ASSERT_TRUE(other.ok());
@@ -58,9 +58,9 @@ TEST_F(CacheManagerTest, FailedAdmissionDoesNotLeavePartialAllocation) {
   CacheManager cache(pool_.get());
   EXPECT_FALSE(cache.Reserve(1, 16).ok());
   EXPECT_TRUE(cache.Blocks(1).empty());
-  EXPECT_EQ(cache.free_blocks(), 3);
+  EXPECT_EQ(cache.FreeBlocks(), 3);
   ASSERT_TRUE(cache.Release(1).ok());
-  EXPECT_EQ(cache.free_blocks(), 3);
+  EXPECT_EQ(cache.FreeBlocks(), 3);
 }
 
 TEST_F(CacheManagerTest, ReleaseIsIdempotentAndIdsCanBeReused) {
@@ -69,7 +69,7 @@ TEST_F(CacheManagerTest, ReleaseIsIdempotentAndIdsCanBeReused) {
   ASSERT_TRUE(cache.Release(42).ok());
   ASSERT_TRUE(cache.Release(42).ok());
   EXPECT_TRUE(cache.Blocks(42).empty());
-  EXPECT_EQ(cache.free_blocks(), 3);
+  EXPECT_EQ(cache.FreeBlocks(), 3);
   auto reused = cache.Reserve(42, 12);
   ASSERT_TRUE(reused.ok());
   EXPECT_EQ(reused->size(), 3);
@@ -94,7 +94,7 @@ TEST_F(CacheManagerTest, InvalidAndExtremeCapacityDoNotChangeAllocation) {
   ASSERT_TRUE(empty.ok());
   EXPECT_TRUE(empty->empty());
   EXPECT_TRUE(cache.Blocks(1).empty());
-  EXPECT_EQ(cache.free_blocks(), 3);
+  EXPECT_EQ(cache.FreeBlocks(), 3);
 }
 
 }  // namespace

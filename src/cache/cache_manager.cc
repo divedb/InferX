@@ -13,8 +13,23 @@ CacheManager::CacheManager(KvBlockPool* pool, bool enable_prefix_caching)
 
 CacheManager::~CacheManager() {
   for (const auto& entry : allocations_) {
-    if (prefix_ != nullptr) prefix_->Release(entry.second);
-    const Status status = pool_->FreeBlocks(entry.second);
+    // Same contract as Release: untracked blocks return to the pool exactly
+    // once, and the snapshot must precede the cache release because letting
+    // go of a tombstone's last reference frees its block through the cache.
+    // Draining cached blocks fully is C02's scope.
+    std::vector<int32_t> returning;
+    if (prefix_ == nullptr) {
+      returning = entry.second;
+    } else {
+      returning.reserve(entry.second.size());
+      for (const int32_t block : entry.second) {
+        if (!prefix_->Contains(block)) returning.push_back(block);
+      }
+      const Status release_status = prefix_->Release(entry.second);
+      assert(release_status.ok());
+      (void)release_status;
+    }
+    const Status status = pool_->FreeBlocks(returning);
     assert(status.ok());
     (void)status;
   }
@@ -54,6 +69,7 @@ CacheManager::PrefixAdoption CacheManager::AdoptPrefix(uint64_t request_id,
   PrefixState state;
   state.chain = BlockHashChain(cache_salt);
   state.hashed_blocks = 0;
+  state.epoch = epoch_;
   allocations_[request_id] = adoption.block_ids;
   prefix_state_[request_id] = std::move(state);
   return adoption;
@@ -82,6 +98,11 @@ Status CacheManager::PublishComputed(uint64_t request_id,
   };
 
   PrefixState& state = state_it->second;
+  if (state.epoch != epoch_) {
+    // Admitted before a ClearPrefixCache: KV computed under the old epoch
+    // must never reenter the index, so the stale chain stops here.
+    return OkStatus();
+  }
   std::vector<TokenId> window;
   window.reserve(static_cast<size_t>(block_size));
   for (int64_t b = state.hashed_blocks; b < full_blocks; ++b) {
@@ -149,15 +170,17 @@ Status CacheManager::Release(uint64_t request_id) {
   if (it == allocations_.end()) return OkStatus();
   prefix_state_.erase(request_id);
   if (prefix_ != nullptr) {
-    // Cached blocks keep their bytes and hash entries; they leave through
-    // eviction, not the free list. Blocks without entries (partial tails,
-    // or entries dropped by Clear) return immediately.
-    prefix_->Release(it->second);
+    // Snapshot the untracked blocks (partial tails) before releasing:
+    // releasing a tombstone whose last holder just let go frees the block
+    // through the cache, and a freed block must not be freed again below.
+    // Blocks with discoverable entries stay cached and leave through
+    // eviction instead.
     std::vector<int32_t> returning;
     returning.reserve(it->second.size());
     for (const int32_t block : it->second) {
       if (!prefix_->Contains(block)) returning.push_back(block);
     }
+    INFERX_RETURN_IF_ERROR(prefix_->Release(it->second));
     INFERX_RETURN_IF_ERROR(pool_->FreeBlocks(returning));
   } else {
     INFERX_RETURN_IF_ERROR(pool_->FreeBlocks(it->second));
@@ -167,14 +190,19 @@ Status CacheManager::Release(uint64_t request_id) {
 }
 
 void CacheManager::ClearPrefixCache() {
-  if (prefix_ != nullptr) prefix_->Clear();
+  if (prefix_ == nullptr) return;
+  // In-flight requests keep their blocks but lose publication rights: with
+  // the epoch bumped, their next PublishComputed cannot extend an old chain
+  // into the freshly cleared index.
+  ++epoch_;
+  prefix_->Clear();
 }
 
-int64_t CacheManager::cached_prefix_blocks() const {
-  return prefix_ == nullptr ? 0 : prefix_->cached_blocks();
+int64_t CacheManager::CachedPrefixBlocks() const {
+  return prefix_ == nullptr ? 0 : prefix_->CachedBlocks();
 }
 
-float CacheManager::usage() const {
+float CacheManager::Usage() const {
   if (pool_->NumBlocks() == 0) return 0.0f;
   return static_cast<float>(pool_->UsedBlocks()) / static_cast<float>(pool_->NumBlocks());
 }

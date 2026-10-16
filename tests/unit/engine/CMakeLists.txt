@@ -1,4 +1,11 @@
 inferx_add_test(
+  NAME request_test
+  SRCS request_test.cc
+  DEPS inferx::engine
+  LABELS unit
+)
+
+inferx_add_test(
   NAME scheduler_output_test
   SRCS scheduler_output_test.cc
   DEPS inferx::engine

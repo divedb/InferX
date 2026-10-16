@@ -30,7 +30,7 @@ void RequestQueue::PushFront(Request request) {
 
 bool RequestQueue::Erase(uint64_t request_id) {
   for (auto it = requests_.begin(); it != requests_.end(); ++it) {
-    if (it->id() == request_id) {
+    if (it->GetRequestId() == request_id) {
       requests_.erase(it);
       return true;
     }

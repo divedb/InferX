@@ -138,7 +138,7 @@ TEST_F(SchedulerPrefixTest, SaltedRequestSharesNothing) {
   const std::vector<TokenId> prompt = Tokens(12);
 
   Request salted(1, prompt, ShortParams());
-  salted.set_cache_salt("tenant-a");
+  salted.SetCacheSalt("tenant-a");
   ASSERT_TRUE(scheduler_->AddRequest(std::move(salted)).ok());
   RunToCompletion();
   ASSERT_TRUE(scheduler_->PopFinished().has_value());

@@ -23,6 +23,10 @@ namespace inferx {
 /// completed full blocks are published into the index, released blocks with
 /// live entries stay cached (LRU-evictable), and allocation pressure evicts
 /// before it fails.
+///
+/// Clearing the prefix cache invalidates discoverability, not ownership:
+/// shared blocks stay alive until their last holder releases, and requests
+/// admitted before the clear never republish into the new index.
 class CacheManager {
  public:
   /// \brief Result of admitting a prompt to the prefix index.
@@ -65,7 +69,9 @@ class CacheManager {
   /// the accepted output so far, not the token about to be sampled. Calling
   /// this repeatedly is cheap: only newly covered full blocks register.
   /// Block i of the request's table must already hold tokens
-  /// [i*block_size, (i+1)*block_size).
+  /// [i*block_size, (i+1)*block_size). Requests admitted before the most
+  /// recent ClearPrefixCache never publish: their pre-clear KV must not
+  /// reenter the index.
   Status PublishComputed(uint64_t request_id, absl::Span<const TokenId> prompt,
                          absl::Span<const TokenId> output);
 
@@ -84,21 +90,30 @@ class CacheManager {
   /// candidates); the rest return to the pool's free list.
   Status Release(uint64_t request_id);
 
-  /// Drops every prefix-cache entry; evictable blocks return to the pool.
+  /// \brief Makes every prefix-cache entry undiscoverable.
+  ///
+  /// Models a semantic break such as a weight change. Evictable blocks
+  /// return to the pool immediately. Blocks that live requests still hold
+  /// keep their ownership records until the last holder releases, so one
+  /// sharer's release can never free another sharer's KV. Requests admitted
+  /// before the clear never republish into the new index.
   void ClearPrefixCache();
 
-  /// Entries currently discoverable by hash; zero without prefix caching.
-  int64_t cached_prefix_blocks() const;
+  /// \brief Entries currently discoverable by hash; zero without caching.
+  int64_t CachedPrefixBlocks() const;
 
-  /// Whether the prefix index is active for this manager.
-  bool prefix_caching_enabled() const { return prefix_ != nullptr; }
+  /// \brief Whether the prefix index is active for this manager.
+  bool PrefixCachingEnabled() const { return prefix_ != nullptr; }
 
-  /// Tokens per block; the publication granularity of the prefix index.
-  int64_t block_size() const { return pool_->BlockSize(); }
+  /// \brief Tokens per block; the publication granularity of the index.
+  int64_t BlockSize() const { return pool_->BlockSize(); }
 
-  int64_t free_blocks() const { return pool_->FreeBlocks(); }
-  int64_t total_blocks() const { return pool_->NumBlocks(); }
-  float usage() const;
+  /// \brief Blocks currently on the pool's free list.
+  int64_t FreeBlocks() const { return pool_->FreeBlocks(); }
+  /// \brief Total blocks in the pool.
+  int64_t TotalBlocks() const { return pool_->NumBlocks(); }
+  /// \brief Fraction of the pool currently handed out.
+  float Usage() const;
 
  private:
   /// Per-request hash-chain state; present only while prefix caching is on.
@@ -106,6 +121,8 @@ class CacheManager {
     BlockHashChain chain;
     /// Full blocks already hashed (and published where the block was new).
     int64_t hashed_blocks = 0;
+    /// Epoch this state was created in; a clear invalidates older states.
+    uint64_t epoch = 0;
   };
 
   /// Reclaims cached blocks until `extra` blocks are free, or gives up.
@@ -115,6 +132,9 @@ class CacheManager {
   absl::flat_hash_map<uint64_t, std::vector<int32_t>> allocations_;
   absl::flat_hash_map<uint64_t, PrefixState> prefix_state_;
   std::unique_ptr<PrefixCache> prefix_;
+  /// Bumped by every ClearPrefixCache; admission records the current value
+  /// so in-flight requests cannot republish KV from before a clear.
+  uint64_t epoch_ = 0;
 };
 
 }  // namespace inferx

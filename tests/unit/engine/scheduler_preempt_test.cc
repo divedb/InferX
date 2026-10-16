@@ -102,8 +102,10 @@ TEST_F(SchedulerPreemptTest, PreemptedRequestReadoptsItsOwnCachedPrefix) {
   // Grow both until request 2 (the newer) is preempted.
   // The victim can return in the very step that preempted it: preemption
   // happens in the running pass and admission follows in the same step.
-  // Its cached prefix must stand in for the recomputation (the n-1 cap
-  // keeps one prompt token, so the 8-token prompt adopts one block).
+  // Resumption replays prompt plus retained output (C05) and re-adopts the
+  // cached prefix of that sequence: both prompt blocks were published and
+  // stay pinned, so at least eight tokens come from cache; more when the
+  // victim's own output blocks had completed before preemption.
   bool saw_preemption = false;
   bool resumed = false;
   for (int i = 0; i < 500 && scheduler_->HasRequests(); ++i) {
@@ -117,13 +119,68 @@ TEST_F(SchedulerPreemptTest, PreemptedRequestReadoptsItsOwnCachedPrefix) {
       if (fresh.request_id != 2) continue;
       ASSERT_TRUE(saw_preemption);
       resumed = true;
-      EXPECT_EQ(fresh.num_computed_tokens, 4);  // One cached block.
+      EXPECT_GE(fresh.num_computed_tokens, 8);  // Cached prompt blocks back.
     }
     if (saw_preemption && resumed) break;
   }
   ASSERT_TRUE(saw_preemption);
   EXPECT_TRUE(resumed);
   for (int i = 0; i < 500 && scheduler_->HasRequests(); ++i) ASSERT_TRUE(Step());
+}
+
+TEST_F(SchedulerPreemptTest, PreemptedVictimReplaysAcceptedOutput) {
+  // C05: a preempted victim keeps its accepted output and the readmission
+  // plan hands the runner the whole sequence -- prompt plus every retained
+  // output token -- so replay recomputes KV for exactly the tokens the
+  // continuation attends over, and no old token is ever re-emitted.
+  MakeScheduler(false, /*blocks=*/6);
+  ASSERT_TRUE(scheduler_->AddRequest(Request(1, Tokens(8), LongParams(12))).ok());
+  ASSERT_TRUE(Step());
+  ASSERT_TRUE(scheduler_->AddRequest(Request(2, Tokens(8), LongParams(16))).ok());
+  ASSERT_TRUE(Step());
+
+  bool saw_preemption = false;
+  bool saw_replay = false;
+  for (int i = 0; i < 500 && scheduler_->HasRequests(); ++i) {
+    ASSERT_TRUE(Step());
+    if (!saw_preemption && !last_plan_.preempted_request_ids.empty()) {
+      ASSERT_EQ(last_plan_.preempted_request_ids, (std::vector<RequestId>{2}));
+      saw_preemption = true;
+    }
+    for (const NewRequestData& fresh : last_plan_.scheduled_new_reqs) {
+      if (fresh.request_id != 2) continue;
+      ASSERT_TRUE(saw_preemption);  // Readmission follows preemption.
+      if (saw_replay) continue;     // ... and happens once.
+      saw_replay = true;
+      // Prompt first (Tokens(8) = 100..107), then retained output (kTok).
+      ASSERT_GT(fresh.prompt_token_ids.size(), 8u);
+      for (int t = 0; t < 8; ++t) {
+        EXPECT_EQ(fresh.prompt_token_ids[t], static_cast<TokenId>(100 + t));
+      }
+      for (size_t t = 8; t < fresh.prompt_token_ids.size(); ++t) {
+        EXPECT_EQ(fresh.prompt_token_ids[t], kTok);
+      }
+      EXPECT_EQ(fresh.num_computed_tokens, 0);  // Recompute from zero.
+    }
+  }
+  ASSERT_TRUE(saw_preemption);
+  ASSERT_TRUE(saw_replay);
+  for (int i = 0; i < 500 && scheduler_->HasRequests(); ++i) ASSERT_TRUE(Step());
+
+  // Both complete; the victim's output continues past its preemption point
+  // rather than restarting, and reports the preemption it suffered.
+  int finished = 0;
+  std::optional<Request> victim;
+  while (auto done = scheduler_->PopFinished()) {
+    ++finished;
+    if (done->GetRequestId() == 2) victim = std::move(*done);
+  }
+  ASSERT_EQ(finished, 2);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(victim->NumOutputTokens(), 16);
+  EXPECT_EQ(victim->NumTokens(), 8 + 16);
+  EXPECT_GE(victim->NumPreemptions(), 1);
+  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());  // No leaks.
 }
 
 TEST_F(SchedulerPreemptTest, RunnerStateWouldDropPreemptedRequests) {

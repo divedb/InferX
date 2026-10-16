@@ -114,8 +114,8 @@ TEST(PrefixCacheTest, PublishAdoptReleaseEvictLifecycle) {
   const int32_t b1 = pool->AllocateBlock().value();
   cache.Publish(hashes[0], b0);
   cache.Publish(hashes[1], b1);
-  ASSERT_EQ(cache.cached_blocks(), 2);
-  EXPECT_EQ(cache.evictable_blocks(), 0);  // Publishers hold references.
+  ASSERT_EQ(cache.CachedBlocks(), 2);
+  EXPECT_EQ(cache.EvictableBlocks(), 0);  // Publishers hold references.
 
   // A miss adopts nothing and pins nothing.
   EXPECT_TRUE(cache.Adopt({hashes[2]}).empty());
@@ -123,18 +123,18 @@ TEST(PrefixCacheTest, PublishAdoptReleaseEvictLifecycle) {
   // The longest prefix hits; adopted blocks are pinned (not evictable).
   const std::vector<int32_t> adopted = cache.Adopt(hashes);
   EXPECT_EQ(adopted, (std::vector<int32_t>{b0, b1}));
-  EXPECT_EQ(cache.evictable_blocks(), 0);  // Publishers still hold references.
+  EXPECT_EQ(cache.EvictableBlocks(), 0);  // Publishers still hold references.
 
-  cache.Release({b0, b1});  // Publishers done; entries stay cached.
-  cache.Release(adopted);   // Adopter done; now both are evictable.
-  EXPECT_EQ(cache.cached_blocks(), 2);
-  EXPECT_EQ(cache.evictable_blocks(), 2);
+  ASSERT_TRUE(cache.Release({b0, b1}).ok());  // Publishers done; entries stay cached.
+  ASSERT_TRUE(cache.Release(adopted).ok());   // Adopter done; now both are evictable.
+  EXPECT_EQ(cache.CachedBlocks(), 2);
+  EXPECT_EQ(cache.EvictableBlocks(), 2);
   EXPECT_EQ(pool->FreeBlocks(), 6);  // Bytes retained: nothing freed yet.
 
   // Eviction reclaims LRU entries back to the pool's free list.
   EXPECT_EQ(cache.Evict(1), 1);
   EXPECT_EQ(pool->FreeBlocks(), 7);
-  EXPECT_EQ(cache.cached_blocks(), 1);
+  EXPECT_EQ(cache.CachedBlocks(), 1);
   EXPECT_TRUE(cache.Adopt({hashes[0]}).empty());   // Evicted hash is a miss.
   EXPECT_EQ(cache.Adopt({hashes[1]}), (std::vector<int32_t>{b1}));
 }
@@ -148,8 +148,8 @@ TEST(PrefixCacheTest, PinnedBlocksAreNeverEvictionVictims) {
   const int32_t b1 = pool->AllocateBlock().value();
   cache.Publish(hashes[0], b0);
   cache.Publish(hashes[1], b1);
-  cache.Release({b0, b1});
-  ASSERT_EQ(cache.evictable_blocks(), 2);
+  ASSERT_TRUE(cache.Release({b0, b1}).ok());
+  ASSERT_EQ(cache.EvictableBlocks(), 2);
 
   // Pin the older entry: eviction takes the unpinned one instead.
   const std::vector<int32_t> pinned = cache.Adopt({hashes[0]});
@@ -172,21 +172,57 @@ TEST(PrefixCacheTest, ClearWithLiveAdoptionKeepsPinnedBlocksAllocated) {
   const int32_t b1 = pool->AllocateBlock().value();
   cache.Publish(hashes[0], b0);
   cache.Publish(hashes[1], b1);
-  cache.Release({b0, b1});  // Publishers done; both evictable.
-  ASSERT_EQ(cache.evictable_blocks(), 2);
+  ASSERT_TRUE(cache.Release({b0, b1}).ok());  // Publishers done; both evictable.
+  ASSERT_EQ(cache.EvictableBlocks(), 2);
 
   // An adoption pins b0; Clear() forgets every entry but must not free the
   // adopted block -- its bytes are still a request's page table.
   const std::vector<int32_t> adopted = cache.Adopt(hashes);
   ASSERT_EQ(adopted, (std::vector<int32_t>{b0, b1}));
   cache.Clear();
-  EXPECT_EQ(cache.cached_blocks(), 0);
+  EXPECT_EQ(cache.CachedBlocks(), 0);
   EXPECT_EQ(pool->FreeBlocks(), 6);  // Both pinned blocks stay allocated.
 
-  // The adoption's later release finds no entries: the blocks return to
-  // the pool through the plain free path, not double-freed here.
-  cache.Release(adopted);
-  EXPECT_EQ(cache.cached_blocks(), 0);
+  // The adoption's later release finds the ownership tombstones Clear()
+  // left: the blocks return to the pool exactly once, through the cache.
+  ASSERT_TRUE(cache.Release(adopted).ok());
+  EXPECT_EQ(cache.CachedBlocks(), 0);
+  EXPECT_EQ(pool->FreeBlocks(), 8);
+}
+
+TEST(PrefixCacheTest, ClearKeepsOwnershipOfPinnedBlocksUntilLastReference) {
+  auto pool = MakePool(8);
+  PrefixCache cache(pool.get());
+
+  const auto hashes =
+      HashBlocks({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
+  const int32_t b0 = pool->AllocateBlock().value();
+  const int32_t b1 = pool->AllocateBlock().value();
+  const int32_t b2 = pool->AllocateBlock().value();
+  const int32_t b3 = pool->AllocateBlock().value();
+  cache.Publish(hashes[0], b0);
+  cache.Publish(hashes[1], b1);
+  ASSERT_TRUE(cache.Release({b0, b1}).ok());  // Publishers done; both evictable.
+  const std::vector<int32_t> adopted = cache.Adopt(absl::MakeConstSpan(hashes).subspan(0, 2));
+  ASSERT_EQ(adopted, (std::vector<int32_t>{b0, b1}));  // Adopter pins both.
+  cache.Publish(hashes[2], b2);                        // This publisher keeps its reference.
+  cache.Publish(hashes[3], b3);
+  ASSERT_TRUE(cache.Release({b3}).ok());
+  ASSERT_EQ(pool->FreeBlocks(), 4);
+
+  cache.Clear();
+  // Nothing is discoverable anymore; only the evictable block returns now.
+  EXPECT_EQ(cache.CachedBlocks(), 0);
+  EXPECT_TRUE(cache.Adopt({hashes[0]}).empty());
+  EXPECT_EQ(pool->FreeBlocks(), 5);
+
+  // The last holder of a cleared block frees it -- exactly once.
+  ASSERT_TRUE(cache.Release(adopted).ok());
+  EXPECT_EQ(pool->FreeBlocks(), 7);
+  ASSERT_TRUE(cache.Release({b2}).ok());
+  EXPECT_EQ(pool->FreeBlocks(), 8);
+  EXPECT_EQ(cache.CachedBlocks(), 0);
+  EXPECT_EQ(cache.EvictableBlocks(), 0);
 }
 
 TEST(PrefixCacheTest, DuplicateRegistrationsCoexist) {
@@ -198,7 +234,7 @@ TEST(PrefixCacheTest, DuplicateRegistrationsCoexist) {
   const int32_t second = pool->AllocateBlock().value();
   cache.Publish(hashes[0], first);
   cache.Publish(hashes[0], second);  // Concurrent identical writers.
-  EXPECT_EQ(cache.cached_blocks(), 2);
+  EXPECT_EQ(cache.CachedBlocks(), 2);
 
   // Both adopters hit. They may share one physical block (refcounted) or
   // land on the duplicate; either way every adoption is a hit.
@@ -206,14 +242,14 @@ TEST(PrefixCacheTest, DuplicateRegistrationsCoexist) {
   const std::vector<int32_t> another = cache.Adopt(hashes);
   ASSERT_EQ(one.size(), 1u);
   ASSERT_EQ(another.size(), 1u);
-  EXPECT_EQ(cache.evictable_blocks(), 0);  // Publishers still hold refs.
+  EXPECT_EQ(cache.EvictableBlocks(), 0);  // Publishers still hold refs.
 
   // Every holder releases; both physical blocks become evictable and the
   // index can reclaim both.
-  cache.Release(one);
-  cache.Release(another);
-  cache.Release({first, second});
-  EXPECT_EQ(cache.evictable_blocks(), 2);
+  ASSERT_TRUE(cache.Release(one).ok());
+  ASSERT_TRUE(cache.Release(another).ok());
+  ASSERT_TRUE(cache.Release({first, second}).ok());
+  EXPECT_EQ(cache.EvictableBlocks(), 2);
   EXPECT_EQ(cache.Evict(2), 2);
   EXPECT_EQ(pool->FreeBlocks(), 8);
 }

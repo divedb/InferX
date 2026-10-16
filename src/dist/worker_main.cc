@@ -132,12 +132,12 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
     }
 
     while (auto finished = scheduler.PopFinished()) {
-      auto it = live.find(finished->id());
+      auto it = live.find(finished->GetRequestId());
       if (it == live.end()) continue;
       WireMessage message{};
       message.kind = MessageKind::kFinished;
-      message.finished.request_id = finished->id();
-      const FinishReason reason = finished->finish_reason();
+      message.finished.request_id = finished->GetRequestId();
+      const FinishReason reason = finished->GetFinishReason();
       message.finished.finish =
           reason == FinishReason::kStopped         ? FinishKind::kStopped
           : reason == FinishReason::kLengthCapped  ? FinishKind::kLengthCapped

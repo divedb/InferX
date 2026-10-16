@@ -77,29 +77,41 @@ void PrefixCache::Publish(const BlockHash& hash, int32_t block) {
   Entry* raw = entry.get();
   by_hash_[hash].push_back(raw);
   by_block_[block] = std::move(entry);
+  ++discoverable_entries_;
 }
 
-void PrefixCache::Release(absl::Span<const int32_t> blocks) {
+Status PrefixCache::Release(absl::Span<const int32_t> blocks) {
   for (const int32_t block : blocks) {
     auto it = by_block_.find(block);
     if (it == by_block_.end()) continue;
     Entry* entry = it->second.get();
     if (entry->refs == 0) continue;  // Double release is a caller bug; ignore.
     if (--entry->refs == 0) {
-      entry->lru = lru_.insert(lru_.end(), block);
+      if (entry->discoverable) {
+        entry->lru = lru_.insert(lru_.end(), block);
+      } else {
+        // The entry outlived a Clear: nothing can rediscover the block, so
+        // its bytes return to the pool together with its ledger entry.
+        Unlink(entry);
+        INFERX_RETURN_IF_ERROR(pool_->FreeBlock(block));
+      }
     }
   }
+  return OkStatus();
 }
 
 void PrefixCache::Unlink(Entry* entry) {
-  auto& duplicates = by_hash_[entry->hash];
-  for (size_t i = 0; i < duplicates.size(); ++i) {
-    if (duplicates[i] == entry) {
-      duplicates.erase(duplicates.begin() + static_cast<std::ptrdiff_t>(i));
-      break;
+  if (entry->discoverable) {
+    auto& duplicates = by_hash_[entry->hash];
+    for (size_t i = 0; i < duplicates.size(); ++i) {
+      if (duplicates[i] == entry) {
+        duplicates.erase(duplicates.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+      }
     }
+    if (duplicates.empty()) by_hash_.erase(entry->hash);
+    --discoverable_entries_;
   }
-  if (duplicates.empty()) by_hash_.erase(entry->hash);
   by_block_.erase(entry->block);
 }
 
@@ -117,15 +129,27 @@ int64_t PrefixCache::Evict(int64_t count) {
 }
 
 void PrefixCache::Clear() {
-  // Free the blocks snapshot first: iterating the owning map while erasing
-  // through Unlink would invalidate it.
+  // Unreferenced entries own their bytes outright: free them and destroy
+  // their ledger records, so a new owner of the physical block can publish
+  // it fresh. Snapshot first: freeing through the pool while erasing from
+  // lru_ below would invalidate the iteration.
   std::vector<int32_t> evictable(lru_.begin(), lru_.end());
   for (const int32_t block : evictable) {
     (void)pool_->FreeBlock(block);
   }
-  by_hash_.clear();
-  by_block_.clear();
   lru_.clear();
+  // Entries live requests still reference keep their ownership ledger --
+  // one holder's release must never free a block another holder reads --
+  // but nothing stays discoverable by hash. Collect-then-erase: erasing in
+  // place would invalidate the iteration.
+  std::vector<int32_t> unreferenced;
+  for (const auto& [block, entry] : by_block_) {
+    if (entry->refs == 0) unreferenced.push_back(block);
+  }
+  for (const int32_t block : unreferenced) by_block_.erase(block);
+  for (auto& entry : by_block_) entry.second->discoverable = false;
+  by_hash_.clear();
+  discoverable_entries_ = 0;
 }
 
 }  // namespace inferx
