@@ -11,6 +11,7 @@
 #include "inferx/models/layers/fused_moe.h"
 #include "inferx/models/layers/linear.h"
 #include "inferx/models/layers/mlp.h"
+#include "inferx/dist/shard.h"
 #include "inferx/models/model.h"
 #include "inferx/models/qwen3_moe/qwen3_moe_config.h"
 #include "inferx/models/weight_loader.h"
@@ -45,17 +46,27 @@ class Qwen3Moe {
   ///        shared-expert names when present.
   Status BindWeights(const std::string& prefix, WeightMap& weights);
 
+  /// \brief Declarative manifest: the replicated router, one expert-kind
+  ///        entry per expert (gate/up rows and down columns split over the
+  ///        MoE-TP group, experts partitioned over Ep), and the shared
+  ///        expert's dense-MLP names when present.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix) const;
+
  private:
   Qwen3Moe(Linear router, FusedExperts experts, std::optional<MLP> shared,
            std::optional<Linear> shared_gate, ops::RoutingConfig routing, int64_t hidden,
-           int64_t tp_rank)
+           int64_t tp_rank, int64_t num_experts, int64_t global_intermediate,
+           int64_t shared_global_intermediate)
       : router_(std::move(router)),
         experts_(std::move(experts)),
         shared_expert_(std::move(shared)),
         shared_expert_gate_(std::move(shared_gate)),
         routing_(routing),
         hidden_(hidden),
-        tp_rank_(tp_rank) {}
+        tp_rank_(tp_rank),
+        num_experts_(num_experts),
+        global_intermediate_(global_intermediate),
+        shared_global_intermediate_(shared_global_intermediate) {}
 
   Linear router_;  ///< [experts, hidden], replicated across ranks.
   FusedExperts experts_;
@@ -66,6 +77,10 @@ class Qwen3Moe {
   ops::RoutingConfig routing_;
   int64_t hidden_ = 0;
   int64_t tp_rank_ = 0;
+  // Checkpoint extents for DescribeParams.
+  int64_t num_experts_ = 0;
+  int64_t global_intermediate_ = 0;
+  int64_t shared_global_intermediate_ = 0;
 };
 
 }  // namespace qwen3_moe

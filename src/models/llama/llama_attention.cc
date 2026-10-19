@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "inferx/ops/elementwise.h"
+#include "inferx/dist/shard.h"
 #include "inferx/ops/attention/types.h"
 #include "inferx/ops/rotary.h"
 
@@ -26,9 +27,43 @@ StatusOr<LlamaAttention> LlamaAttention::Create(const LlamaConfig& config,
       Linear o_proj, Linear::Create(local_heads * head_dim, config.hidden_size, dtype,
                                     device));
 
+  const int kv_replicate = static_cast<int>(
+      std::max<int64_t>(1, parallel.tensor_parallel_size / config.num_key_value_heads));
   return LlamaAttention(std::move(qkv_proj), RotaryEmbedding(config.rope),
                         std::move(o_proj), local_heads, local_kv_heads, head_dim,
-                        config.sliding_window, parallel.tensor_parallel_rank);
+                        config.sliding_window, parallel.tensor_parallel_rank, config.hidden_size,
+                        config.num_attention_heads * head_dim,
+                        config.num_key_value_heads * head_dim, kv_replicate);
+}
+
+std::vector<ParamDecl> LlamaAttention::DescribeParams(const std::string& prefix) const {
+  const auto split_rows = [&](std::string_view name, int64_t global_rows, int replicate) {
+    ParamDecl p;
+    p.name = name;
+    p.global_shape = ShardShape{global_rows, hidden_size_};
+    p.rank = 2;
+    ShardSpec shard;
+    shard.kind = ShardSpec::Kind::kSplit;
+    shard.split = SplitSpec{Axis::kTensorParallel, 0, replicate};
+    p.shard = shard;
+    return p;
+  };
+  std::vector<ParamDecl> params;
+  params.push_back(split_rows(prefix + ".q_proj.weight", global_q_rows_, 1));
+  params.push_back(split_rows(prefix + ".k_proj.weight", global_kv_rows_, kv_replicate_));
+  params.push_back(split_rows(prefix + ".v_proj.weight", global_kv_rows_, kv_replicate_));
+
+  ParamDecl o_proj;
+  o_proj.name = prefix + ".o_proj.weight";
+  o_proj.global_shape = ShardShape{hidden_size_, global_q_rows_};
+  o_proj.rank = 2;
+  ShardSpec cols;
+  cols.kind = ShardSpec::Kind::kSplit;
+  cols.split = SplitSpec{Axis::kTensorParallel, 1, 1};
+  o_proj.shard = cols;
+  o_proj.dst = o_proj_.Weight();
+  params.push_back(std::move(o_proj));
+  return params;
 }
 
 attn::AttentionSpec LlamaAttention::Spec() const {

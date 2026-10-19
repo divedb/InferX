@@ -36,6 +36,7 @@ class LlamaForCausalLM final : public Model, public WeightBindable {
   std::vector<attn::AttentionSpec> GetAttentionSpecs() const override {
     return model_.AttentionSpecs();
   }
+  std::vector<ParamDecl> DescribeParams() const override;
   Status LoadWeights(CheckpointReader& checkpoint) override;
   Status Forward(ForwardContext& ctx, const StepInputs& inputs, Tensor& hidden) const override;
   Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden, const Tensor& rows,

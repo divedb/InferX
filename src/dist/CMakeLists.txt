@@ -22,6 +22,17 @@ inferx_add_library(
     inferx::config
 )
 
+# inferx_shard -- declarative weight partitioning (docs/executor.md §7.1):
+# ShardSpec -> LocalShape single source of truth, ParallelContext view,
+# pipeline ownership.
+inferx_add_library(
+  NAME shard
+  SRCS
+    shard.cc
+  DEPS
+    inferx::topology
+)
+
 # inferx_dist -- tensor-parallel worker topology: the controller-side
 # process pool (posix_spawn, one worker per device), the IPC wire protocol
 # over Boost.InterProcess message queues, and the worker-side engine loop.

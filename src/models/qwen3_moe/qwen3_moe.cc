@@ -39,7 +39,83 @@ StatusOr<Qwen3Moe> Qwen3Moe::Create(const Qwen3MoeConfig& config,
 
   return Qwen3Moe(std::move(router), std::move(experts), std::move(shared),
                   std::move(shared_gate), config.Routing(), hidden,
-                  parallel.tensor_parallel_rank);
+                  parallel.tensor_parallel_rank, config.num_experts,
+                  config.base.intermediate_size, config.shared_expert_intermediate);
+}
+
+std::vector<ParamDecl> Qwen3Moe::DescribeParams(const std::string& prefix) const {
+  std::vector<ParamDecl> params;
+
+  // Router: [experts, hidden], replicated across the plane.
+  ParamDecl router;
+  router.name = prefix + ".gate.weight";
+  router.global_shape = ShardShape{num_experts_, hidden_};
+  router.rank = 2;
+  router.dst = router_.Weight();
+  params.push_back(std::move(router));
+
+  // Experts: the checkpoint stores each expert under its own name, so the
+  // Ep partition rides the name (a rank simply does not describe or load
+  // another ep_rank's experts); each expert's gate/up rows and down
+  // columns split over the TP group exactly like a dense MLP. Placement
+  // into the flattened expert stacks stays model-side (BindWeights).
+  const auto split_rows = [&](std::string_view name) {
+    ParamDecl p;
+    p.name = name;
+    p.global_shape = ShardShape{global_intermediate_, hidden_};
+    p.rank = 2;
+    ShardSpec shard;
+    shard.kind = ShardSpec::Kind::kSplit;
+    shard.split = SplitSpec{Axis::kTensorParallel, 0, 1};
+    p.shard = shard;
+    return p;
+  };
+  for (int64_t expert = 0; expert < num_experts_; ++expert) {
+    const std::string name = prefix + ".experts." + std::to_string(expert);
+    params.push_back(split_rows(name + ".gate_proj.weight"));
+    params.push_back(split_rows(name + ".up_proj.weight"));
+
+    ParamDecl down;
+    down.name = name + ".down_proj.weight";
+    down.global_shape = ShardShape{hidden_, global_intermediate_};
+    down.rank = 2;
+    ShardSpec cols;
+    cols.kind = ShardSpec::Kind::kSplit;
+    cols.split = SplitSpec{Axis::kTensorParallel, 1, 1};
+    down.shard = cols;
+    params.push_back(std::move(down));
+  }
+
+  // Shared expert (when present): a dense MLP, TP-split like Qwen3MLP.
+  if (shared_expert_.has_value()) {
+    const std::string shared = prefix + ".shared_expert";
+    params.push_back(split_rows(shared + ".gate_proj.weight"));
+    // The row extent differs from the routed experts.
+    params.back().global_shape = ShardShape{shared_global_intermediate_, hidden_};
+    params.push_back(split_rows(shared + ".up_proj.weight"));
+    params.back().global_shape = ShardShape{shared_global_intermediate_, hidden_};
+
+    ParamDecl down;
+    down.name = shared + ".down_proj.weight";
+    down.global_shape = ShardShape{hidden_, shared_global_intermediate_};
+    down.rank = 2;
+    ShardSpec cols;
+    cols.kind = ShardSpec::Kind::kSplit;
+    cols.split = SplitSpec{Axis::kTensorParallel, 1, 1};
+    down.shard = cols;
+    down.dst = shared_expert_->Down().Weight();
+    params.push_back(std::move(down));
+
+    if (shared_expert_gate_.has_value()) {
+      ParamDecl gate;
+      gate.name = shared + "_gate.weight";
+      gate.global_shape = ShardShape{1, hidden_};
+      gate.rank = 2;
+      gate.dst = shared_expert_gate_->Weight();
+      params.push_back(std::move(gate));
+    }
+  }
+  return params;
 }
 
 Status Qwen3Moe::Forward(ForwardContext& ctx, const Tensor& hidden, Tensor& out) const {

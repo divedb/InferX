@@ -13,3 +13,9 @@ inferx_add_test(
   DEPS inferx::topology
   LABELS unit
 )
+inferx_add_test(
+  NAME shard_test
+  SRCS shard_test.cc
+  DEPS inferx::shard
+  LABELS unit
+)

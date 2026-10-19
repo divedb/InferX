@@ -54,6 +54,33 @@ StatusOr<std::unique_ptr<Qwen3MoeForCausalLM>> Qwen3MoeForCausalLM::Create(
       std::move(spec)));
 }
 
+std::vector<ParamDecl> Qwen3MoeForCausalLM::DescribeParams() const {
+  ShardSpec vocab_split;
+  vocab_split.kind = ShardSpec::Kind::kSplit;
+  vocab_split.split = SplitSpec{Axis::kTensorParallel, 0, 1};
+
+  ParamDecl embed;
+  embed.name = "model.embed_tokens.weight";
+  embed.global_shape = ShardShape{spec_.vocab_size, spec_.hidden_size};
+  embed.rank = 2;
+  embed.shard = vocab_split;
+  embed.owner = Owner::kFirstStage;
+  embed.dst = embed_tokens_.Weight();
+
+  ParamDecl head = embed;
+  head.name = tied_ ? "model.embed_tokens.weight" : "lm_head.weight";
+  head.owner = Owner::kLastStage;
+  head.dst = lm_head_.Weight();
+
+  std::vector<ParamDecl> params;
+  params.push_back(std::move(embed));
+  std::vector<ParamDecl> tower = model_.DescribeParams("model");
+  params.insert(params.end(), std::make_move_iterator(tower.begin()),
+                std::make_move_iterator(tower.end()));
+  params.push_back(std::move(head));
+  return params;
+}
+
 Status Qwen3MoeForCausalLM::BuildWeightMap(WeightMap& weights) {
   INFERX_RETURN_IF_ERROR(weights.Add(
       "model.embed_tokens.weight",

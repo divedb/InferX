@@ -5,6 +5,7 @@
 
 #include "inferx/core/status.h"
 #include "inferx/ops/elementwise.h"
+#include "inferx/dist/shard.h"
 #include "inferx/ops/attention/types.h"
 #include "inferx/ops/rotary.h"
 
@@ -39,10 +40,66 @@ StatusOr<Qwen3Attention> Qwen3Attention::Create(const Qwen3Config& config,
   INFERX_ASSIGN_OR_RETURN(RMSNorm k_norm,
                           RMSNorm::Create(head_dim, config.rms_norm_eps, dtype, device));
 
+  const int kv_replicate = static_cast<int>(
+      std::max<int64_t>(1, parallel.tensor_parallel_size / config.num_key_value_heads));
   return Qwen3Attention(std::move(qkv_proj), std::move(q_norm), std::move(k_norm),
                         RotaryEmbedding(config.rotary_params), std::move(o_proj), local_heads,
-                        local_kv_heads, head_dim,
-                        config.sliding_window.value_or(0), parallel.tensor_parallel_rank);
+                        local_kv_heads, head_dim, config.sliding_window.value_or(0),
+                        parallel.tensor_parallel_rank, hidden,
+                        config.num_attention_heads * head_dim,
+                        config.num_key_value_heads * head_dim, kv_replicate);
+}
+
+std::vector<ParamDecl> Qwen3Attention::DescribeParams(const std::string& prefix) const {
+  // Fused QKV: three checkpoint tensors, one packed destination. The K/V
+  // pieces replicate across kv_replicate ranks (KV heads when tp exceeds
+  // num_key_value_heads); fused placement stays model-side (BindWeights).
+  const auto split_rows = [&](int64_t global_rows, int replicate) {
+    ShardSpec shard;
+    shard.kind = ShardSpec::Kind::kSplit;
+    shard.split = SplitSpec{Axis::kTensorParallel, 0, replicate};
+    ParamDecl p;
+    p.global_shape = ShardShape{global_rows, hidden_size_};
+    p.rank = 2;
+    p.shard = shard;
+    return p;
+  };
+
+  std::vector<ParamDecl> params;
+  ParamDecl q = split_rows(global_q_rows_, 1);
+  q.name = prefix + ".q_proj.weight";
+  params.push_back(std::move(q));
+  ParamDecl k = split_rows(global_kv_rows_, kv_replicate_);
+  k.name = prefix + ".k_proj.weight";
+  params.push_back(std::move(k));
+  ParamDecl v = split_rows(global_kv_rows_, kv_replicate_);
+  v.name = prefix + ".v_proj.weight";
+  params.push_back(std::move(v));
+
+  // q_norm/k_norm normalize over head_dim, not hidden.
+  const auto replicated = [&](std::string_view name, Tensor weight) {
+    ParamDecl p;
+    p.name = name;
+    p.global_shape = ShardShape{head_dim_};
+    p.rank = 1;
+    p.dst = std::move(weight);
+    return p;
+  };
+  params.push_back(replicated(prefix + ".q_norm.weight", q_norm_.Weight()));
+  params.push_back(replicated(prefix + ".k_norm.weight", k_norm_.Weight()));
+
+  // o_proj holds this rank's column block of [hidden, qh * hd].
+  ParamDecl o_proj;
+  o_proj.name = prefix + ".o_proj.weight";
+  o_proj.global_shape = ShardShape{hidden_size_, global_q_rows_};
+  o_proj.rank = 2;
+  ShardSpec cols;
+  cols.kind = ShardSpec::Kind::kSplit;
+  cols.split = SplitSpec{Axis::kTensorParallel, 1, 1};
+  o_proj.shard = cols;
+  o_proj.dst = o_proj_.Weight();
+  params.push_back(std::move(o_proj));
+  return params;
 }
 
 attn::AttentionSpec Qwen3Attention::Spec() const {

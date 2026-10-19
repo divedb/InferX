@@ -39,6 +39,12 @@ class Qwen3ForCausalLM final : public Model, public WeightBindable {
   std::vector<attn::AttentionSpec> GetAttentionSpecs() const override {
     return model_.AttentionSpecs();
   }
+  std::vector<ParamDecl> DescribeParams() const override;
+
+ private:
+  [[nodiscard]] std::string_view tie_word_embeddings_spec_name() const;
+
+ public:
   Status LoadWeights(CheckpointReader& checkpoint) override;
   Status Forward(ForwardContext& ctx, const StepInputs& inputs, Tensor& hidden) const override;
   Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden, const Tensor& rows,

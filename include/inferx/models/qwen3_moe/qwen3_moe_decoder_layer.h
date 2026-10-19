@@ -42,6 +42,10 @@ class Qwen3MoeDecoderLayer {
   /// \brief The attention layer's spec.
   [[nodiscard]] attn::AttentionSpec Spec() const { return self_attn_.Spec(); }
 
+  /// \brief This layer's parameter manifest, tagged Owner::kLayer.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix,
+                                                     int64_t layer) const;
+
  private:
   Qwen3MoeDecoderLayer(RMSNorm input_layernorm, qwen3::Qwen3Attention self_attn,
                        RMSNorm post_attention_layernorm, Qwen3Moe moe)

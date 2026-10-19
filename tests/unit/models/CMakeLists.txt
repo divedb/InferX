@@ -54,3 +54,9 @@ inferx_add_test(
   LABELS unit
   GPU
 )
+inferx_add_test(
+  NAME describe_params_test
+  SRCS describe_params_test.cc
+  DEPS inferx::models
+  LABELS unit
+)

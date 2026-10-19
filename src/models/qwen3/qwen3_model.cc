@@ -52,6 +52,24 @@ std::vector<attn::AttentionSpec> Qwen3Model::AttentionSpecs() const {
   return specs;
 }
 
+std::vector<ParamDecl> Qwen3Model::DescribeParams(const std::string& prefix) const {
+  std::vector<ParamDecl> params;
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    std::vector<ParamDecl> layer_params = layers_[i].DescribeParams(
+        prefix + ".layers." + std::to_string(i), static_cast<int64_t>(i));
+    params.insert(params.end(), std::make_move_iterator(layer_params.begin()),
+                  std::make_move_iterator(layer_params.end()));
+  }
+  ParamDecl norm;
+  norm.name = prefix + ".norm.weight";
+  norm.global_shape = ShardShape{norm_.Weight().Dim(0)};
+  norm.rank = 1;
+  norm.owner = Owner::kLastStage;  // Produces the stage output.
+  norm.dst = norm_.Weight();
+  params.push_back(std::move(norm));
+  return params;
+}
+
 Status Qwen3Model::BindWeights(const std::string& prefix, WeightMap& weights) {
   for (size_t i = 0; i < layers_.size(); ++i) {
     INFERX_RETURN_IF_ERROR(layers_[i].BindWeights(

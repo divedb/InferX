@@ -36,6 +36,9 @@ class LlamaModel {
   /// \brief One attention spec per decoder layer, in tower order.
   [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
+  /// \brief Every layer's parameter manifest plus the final norm.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix) const;
+
  private:
   LlamaModel(std::vector<LlamaDecoderLayer> layers, RMSNorm norm, int64_t hidden_size)
       : layers_(std::move(layers)), norm_(std::move(norm)), hidden_size_(hidden_size) {}

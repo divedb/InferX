@@ -13,6 +13,7 @@
 #include "inferx/core/stream.h"
 #include "inferx/core/tensor.h"
 #include "inferx/dist/comm.h"
+#include "inferx/dist/shard.h"
 #include "inferx/models/model_spec.h"
 #include "inferx/models/safetensors.h"
 #include "inferx/models/weight_loader.h"
@@ -102,6 +103,16 @@ class Model {
   /// \brief One attention spec per attention layer, in tower order; the
   ///        runner builds its attn::AttentionRuntime from these.
   virtual std::vector<attn::AttentionSpec> GetAttentionSpecs() const = 0;
+
+  /// \brief Declarative parameter manifest for sharded loading
+  ///        (docs/executor.md §7.1): global shapes plus ShardSpecs, one
+  ///        entry per checkpoint tensor the model consumes. LocalShape
+  ///        against a ParallelContext is the single source of truth for
+  ///        local extents; `dst` is engaged wherever the parameter maps
+  ///        1:1 to a layer tensor (fused-buffer components leave it empty
+  ///        -- their placement stays model-side). Returned spans reference
+  ///        storage owned by the model and live as long as it does.
+  virtual std::vector<ParamDecl> DescribeParams() const = 0;
 
   virtual Status LoadWeights(CheckpointReader& checkpoint) = 0;
 

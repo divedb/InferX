@@ -1,5 +1,7 @@
 #include "inferx/models/llama/llama_mlp.h"
 
+
+#include "inferx/dist/shard.h"
 #include <utility>
 
 namespace inferx {
@@ -13,7 +15,37 @@ StatusOr<LlamaMLP> LlamaMLP::Create(const LlamaConfig& config, const ParallelCon
       MLP::Create(config.hidden_size, config.intermediate_size,
                           parallel.tensor_parallel_size, parallel.tensor_parallel_rank,
                           ops::Activation::kSilu, dtype, device));
-  return LlamaMLP(std::move(mlp), parallel.tensor_parallel_rank);
+  return LlamaMLP(std::move(mlp), parallel.tensor_parallel_rank, config.hidden_size,
+                 config.intermediate_size);
+}
+
+std::vector<ParamDecl> LlamaMLP::DescribeParams(const std::string& prefix) const {
+  const auto split_rows = [&](std::string_view name) {
+    ParamDecl p;
+    p.name = name;
+    p.global_shape = ShardShape{global_intermediate_, hidden_};
+    p.rank = 2;
+    ShardSpec shard;
+    shard.kind = ShardSpec::Kind::kSplit;
+    shard.split = SplitSpec{Axis::kTensorParallel, 0, 1};
+    p.shard = shard;
+    return p;
+  };
+  std::vector<ParamDecl> params;
+  params.push_back(split_rows(prefix + ".gate_proj.weight"));
+  params.push_back(split_rows(prefix + ".up_proj.weight"));
+
+  ParamDecl down;
+  down.name = prefix + ".down_proj.weight";
+  down.global_shape = ShardShape{hidden_, global_intermediate_};
+  down.rank = 2;
+  ShardSpec cols;
+  cols.kind = ShardSpec::Kind::kSplit;
+  cols.split = SplitSpec{Axis::kTensorParallel, 1, 1};
+  down.shard = cols;
+  down.dst = mlp_.Down().Weight();
+  params.push_back(std::move(down));
+  return params;
 }
 
 Status LlamaMLP::Forward(ForwardContext& ctx, const Tensor& hidden, Tensor& out) const {

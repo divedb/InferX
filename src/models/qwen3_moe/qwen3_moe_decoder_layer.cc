@@ -53,6 +53,34 @@ Status Qwen3MoeDecoderLayer::Forward(ForwardContext& ctx, const Tensor& position
   return moe_.Forward(ctx, moe_in, out);
 }
 
+std::vector<ParamDecl> Qwen3MoeDecoderLayer::DescribeParams(const std::string& prefix,
+                                                            int64_t layer) const {
+  const auto tag = [&](ParamDecl p) {
+    p.owner = Owner::kLayer;
+    p.layer = layer;
+    return p;
+  };
+  const auto norm = [&](std::string_view name, const RMSNorm& weight) {
+    ParamDecl p;
+    p.name = name;
+    p.global_shape = ShardShape{weight.Weight().Dim(0)};
+    p.rank = 1;
+    p.dst = weight.Weight();
+    return tag(std::move(p));
+  };
+
+  std::vector<ParamDecl> params;
+  params.push_back(norm(prefix + ".input_layernorm.weight", input_layernorm_));
+  for (ParamDecl& p : self_attn_.DescribeParams(prefix + ".self_attn")) {
+    params.push_back(tag(std::move(p)));
+  }
+  params.push_back(norm(prefix + ".post_attention_layernorm.weight", post_attention_layernorm_));
+  for (ParamDecl& p : moe_.DescribeParams(prefix + ".mlp")) {
+    params.push_back(tag(std::move(p)));
+  }
+  return params;
+}
+
 Status Qwen3MoeDecoderLayer::BindWeights(const std::string& prefix, WeightMap& weights) {
   INFERX_RETURN_IF_ERROR(
       weights.Add(prefix + ".input_layernorm.weight",

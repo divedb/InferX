@@ -6,6 +6,7 @@
 #include "inferx/core/dtype.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
+#include "inferx/dist/shard.h"
 #include "inferx/ops/attention/spec.h"
 #include "inferx/models/layers/linear.h"
 #include "inferx/models/layers/rms_norm.h"
@@ -52,10 +53,19 @@ class Qwen3Attention {
   ///        attends. The runner binds an executor for it at init.
   [[nodiscard]] attn::AttentionSpec Spec() const;
 
+  /// \brief Declarative parameter manifest for this layer's projection and
+  ///        norm weights (global shapes; LocalShape derives local extents).
+  ///        Q/K/V components of the fused buffer leave `dst` empty: their
+  ///        placement into the packed [q | k | v] destination is
+  ///        model-side, exactly as in BindWeights.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix) const;
+
  private:
   Qwen3Attention(Linear qkv_proj, RMSNorm q_norm, RMSNorm k_norm, RotaryEmbedding rope,
                  Linear o_proj, int64_t local_heads, int64_t local_kv_heads,
-                 int64_t head_dim, int64_t sliding_window, int64_t tp_rank)
+                 int64_t head_dim, int64_t sliding_window, int64_t tp_rank,
+                 int64_t hidden_size, int64_t global_q_rows, int64_t global_kv_rows,
+                 int kv_replicate)
       : qkv_proj_(std::move(qkv_proj)),
         q_norm_(std::move(q_norm)),
         k_norm_(std::move(k_norm)),
@@ -65,7 +75,11 @@ class Qwen3Attention {
         local_kv_heads_(local_kv_heads),
         head_dim_(head_dim),
         sliding_window_(sliding_window),
-        tp_rank_(tp_rank) {}
+        tp_rank_(tp_rank),
+        hidden_size_(hidden_size),
+        global_q_rows_(global_q_rows),
+        global_kv_rows_(global_kv_rows),
+        kv_replicate_(kv_replicate) {}
 
   Linear qkv_proj_;  ///< [(qh + 2*kvh) * hd, hidden], rows [q | k | v]
   RMSNorm q_norm_;   ///< Per-head query norm over head_dim.
@@ -79,6 +93,13 @@ class Qwen3Attention {
   /// 0 disables windowing (also stored in the spec's mask).
   int64_t sliding_window_ = 0;
   int64_t tp_rank_ = 0;
+
+  // Checkpoint extents for DescribeParams; config-derived, rank-free.
+  int64_t hidden_size_ = 0;
+  int64_t global_q_rows_ = 0;
+  int64_t global_kv_rows_ = 0;
+  /// Ranks sharing one KV piece: tp / min(tp, num_key_value_heads).
+  int kv_replicate_ = 1;
 };
 
 }  // namespace qwen3

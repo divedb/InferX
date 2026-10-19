@@ -45,6 +45,9 @@ class Qwen3Model {
   /// \brief One attention spec per decoder layer, in tower order.
   [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
+  /// \brief Every layer's parameter manifest plus the final norm.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix) const;
+
  private:
   Qwen3Model(std::vector<Qwen3DecoderLayer> layers, RMSNorm norm)
       : layers_(std::move(layers)), norm_(std::move(norm)) {}

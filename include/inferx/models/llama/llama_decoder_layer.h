@@ -36,6 +36,10 @@ class LlamaDecoderLayer {
   /// \brief The attention layer's spec.
   [[nodiscard]] attn::AttentionSpec Spec() const { return self_attn_.Spec(); }
 
+  /// \brief This layer's parameter manifest, tagged Owner::kLayer.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix,
+                                                     int64_t layer) const;
+
  private:
   LlamaDecoderLayer(RMSNorm input_layernorm, LlamaAttention self_attn,
                     RMSNorm post_attention_layernorm, LlamaMLP mlp)

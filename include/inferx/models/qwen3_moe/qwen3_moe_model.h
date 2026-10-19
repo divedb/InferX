@@ -39,6 +39,9 @@ class Qwen3MoeModel {
   /// \brief One attention spec per decoder layer, in tower order.
   [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
+  /// \brief Every layer's parameter manifest plus the final norm.
+  [[nodiscard]] std::vector<ParamDecl> DescribeParams(const std::string& prefix) const;
+
  private:
   Qwen3MoeModel(std::vector<Qwen3MoeDecoderLayer> layers, RMSNorm norm,
                 int64_t hidden_size)
