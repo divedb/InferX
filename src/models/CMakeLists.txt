@@ -41,7 +41,7 @@ inferx_add_library(
     inferx::core
     inferx::config
     inferx::ops
-    inferx::cache
+    inferx::cache_manager
     inferx::comm
     inferx::util
     inferx::sampling

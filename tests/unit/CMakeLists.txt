@@ -1,6 +1,7 @@
 # Unit tests: one CMakeLists per component area, registered next to the
 # sources it covers. Labels follow the source layout (everything here is
 # "unit"); integration suites live under tests/integration.
+add_subdirectory(attn)
 add_subdirectory(cache)
 add_subdirectory(cli)
 add_subdirectory(config)

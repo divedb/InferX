@@ -2,139 +2,236 @@
 #define INFERX_CACHE_CACHE_MANAGER_H_
 
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
+#include "inferx/cache/block_hash.h"
+#include "inferx/cache/cache_group_manager.h"
+#include "inferx/cache/cache_spec.h"
 #include "inferx/cache/kv_block_pool.h"
-#include "inferx/cache/prefix_cache.h"
+#include "inferx/cache/recurrent_state_pool.h"
+#include "inferx/core/status.h"
+#include "inferx/tokenizer/id.h"  // TokenId
 
 namespace inferx {
 
-/// Owns logical request allocations over borrowed rank-local KV storage.
-/// Single-threaded; the pool must outlive this manager. Allocator operations
-/// for managed blocks must go through this object. Device execution must
-/// finish before Release or destruction: this initial contract has no async leases.
-/// Capacity is reserved storage, not a watermark of successfully computed KV.
+/// \brief Request-level facade over the cache groups.
 ///
-/// With prefix caching enabled, the manager also owns the hash-keyed prefix
-/// index: admission adopts and pins the longest cached prompt prefix,
-/// completed full blocks are published into the index, released blocks with
-/// live entries stay cached (LRU-evictable), and allocation pressure evicts
-/// before it fails.
+/// One CacheGroupManager knows one group. This class owns what spans groups:
+///  - per-request state, one RequestGroupState per planned group;
+///  - the request's block-hash chain (one chain suffices, because every
+///    prefix-index key already carries its group index and phase 1 uses a
+///    uniform block size);
+///  - prefix adoption: the usable hit is the longest length every token-wise
+///    group can supply, found by calling FindLongestCacheHit with shrinking
+///    caps until the groups agree;
+///  - atomic multi-group Reserve and Fork, with rollback;
+///  - request-level prefix statistics and the device work queued for the
+///    runner.
 ///
-/// Clearing the prefix cache invalidates discoverability, not ownership:
-/// shared blocks stay alive until their last holder releases, and requests
-/// admitted before the clear never republish into the new index.
+/// Counterpart of vLLM's KVCacheManager plus KVCacheCoordinator.
+///
+/// The pools are borrowed and must outlive this object; the plan is copied.
+/// Not thread-safe: call from the scheduler thread only.
 class CacheManager {
  public:
   /// \brief Result of admitting a prompt to the prefix index.
   struct PrefixAdoption {
-    /// Whole blocks of prompt KV already computed elsewhere.
+    /// Agreed whole-block cached tokens: the longest length every token-wise
+    /// group can supply, not simply the minimum of per-group hits.
     int64_t cached_tokens = 0;
-    /// Pinned blocks holding that KV, in logical order. Empty when the
-    /// manager runs without prefix caching or nothing matched.
-    std::vector<int32_t> block_ids;
+
+    /// Block ids per token-wise group, in logical order, indexed by group
+    /// index. A window or chunk group leads with kNullBlockId for the part of
+    /// the prefix that lies before its retention floor. Empty when prefix
+    /// caching is off or nothing hit.
+    std::vector<std::vector<BlockId>> group_block_ids;
   };
 
-  /// \brief Wires the manager to the KV block pool.
+  /// \brief Prefix-caching counters, per request and in tokens. Pool-level
+  /// counters, when added, count per block probe; keep the scopes distinct.
+  struct Stats {
+    int64_t prefix_queries = 0;
+    int64_t prefix_hits = 0;
+    int64_t prefix_queried_tokens = 0;
+    int64_t prefix_hit_tokens = 0;
+  };
+
+  /// \brief Device work the runner must perform before this step's kernels
+  /// run. Drained by TakeRunnerWork.
+  struct RunnerWork {
+    /// State slots newly assigned to requests; the runner zeroes them with
+    /// RecurrentStatePool::ResetSlot.
+    std::vector<int64_t> slots_to_reset;
+    /// Recurrent-state copies for forked children.
+    std::vector<SlotCopy> slot_copies;
+    /// Block-page copies for copy-on-write after a fork.
+    std::vector<BlockCopy> block_copies;
+  };
+
+  /// \brief Builds one manager per planned group.
   ///
-  /// \param pool                 The pool to allocate from; must outlive the
-  ///                             manager.
-  /// \param enable_prefix_caching Whether completed blocks become shareable
-  ///                             prefix-cache entries. When false the manager
-  ///                             behaves exactly as before the cache existed.
-  explicit CacheManager(KvBlockPool* pool, bool enable_prefix_caching = false);
+  /// \param pool        Block pool for the token-wise groups (null only when
+  ///                    the plan has none).
+  /// \param state_pool  State pool for the recurrent group (null only when the
+  ///                    plan has none).
+  /// \param plan        From PlanCacheGroups; copied.
+  /// \return InvalidArgument when a needed pool is null, the plan's block size
+  ///         differs from the pool's, or a group manager cannot be created.
+  static StatusOr<std::unique_ptr<CacheManager>> Create(KvBlockPool* pool,
+                                                        RecurrentStatePool* state_pool,
+                                                        const CachePlan& plan,
+                                                        bool enable_prefix_caching);
+
   ~CacheManager();
   CacheManager(const CacheManager&) = delete;
   CacheManager& operator=(const CacheManager&) = delete;
 
-  /// \brief Adopts the prompt's cached prefix, pinning its blocks.
-  ///
-  /// Must be called at most once per request, before any Reserve, with the
-  /// full prompt. The adoption is capped at `max_cached_tokens` (pass
-  /// prompt_len - 1 to keep the last prompt token recomputing for logits)
-  /// and truncated to whole blocks. Also records the prompt's hash chain so
-  /// later PublishComputed calls extend rather than recompute it. Salt
-  /// namespaces the chain: salted and unsalted versions of one prompt share
-  /// nothing.
-  PrefixAdoption AdoptPrefix(uint64_t request_id, absl::Span<const TokenId> prompt,
-                             std::string_view cache_salt, int64_t max_cached_tokens);
+  // -- admission and growth ---------------------------------------------------
 
-  /// \brief Publishes every full block of `prompt + output` beyond what was
-  ///        already hashed for this request.
+  /// \brief Registers `request_id` and adopts the longest cached prefix of
+  /// `prompt`. At most once per request, before any Reserve. The hit is
+  /// capped by `max_cached_tokens` (the caller's n-1 rule), truncated to whole
+  /// blocks, and pinned. `cache_salt` namespaces the hash chain, so tenants
+  /// never share prefixes. With caching off the request is still registered
+  /// and the adoption is empty.
   ///
-  /// The two spans concatenated are exactly the tokens whose KV exists —
-  /// the accepted output so far, not the token about to be sampled. Calling
-  /// this repeatedly is cheap: only newly covered full blocks register.
-  /// Block i of the request's table must already hold tokens
-  /// [i*block_size, (i+1)*block_size). Requests admitted before the most
-  /// recent ClearPrefixCache never publish: their pre-clear KV must not
-  /// reenter the index.
+  /// While the plan has a recurrent group the agreed length is 0: KV blocks
+  /// cannot be reused without the matching recurrent state, and state boundary
+  /// sharing does not exist yet. Counted as a miss.
+  ///
+  /// \return InvalidArgument for a duplicate request id; other errors leave no
+  ///         pin and no registered request.
+  StatusOr<PrefixAdoption> AdoptPrefix(uint64_t request_id, absl::Span<const TokenId> prompt,
+                                       std::string_view cache_salt, int64_t max_cached_tokens);
+
+  /// \brief Grows `request_id`'s holdings in every group to `target`;
+  /// all-or-nothing across groups. Order per call: roll off tokens below each
+  /// group's retention floor, check capacity, reserve each group, and roll
+  /// back the groups already reserved if a later one fails. Never shrinks. A
+  /// request not yet registered is registered on its first Reserve.
+  ///
+  /// Rolled-off blocks stay released even when the call then fails: they are
+  /// dead for this request either way.
+  ///
+  /// \return ResourceExhausted only when eviction cannot help (no free block
+  ///         or state slot); the request is unchanged apart from roll-off.
+  Status Reserve(uint64_t request_id, const GrowthTarget& target);
+
+  /// \brief Whether Reserve(request_id, target) would succeed now. Does not
+  /// change anything. Conservative: it does not count blocks that roll-off
+  /// would free. An unknown request is costed as a fresh one.
+  bool CanReserve(uint64_t request_id, const GrowthTarget& target) const;
+
+  /// \brief Publishes every newly completed full block, per token-wise group,
+  /// to the prefix index. `num_computed_tokens` bounds what is complete: the
+  /// hash chain is extended over `prompt` then `output` as far as full blocks
+  /// within `num_computed_tokens` reach. Publishes nothing while the plan has a
+  /// recurrent group (the entries could never be reused). No-op with caching
+  /// off.
   Status PublishComputed(uint64_t request_id, absl::Span<const TokenId> prompt,
-                         absl::Span<const TokenId> output);
+                         absl::Span<const TokenId> output, int64_t num_computed_tokens);
 
-  /// Ensures capacity for target_tokens and returns only newly granted blocks
-  /// in logical order. Growth is all-or-nothing: failure leaves the existing
-  /// mapping and pool availability unchanged. A smaller target never shrinks.
-  /// With prefix caching, evicts cached blocks before failing.
-  StatusOr<std::vector<int32_t>> Reserve(uint64_t request_id, int64_t target_tokens);
+  /// \brief Forks a live request into children (beam-style branching).
+  /// Children share token-wise blocks (ref-counted; copy-on-write when a
+  /// child writes a shared partial block) and get fresh recurrent slots with
+  /// copied state; the copies are queued as RunnerWork. Children must be
+  /// unregistered ids; the parent stays live. All-or-nothing across groups and
+  /// children. Each child should subsequently go through PublishComputed with
+  /// its own token stream.
+  Status Fork(uint64_t parent_request_id, absl::Span<const uint64_t> child_request_ids);
 
-  /// Borrowed logical block mapping. Invalidated by growth/release of this
-  /// request. An unknown request has an empty mapping.
-  absl::Span<const int32_t> Blocks(uint64_t request_id) const;
-
-  /// Releases the request's allocation; unknown/already released IDs are no-ops.
-  /// Blocks with live prefix-cache entries stay cached (they become eviction
-  /// candidates); the rest return to the pool's free list.
+  /// \brief Releases every holding of `request_id`, tail blocks first. Unknown
+  /// or already-released ids are no-ops.
   Status Release(uint64_t request_id);
 
-  /// \brief Makes every prefix-cache entry undiscoverable.
-  ///
-  /// Models a semantic break such as a weight change. Evictable blocks
-  /// return to the pool immediately. Blocks that live requests still hold
-  /// keep their ownership records until the last holder releases, so one
-  /// sharer's release can never free another sharer's KV. Requests admitted
-  /// before the clear never republish into the new index.
-  void ClearPrefixCache();
+  /// \brief Drains the device work queued by Reserve and Fork.
+  RunnerWork TakeRunnerWork();
 
-  /// \brief Entries currently discoverable by hash; zero without caching.
-  int64_t CachedPrefixBlocks() const;
+  // -- prefix index -----------------------------------------------------------
 
-  /// \brief Whether the prefix index is active for this manager.
-  bool PrefixCachingEnabled() const { return prefix_ != nullptr; }
+  /// \brief Drops every prefix-index entry. Fails (FailedPrecondition) while
+  /// any request holds blocks, as the pool does: there are no tombstones, so
+  /// drain requests first.
+  Status ResetPrefixCache();
 
-  /// \brief Tokens per block; the publication granularity of the index.
-  int64_t BlockSize() const { return pool_->BlockSize(); }
+  // -- per-request views -------------------------------------------------------
 
-  /// \brief Blocks currently on the pool's free list.
-  int64_t FreeBlocks() const { return pool_->FreeBlocks(); }
-  /// \brief Total blocks in the pool.
-  int64_t TotalBlocks() const { return pool_->NumBlocks(); }
-  /// \brief Fraction of the pool currently handed out.
-  float Usage() const;
+  /// \brief Number of token-wise groups; the valid range for `group_index`
+  /// below. Hybrid callers branch on this.
+  int64_t NumTokenWiseGroups() const;
+
+  /// \brief True when the plan has a recurrent group.
+  bool HasRecurrentGroup() const;
+
+  /// \brief One token-wise group's block table for a request, in logical
+  /// order, with kNullBlockId for rolled-off entries. Empty for an unknown
+  /// request. Invalidated by Reserve, Fork and Release.
+  absl::Span<const BlockId> GroupBlocks(uint64_t request_id, int64_t group_index) const;
+
+  /// \brief One group's skipped tokens at `num_computed_tokens`: what the
+  /// runner turns into window_left per layer. 0 for full-attention groups.
+  int64_t GroupSkippedTokens(int64_t group_index, int64_t num_computed_tokens) const;
+
+  /// \brief The state slot of a request, or -1 if it has none (or the plan has
+  /// no recurrent group).
+  int64_t StateSlot(uint64_t request_id) const;
+
+  // -- counters ----------------------------------------------------------------
+
+  bool PrefixCachingEnabled() const;
+  int64_t BlockSize() const;
+  /// \brief Blocks available to Reserve: free plus evictable.
+  int64_t NumFreeBlocks() const;
+  int64_t NumBlocks() const;
+  /// \brief Free state slots; 0 when the plan has no recurrent group.
+  int64_t NumFreeSlots() const;
+  double Usage() const;
+  int64_t NumCachedBlocks() const;
+  const Stats& stats() const { return stats_; }
+  void ResetStats() { stats_ = Stats{}; }
 
  private:
-  /// Per-request hash-chain state; present only while prefix caching is on.
-  struct PrefixState {
-    BlockHashChain chain;
-    /// Full blocks already hashed (and published where the block was new).
-    int64_t hashed_blocks = 0;
-    /// Epoch this state was created in; a clear invalidates older states.
-    uint64_t epoch = 0;
+  /// Everything the facade keeps per live request.
+  struct RequestState {
+    /// One per planned group, in plan order (token-wise first, recurrent last).
+    std::vector<RequestGroupState> groups;
+
+    /// The request's block-hash chain, one digest per hashed full block, and
+    /// the cache salt it is rooted in.
+    std::vector<BlockHash> hashes;
+    std::vector<uint8_t> salt;
   };
 
-  /// Reclaims cached blocks until `extra` blocks are free, or gives up.
-  void EvictFor(int64_t extra);
+  CacheManager(KvBlockPool* pool, RecurrentStatePool* state_pool, CachePlan plan,
+               bool enable_prefix_caching);
 
-  KvBlockPool* pool_;
-  absl::flat_hash_map<uint64_t, std::vector<int32_t>> allocations_;
-  absl::flat_hash_map<uint64_t, PrefixState> prefix_state_;
-  std::unique_ptr<PrefixCache> prefix_;
-  /// Bumped by every ClearPrefixCache; admission records the current value
-  /// so in-flight requests cannot republish KV from before a clear.
-  uint64_t epoch_ = 0;
+  /// Longest whole-block length every token-wise group can supply, found by
+  /// shrinking the cap until each group's FindLongestCacheHit agrees.
+  CacheHit FindAgreedHit(absl::Span<const BlockHash> hashes, int64_t max_tokens,
+                         std::vector<CacheHit>* per_group) const;
+
+  /// Extends `request`'s chain to cover `num_blocks` full blocks of
+  /// prompt followed by output.
+  void ExtendHashes(RequestState& request, absl::Span<const TokenId> prompt,
+                    absl::Span<const TokenId> output, int64_t num_blocks) const;
+
+  Status ReleaseRequest(RequestState& request);
+
+  KvBlockPool* const pool_;
+  RecurrentStatePool* const state_pool_;
+  const CachePlan plan_;
+  const bool enable_prefix_caching_;
+
+  /// One manager per planned group, in plan order.
+  std::vector<CacheGroupManagerPtr> managers_;
+  absl::flat_hash_map<uint64_t, RequestState> requests_;
+
+  RunnerWork pending_work_;
+  Stats stats_;
 };
 
 }  // namespace inferx

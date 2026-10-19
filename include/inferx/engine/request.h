@@ -211,6 +211,8 @@ class Request {
   ///
   /// Unlike NumComputedTokens(), this is recorded once and never overwritten, so it stays valid
   /// for hit-rate metrics after the request progresses or is preempted.
+  ///
+  /// \return The number of cached tokens, or -1 if not scheduled yet.
   int NumCachedTokens() const noexcept { return num_cached_tokens_; }
 
   /// \brief Records the prefix-cache hit count. Scheduler-only; no-op after

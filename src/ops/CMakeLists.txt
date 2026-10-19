@@ -49,3 +49,7 @@ set_source_files_properties(cpu/norm.cc PROPERTIES
 # FlashInfer LayerNorm gates its BF16 type traits on this definition.
 set_source_files_properties(cuda/norm.cu PROPERTIES
   COMPILE_DEFINITIONS "ENABLE_BF16=1")
+
+# Unified attention architecture (host side): spec, bridge, capability,
+# cache views. See docs/attention.md.
+add_subdirectory(attention)

@@ -90,30 +90,13 @@ class Model {
  public:
   virtual ~Model() = default;
 
-  /// \brief Engine-facing facts (shapes, eos ids, state requirements).
-  virtual const ModelSpec& GetModelSpec() const = 0;
+  virtual const CacheRequirements& GetCacheRequirements() const = 0;
 
-  /// \brief Loads every weight this rank needs from the opened checkpoint.
-  ///
-  /// The default staging path runs on the model's own device; on return
-  /// every bound tensor is filled and the model is immutable.
   virtual Status LoadWeights(CheckpointReader& checkpoint) = 0;
 
-  /// \brief Runs the stack: embed (or take `inputs.input_embeds`), decode
-  ///        layers, final norm.
-  ///
-  /// \param ctx    The step's execution context.
-  /// \param inputs Tokens and positions for this step.
-  /// \param hidden [num_tokens, hidden_size] final-norm activations.
   virtual Status Forward(ForwardContext& ctx, const StepInputs& inputs,
                          Tensor& hidden) const = 0;
 
-  /// \brief Projects selected hidden rows onto the vocabulary.
-  ///
-  /// \param hidden  [num_tokens, hidden] from `Forward`.
-  /// \param rows    [sample_rows] int32 token-stream rows whose logits are
-  ///                needed (one per sequence: its last new token).
-  /// \param logits  [sample_rows, vocab] output, allocated by the caller.
   virtual Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden, const Tensor& rows,
                                Tensor& logits) const = 0;
 };

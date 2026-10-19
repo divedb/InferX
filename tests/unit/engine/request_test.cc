@@ -9,9 +9,14 @@ namespace inferx {
 namespace {
 
 std::vector<TokenId> Prompt(int count) {
+  constexpr int kTokenIdOffset = 100;  // Arbitrary offset to avoid zero.
   std::vector<TokenId> tokens;
   tokens.reserve(count);
-  for (int i = 0; i < count; ++i) tokens.push_back(static_cast<TokenId>(100 + i));
+
+  for (int i = 0; i < count; ++i) {
+    tokens.push_back(static_cast<TokenId>(kTokenIdOffset + i));
+  }
+
   return tokens;
 }
 

@@ -1,1588 +1,845 @@
-# InferX distributed execution architecture
-
-**Status: architecture proposal — no implementation is included.** Written 2026-10-15 as a from-scratch redesign of the `ModelRunner` / `Executor` / `Scheduler` / `Model` layer. It is deliberately *not* constrained by the current tree; section 9 maps the proposal onto what exists only as a migration aid. **Updated 2026-10-15 (second pass):** sections 10–14 add a case-by-case feature-coverage validation against vLLM, a gap analysis with concrete API extensions, the phased implementation roadmap, per-phase test gates, and P0/P1/P2 priorities.
-
-Reference systems studied (best practices adopted where cited, with trade-offs in section 8):
-
-- **vLLM V1** — engine-core/frontend split, immutable `SchedulerOutput`, worker/group-coordinator layering, DP replication.
-- **SGLang** — overlap scheduling, hybrid-parallel decomposition (attention TP vs MoE TP/EP), router-based DP, attention-backend abstraction.
-- **TensorRT-LLM** — executor-session API with futures, C++ single-process multi-GPU worker model, world config + micro-batch pipeline scheduling for PP, inflight batching.
-
-The cache-layer contract referenced throughout (`KVCacheManager`, cache groups, graphs) is specified by the `TODO.md` backlog (F05/F06, A07, A12); this document only defines the interfaces the executor touches.
-
----
-
-## 1. Architecture overview
-
-### 1.1 Layer diagram
-
-```mermaid
-flowchart TB
-    subgraph Frontend["Frontend (per process)"]
-        API["HTTP / gRPC server"]
-        TOK["Tokenizer / detokenizer"]
-    end
-
-    subgraph EngineCore["Engine (one per process, owns the engine thread)"]
-        ENG["Engine<br/>(submission, cancellation, events)"]
-        SCH["Scheduler<br/>(admission, batching,<br/>preemption, stats)"]
-        KVM["KVCacheManager<br/>(borrows rank-0 pool)"]
-    end
-
-    subgraph ExecLayer["Executor (topology plane)"]
-        direction TB
-        EX["Executor<br/>(plan dispatch, result<br/>aggregation, failure domain)"]
-        subgraph Workers["Worker x R (one per device rank)"]
-            W1["ModelRunner<br/>(model, attention backend,<br/>graphs, sampler, memory plan)"]
-            MDL["Model (static graph)"]
-            ATTN["AttentionBackend"]
-            W1 --> MDL
-            W1 --> ATTN
-        end
-        COMM["CommGroups<br/>(TP / MoE / PP / DP collectives)"]
-        EX --> Workers
-        EX --> COMM
-    end
-
-    API --> ENG
-    ENG --> SCH
-    SCH --> KVM
-    ENG --> EX
-    KVM -. "borrows block pool owned by rank-0 runner" .-> W1
-```
-
-### 1.2 Responsibilities and boundaries
-
-| Component | Plane | Owns | Must never do |
-| --- | --- | --- | --- |
-| **Engine** | Service | request registry, engine thread, event fan-out, lifecycle (start/drain/shutdown) | touch tensors, know parallelism details |
-| **Scheduler** | Control (CPU) | waiting/running queues, admission & budgets, continuous batching (chunked prefill), preemption policy, per-step **immutable plan**, scheduler stats | touch device memory, execute kernels, know model families (beyond `ModelSpec`) |
-| **KVCacheManager** | Control (CPU) | logical block ownership, prefix index, admission headroom | own device memory (the pool belongs to the runner) |
-| **Executor** | Topology | workers, communicator groups, plan sharding/dispatch, microbatch pipeline (PP), replica routing (DP), result aggregation, group failure handling | scheduling policy, request semantics |
-| **ModelRunner** | Device (1 per GPU rank) | `Model` instance, attention backend, CUDA-graph pool, sampler, device memory plan (weights → workspace → KV pool) | request policy, cross-rank orchestration |
-| **Model** | Graph | static architecture, weight bindings, `ModelSpec` (geometry, cache specs, shard rules) | allocation, scheduling, collectives beyond what `Forward` issues through `CommBackend` |
-| **AttentionBackend** | Kernel | mask/layout contracts, plan metadata, graph-safe kernel state | cache policy |
-
-Data flows **down** only: `Engine → Scheduler + Executor → ModelRunner → Model`. Results flow **up** as plain values (`StepResult`). The single deliberate shared resource is the KV block pool: the rank-0 `ModelRunner` owns the allocation; the scheduler's `KVCacheManager` borrows it and is the *only* allocator of block IDs; the runners of all ranks consume IDs read-only (they write bytes into blocks the plan names). This preserves the current system's best invariant (scheduler owns bookkeeping, runner owns bytes) while making it explicit and checked at init.
-
-### 1.3 Process and threading model
-
-- **One OS process per node** (C++ native; unlike vLLM/SGLang, no GIL forces process-per-rank). One *worker thread* per GPU, each pinned to its device and stream set. This is the TensorRT-LLM model.
-- **Multi-node** is launched externally (`mpirun`/`srun`/container orchestrator); ranks rendezvous over a TCP/env store and use NCCL/UCX for data-plane collectives. A `LoopbackTransport` exists for unit tests (the current `LoopbackComm` pattern, kept as a first-class citizen).
-- **Engine thread** runs the step loop. **Overlap scheduling** (SGLang): while the executor runs step *N* on GPU streams, the scheduler thread computes the plan for step *N+1* from the *predicted* state; the plan is committed only after step *N*'s result lands. Overlap is a runtime toggle, not a redesign — the non-overlapped loop is the degenerate case.
-- **Frontend threads** (HTTP) never touch scheduler or runners; they communicate with the engine thread through mutex-guarded pending/cancel lists and lock-free event queues (the current `EngineGateway` threading contract, generalized).
-
-### 1.4 Design invariants
-
-1. **The plan is a message.** `SchedulerOutput` is immutable value data. Anything consuming it (executor, runners, graph replay, future debug tooling) sees the same bytes; no back-pointers into scheduler state.
-2. **Single writer per resource.** Block IDs: scheduler (via `KVCacheManager`). Device bytes: the owning rank's stream. Sampling decisions: exactly one designated rank per engine.
-3. **Determinism by construction.** Given identical requests and seeds, greedy/seeded output is bit-identical regardless of TP/PP/EP shape (rank-0 samples, tokens broadcast; collectives use deterministic reductions where kernels require it).
-4. **Unsupported combinations fail at startup**, with an actionable error naming the constraint (the cache backlog's ground rule, applied to parallelism: e.g. CP with prefix caching, PP with sliding-window groups, EP a2a under CUDA graphs until validated).
-5. **Fail-stop groups.** A rank failure poisons the smallest enclosing group; the engine drains pending requests with an explicit error rather than deadlocking. Every collective has a matching abort path (section 7.4).
-
----
-
-## 2. Class API design
-
-Conventions: Google C++ Style Guide; `Status`/`StatusOr<T>` for fallible operations; `absl::Span` for non-owning views; PascalCase methods; Doxygen `///` comments. All classes are non-copyable singletons-per-scope unless stated. Namespaces: `inferx::runtime` (engine/executor/scheduler), `inferx::models` (model layer), `inferx::dist` (communication), `inferx::cache` (cache subsystem).
-
-### 2.1 Configuration and world topology
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Parallel decomposition of the engine across ranks.
-///
-/// World math (validated by Validate(), section 3.1):
-///
-///     world_size = dp_size * pp_size * tp_size * cp_size
-///     tp_size    = attn_tp_size * moe_ep_size * moe_tp_size
-///
-/// dp replicates whole pp x tp x cp engines; pp splits layers into stages;
-/// tp splits each layer's heads and experts as above; cp splits sequences
-/// (deferred, see 3.6). ep_size == moe_ep_size names the expert dimension
-/// explicitly for readability at call sites.
-struct ParallelConfig {
-  int dp_size = 1;
-  int pp_size = 1;
-  int tp_size = 1;
-  int cp_size = 1;
-  /// Attention tensor-parallel degree (heads sharded over this many ranks).
-  int attn_tp_size = 0;   // 0 -> derive: == tp_size when no MoE split.
-  /// Expert-parallel degree inside the TP group (experts across ranks).
-  int moe_ep_size = 0;    // 0 -> derive.
-  /// Tensor-parallel degree *within one expert* (expert weight sharding).
-  int moe_tp_size = 0;    // 0 -> derive.
-
-  /// Expert token-dispatch transport. kAllToAll is the low-latency path for
-  /// large worlds; kAllGather is simpler and fine for small worlds.
-  enum class MoeDispatch { kAllToAll, kAllGather };
-  MoeDispatch moe_dispatch = MoeDispatch::kAllToAll;
-
-  /// Rendezvous for multi-process/multi-node launches; ignored when the
-  /// engine is single-process (threads only).
-  std::string rendezvous_endpoint;  // "host:port" or "env://" (MASTER_ADDR/PORT)
-
-  int WorldSize() const;
-  /// \brief Rejects impossible or unimplemented decompositions with the
-  ///        constraint named (invariant 4).
-  Status Validate() const;
-};
-
-/// \brief Coordinates of one rank in the parallel world, plus the communicator
-///        groups it belongs to.
-///
-/// Decomposition order (row-major, so consecutive ranks are TP neighbors --
-/// NCCL-friendly and matches SGLang's hybrid-parallel layout):
-///
-///     rank = ((dp * pp_size + pp) * tp_size + tp) * cp_size + cp
-///
-/// Derived inside a TP group: attn_rank = tp % attn_tp_size,
-/// moe_rank = tp / attn_tp_size (in [0, moe_ep*moe_tp)).
-class WorldMapping {
- public:
-  static WorldMapping FromConfig(const ParallelConfig& config, int rank);
-
-  int Rank() const;            // Global rank in [0, world_size).
-  int WorldSize() const;
-  RankCoord Coord() const;     // {dp, pp, tp, cp} for this rank.
-  int DpRank() const;
-  int PpRank() const;          // Stage index in [0, pp_size).
-  int PpNext() const;          // -1 on last stage.
-  int PpPrev() const;          // -1 on first stage.
-  bool IsFirstStage() const;
-  bool IsLastStage() const;    // Owns LM head + sampling.
-  int AttnTpRank() const;
-  int MoeRank() const;
-  /// Global ranks of this rank's TP group (attn + moe), PP neighbors,
-  /// DP peers, CP ring -- used to build communicators once.
-  std::vector<int> TpGroupRanks() const;
-  std::vector<int> AttnGroupRanks() const;
-  std::vector<int> MoeGroupRanks() const;
-  std::vector<int> DpGroupRanks() const;
-};
-
-/// \brief Aggregate of every user-facing configuration section.
-struct EngineConfig {
-  models::ModelConfig model;       // architecture, dtype, quantization.
-  cache::CacheConfig cache;        // block size, prefix caching, budgets.
-  SchedulerConfig scheduler;       // max_seqs, token budget, policy knobs.
-  ParallelConfig parallel;
-  ExecutionConfig execution;       // overlap on/off, graphs, capture sizes.
-};
-
-}  // namespace inferx::runtime
-```
-
-### 2.2 Requests, events, and the Engine
-
-```cpp
-namespace inferx::runtime {
-
-using RequestId = std::uint64_t;
-
-/// \brief What a client wants generated. Immutable after submission.
-struct CompletionSpec {
-  std::vector<TokenId> prompt_tokens;
-  std::string cache_salt;                 // Prefix-cache namespacing (F04).
-  sampling::SamplingParams sampling;
-  std::vector<TokenId> stop_token_ids;
-  int max_new_tokens = 0;
-  bool ignore_eos = false;
-  /// Requested intermediate outputs; non-empty forces cache-reuse bypass
-  /// (A08 semantics).
-  OutputSpec outputs;                     // Logprobs, embeddings, hidden.
-};
-
-/// \brief Streaming events for one request, delivered in order.
-///        Implementations must be thread-safe (called from the engine thread,
-///        consumed anywhere).
-class EventSink {
- public:
-  virtual ~EventSink() = default;
-  virtual void OnTokenDelta(RequestId id, std::string_view utf8_delta) = 0;
-  virtual void OnUsage(RequestId id, const UsageInfo& usage) = 0;
-  virtual void OnFinished(RequestId id, FinishReason reason,
-                          const FinalResult& result) = 0;
-  virtual void OnError(RequestId id, const Status& error) = 0;
-};
-
-/// \brief Public entry point: one inference engine instance.
-///
-/// Thread-safe for Submit/Cancel/Stats from any thread; everything else
-/// happens on the engine thread. Lifecycle: Create -> (running) -> Shutdown.
-/// The destructor joins all threads after a graceful drain; it never blocks
-/// indefinitely (drain deadline is configurable).
-class Engine {
- public:
-  /// \brief Builds the whole stack: communicators, workers, weights, caches,
-  ///        scheduler. Performs startup validation (invariant 4) and the
-  ///        distributed barriers of section 4; on failure every rank unwinds
-  ///        and Create returns the same error on every rank.
-  static StatusOr<std::unique_ptr<Engine>> Create(const EngineConfig& config,
-                                                  std::shared_ptr<EventSink> sink);
-  ~Engine();
-
-  /// \brief Enqueues a request; returns after the request is registered,
-  ///         before any scheduling decision. ResourceExhausted when the
-  ///         waiting queue is full.
-  Status Submit(CompletionSpec spec);
-  /// \brief Cancels by id; unknown/finished ids are ignored. Returns the ids
-  ///        actually cancelled. Blocks until the requests' blocks are freed.
-  std::vector<RequestId> Cancel(absl::Span<const RequestId> ids);
-  EngineStats Stats() const;   // Snapshot; safe concurrently.
-  /// \brief Stops admitting, drains running requests up to a deadline,
-  ///        then tears down workers and communicators in reverse order.
-  Status Shutdown(absl::Duration drain_deadline);
-
- private:
-  // Constructed only through Create; members are wired there.
-};
-
-}  // namespace inferx::runtime
-```
-
-The C++ API is callback-based (`EventSink`); a `FutureFacade` (`SubmitAndWait` returning `StatusOr<FinalResult>` futures, TensorRT-LLM executor style) is a thin adapter over the same engine, not a second path.
-
-### 2.3 The Scheduler and its output
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief One request as the scheduler sees it: policy state only.
-///
-/// This is today's `inferx::Request`, retained under the same name and in
-/// the same role as vLLM V1's `Request`. Mutable, scheduler-private
-/// (single-threaded by contract, 1.3); it never leaves the scheduler --
-/// NewRequestData/CachedRequestData are its read-only projections into
-/// SchedulerOutput. Watermark ownership follows decision D2: *scheduled*
-/// lengths live per-step in SchedulerOutput, *allocated* lengths live in
-/// the KVCacheManager, *computed* (num_computed_tokens) and *accepted*
-/// (output_tokens) live here. No tensors, no ranks, no block ids, no
-/// compiled grammar, no draft state.
-struct Request {
-  // ---- Present today (include/inferx/engine/request.h). ----
-  RequestId id = 0;
-  absl::Span<const TokenId> prompt_tokens;
-  std::vector<TokenId> output_tokens;      // Accepted tokens only (D2).
-  sampling::SamplingParams sampling_params;  // Seed, min/max tokens.
-  std::string_view cache_salt;             // Prefix-cache namespace (F04).
-  RequestStatus status = RequestStatus::kWaiting;  // D3 state machine; the
-                     // C05 fix restores kWaiting -> kRunning admission.
-  FinishReason finish_reason = FinishReason::kStopped;
-  int num_computed_tokens = 0;             // KV-backed watermark (D2).
-
-  // Guard-railed transitions (scheduler thread only).
-  Status Admit();          // kWaiting -> kRunning (C05 / D3).
-  Status Preempt();        // kRunning -> kPreempted; watermark resets to hits.
-  void MarkWaiting();      // kPreempted -> kWaiting (requeue at head).
-  Status AppendAccepted(absl::Span<const TokenId> tokens);
-  Status Finish(FinishReason reason);
-
-  // ---- Extensions land with their owning phases, not up front: ----
-  //   + fork_parent / fork_point_tokens / fork_children   (n>1, 11.6 / A02)
-  //   + num_last_spec_tokens                              (speculation, 11.2)
-  //   + priority / arrived_at / num_preemptions           (A10 policies)
-  //   + mm_spans / GuidedSpec                             (F04, 11.3 / 11.5)
-  //   + kWaitingRemote status                             (PD disagg, 11.1)
-};
-
-/// \brief A newly admitted request, resolved for the executors.
-struct NewRequestData {
-  RequestId request_id;
-  absl::Span<const TokenId> prompt_tokens;  // Full prompt (chunking later).
-  int num_cached_tokens;                    // Adopted prefix length.
-  absl::Span<const int32_t> block_ids;      // Prompt blocks, logical order.
-  sampling::SamplingParams sampling;
-};
-
-/// \brief A running request's delta for this step.
-struct CachedRequestData {
-  RequestId request_id;
-  int num_new_tokens;          // 1 for decode; k for speculative verify.
-  absl::Span<const int32_t> new_block_ids;  // Growth granted this step.
-  int num_cached_tokens;       // Watermark after adoption/preemption replay.
-};
-
-/// \brief The scheduler's immutable step output (vLLM V1-aligned name).
-///
-/// Produced by Scheduler::Schedule(), consumed by exactly one
-/// Executor::Execute(). Value semantics; every span points into storage
-/// owned by the output. Contains *no* device pointers and *no* policy state,
-/// so it can be logged, broadcast (DP), or replayed (graph debug) verbatim.
-struct SchedulerOutput {
-  std::vector<NewRequestData> new_requests;
-  std::vector<CachedRequestData> running_requests;
-  std::vector<RequestId> preempted_request_ids;
-  std::vector<RequestId> finished_request_ids;   // Detected last step.
-  int total_num_scheduled_tokens = 0;
-  StepKind kind = StepKind::kMixed;              // Prefill/decode/mixed.
-  /// DP routing hint when the executor fronts multiple replicas.
-  int dp_replica = 0;
-};
-
-/// \brief The executor's answer to one plan.
-struct StepResult {
-  /// One sampled token per scheduled request that completed its prompt or
-  /// continued decode; aligned with plan order (mid-prompt prefill chunks
-  /// contribute no sample).
-  std::vector<SampledTokens> samples;
-  std::vector<RequestId> finished;         // Stop conditions detected on rank 0.
-  std::vector<Status> request_errors;      // Per-request failures (OOM'd etc.).
-  StepTiming timing;                       // Device-side, for overlap + stats.
-};
-
-/// \brief Continuous-batching scheduler. Pure control plane.
-///
-/// Single-threaded by contract: only the (engine or scheduler) thread that
-/// calls Schedule()/UpdateFromOutput() touches it. The scheduler sees the
-/// model only through ModelSpec (max context, cache-group geometry) and the
-/// pool only through KVCacheManager.
-class Scheduler {
- public:
-  Scheduler(SchedulerConfig config, const cache::CacheConfig& cache,
-            cache::KVCacheManager* kv);
-
-  Status AddRequest(Request request);   // Queue admission.
-  /// \brief Computes the next step's plan. Never blocks on the device.
-  StatusOr<SchedulerOutput> Schedule();
-  /// \brief Applies a finished step: advances watermarks, finishes requests,
-  ///        frees blocks. Called with step N's result before N+1's plan is
-  ///        committed (the only scheduler mutation point).
-  Status UpdateFromOutput(const SchedulerOutput& plan, const StepResult& result);
-
-  std::vector<RequestId> AbortRequests(absl::Span<const RequestId> ids);
-  bool HasRequests() const;
-  SchedulerStats Stats() const;
-
- private:
-  /// Preemption policy hook: newest-first recompute victims (vLLM V1
-  /// semantics), pluggable for cache-aware policies (backlog A10).
-  virtual bool PreemptFor(int64_t block_shortfall, std::vector<RequestId>* victims);
-};
-
-}  // namespace inferx::runtime
-```
-
-`cache::KVCacheManager` is the backlog's subsystem (C01–C08, F01–F11); the executor-facing surface it must expose is: adoption/publish/release (as today), per-group allocation with a non-mutating capacity estimate, and graph-stable block-table access (A12). No executor code may call the pool directly.
-
-*Alignment note (vLLM V1):* `SchedulerOutput`, `NewRequestData`, and `CachedRequestData` keep vLLM's names and shapes, so migration from the current tree (and comparison against vLLM sources) is a field-mapping exercise. Two deliberate differences: vLLM's `block_number_to_hash` is absent — the in-process `KVCacheManager` owns hash bookkeeping, so it never crosses the output boundary (§7.2) — and `kind` / `dp_replica` are added for step selection and DP routing. `StepResult` fills the role vLLM splits between `ModelRunnerOutput` (per-runner samples) and `EngineCoreOutput` (per-request events): the executor folds both into the single value the scheduler consumes. The scheduler keeps vLLM's `Request` name for its private request state; it never leaves the scheduler.
-
-### 2.4 The Executor
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Topology plane: turns one plan into distributed execution and one
-///        aggregated result. Owns workers and communicators; knows nothing
-///        about request policy.
-///
-/// Concrete compositions (section 3.7):
-///   TensorParallelExecutor   -- one node's TP/EP/CP group of ModelRunners.
-///   PipelineExecutor         -- pp_size stages, microbatch pipeline.
-///   ReplicatedExecutor       -- dp_size child executors behind a router.
-/// They compose: Replicated( Pipeline( TensorParallel(...) ) ).
-class Executor {
- public:
-  static StatusOr<std::unique_ptr<Executor>> Create(
-      const EngineConfig& config, const dist::WorldContext& world,
-      cache::KvBlockPool* rank0_pool /* borrowed for the scheduler's manager */,
-      WorkerEventSink* events);
-
-  /// \brief Executes one plan synchronously on the caller's (engine) thread;
-  ///        returns when all streams and collectives for the step complete.
-  StatusOr<StepResult> Execute(const SchedulerOutput& plan);
-
-  /// \brief Overlap-mode entry: dispatches the plan, invokes `on_done` from a
-  ///        completion thread when device work finishes. The caller commits
-  ///        the plan (scheduler UpdateFromOutput) inside `on_done` or after.
-  Status ExecuteAsync(const SchedulerOutput& plan, StepDoneCallback on_done);
-
-  /// \brief Group-scoped abort: releases every rank from any in-flight or
-  ///        blocked collective for these requests (invariant 5).
-  Status Abort(absl::Span<const RequestId> ids);
-  /// \brief Collective health probe + rank-liveness heartbeat result.
-  ExecutorHealth Health() const;
-
-  /// \brief The pool owned by the rank-0 runner (shared with the scheduler's
-  ///        KVCacheManager; single-writer rule, 1.2).
-  cache::KvBlockPool* Rank0KvPool() const;
-
- private:
-  virtual StatusOr<StepResult> ExecuteOnWorkers(const PlanShard& shard) = 0;
-};
-
-}  // namespace inferx::runtime
-```
-
-`PlanShard` is the per-worker slice of a plan (its requests' token spans, block tables, sampling rows) — produced by pure functions so PP microbatch splitting and DP routing reuse the same code path.
-
-### 2.5 The ModelRunner
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief One rank's device execution: everything that touches CUDA on this
-///        GPU lives here. Created and driven by the Executor; one instance
-///        per (device, cp_shard).
-class ModelRunner {
- public:
-  static StatusOr<std::unique_ptr<ModelRunner>> Create(
-      const EngineConfig& config, const dist::WorldContext& world,
-      Device device, const dist::CommGroupSet& comms,
-      MemoryQuota quota /* weights, workspace, KV split; section 4.5 */);
-
-  /// \brief Loads and partitions weights for this rank (section 4).
-  Status LoadWeights(const models::CheckpointPlan& plan);
-  /// \brief Captures decode graphs for the configured batch-size buckets
-  ///        after the KV pool exists (A12 contract: stable device block
-  ///        tables, delta updates between replays).
-  Status CaptureGraphs();
-
-  /// \brief Runs one shard: build attention metadata -> select graph or
-  ///        eager -> Model::Forward -> (last stage) sample. The runner
-  ///        issues collectives only through `comms` (TP all-reduce, EP
-  ///        dispatch/combine) inside Forward's group calls.
-  StatusOr<ShardResult> Run(const PlanShard& shard);
-
-  /// \brief Device-side partial results for this rank; aggregated by the
-  ///        executor. Only the sampling rank fills `samples`.
-  struct ShardResult { /* partial logits ptrs, samples, timings */ };
-
-  cache::KvBlockPool* KvPool();      // Owned; borrowed by the manager.
-  const models::ModelSpec& Spec() const;
-  Status Synchronize() const;        // Stream-ordered device sync.
-
-  MemoryPlan ReportMemory() const;   // For F10-style diagnostics.
-};
-
-}  // namespace inferx::runtime
-```
-
-### 2.6 The Model layer
-
-```cpp
-namespace inferx::models {
-
-/// \brief One static architecture, ready to load weights and run.
-///
-/// Immutable after LoadWeights. A model expresses *what* it needs (geometry,
-/// cache specs, shard rules) and *how* to compute one step; it never
-/// allocates persistent state, schedules, or orchestrates ranks -- those
-/// belong to runner/executor/scheduler respectively.
-class Model {
- public:
-  virtual ~Model() = default;
-
-  /// \brief Engine-facing facts: shapes, eos ids, per-layer cache/state
-  ///        specs (typed groups per backlog F05/F06: attention kind,
-  ///        window/sink params, cacheability, aliasing), expert layout
-  ///        for EP planning, and the weight shard rules (section 4.3).
-  virtual const ModelSpec& GetModelSpec() const = 0;
-
-  /// \brief Describes every weight tensor this rank needs and how checkpoint
-  ///        tensors map onto it (slice / replicate / transpose / quantize).
-  virtual WeightBindingMap DescribeWeightBindings(
-      const dist::WorldMapping& world) const = 0;
-
-  /// \brief Runs the stack for one shard: embed (or take input_embeds),
-  ///        decoder layers (attention through AttentionBackend, MoE through
-  ///        the dispatch/combine ops), final norm.
-  virtual Status Forward(ForwardContext& ctx, const StepInputs& inputs,
-                         Tensor& hidden_out) const = 0;
-
-  /// \brief Projects sampled rows onto the vocabulary (last PP stage only).
-  virtual Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden,
-                               const Tensor& rows, Tensor& logits) const = 0;
-};
-
-}  // namespace inferx::models
-```
-
-`ModelSpec` evolves from today's flat `StateRequirements` into typed per-layer descriptors; the virtual-seam decision (keep one `GetModelSpec()`, load-time static, policy knobs excluded) is recorded with the backlog's D-series decisions. MoE layers additionally declare `ExpertLayout{num_experts, top_k, shared_experts}` so the executor's EP planner can place experts (3.4).
-
-### 2.7 Attention backend
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Kernel-side attention contract (SGLang backend analog).
-///
-/// One backend instance per runner, selected from ModelSpec cache-group
-/// descriptors + backend capability table. Owns plan metadata, workspaces,
-/// and graph-safe state; the runner calls BeginStep/Run/EndStep in order.
-class AttentionBackend {
- public:
-  virtual ~AttentionBackend() = default;
-  static StatusOr<std::unique_ptr<AttentionBackend>> Select(
-      const models::ModelSpec& spec, const ExecutionConfig& config, Device device);
-
-  /// \brief Builds this step's metadata (queries per seq, block tables,
-  ///        window/sink bounds) from the PlanShard. Must be callable on the
-  ///        scheduler thread for overlap (CPU-only work).
-  virtual StatusOr<AttentionMetadata> BuildMetadata(const PlanShard& shard) = 0;
-  virtual Status Run(const AttentionMetadata& meta, const StepInputs& inputs,
-                     Tensor& query_inout) = 0;  // Fused QKV-norm/RoPE hooks.
-  /// \brief Graph contracts: which shapes are captureable, slot-mapping
-  ///        deltas safe between replays (A12).
-  virtual GraphSupport QueryGraphSupport() const = 0;
-};
-
-}  // namespace inferx::runtime
-```
-
-### 2.8 Checkpoint and weight loading
-
-```cpp
-namespace inferx::models {
-
-/// \brief Where weights come from and how they reach device memory.
-class CheckpointReader {
- public:
-  static StatusOr<std::unique_ptr<CheckpointReader>> Open(
-      const ModelConfig& config);
-  /// \brief Metadata for one checkpoint tensor (shape, dtype, shard index).
-  StatusOr<TensorMeta> LookupMeta(std::string_view name) const;
-  /// \brief Streams one checkpoint tensor's bytes into `dst` (host staging).
-  Status Read(std::string_view name, absl::Span<std::byte> dst) const;
-};
-
-/// \brief Per-rank weight plan produced once by the loader and consumed by
-///        every ModelRunner (identical bytes -> identical models, invariant 3).
-struct CheckpointPlan {
-  struct Binding {
-    std::string checkpoint_tensor;
-    std::string model_tensor;
-    ShardRule rule;          // kReplicate | kSliceRows(dim, begin, end) | ...
-    QuantPlan quantize;      // Optional on-load quantization.
-  };
-  std::vector<Binding> bindings;
-  std::vector<std::string> verify_hashes;  // Manifest digests (section 4.4).
-};
-
-/// \brief Orchestrates the loading phases of section 4 across workers.
-class WeightService {
- public:
-  /// \brief Plans (rank-local), stages (pinned host), transfers, verifies.
-  ///        Barriers at the documented sync points; one rank's failure fails
-  ///        the group (fail-stop, invariant 5).
-  static Status Load(Executor* executor, const ModelConfig& config);
-};
-
-}  // namespace inferx::models
-```
-
-### 2.9 Communication
-
-```cpp
-namespace inferx::dist {
-
-/// \brief Rank + world + transport after rendezvous.
-class WorldContext {
- public:
-  static StatusOr<WorldContext> Join(const runtime::ParallelConfig& config,
-                                     int local_rank /* device index */);
-  const runtime::WorldMapping& Mapping() const;
-};
-
-/// \brief One collective domain (a set of ranks + a transport instance).
-class CommGroup {
- public:
-  Status AllReduce(Tensor* t, ReduceOp op);      // NCCL / custom / loopback.
-  Status ReduceScatter(Tensor* t, ReduceOp op);
-  Status AllGather(Tensor* in, Tensor* out);
-  Status Broadcast(Tensor* t, int root);
-  Status SendRecv(Tensor* t, int peer, Channel ch);   // PP hidden handoff.
-  Status AllToAll(const DispatchPlan& tokens);        // EP moe dispatch.
-  /// \brief Non-blocking counterpart used by overlap mode; completion is
-  ///        observed through the runner's event set.
-  Status Enqueue(Collective c, StreamRef stream);
-};
-
-/// \brief The set of groups one rank belongs to, built once from
-///        WorldMapping (TP/attn/moe/PP-pairs/DP/CP).
-struct CommGroupSet {
-  std::shared_ptr<CommGroup> attn_tp;   // Attention all-reduce domain.
-  std::shared_ptr<CommGroup> moe;       // Expert dispatch/combine domain.
-  std::shared_ptr<CommGroup> moe_tp;    // Intra-expert reduce domain.
-  std::shared_ptr<CommGroup> pp_prev_next;  // Point-to-point stages.
-  std::shared_ptr<CommGroup> dp;        // Router/stats/broadcast domain.
-};
-
-}  // namespace inferx::dist
-```
-
-### 2.10 Lifecycle state machines
-
-```
-Engine:     Created -> LoadingWeights -> CapturingGraphs -> Ready
-            <-> Running -> Draining -> Shutdown
-Executor:   matches Engine phase; workers transition Idle <-> Executing;
-            any group error -> Aborting -> Terminal (engine restarts process).
-Scheduler:  per-step cycle Schedule() -> [plan handed off] -> UpdateFromOutput()
-            (strictly alternating; overlap mode schedules N+1 before applying N).
-Model:      Constructed -> WeightsBound (immutable thereafter).
-```
-
-All constructors that do real work are `static Create(...)` factories returning `StatusOr`; constructors only wire trivial state. Destruction order is the reverse of creation: events -> scheduler -> executor (workers, then communicators) -> pools.
-
----
-
-## 3. Parallelism design
-
-### 3.1 World decomposition
-
-```
-world_size = dp_size x pp_size x tp_size x cp_size
-tp_size    = attn_tp_size x moe_ep_size x moe_tp_size     (each factor optional = 1)
-rank       = ((dp * pp_size + pp) * tp_size + tp) * cp_size + cp
-attn_rank  = tp % attn_tp_size            (attention heads sharded here)
-moe_rank   = tp / attn_tp_size            (experts + expert-internal TP)
-```
-
-Row-major order keeps TP neighbors on one node (consecutive CUDA devices), which is what NCCL and PCIe/NVLink P2P want. `WorldMapping` is the *only* place these formulas live; every component asks it for coordinates and group members. `ParallelConfig::Validate()` rejects at startup (invariant 4): `attn_tp * moe_ep * moe_tp != tp`, attention head counts not divisible by `attn_tp`, PP with cache groups that cannot keep per-stage consistency (until F05 lands), `cp_size > 1` entirely (deferred), worlds exceeding the device count of the node without a multi-process rendezvous.
-
-### 3.2 Tensor parallelism (TP)
-
-- **Attention**: query heads sharded over `attn_tp`; each rank holds `heads/attn_tp` query heads and the matching KV heads (replicating KV when `kv_heads < attn_tp` — MQA/MLA latents replicate, cost documented in the spec, not discovered at runtime). `o_proj` is row-parallel -> one `attn_tp` all-reduce per layer.
-- **MLP / MoE dense parts**: gate/up column-parallel, down row-parallel, sharing the same all-reduce (sequence-parallel option folds the residual add into reduce-scatter/all-gather for large hidden sizes — a runtime toggle).
-- **Embedding / LM head**: vocab-row sharded; last stage gathers sampled rows only (`ComputeLogits`' `[rows, vocab]` contract keeps the GEMM small).
-- **KV pool**: rank-local per TP rank (current design, kept); block IDs are logical and identical on every rank — the executor validates pool capacity equality across the TP group at init (backlog A07's amendment).
-
-### 3.3 Pipeline parallelism (PP)
-
-- Layers are split into `pp_size` contiguous **stages** (balanced by per-layer compute estimate from `ModelSpec`, falling back to even counts). The first stage owns embedding; the last owns final norm, LM head, and sampling.
-- The **scheduler emits microbatches**: one `SchedulerOutput` may contain several microbatch slots; `PipelineExecutor` drives a 1F1B schedule (TensorRT-LLM micro-batch scheduler pattern; vLLM V1's PP worker analog) over an in-flight window of `min(pp_size, num_microbatches)` slots.
-- **Handoff**: hidden states cross stages with `SendRecv` on a dedicated channel, optionally BF16/FP8-compressed with a documented tolerance test; the *last* microbatch slot carries the sampled-row indices so the final stage projects only what it must.
-- **KV**: each stage's runners own KV only for their layers; block tables are identical across stages, capacity must be equal on every stage (validated).
-- Bubble: `1F1B` gives `(pp-1)/(m+pp-1)` for `m` microbatches; the scheduler biases toward more, smaller microbatches under PP (policy knob `microbatch_tokens`).
-- Startup runs a warmup microbatch through the pipe before `Ready` so the first real request does not pay pipeline-fill latency.
-
-### 3.4 Expert parallelism (EP)
-
-- Experts of every MoE layer are distributed over the `moe_ep` ranks of the TP group by `ExpertPlacer` (round-robin default, frequency-balanced from `ModelSpec` hotness hints when present); each rank holds `experts/moe_ep` experts, optionally sharded further by `moe_tp`.
-- **Dispatch**, two selectable modes (`ParallelConfig::moe_dispatch`):
-  - `kAllToAll` — per-layer `AllToAll` of routed tokens (SGLang/DeepEP-style low-latency path), grouped-GEMM per expert, `AllToAll` combine. Best for large expert counts/worlds; requires capacity handling (drop-less by default, capacity-factor knob with explicit overflow accounting surfaced in stats).
-  - `kAllGather` — gather routed tokens on all moe ranks, compute local experts, all-reduce combine (DeepSpeed-style). Simpler, graph-capture friendly, fine for small worlds.
-- Shared experts compute on the attention ranks (no dispatch), per model family declaration.
-- CUDA-graph capture with a2a dispatch is allowed only in the backend capability table says so (invariant 4); otherwise PP-free graphs run with `kAllGather` or eager MoE.
-
-### 3.5 Data parallelism (DP)
-
-Two modes, cleanly separated:
-
-1. **Replicated DP (default)** — `dp_size` independent Engines (each with its own scheduler, cache, and pp x tp executor) fronted by a `ReplicatedExecutor` acting as an in-process router: lowest-projected-wait routing by default, optional cache-affinity hashing on `cache_salt`+prompt digest so multi-turn traffic reuses one replica's prefix cache (SGLang srt-router practice). Replicas share nothing; stats aggregate through the DP `CommGroup` (a cheap side-channel, not the data plane). This mode composes with everything (TP/PP/EP) because each replica is a full engine.
-2. **DP-attention (deferred)** — one logical batch split across DP groups that share expert ranks (vLLM DP-attention). Deliberately *not* in the initial proposal: it couples scheduler output broadcast, per-group padding, and EP capacity in ways that deserve their own validated design. The `SchedulerOutput.dp_replica` field and the DP `CommGroup` are the reserved hooks; enabling it is a startup-rejected config until then (invariant 4).
-
-### 3.6 Context parallelism (CP)
-
-Deferred with hooks: `cp_size` stays in the world math, `CommGroupSet` reserves a CP ring, and `ModelSpec` cache groups reserve the DCP-sharded flag (backlog A07). Any `cp_size > 1` config fails validation today with the constraint named. The reason is honest scoping: CP changes retention/reuse semantics (the pinned upstream managers assert `DCP == 1` for windowed/local/mamba groups [V4]), and InferX should not ship a combination upstream itself restricts.
-
-### 3.7 Hybrid configurations
-
-| Config | World math | Executor composition | Notes |
-| --- | --- | --- | --- |
-| TP=8 | world=8, tp=8, attn_tp=8 | `TensorParallel` | Baseline dense path. |
-| TP=4, EP=4 | world=4, tp=4 = attn 1 x ep 4 | `TensorParallel` | Attention un-sharded (each rank all heads); experts across ranks; a2a per layer. |
-| TP=8 = attn 2 x EP 4 | world=8 | `TensorParallel` | SGLang-style hybrid: attention over 2 ranks, experts over 4. |
-| TP=4, PP=2 | world=8 | `Pipeline(TensorParallel x2)` | Stages of 4-rank TP groups; microbatch 1F1B. |
-| TP=2, PP=2, DP=2 | world=8 | `Replicated(Pipeline(TensorParallel))` | Router fronts two pipelines. |
-| TP=4, PP=4, EP=2, DP=4 | world=64 | `Replicated(Pipeline(TensorParallel))` | Node-boundary placement via row-major rank order. |
-| CP>1 | any | -- | Startup-rejected (deferred). |
-
-Composability rule: **DP wraps PP wraps TP**. Exactly this nesting order is supported; other nestings are rejected by `Validate()` rather than half-working.
-
-### 3.8 CUDA graphs and collectives
-
-Graphs are captured per runner for decode buckets (`ExecutionConfig::graph_batch_sizes`), always with stable device block-table buffers and guarded padding (backlog A12). Collectives inside graphs use the graph-capturable NCCL mode; a2a dispatch under graphs only when the backend capability table allows it (3.4). Eager execution remains the fallback and the correctness oracle: every graph path has an eager twin, and the nightly test matrix diffs them token-for-token.
-
----
-
-## 4. Model loading
-
-### 4.1 Phases
-
-```
-1. Resolve        Open checkpoint, read manifest (architecture, tensor metas, digests).
-2. Rendezvous     WorldContext::Join (TCP/env store); broadcast ParallelConfig
-                  hash; every rank must agree or load aborts group-wide.
-3. Plan           Model::DescribeWeightBindings(WorldMapping) -> CheckpointPlan
-                  per rank (pure function of config + world: same inputs,
-                  same plan on every rank -- verified by hash compare).
-4. Allocate       ModelRunner::Create with MemoryQuota: weights (planned),
-                  activation workspace (profiled), KV pool (remainder;
-                  TP-min-reduced across the group so every rank derives the
-                  same capacity; PP validates per-stage equality).
-5. Stage          CheckpointReader::Read into pinned host buffers (double-
-                  buffered stream; multi-threaded per shard file).
-6. Transfer       H2D on each rank's stream; on-load quantization/dequant
-                  fusion for quantized checkpoints; SendRecv reshards only
-                  when the checkpoint's intrinsic shard shape differs from
-                  the target world's (e.g. TP-4 checkpoint into TP-8 world) --
-                  resharding is compute-at-load on the source ranks.
-7. Verify         Per-tensor digests on a sampled basis + full digest option;
-                  rank-0 manifest compare; collective barrier.
-8. Barrier+Ready  NCCL barrier; executors run the warmup microbatch (PP) or
-                  a dummy decode; Engine transitions to Ready.
-```
-
-### 4.2 Device assignment and distributed initialization
-
-`local_rank` maps to the CUDA device ordinal within the process (multi-GPU, one worker thread each); multi-node ranks join through `rendezvous_endpoint`. Communicator groups are constructed in a fixed global order (TP, attn, moe, moe_tp, PP pairs, DP) so NCCL communicator IDs are created deterministically — this avoids the classic deadlock of ranks building comms in different orders. All of this happens inside `Engine::Create` before any request is accepted.
-
-### 4.3 Weight partitioning rules
-
-Per layer type, decided by `Model::DescribeWeightBindings` from the world mapping — the model declares *rules*, the loader materializes slices:
-
-| Tensor kind | attn_tp | moe_ep / moe_tp | pp |
-| --- | --- | --- | --- |
-| Attention QKV / o | row/col split by heads | -- | stage-local |
-| Attention norm | replicate | -- | replicate |
-| Dense MLP gate/up/down | col / row split | -- | stage-local |
-| Router gate | replicate | -- | replicate |
-| Expert weights | -- | experts sharded over ep; per-expert split over moe_tp | stage-local |
-| Embedding / LM head | vocab-row split (parallel vocab) | -- | first / last stage |
-| Biases / scalars | replicate | replicate | replicate |
-
-MLA latent KV is not a weight; its cache geometry rides `ModelSpec` cache groups. Quantized checkpoints quantize at transfer (phase 6) so host staging stays compressed.
-
-### 4.4 Synchronization and verification
-
-Sync points are exactly the barriers of phases 2, 7, 8 — nothing else blocks globally, so loading throughput is bounded by the slowest rank's H2D, not by lock-step staging. Verification: every rank computes its bound tensors' digests; the executor compares rank-0's collected manifest against the checkpoint manifest; any mismatch (or any rank's error) fails the whole group with the rank and tensor named (invariant 5: no partially-initialized engine ever serves).
-
-### 4.5 Memory budgeting
-
-Order of allocation inside each rank's `MemoryQuota`: reserved runtime buffers -> weights (known after phase 3) -> profiled activation workspace (one max-shape profile step, then frozen + margin) -> KV pool fills the remainder (utilization mode) or an explicit byte/block override (precedence validated per backlog F11). Budgets are min-reduced across the TP group before pool creation so all ranks derive identical capacity; heterogeneous per-layer layouts use the single-allocation heterogeneous pool (F11's no-double-peak rule).
-
----
-
-## 5. Execution workflow
-
-### 5.1 Request lifecycle
-
-```
-HTTP/gRPC -> tokenize -> Engine::Submit (registry, queue)
-          -> Scheduler::AddRequest
-          [engine loop]
-   plan = Scheduler::Schedule()            -- admission (prefix adoption via
-                                              KVCacheManager), chunked prefill,
-                                              decode growth, preemption
-   result = Executor::Execute(plan)        -- section 5.2
-   Scheduler::UpdateFromOutput(plan, result) -- watermark advance, publication
-                                              of computed blocks, finish/abort,
-                                              block release
-          [finish] -> EventSink::OnTokenDelta/OnFinished -> detokenize/stream
-```
-
-### 5.2 One step through the executor (TP+EP; PP in parentheses)
-
-1. **Shard**: plan -> `PlanShard` per worker (pure); (PP: microbatch slots).
-2. **Prepare** (scheduler thread, overlapped): attention metadata build, device block-table delta upload, sampling-row gather.
-3. **Dispatch** (engine thread): each worker thread gets its shard; streams are recorded into a per-step event set.
-4. **Forward per rank**: embed -> per layer: attention (backend; KV write into plan-named blocks) -> (attn_tp all-reduce) -> MoE dispatch (a2a or allgather), grouped GEMM, combine -> (moe reduce) -> norm. (PP: send/recv hidden to next stage per microbatch slot, 1F1B interleave.)
-5. **Sample**: last stage's runner projects sampled rows -> vocab; the *designated sampling rank* runs the sampler once (greedy or seeded); tokens are broadcast on the TP group (determinism invariant 3).
-6. **Aggregate**: executor collects ShardResults into one `StepResult` aligned with plan order; PP assembles per-microbatch results in slot order.
-7. **Commit**: engine thread calls `Scheduler::UpdateFromOutput` (or the overlap callback does); cache publication happens here (computed-block watermark), finish/stop detection runs on the scheduler CPU, events fan out.
-
-### 5.3 Overlap timeline
-
-```
-scheduler thread   [ plan N ]-----------[ plan N+1 ]-----------[ plan N+2 ]
-engine thread      --------[ dispatch N ]----------------[ dispatch N+1 ]----
-GPU streams        ------------[ forward N ][ sample N ]-[ forward N+1 ]-----
-commit                      (on N done -> UpdateFromOutput(N) + commit N+1)
-```
-
-The plan for N+1 is computed from predicted state and **committed only after** result N applies (so preemption/finish decisions are never speculative in the committed state). This is SGLang's overlap event loop discipline with the commit point made explicit.
-
-### 5.4 Preemption, abort, and failure handling
-
-- **Preemption** (capacity): scheduler picks victims (newest-first), releases blocks through the manager (cached prefix survives), requeues at the waiting head with a zeroed watermark; resumption replays prompt+accepted output (backlog C05's contract).
-- **Abort** (client): `Engine::Cancel` -> scheduler abort list -> next `Schedule()` emits the release; in-flight steps finish naturally (requests are not mid-kernel cancelled).
-- **Rank/device failure**: the worker's error poisons the executor group; blocked collectives are released through `Executor::Abort` (every collective enrolled in an abort set); the engine fails all pending requests with `kUnavailable` and terminates the process (fail-stop; a supervisor/router reroutes). Engine-internal recovery is explicitly out of scope for v1 — the DP router makes process-level restart cheap.
-
-### 5.5 Worked example (TP=4, EP=4 hybrid, chunked prefill)
-
-Request R (prompt 4096 tokens, budget 2048): step 1 admits R with a 2048-token chunk -> plan.new_requests with 128 blocks; runners write KV for tokens 0..2047, a2a-dispatch the MoE tokens of chunk 1, return no sample (prompt incomplete). Step 2 schedules the 2048-token remainder + decode for other requests (mixed step). Step 3+: R decodes 1 token/step; each step's plan carries one new block occasionally; sampler rank emits token, broadcast, `UpdateFromOutput` publishes R's full blocks into the prefix cache as they complete. A second request with R's prompt as prefix adopts it (cached_tokens = 4095 under the n-1 cap) and decodes immediately.
-
----
-
-## 6. Sequence diagrams
-
-### 6.1 System initialization (single node, TP=2)
+# Distributed Execution Architecture
+
+**Status:** reviewed design proposal grounded in the current repository. Only
+single-rank and tensor-parallel execution are established execution paths here;
+configuration fields, kernels, and transport primitives alone do not establish
+end-to-end support for another strategy. All extensions below are proposed, not
+implemented by this document.
+
+**Scope:** inference execution, topology, communication, model and weight
+partitioning, pipeline scheduling, KV ownership, completion, and failure handling.
+Request admission and batching policy remain in `Scheduler`; sampling algorithms,
+training, elastic resizing, and prefill/decode disaggregation are out of scope.
+
+## 1. Repository baseline and design decisions
+
+The design extends the existing executor/runner boundary. It does not introduce a
+second execution stack under `exec`, a replacement tensor type, or a parallelism
+strategy class hierarchy.
+
+| Repository component | Current behavior and implication |
+|---|---|
+| [`ModelExecutor`](../include/inferx/engine/model_executor.h), [implementation](../src/engine/model_executor.cc) | Coordinates rank-local runners. The normal multi-GPU path creates an `NcclWorld` across distinct CUDA devices in one process. `Execute` drives ranks concurrently, takes rank zero's samples, and applies accepted tokens to peers. Preserve this public boundary. |
+| [`ModelRunner`](../include/inferx/models/model_runner.h), [implementation](../src/models/model_runner.cc) | Owns the model, request state, KV pool, scratch, and sampler. `Run` synchronizes before returning. Graph replay is explicitly unimplemented. Extend this owner rather than adding a competing `RankRuntime`. |
+| [`SchedulerOutput`](../include/inferx/engine/scheduler_output.h) | Contains allocations, new requests, cached-request deltas, and finished/preempted IDs. Prompt spans borrow request memory. This is suitable for synchronous local execution, not directly for a wire protocol or asynchronous queue. |
+| [`ParallelConfig`](../include/inferx/config/parallel_config.h) | Has TP, PP, DP sizes/ranks and an EP flag. Its world size is DP × PP × TP; EP size is DP × TP when enabled. Validation checks positive sizes and coordinate bounds, not model or execution support. |
+| [`CommBackend`](../include/inferx/dist/comm.h) | One group per runner; BF16 sum all-reduce, last-dimension all-gather, and host scalar minimum. No token-axis gather/scatter, activation P2P, routed exchange, or CP reduction contract. |
+| [`NcclWorld` / `NcclComm`](../include/inferx/dist/nccl_comm.h) | Local multi-device coordination and an explicit rank-join primitive exist. They are not a multi-node execution service. [`worker_ipc.h`](../include/inferx/dist/worker_ipc.h) carries fixed-size generate/shutdown messages, not scheduler plans; [`RunWorker`](../src/dist/worker_main.cc) constructs its own scheduler. |
+| [`Model` / `ForwardContext`](../include/inferx/models/model.h) | `Forward` runs the whole stack and produces final-normalized hidden states; context exposes one TP communicator. `StepInputs::input_embeds` alone is not a pipeline stage contract. |
+| [`WeightMap` / `WeightBinding`](../include/inferx/models/weight_loader.h) | Already describes row spans and column windows. Extend this loader for stage/expert ownership instead of creating another parameter-declaration system. |
+| [`FusedExperts`](../include/inferx/models/layers/fused_moe.h) | Holds all experts, TP-shards their matrices, and reduces partial outputs. Local token grouping is not distributed EP dispatch. |
+| [`DeviceRuntime`](../include/inferx/core/device_runtime.h), [`Tensor`](../include/inferx/core/tensor.h), [`Status`](../include/inferx/core/status.h) | Reuse device/stream/event ownership, tensor storage, and Abseil-backed status types. |
+
+[`attention.md`](attention.md) is a companion proposal, not the implemented
+attention API. Its hypothetical `attn` types are not dependencies of this design.
+Implementation must adapt the actual `AttentionMetadata`, `KvBlockPool`, and
+`ForwardContext`; future attention work can supply the CP contracts in §8.
+
+The inspected CMake configuration selects C++23. Examples here use the C++20
+subset (included repository headers still require C++23) and the
+[Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html):
+`UpperCamelCase` types and functions, `snake_case` variables, trailing underscores
+for private fields, `kCamelCase` enumerators/constants, two-space indentation,
+explicit single-argument constructors, header guards, and explicit ownership.
+Existing lowercase accessors such as `rank()` are valid accessor-style names.
+Use `Status`/`StatusOr` for fallible operations, including factories; do not add
+exception-based initialization. References to existing APIs retain their real
+names. All new interface excerpts are labeled proposals and use `inferx` or
+`inferx::models`.
+
+**Decisions:** retain synchronous `ModelExecutor::Execute` initially; keep one
+scheduler per independent replica; add immutable topology and named communicator
+roles; introduce stage execution only for PP; implement eager correctness before
+capture or overlap. Keep local multi-device execution as the first backend.
+Process-per-device deployment is a later transport option, not a prerequisite.
+
+## 2. Support assessment
+
+Here, SP means TP-associated activation sequence parallelism, and CP means
+persistent sequence/KV partitioning. They are distinct layouts, not synonyms.
+NVIDIA's [context parallelism documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/context_parallel.html)
+also distinguishes CP from the sequence parallelism used around TP operators.
+These definitions inform this inference design; training support elsewhere does
+not imply InferX support.
+
+| Strategy | Current architecture | Required extension and feasibility |
+|---|---|---|
+| TP | Working foundation: rank runners, weight slices, reductions, gathered logits, one sampling owner. | Strengthen configuration/capacity validation and persistent rank dispatch. GQA/MQA replication and model-specific divisibility must be validated by the loader. |
+| PP | Configurable coordinates, but whole-model forward and synchronous full-step runner cannot execute a pipeline. | Stage-local weights/KV, explicit activation layouts, P2P, microbatch schedule, output ownership, and bounded buffers. Feasible without replacing the executor. |
+| DP | Separate engine instances can serve independent requests. A DP size field does not create a router or replicas. | Route each request to one scheduler/executor and keep cache affinity. No per-step collective between independent replicas. |
+| EP | Existing experts use TP, not expert ownership across ranks. | Expert placement, unique token ownership, variable-count dispatch/combine, inverse permutation, and expert TP subgroups. Feasible with a new MoE communication path. |
+| CP | No CP configuration, distributed attention metadata, or KV placement contract. | Position-aware token/KV ownership and numerically correct distributed attention. This is attention/cache work as well as executor work. |
+| SP | Existing gather is along hidden/vocabulary width; it cannot gather token shards. | Token-axis all-gather/reduce-scatter, residual layout tracking, masked padding. Feasible for prefill; decode padding can eliminate its benefit. |
+| Hybrid | A single communicator and whole-model forward do not compose these strategies. | Validated groups, layouts, common operation order, and coupled failure domains. Enable only explicitly tested combinations (§10). |
+
+Unsupported settings must fail before device allocation/collective initialization.
+Do not silently rebuild a TP-only configuration from a requested PP/DP/EP one.
+The current multi-device factory constructs rank configurations from TP fields;
+future validation must guard that boundary. `CreateGroup` currently checks null
+runners and vocabulary agreement; the proposed admission checks additionally
+compare topology, shard identity, cache capacities, and execution limits.
+
+## 3. Responsibilities and lifecycle
+
+`ModelExecutor` owns coordination and the rank group. Each `ModelRunner` owns local
+model state and device resources. `Scheduler` owns request/cache policy; it never
+issues model collectives. Models choose collectives through a non-owning parallel
+context, with no environment-variable lookups or global parallel state.
+
+A future `PipelineDriver` is a concrete helper owned by the executor. A future
+`ParallelContext` borrows topology and communicator owners, which outlive models
+and all queued device work. Communicators are never owned by model layers.
+`DeviceRuntime` remains the stream/event abstraction; no parallel `DeviceContext`
+is needed. Single-rank groups provide identity operations instead of null pointers.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant App as Caller
-    participant E as Engine
-    participant W as WorldContext
-    participant X as Executor
-    participant R0 as ModelRunner(gpu0)
-    participant R1 as ModelRunner(gpu1)
-
-    App->>E: Create(EngineConfig)
-    E->>W: Join(ParallelConfig, local_rank)
-    W-->>E: WorldContext (rank, groups)
-    E->>X: Create(config, world)
-    X->>R0: Create(config, world, gpu0, quota)
-    X->>R1: Create(config, world, gpu1, quota)
-    R0-->>X: ready
-    R1-->>X: ready
-    X->>X: Validate group (capacities, specs)
-    X-->>E: ready
-    E-->>App: Engine (Ready)
-```
-
-### 6.2 Distributed model loading (TP=2)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant E as Engine
-    participant WS as WeightService
-    participant M as Model (per rank)
-    participant R0 as ModelRunner(gpu0)
-    participant R1 as ModelRunner(gpu1)
-    participant CK as CheckpointReader
-
-    E->>WS: Load(executor, model_config)
-    WS->>CK: Open(manifest)
-    WS->>M: DescribeWeightBindings(world)
-    M-->>WS: CheckpointPlan (per rank)
-    WS->>WS: Hash-compare plans across ranks
-    WS->>R0: quota(weights, workspace, kv)
-    WS->>R1: quota(weights, workspace, kv)
-    WS->>CK: Read shard 0 (pinned)
-    WS->>CK: Read shard 1 (pinned)
-    par transfer rank 0
-        WS->>R0: LoadWeights(plan0)  [H2D + quantize]
-    and transfer rank 1
-        WS->>R1: LoadWeights(plan1)  [H2D + quantize]
-    end
-    R0-->>WS: digests
-    R1-->>WS: digests
-    WS->>WS: Verify manifest + barrier
-    WS->>R0: CaptureGraphs()
-    WS->>R1: CaptureGraphs()
-    WS-->>E: ok -> Engine Ready
-```
-
-### 6.3 Request scheduling loop (with overlap)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant E as Engine (engine thread)
-    participant S as Scheduler (scheduler thread)
-    participant KV as KVCacheManager
-    participant X as Executor
-
-    C->>E: Submit(spec)
-    E->>S: AddRequest
-    loop every step
-        S->>KV: AdoptPrefix / Reserve / Release
-        KV-->>S: blocks, cached tokens
-        S-->>E: SchedulerOutput N
-        E->>X: ExecuteAsync(plan N, on_done)
-        S-->>E: SchedulerOutput N+1 (predicted state)
-        X-->>E: on_done(StepResult N)
-        E->>S: UpdateFromOutput(plan N, result N)
-        E->>E: commit plan N+1
-        E-->>C: OnTokenDelta / OnFinished
-    end
-```
-
-### 6.4 Parallel inference execution (TP=2 + EP, one step)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant X as Executor
-    participant R0 as ModelRunner(gpu0)
-    participant R1 as ModelRunner(gpu1)
-    participant G as CommGroup(attn_tp / moe)
-
-    X->>R0: Run(PlanShard 0)
-    X->>R1: Run(PlanShard 1)
-    par rank 0
-        R0->>R0: attn metadata, KV write
-        R0->>G: AllToAll (MoE dispatch)
-    and rank 1
-        R1->>R1: attn metadata, KV write
-        R1->>G: AllToAll (MoE dispatch)
-    end
-    G-->>R0: expert tokens
-    G-->>R1: expert tokens
-    R0->>R0: grouped GEMM + combine
-    R1->>R1: grouped GEMM + combine
-    R0->>G: AllReduce (o_proj/down)
-    R1->>G: AllReduce (o_proj/down)
-    R0->>R0: logits rows + sample (designated rank)
-    R0->>G: Broadcast(tokens, root=0)
-    R0-->>X: ShardResult (+samples)
-    R1-->>X: ShardResult
-    X-->>X: aggregate StepResult
-```
-
-### 6.5 Pipeline execution (PP=2, microbatches M1/M2)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant X as PipelineExecutor
-    participant S0 as Stage0 (TP group)
-    participant S1 as Stage1 (TP group, samples)
-    participant PP as CommGroup (pp pair)
-
-    X->>S0: Run(microbatch M1)
-    S0->>S0: embed + layers[0..k/2]
-    S0->>PP: SendRecv(hidden M1)
-    X->>S0: Run(microbatch M2)
-    PP-->>S1: hidden M1
-    S1->>S1: layers[k/2..k] + norm + logits
-    S1->>S1: sample M1
-    S0->>PP: SendRecv(hidden M2)
-    S1-->>X: StepResult slot M1
-    PP-->>S1: hidden M2
-    S1->>S1: sample M2
-    S1-->>X: StepResult slot M2
-```
-
-### 6.6 Data-parallel routing (DP=2)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant RT as ReplicatedExecutor (router)
-    participant E0 as Engine replica 0
-    participant E1 as Engine replica 1
-
-    C->>RT: Submit(spec A)
-    RT->>RT: route (wait-time or cache affinity)
-    RT->>E0: Submit(spec A)
-    C->>RT: Submit(spec B)
-    RT->>E1: Submit(spec B)
-    E0-->>C: events A
-    E1-->>C: events B
-    RT->>RT: aggregate stats over DP group
-```
-
----
-
-## 7. Component collaboration
-
-### 7.1 Ownership graph
-
-| Resource | Owner | Borrowers (read-only unless noted) |
-| --- | --- | --- |
-| Request registry / event fan-out | Engine | -- |
-| Waiting/running queues, plan | Scheduler | Executor (per step, moved) |
-| KV block pool (device bytes) | rank-0 ModelRunner | KVCacheManager (sole allocator of IDs, by contract), all runners (writers of bytes into plan-named blocks) |
-| Model / attention backend / graphs / sampler | each ModelRunner | -- |
-| Communicators | Executor | ModelRunner (through `ForwardContext`) |
-| Checkpoint plan | WeightService (transient) | ModelRunners |
-
-### 7.2 Communication protocols
-
-- **SchedulerOutput** (Scheduler -> Executor): immutable value message, one per step, optionally broadcast verbatim to DP replicas (byte-identical routing decisions).
-- **Shard** (Executor -> Runner): pure projection of the plan; no policy fields.
-- **Result** (Runner -> Executor -> Engine): value aggregation; device pointers only inside `ShardResult` and only on the owning rank.
-- **Events** (Engine -> client sink): ordered per request, lock-free queues, backpressure by slow-consumer policy (abort after bounded undelivered events).
-- **Control** (Engine <-> Executor): health heartbeats, abort, shutdown — all collective-enrolled so a stuck rank cannot wedge the group.
-
-### 7.3 Synchronization
-
-- Engine thread is the single commit point (scheduler state changes only in `UpdateFromOutput`).
-- Overlap mode adds one scheduler thread; the hand-off pair (plan, result) is double-buffered; the device boundary is a per-step CUDA event set recorded by workers and awaited by the completion path.
-- Collective orderings are deterministic by construction (fixed group build order, per-layer call order from the static model graph), which is what makes CUDA-graph replay safe.
-- Cross-rank block-ID agreement is validated once at init (pool capacity/spec equality), then assumed (single-writer invariant).
-
-### 7.4 Error-handling responsibilities
-
-| Failure | Detects | Contains | Reports |
-| --- | --- | --- | --- |
-| Invalid request (params) | Engine at Submit | rejected pre-queue | `Submit` Status |
-| Admission/capacity | Scheduler | retry/preempt/fail-explicit | per-request event, stats |
-| Kernel/allocator error on rank | ModelRunner | stream mark-error | Executor poisons group |
-| Collective timeout / rank death | Executor (heartbeat + collective abort set) | releases all ranks from blocked collectives | Engine -> all requests `kUnavailable`, process exits |
-| Scheduler bug (bad plan) | Executor validation of shard invariants | fail-stop group | engine error event + core dump hook |
-| Client disconnect | EventSink | stop generation, schedule abort | -- |
-
-Requests never observe partial steps: a step either lands in `StepResult` (and is committed) or fails atomically for the group.
-
----
-
-## 8. Design trade-offs
-
-### 8.1 System comparison
-
-| Aspect | vLLM V1 | SGLang | TensorRT-LLM | InferX proposal |
-| --- | --- | --- | --- | --- |
-| Language/process model | Python; process per TP rank | Python; process per TP group | C++; single process multi-GPU, MPI multi-node | C++; single process multi-GPU, external launcher multi-node |
-| Frontend/engine split | AsyncLLM + separate EngineCore proc | tokenizer-manager + scheduler procs | executor session in-process | in-process `Engine`, thread-isolated (C++ makes process split unnecessary for GIL) |
-| Scheduler output | immutable `SchedulerOutput` msg | `ForwardBatch` built in scheduler | internal request scheduler | immutable `SchedulerOutput` msg (vLLM pattern) |
-| Overlap | V1 default async output | overlap event loop (mature) | inflight batching + graphs | two-thread overlap with explicit commit point (SGLang pattern, vLLM message discipline) |
-| DP | replication + DP-attention | router (srt-router) + dp attention | multi-instance + orchestrator | replication behind `ReplicatedExecutor` first; DP-attention deferred behind validated design |
-| PP | stage workers, microbatching | supported (less central) | micro-batch scheduler (strongest) | 1F1B microbatch executor (TRT-LLM pattern) |
-| EP | within TP (deepep a2a) | hybrid attn-tp/moe split, a2a + TBO | via plugins/world config | hybrid attn_tp x moe_ep x moe_tp world math (SGLang pattern) with ag/ar fallback |
-| API style | async callbacks/queues | async server | futures (`Executor` API) | callbacks core + futures facade |
-| CUDA graphs | per-bucket capture | aggressive (decode-mostly) | aggressive + strong PP integration | per-bucket with eager twin oracle |
-
-### 8.2 Key decisions (alternative -> chosen -> why)
-
-1. **Process-per-rank vs thread-per-rank.** Chosen: threads (TRT-LLM). Python systems need processes for GIL isolation; C++ gets the same isolation with shared-memory metadata for free, and makes the plan hand-off a pointer move instead of IPC. Multi-node still needs processes — handled by launcher + rendezvous, not by the engine.
-2. **Scheduler in engine process vs per rank.** Chosen: one scheduler per engine (vLLM V1, TRT-LLM). Per-rank scheduling (vLLM V0-style worker autonomy) complicates determinism and cache coherence for little gain when the plan is cheap to broadcast.
-3. **Immutable plan message vs shared batch state.** Chosen: message (vLLM V1). Enables overlap, DP broadcast, replay, and snapshot testing; costs one shallow copy per step — negligible next to a forward pass.
-4. **Inheritance-based worker layer vs composed executors.** Chosen: composition (`Replicated(Pipeline(TensorParallel))`). vLLM's worker-class tree (`WorkerBase` -> distributed/PP/dp variants) grows combinatorially; three composable executors cover the same matrix with independently testable units.
-5. **Hybrid TP/EP world math.** Chosen: SGLang-style factorization (`tp = attn_tp x moe_ep x moe_tp`). vLLM's "EP inside TP" is simpler but cannot express attention-shallow/expert-deep shapes (DeepSeek-class) without awkward config.
-6. **PP microbatching vs macro-batch.** Chosen: microbatch 1F1B (TRT-LLM). Macro-batch (whole step per stage) is simpler but bubbles scale with step time; microbatches amortize. Cost: pipeline-aware scheduling complexity, contained inside `PipelineExecutor` + `microbatch_tokens` knob.
-7. **EP a2a-only vs dual-mode.** Chosen: dual-mode with startup-validated graph interaction. a2a wins large worlds; allgather is the graph-safe small-world default. Single-mode would either forfeit perf or forfeit graphs.
-8. **External DP router vs in-process.** Chosen: in-process `ReplicatedExecutor` (deployable behind an external LB too). Keeps cache-affinity routing co-located with cache state; avoids mandating a second deployable for the common 2-8 replica case; process-level restart stays trivial.
-9. **Futures vs callbacks.** Chosen: callbacks core, futures facade. TRT-LLM proves futures ergonomics; vLLM/SGLang prove streaming callbacks. The facade gives both without a second execution path.
-10. **Fail-stop vs in-engine recovery.** Chosen: fail-stop + supervisor reroute. Transparent rank recovery requires weight re-sharding and cache reconciliation protocols that dwarf their availability benefit at replica counts DP already provides (and upstream disagg designs solve separately — deferred like A06).
-
-### 8.3 Risks and mitigations
-
-- **NCCL + CUDA-graph + a2a interactions** are the classic footgun: mitigated by the capability-table gates and the eager-twin differential tests.
-- **Overlap correctness** (speculative plans under preemption): mitigated by the explicit commit point; property tests replay random schedules against the non-overlapped oracle.
-- **PP cache coherence** (per-stage pools, prefix across stages): blocked on cache groups (F05); PP ships with per-stage prefix caching *disabled* until its acceptance list (mirroring the backlog's honest-combination rule).
-- **Memory budget drift** between ranks (workspace asymmetry under EP): min-reduce plus per-rank report in `ReportMemory()`; startup fails on derived KV capacity mismatch.
-
----
-
-## 9. Relationship to the current tree (migration notes only)
-
-| Proposal | Current tree |
-| --- | --- |
-| `Engine` | `server::EngineGateway` (threading contract kept, generalized) |
-| `Scheduler` + `SchedulerOutput` | `engine::Scheduler` + `SchedulerOutput` (vLLM-aligned name kept; fields grow `kind`/`dp_replica`, microbatch slots with PP) |
-| `KVCacheManager` (interface) | `cache::CacheManager` (backlog C/F items evolve it; interface extracted) |
-| `Executor` composition | `engine::ModelExecutor` (single TP mode; vocabulary-only group checks today) |
-| `ModelRunner` | `models::ModelRunner` (adds graphs, quota, backend selection; drops scheduler knowledge) |
-| `Model` / `ModelSpec` | `models::Model` (kept; `StateRequirements` grows typed cache-group specs per F05/F06) |
-| `dist::CommGroupSet` | `dist::CommBackend` + `LoopbackComm` (group semantics added) |
-
-The landing order now lives in section 12, which expands these notes into a phased roadmap (phases 0–11) with per-phase API changes, deliverables, dependencies, and test gates (section 13).
-
----
-
-## 10. Feature coverage vs vLLM
-
-### 10.1 How to read this section
-
-Each vLLM capability is judged **case by case** against the APIs of sections 2–9 (plus the extensions of section 11), with one of three verdicts:
-
-- **● full** — the proposed APIs express the scenario as designed; only engineering remains.
-- **◐ partial** — expressible once a named phase or section-11 extension lands; the blocking piece is named.
-- **○ deferred** — deliberately out of scope for the initial architecture, with the reason and the upstream caveat (invariant 4: never "supported by analogy").
-
-"vLLM" below means the V1 engine (the architecture this proposal benchmarks against); where V1 itself restricts a combination, the restriction is noted rather than inherited silently.
-
-### 10.2 Coverage matrix
-
-**A. Parallelism and placement**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| A1 | Tensor parallelism (dense GQA/MQA models) | ● | §3.2; Phase 2 |
-| A2 | TP with replicated KV (MQA, MLA latent) | ● | §3.2 (replicate when `kv_heads < attn_tp`); spec-visible cost |
-| A3 | Pipeline parallelism (contiguous stages) | ● | §3.3; Phase 6 |
-| A4 | Virtual / interleaved PP | ○ | Upstream-partial; deferred (benefit concentrates in very-large-PP regimes); `WorldMapping` reserves the hook |
-| A5 | DP replication + external router/LB | ● | §3.5 mode 1; Phase 7 |
-| A6 | DP attention (batch split across DP groups) | ◐ | §11.8 `DpPlanSplit`; Phase 11 (upstream couples it with EP capacity; deserves its own validated design) |
-| A7 | Expert parallelism (a2a dispatch) | ● | §3.4 `kAllToAll`; Phase 5 |
-| A8 | EP fallback (allgather+allreduce) | ● | §3.4 `kAllGather`; graph-safe small-world default |
-| A9 | Hybrid TP×EP (attention-shallow, expert-deep) | ● | §3.1 world math (`attn_tp × moe_ep × moe_tp`); Phase 5 |
-| A10 | Context parallelism (long context) | ○ | §3.6 — deferred; upstream's own windowed/local/mamba managers assert `DCP == 1` [V4], so CP must not ship before its cache semantics exist |
-| A11 | Multi-node (multi-process launch, NCCL/UCX) | ● | §1.3 launcher + rendezvous; Phase 2 (transport) / Phase 6 (multi-node PP value) |
-| A12 | Combined TP+PP+DP topologies | ● | §3.7 composition rule `DP(PP(TP))`; Phases 2/6/7 |
-| A13 | Custom all-reduce / fused collectives | ● | §2.9 `CommGroup` transport strategy; selection table per world size |
-
-**B. Batching and scheduling**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| B1 | Continuous (inflight) batching | ● | §2.3 `Scheduler::Schedule/UpdateFromOutput`; Phase 1 |
-| B2 | Chunked prefill (default on) | ● | §2.3 + `clip_chunk` semantics; backlog C03 watermark |
-| B3 | Chunked prefill disabled (whole-prompt admission) | ◐ | Scheduler knob; backlog C08 amendment (honor or reject the flag explicitly) |
-| B4 | Mixed prefill+decode steps | ● | `StepKind::kMixed`; Phase 1 |
-| B5 | Async/overlap scheduling | ● | §5.3 two-thread overlap with explicit commit; Phase 3 |
-| B6 | Preemption (V1: recompute-only) | ● | §5.4; backlog C05 owns the state-machine fix this depends on |
-| B7 | Priority scheduling | ◐ | `Scheduler::PreemptFor` hook exists; policy + aging = backlog A10; Phase 8 |
-| B8 | `max_num_seqs` / token budget / queue capacity knobs | ● | `SchedulerConfig`; edge cases = backlog C08 |
-| B9 | Prefix-aware / cache-aware scheduling | ◐ | Non-mutating hit estimate API = backlog A10; Phase 8 |
-
-**C. Speculative decoding**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| C1 | n-gram / prompt-lookup speculation | ● | §11.2 `SpecController` (CPU proposer, no draft weights); Phase 8 |
-| C2 | EAGLE / EAGLE-3 (separate draft architecture) | ● | §11.2 draft+target runner pair, draft cache group; Phase 8 (cache side = backlog A01/A13) |
-| C3 | MTP heads (DeepSeek-style) | ● | `SpecController` with in-model draft head (ModelSpec-declared); Phase 8 |
-| C4 | Medusa / multi-head predictors | ◐ | Verify path identical; per-head tree scoring is Model-layer; Phase 8 partial |
-| C5 | Spec × TP / PP | ● | Composes: draft lives on every rank like any model; Phase 8 gate |
-| C6 | Spec × CUDA graphs | ◐ | Replays must include draft loop; gated by backlog A12 + Phase 3 |
-| C7 | Spec × disagg | ○ | Upstream-partial too; deferred with PD disagg (Phase 10+1) |
-
-**D. KV cache features**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| D1 | Hash-based prefix caching (V1 default on) | ● | Cache layer (backlog C/F); executor only transports block IDs |
-| D2 | Prefix caching disabled (private KV only) | ● | `CacheConfig` |
-| D3 | Cache salt / tenant namespacing | ● | `CompletionSpec.cache_salt`; backlog F04 |
-| D4 | Fine-grained match unit / partial-block reuse | ◐ | Backlog A03; Phase 8+ |
-| D5 | FP8 (quantized) KV cache | ◐ | Byte storage exists; full pipeline = backlog F09; Phase 4 load-time quant plan |
-| D6 | Per-layer KV dtype overrides | ◐ | Backlog F09 mixed groups; `ModelSpec` cache groups carry it |
-| D7 | KV offload to host (native / LMCache-style) | ◐ | Backlog A04; §11.1 `KvConnector` is the same interface; Phase 10 |
-| D8 | Hybrid-attention cache groups (window/sink/local/recurrent) | ◐ | Backlog F05–F08 + T04 fixtures; scheduler-side capacity per group; Phases 1–5 as they land |
-| D9 | Distributed / shared prefix cache across instances | ◐ | Backlog A05 external tier via `KvConnector`; Phase 10 |
-
-**E. Serving features**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| E1 | Streaming tokens + usage events | ● | `EventSink`; Phase 1 |
-| E2 | Sampled logprobs | ● | §11.5 `OutputSpec` extension; sampler emits logprobs rows; Phase 8 |
-| E3 | Prompt logprobs / echo | ● | Output-bypass reuse (backlog A08); Phase 9 |
-| E4 | `n > 1` / parallel sampling | ◐ | §11.6 fork on shared prefix = backlog A02; Phase 8 |
-| E5 | Per-request seed determinism | ● | Invariant 3 (rank-0 sample + broadcast); Phase 2 gate |
-| E6 | Stop tokens/strings, min_tokens, ignore_eos | ● | `CompletionSpec` + scheduler/detokenizer split (strings in detokenizer); Phase 1 |
-| E7 | Structured output (guided grammar/regex/json) | ◐ | §11.3 `GrammarEngine` logit masking; Phase 8 |
-| E8 | Multi-LoRA adapters | ◐ | §11.4 `AdapterService` + cache-identity epoch (backlog F04); Phase 11 |
-| E9 | Multimodal inputs (VLM) | ◐ | §11.5 `MultimodalInputs` + F04 identity; Phase 9 |
-| E10 | Encoder–decoder (Whisper-class) | ◐ | Cross-attention cache groups (backlog A08); Phase 9 |
-| E11 | Pooling / embedding / classification / rerank | ◐ | §11.7 `PoolingOutput` runner mode; Phase 9 |
-| E12 | Request cancellation / disconnect handling | ● | §5.4; Phase 1 |
-| E13 | Metrics / stats API | ● | `EngineStats` + backlog F10 diagnostics; grows per phase |
-
-**F. Memory and execution**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| F1 | Decode CUDA graphs (batch buckets) | ● | §3.8 + backlog A12; Phase 3 |
-| F2 | Piecewise graph capture / torch.compile | ○ | N/A by construction: C++ kernels are compiled; the graph/eager twin discipline (§3.8) replaces it |
-| F3 | Sleep/wake for colocation | ◐ | §11.9 `ElasticityController` = backlog X02; Phase 11 |
-| F4 | Weight quantization families (GPTQ/AWQ/FP8/int8…) | ◐ | `WeightService::QuantPlan` is the seam; per-family kernel support tracks the models backlog; Phase 4+ |
-| F5 | Utilization-based memory budgeting + overrides | ● | §4.5 quota order; backlog F11 validation |
-| F6 | Sliding-window / hybrid-attention serving | ◐ | Cache groups (F05/F07) + T04 fixtures; retention owned by cache layer, masks by backend |
-| F7 | `max_model_len` > KV capacity (queue/preempt) | ● | Backlog C08 admission policy; Phase 1 |
-
-**G. Disaggregation and distributed serving**
-
-| # | vLLM capability | Verdict | Where it lands |
-| --- | --- | --- | --- |
-| G1 | PD disaggregation (prefill/decode roles) | ◐ | §11.1 `RoleConfig` + `KvConnector`; Phase 10 |
-| G2 | KV transfer connectors (NIXL/LMCache-class) | ◐ | Same `KvConnector` interface, transport-agnostic core (backlog A06); Phase 10 |
-| G3 | Layerwise / partial KV transfer | ◐ | Connector contract includes per-layer completion; Phase 10 partial |
-| G4 | Central router across heterogeneous instances | ● | `ReplicatedExecutor` policy (§3.5) or external LB; Phase 7 |
-| G5 | Last-token/logits handoff in disagg | ◐ | `RoleConfig::kPrefill` final-step contract; Phase 10 |
-
-**Totals:** of the 63 enumerated capabilities — 35 ●, 24 ◐ (each tied to a named phase or section-11 extension), and 4 ○ (virtual PP, context parallelism, piecewise compile, spec×disagg). The ○ set is either upstream-restricted or C++-mooted; every ◐ has a designed landing spot. This is the "vast majority" bar met by construction rather than claim.
-
-### 10.3 Case-by-case validation
-
-Representative scenarios; each names the config, then walks the four components and the wire.
-
-**UC-01 — Single-GPU dense decode with CUDA graphs** (`tp=1, graphs=[1,2,4,8]`).
-`Scheduler` emits a decode plan (one `CachedRequestData` per seq, occasional `new_block_ids`); `Executor` (trivial `TensorParallel` of one worker) forwards the shard; `ModelRunner` selects the bucket, replays the graph with a device block-table delta; `Model::Forward` never runs eagerly. Sampler on rank 0 = the only rank. Commit publishes completed blocks. *Gate: T-GRP, T-DET.*
-
-**UC-02 — TP=8 dense serving** (`tp=8`).
-Plan broadcast is intra-process (8 worker threads). Each `ModelRunner` computes `heads/8` attention heads, issues one `attn_tp` all-reduce per layer; embedding vocab-sharded; logits computed on sampled rows only. KV pool per rank; block IDs logical and identical (validated at init). *Gate: T-TP (2-rank Loopback logits ≈ single-rank), T-DET.*
-
-**UC-03 — Chunked prefill with prefix cache, salted tenants** (`tp=2, chunk=2048, salt="tenant-b"`).
-`Scheduler::Schedule` adopts the salted prefix via `KVCacheManager` (F04 identity), clips chunks to block boundaries, grants growth; runners write KV into plan-named blocks; `UpdateFromOutput` publishes full blocks at the computed watermark (C03). No executor involvement beyond TP dispatch. *Gate: T-VDX, cache-backlog suites.*
-
-**UC-04 — PP=4 long-context pipeline** (`pp=4, microbatch_tokens=1024`).
-`Scheduler` produces a plan with microbatch slots; `PipelineExecutor` runs 1F1B: stage 0 embeds and sends hidden via `SendRecv`; stages 1–2 forward; stage 3 norms, projects sampled rows, samples. Per-stage KV for per-stage layers; equal capacity validated. Warmup microbatch at startup fills the pipe. *Gate: T-PP.*
-
-**UC-05 — Pure EP MoE** (`tp=4 = attn_tp 1 × moe_ep 4, dispatch=a2a`).
-Attention un-sharded per rank (each rank holds all heads for its token shard — vLLM DP-attention-like shape expressed inside the TP group); MoE tokens cross ranks per layer with `AllToAll`, grouped-GEMM on local experts, combine. Capacity overflow surfaced in stats, not dropped silently. *Gate: T-EP.*
-
-**UC-06 — Hybrid attention-TP × EP** (`tp=8 = attn_tp 2 × moe_ep 4`).
-`WorldMapping` decomposes `tp` rank → (attn rank, moe rank); attention all-reduce over 2-rank group; experts over 4-rank group; dense layers use the attn group only. This is the SGLang hybrid-parallel shape for DeepSeek-class models. *Gate: T-EP (hybrid case), T-DET.*
-
-**UC-07 — DP=4 replicated router with cache affinity** (`dp=4`).
-Four full engines; `ReplicatedExecutor` routes on lowest projected wait; with `cache_affinity` enabled, hashes `salt+prompt-digest` onto a replica so multi-turn traffic hits warm prefix caches; stats aggregate over the DP side-channel. *Gate: T-DP.*
-
-**UC-08 — DP attention** (`dp=2, shared expert ranks`) — **◐ Phase 11.** Requires `DpPlanSplit` (§11.8): one plan split into per-DP-group shards with padding accounting and EP capacity reconciliation. Explicitly not claimed before that phase ships its own acceptance list.
-
-**UC-09 — EAGLE-3 speculation with TP=4 + graphs** (`spec=eagle3, num_speculative_tokens=4`).
-`SpecController` (§11.2) drives: draft runner proposes k tokens from a small attention+head model (own cache group, tentative allocation per backlog A01); target executes the verify batch (k+1 queries, tree mask via backend); controller commits accepted prefix, truncates the rejected tail, restores recurrent state where present; never publishes draft-only hashes. Graph replays cover the fused propose-verify loop. *Gate: T-SPEC (accept none/some/all vs non-spec greedy reference).*
-
-**UC-10 — n-gram speculation** (`spec=ngram`). Same controller, CPU proposer over the request's own text; no draft weights; identical verify path. Exercises the controller interface without a second model. *Gate: T-SPEC.*
-
-**UC-11 — Multimodal VLM prefill→decode** (`tp=2, image input`).
-`CompletionSpec.multimodal` carries preprocessed embeddings/span placeholders (§11.5); `Model::Forward` consumes `input_embeds` in place of token rows for the image span; cache identity binds the embedding digest (F04) so same-tokens-different-image never shares; scheduler otherwise unchanged — multimodality is an input-representation concern, not a scheduling one. *Gate: T-MM.*
-
-**UC-12 — Encoder–decoder (Whisper-class)** (`tp=2, cross-attention groups`).
-Encoder pass produces cross-KV into a separately sized group (backlog A08); decoder requests carry encoder-input identity; adoption skips the cross group (upstream semantics [V4]); beam/n>1 fork shares encoder blocks. *Gate: T-MM (enc-dec case).*
-
-**UC-13 — Pooling / embedding / scoring** (`tp=2, mode=embed`).
-`RoleConfig`-adjacent *model* mode: last-stage runner returns pooled hidden rows instead of logits; scheduler bypasses prefix reuse when exactness demands (A08); no sampling rank. `StepResult` carries `PoolingOutput`. *Gate: T-SERVE (pooling).*
-
-**UC-14 — PD disaggregation** (`roles: prefill tp=4, decode tp=2`) — **◐ Phase 10.**
-Prefill engine computes the prompt, `KvConnector.SaveKv` ships blocks (resharded or rejected across mismatched TP layouts, backlog A06), last token + logits hand off; decode engine's scheduler adopts "remote-pending" lengths as a distinct state and waits with deadline/recompute-fallback. *Gate: T-PD.*
-
-**UC-15 — Pressure: preemption + priority** (`tp=2, pool undersized`).
-Scheduler preempts newest-first via `PreemptFor` (priority-aware when Phase 8 lands), releases blocks through the manager (prefix survives, C05 replay), requeues at head; runner sees nothing but smaller plans. *Gate: T-FAULT (pressure case), T-VDX.*
-
-**UC-16 — Multi-node TP=16 with a rank death** (`tp=16, 2 nodes`).
-Rendezvous over TCP store; NCCL groups across nodes; heartbeat detects rank loss; `Executor::Abort` releases every rank from blocked collectives; engine fails pending requests `kUnavailable` and exits; supervisor/router (G4) reroutes. No partial steps committed. *Gate: T-FAULT.*
-
-**UC-17 — Logprobs + structured output** (`tp=2, logprobs=5, grammar=json`).
-Sampler returns top-k rows + logprobs (`OutputSpec`); `GrammarEngine` (§11.3) applies a token mask from the compiled FSM each step on the sampling rank before selection — determinism invariant unchanged (mask is a pure function of committed tokens). *Gate: T-SERVE.*
-
-**UC-18 — `n=4` parallel sampling** (`tp=2, n=4`).
-Scheduler admits one request; at first sampled token it forks four `Request`s sharing the prompt's full blocks (backlog A02 copy-on-write tails); the four decode independently; finish aggregates into one `FinalResult.choice[i]`. *Gate: T-SERVE (fork).*
-
-**UC-19 — Sleep/wake colocation** (`dp=2, sleep between bursts`) — **◐ Phase 11.**
-`ElasticityController.Sleep` quiesces (drain → stream sync → weights offload → pool release, X02's safe boundaries), `Wake` restores and re-validates capacity; prefix cache epoch survives across sleep (cache identity stable), requests are rejected while asleep. *Gate: T-ADV.*
-
-**UC-20 — FP8 KV + GPTQ weights** (`tp=4, kv_dtype=fp8_e4m3, w=GPTQ`).
-`WeightService` quant plan dequantizes-at-load or keeps GPTQ per kernel support; KV pool carries FP8 bytes with scale plane (F09); attention backend contract declares which geometries it dequantizes. Unsupported mixes (e.g. FP8 KV × window group without a kernel) fail at startup by name. *Gate: T-WGT, T-VDX (tolerance).*
-
----
-
-## 11. Gap analysis and API extensions
-
-The §10.2 matrix's ◐/○ rows reduce to eight architectural gaps. Each gets a concrete API addition (Google style, consistent with §2) and a phase. These extensions are *additive* — none reopens a §2 interface.
-
-### 11.1 Engine roles and KV connectors (PD disaggregation, offload, external caches)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief What this engine instance is for. kUnified is today's behavior;
-///        split roles enable PD disaggregation (backlog A06).
-struct RoleConfig {
-  enum class Role { kUnified, kPrefill, kDecode };
-  Role role = Role::kUnified;
-  /// For kPrefill: where computed KV goes. For kDecode: where it comes from.
-  std::string kv_connector;  // Transport name resolved by the factory.
-};
-
-}  // namespace inferx::runtime
-
-namespace inferx::cache {
-
-/// \brief Transfer-plane contract between an engine and an external KV store
-///        or peer engine (vLLM's KV connector roles: lookup / async load /
-///        save; SGLang's HiCache transfer engine). Transport-agnostic; the
-///        cache core never sees a socket.
-class KvConnector {
- public:
-  virtual ~KvConnector() = default;
-  /// \brief Lookup remote residency for a request's prefix; feeds the
-  ///        scheduler's distinct "remote-pending" adoption state.
-  virtual StatusOr<RemotePrefix> Lookup(const PrefixKey& key) = 0;
-  /// \brief Starts an asynchronous load into reserved local blocks.
-  virtual Status StartLoad(RequestId id, absl::Span<const int32_t> blocks,
-                           const RemotePrefix& source) = 0;
-  /// \brief Saves computed blocks for a finishing or migrating request.
-  virtual Status SaveKv(RequestId id, absl::Span<const int32_t> blocks,
-                        absl::Span<const LayerRange> layers) = 0;
-  /// \brief Per-request transfer state polled at schedule time; carries
-  ///        arrival, failure, and timeout so waits never become indefinite.
-  virtual TransferState Poll(RequestId id) = 0;
-};
-
-}  // namespace inferx::cache
-```
-
-Scheduler integration: `KVCacheManager` gains a third length class — locally cached, **remotely pending**, newly computed — exactly A06's requirement. Resharding across differing TP layouts is a connector capability flag; absent it, mismatched role pairs are startup-rejected.
-
-### 11.2 Speculation controller (n-gram, EAGLE-3, MTP, Medusa)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Drives propose -> verify -> commit for one step. Owns the draft
-///        runner (when the proposer is a model) and the acceptance policy;
-///        interacts with the cache through backlog A01's tentative
-///        reservation/commit/rollback contract only.
-class SpecController {
- public:
-  static StatusOr<std::unique_ptr<SpecController>> Create(
-      const SpecConfig& config /* proposer kind, k, tree shape */,
-      Executor* target, std::unique_ptr<ModelRunner> draft /* optional */);
-
-  /// \brief Proposes k tokens for each scheduled request (CPU n-gram or
-  ///        draft-model batch), returning the verify shard the target runs.
-  StatusOr<PlanShard> Propose(const PlanShard& decode_shard);
-  /// \brief Applies the target's logits: longest accepted prefix per
-  ///        request, plus the bonus token. Commits KV watermarks and
-  ///        truncates rejected tails atomically.
-  StatusOr<VerifyOutcome> Verify(const StepResult& target_result);
-  /// \brief State restore for recurrent groups on rejection (backlog A08).
-  Status RestoreRejected(RequestId id, int64_t accepted_tokens);
-};
-
-}  // namespace inferx::runtime
-```
-
-### 11.3 Structured output (grammar-constrained decoding)
-
-```cpp
-namespace inferx::sampling {
-
-/// \brief Compiles a guided-decoding spec (json schema, regex, ebnf) into a
-///        token FSM and produces per-step logit masks. Pure function of the
-///        committed token prefix, so determinism invariant 3 is untouched.
-class GrammarEngine {
- public:
-  static StatusOr<GrammarEngine> Compile(const GuidedSpec& spec,
-                                         const TokenizerView& tokenizer);
-  /// \brief Applies the mask for `id`'s next token to logits on the
-  ///        sampling rank, before selection. No-op for unconstrained ids.
-  Status ApplyMask(RequestId id, absl::Span<const TokenId> committed,
-                   Tensor* logits) const;
-};
-
-}  // namespace inferx::sampling
-```
-
-*Design note:* requests blocked on grammar compilation will need a
-scheduler-visible wait state when this lands; the removed `kWaitingForFsm`
-enum value is the reserved shape for it, to be reintroduced only with its
-callers and tests (dead states drift — see the 2026-10-15 request review).
-
-### 11.4 Adapter service (multi-LoRA)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Per-request adapter selection. Adapters are separate weight
-///        regions (no hot kernel patching); activating one is a cache-epoch
-///        event (backlog F04: adapter identity joins the cache hash).
-class AdapterService {
- public:
-  static StatusOr<std::unique_ptr<AdapterService>> Load(
-      const AdapterConfig& config, ModelRunner* runner);
-  /// \brief Pins `adapter` for the request's steps; empty = base model.
-  Status Activate(RequestId id, std::string_view adapter);
-  /// \brief Number of concurrently resident adapters (capacity gate).
-  int ResidentAdapters() const;
-};
-
-}  // namespace inferx::runtime
-```
-
-### 11.5 Rich inputs and outputs (multimodal, logprobs, pooling)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Multimodal content resolved before the engine: embeddings plus
-///        their token-span placeholders. Identity digests feed F04 hashing.
-struct MultimodalInputs {
-  struct Span { int64_t token_begin, token_end; std::array<std::byte, 32> digest; };
-  std::optional<Tensor> input_embeds;   // Replaces the span's token rows.
-  std::vector<Span> spans;
-};
-
-struct OutputSpec {
-  int num_logprobs = 0;          // Top-k sampled logprobs.
-  bool prompt_logprobs = false;  // Forces cache-reuse bypass (A08).
-  bool embeddings = false;       // Pooling mode.
-};
-
-}  // namespace inferx::runtime
-```
-
-### 11.6 Parallel sampling (`n > 1`)
-
-Scheduler-side fork on first sampled token, backed by backlog A02's shared-prefix copy-on-write: `Request` spawns `n` children sharing full blocks with private mutable tails; `FinalResult` aggregates choices. No executor change — children are ordinary requests from Phase 1 onward.
-
-### 11.7 Pooling outputs
-
-`StepResult` gains `std::optional<PoolingOutput>`; in pooling mode the last-stage runner skips the LM head and sampler, returning pooled rows; `Engine` maps them straight into `FinalResult`. Routing-only change.
-
-### 11.8 DP attention (Phase 11)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Splits one logical plan into per-DP-group shards with identical
-///        padding and reassembled sampling rows (vLLM DP-attention shape).
-///        Blocked on: broadcast plan, per-group KV accounting, EP capacity
-///        reconciliation across groups. Ships only with its own gate.
-class DpPlanSplit {
- public:
-  static StatusOr<std::vector<PlanShard>> Split(
-      const SchedulerOutput& plan, const WorldMapping& world);
-  static StatusOr<StepResult> Merge(absl::Span<const StepResult> group_results);
-};
-
-}  // namespace inferx::runtime
-```
-
-### 11.9 Elasticity (sleep/wake, colocation)
-
-```cpp
-namespace inferx::runtime {
-
-/// \brief Yields and restores GPU memory at safe boundaries (backlog X02):
-///        drain -> stream sync -> weights offload -> pool release; wake
-///        reverses it and re-validates capacity before Ready.
-class ElasticityController {
- public:
-  Status Sleep(SleepLevel level /* kReleaseWeights, kReleaseAll */);
-  Status Wake();
-  bool Asleep() const;
-};
-
-}  // namespace inferx::runtime
-```
-
-**Sequence — speculative decoding (UC-09):**
-
-```mermaid
-sequenceDiagram
-    autonumber
     participant S as Scheduler
-    participant SC as SpecController
-    participant DE as Draft runner (per rank)
-    participant X as Executor (target)
-    participant G as CommGroup (tp)
-
-    S-->>SC: decode shard (watermarks)
-    SC->>DE: Propose (k tokens/seq, tentative blocks)
-    DE-->>SC: draft tokens + logprobs
-    SC-->>X: verify shard (k+1 queries, tree mask)
-    X->>G: forward + all-reduce (as UC-02)
-    X-->>SC: target logits
-    SC->>SC: longest accepted prefix + bonus token
-    SC-->>S: VerifyOutcome (commit / truncate / restore)
-    S->>S: UpdateFromOutput (publish accepted blocks only)
+    participant E as ModelExecutor
+    participant R as Rank-local ModelRunners
+    participant C as Group communication
+    participant D as DeviceRuntime
+    E->>E: Validate model, topology, capabilities, and limits
+    E->>C: Create groups in agreed order
+    E->>R: Load local weights and profile bounded scratch
+    R->>C: Agree cache capacity within replica
+    R->>D: Allocate KV, activation slots, and workspaces
+    R-->>E: Ready on every rank
+    loop Scheduled step
+        S->>E: Execute(SchedulerOutput)
+        E->>R: Dispatch matching plan concurrently
+        R->>D: Build metadata and enqueue forward
+        R->>C: Model collectives in agreed order
+        R->>D: Sample on output owner, await completion
+        R-->>E: Rank completion and owner samples
+        E->>R: Apply accepted tokens to replica state
+        E-->>S: Complete ModelRunnerOutput
+        S->>S: UpdateFromOutput, commit progress and release pages
+    end
+    E->>R: Stop admission and drain work
+    E->>C: Destroy groups after work completes
+    E->>D: Release device resources
 ```
 
-**Sequence — PD disaggregation (UC-14, Phase 10):**
+This diagram includes proposed group validation and allocation. Today `Run`
+already returns completed work; preserve that guarantee. A successful enqueue
+must never be mistaken for completed KV writes or permission to reuse scratch.
+Shutdown drains successful work; failure follows the abort path in §11 instead.
+
+Startup must reserve communication buffers, activation slots, and worst-case
+workspace before choosing KV capacity. If graphs are enabled later, reserve their
+memory before final KV sizing too. All participating ranks must enter blocking
+initialization/profile collectives concurrently. Do not sequentially construct
+runners if their constructors can wait for peers.
+
+## 4. Topology and composition
+
+### 4.1 Mesh and placement
+
+Use a logical mesh `[DP, PP, CP, TP]`, with TP fastest varying by default:
+
+`global_rank = (((dp_rank * pp_size + pp_rank) * cp_size + cp_rank) * tp_size + tp_rank)`.
+
+`world_size = dp_size * pp_size * cp_size * tp_size`, checked for overflow before
+conversion to backend integer types. EP and SP do not multiply world size.
+A separate explicit placement table maps every logical rank to host and device;
+logical adjacency must not imply NVLink, shared memory, or even the same host.
+
+TP groups fix DP/PP/CP; CP groups fix DP/PP/TP; pipeline lanes fix DP/CP/TP.
+An independent replica contains all PP/CP/TP ranks at one DP coordinate.
+There is no inference DP gradient reduction. Default placement keeps TP and EP
+on fast links, then places PP stages and independent DP replicas. Cross-node TP
+is allowed only by explicit deployment policy and measured bandwidth/latency.
+
+The following is a **proposed header excerpt**, not a replacement for the current
+`ParallelConfig`. Once implemented, its fields should extend that configuration
+through one validated conversion; do not keep two competing sources of truth.
+
+```cpp
+#ifndef INFERX_CONFIG_EXECUTION_TOPOLOGY_H_
+#define INFERX_CONFIG_EXECUTION_TOPOLOGY_H_
+
+#include <cstdint>
+#include <vector>
+
+#include "inferx/core/status.h"
+
+namespace inferx {
+
+enum class GroupKind {
+  kTensor,
+  kPipeline,
+  kContext,
+  kExpert,
+  kExpertTensor,
+};
+
+struct TopologyOptions {
+  int tensor_parallel_size = 1;
+  int pipeline_parallel_size = 1;
+  int data_parallel_size = 1;
+  int context_parallel_size = 1;
+  int expert_parallel_size = 1;
+  bool enable_expert_parallel = false;
+  bool enable_sequence_parallel = false;
+  bool enable_attention_data_parallel = false;
+};
+
+struct RankPlacement {
+  int global_rank = 0;
+  int host_id = 0;
+  int device_ordinal = 0;
+};
+
+struct GroupDescriptor {
+  int group_id = 0;
+  GroupKind kind = GroupKind::kTensor;
+  std::vector<int> global_ranks;  // Ordered by group-local rank.
+};
+
+// Immutable after successful construction; owns metadata, not communicators.
+class ExecutionTopology {
+ public:
+  static StatusOr<ExecutionTopology> Create(
+      const TopologyOptions& options,
+      const std::vector<RankPlacement>& placements);
+
+  int world_size() const { return world_size_; }
+  const std::vector<GroupDescriptor>& groups() const { return groups_; }
+
+ private:
+  ExecutionTopology(int world_size, std::vector<GroupDescriptor> groups);
+
+  int world_size_;
+  std::vector<GroupDescriptor> groups_;
+};
+
+}  // namespace inferx
+
+#endif  // INFERX_CONFIG_EXECUTION_TOPOLOGY_H_
+```
+
+`Create` validates geometry, unique placements, and deterministic group membership.
+Model/kernel support is checked separately before any groups are opened. Group
+IDs are deterministic within a topology version; compare a topology fingerprint
+at startup. Rank order matters for gathers and expert mapping. Do not deduplicate
+communicators solely by an unordered member set: ordered membership, backend,
+device binding, and independent ordering channels must also match. Initially keep
+one owner per role; aliasing is an optional proven optimization.
+
+### 4.2 Expert groups and attention DP
+
+For ordinary replicas, the FFN plane is the TP group at fixed DP/PP/CP. With
+attention DP enabled, the plane spans DP × TP at fixed PP/CP. Define:
+
+- `plane_size = tp_size`, or `dp_size * tp_size` in attention-DP mode.
+- `expert_parallel_size * expert_tensor_parallel_size = plane_size` when EP is
+  enabled. All experts are replicated across independent planes.
+- For plane index `q`, `expert_rank = q / expert_tensor_parallel_size` and
+  `expert_tensor_rank = q % expert_tensor_parallel_size`.
+- EP groups vary `expert_rank` at fixed `expert_tensor_rank`; expert-TP groups
+  vary `expert_tensor_rank` at fixed `expert_rank`.
+
+When EP is disabled, the normal FFN keeps its TP group. Initially reject
+attention-DP mode without EP; dense FFN redistribution across DP is a separate
+feature with no immediate need. A dense model rejects an enabled EP request
+rather than silently claiming it was honored. Migrate the legacy EP boolean to
+full-plane EP (`expert_tensor_parallel_size = 1`) unless an explicit new size is
+provided. Normal DP remains independent unless attention DP is explicitly enabled;
+a legacy DP+EP request must choose its coupling mode, not change it implicitly.
+
+Static expert ownership requires `num_experts % expert_parallel_size == 0`
+initially. Expert TP additionally requires divisible intermediate widths. Expert
+replication/rebalancing and uneven ownership are deferred; do not hide them in
+rank arithmetic.
+
+## 5. Execution plans, ownership, and completion
+
+Continue using `SchedulerOutput` at the public synchronous boundary. Build a
+validated internal execution envelope with the following information:
+
+| Information | Contract |
+|---|---|
+| Identity | Deployment epoch, topology version, replica ID, monotonically increasing step ID; coupled execution also has a domain round ID. |
+| Scheduling payload | Owned copy of request deltas for queued/remote execution, including prompt tokens and sampling parameters. Never serialize a span, pointer, `Tensor`, or C++ object representation. |
+| Microbatches | Stable IDs, explicit scheduled-row and flat-token ranges, real/padded counts, sample-row mapping, and absolute positions. All ranks in a TP group see the same logical ordering. |
+| Cache state | Allocation/release deltas, per-request generation and committed watermark, and CP placement metadata when applicable. |
+| Execution choice | Validated layout IDs, eager/graph choice, and bounded buffer slot; graph keys are not chosen independently by peers. |
+| Completion | Step ID, status from all participating ranks, and exactly one sample per eligible request from its output owner. |
+
+A synchronous local envelope can borrow `SchedulerOutput` until `Execute`
+returns. An asynchronous or cross-process envelope must own token arrays and all
+other payloads. Bound queue lengths and message sizes; apply backpressure before
+accepting another plan. The current fixed-size worker protocol is insufficient:
+a remote extension needs versioned framing, lengths, validation, deadlines, and
+plan/result messages, not independent worker-side batching.
+
+Apply each delta once in order. Reject stale epochs, duplicate steps, missing
+predecessors, and inconsistent request generations before forward execution.
+Do not retry a partially executed plan against mutated request/KV state. Results
+must preserve `SchedulerOutput::scheduled` order even if microbatches complete
+out of order. Only the output owner samples; derive RNG progress from request
+identity and committed generation position, not rank or microbatch completion.
+
+Maintain one outstanding logical step per replica initially. PP can overlap
+microbatches within that step. Future overlap across steps requires disjoint
+request sets or explicit per-request dependencies, per-slot scratch/metadata, and
+scheduler lifetime changes. `pipeline_parallel_size` is not a safe automatic
+limit on outstanding steps: decode token n+1 depends on token n being sampled
+and accepted, regardless of the number of stages.
+
+Preemption/cancellation takes effect at a coordinated step boundary. Do not free
+KV or skip a collective locally while peers still use that request. A cancelled
+request's result may be discarded after its issued work finishes; release pages
+only after all users complete. Metadata-only steps still propagate finished and
+preempted IDs even when there are no tokens to execute.
+
+## 6. Communication contract
+
+Extend `CommBackend` incrementally, keeping existing TP operations. Each instance
+represents one ordered group, with group-local peer indices. A proposed
+`ParallelContext` selects the appropriate backend for each role. Do not add a
+virtual class for every TP/PP/EP combination.
+
+| Proposed operation | Semantics and use |
+|---|---|
+| `AllGatherTokens` | `[local_tokens, hidden]` to `[group_size * local_tokens, hidden]`, in rank order; SP reconstruction. Distinct from `AllGatherLastDim`. |
+| `ReduceScatterTokensSum` | Sum matching full token tensors and return the rank's contiguous token slice; SP row-parallel output. |
+| `Exchange` | Batch of sends and receives with peer-local ranks and agreed tensor descriptors; PP, CP ring exchange, and sparse EP payload exchange. Enqueue matching operations together rather than blocking send-then-receive. |
+| `ExchangeCounts` | Fixed-length integer counts, one per peer; host-visible completion is explicit for eager EP. |
+| `AllToAllV` | Packed payloads plus per-peer counts and offsets, validated against receive capacity. May be implemented with grouped P2P; no assumption of a native variable-count backend primitive. |
+| `AllReduceMax` and typed `AllReduceSum` | FP32 distributed attention statistics; BF16-only reductions are insufficient for CP. |
+| `CheckHealth` / `Abort` | Backend-owned asynchronous error detection and idempotent failure propagation; abort must release waiting rank dispatch. |
+
+These are semantic requirements, not implemented signatures. Use existing
+`Tensor`, `ops::OpContext`, `DeviceStream`, and `Status`. Specify supported dtype,
+layout, aliasing, zero-count behavior, and capture capability per backend. Reject
+unsupported capabilities at startup. An identity backend still validates shapes
+and performs required copies at size one.
+
+Submission success means work was enqueued, not completed. Input/output storage,
+count arrays, and tensor descriptors stay valid until the associated stream/event
+completes. For a different consumer stream, record a producer event and make the
+consumer wait. No scratch slot, plan payload, or KV block is recycled earlier.
+Host-visible count exchange explicitly waits for counts before buffer offsets
+are used; eager EP is allowed this synchronization cost.
+
+### 6.1 Ordering and progress
+
+1. Serialize communication submission on each rank. Matching group members issue
+   matching operation kinds, counts, dtypes, roots, and sequence numbers.
+2. Derive order from domain round, microbatch, layer, and operation index. For
+   overlapping groups, use an agreed schedule consistent across all members;
+   disjoint replicas need no shared order.
+3. Begin with one ordered communication stream plus explicit compute events.
+   This simplifies dependencies but does **not** prove deadlock freedom: ranks
+   can still enter overlapping groups or P2P in incompatible orders.
+4. Post matching pipeline transfers in a deterministic wavefront. Avoid a cycle
+   in which all ranks wait for a receive whose send is behind that wait. Preserve
+   FIFO per peer/channel; application step IDs validate matching but are not
+   assumed to be transport-level message tags.
+5. Never wait for a peer while holding an executor-wide mutex required by that
+   peer. Multi-device backends must dispatch participating ranks concurrently.
+6. Separate P2P/compute overlap is opt-in after dependency and backend-version
+   tests. No claim that multiple streams automatically overlap efficiently.
+
+NCCL has explicit ordering requirements for grouped operations and multiple
+communicators; backend versions differ in available launch-order guarantees.
+Use conservative ordering unless the selected backend is validated for more.
+See NVIDIA's [group calls](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/groups.html)
+and [communicator documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/communicators.html).
+
+## 7. Strategy execution flows
+
+### 7.1 Tensor parallelism and sequence parallelism
+
+TP splits projection weights, attention heads, and FFN width. Preserve existing
+row/column weight bindings and vocab sharding. Validate query-head divisibility,
+FFN width, vocabulary padding, and GQA mapping. When TP exceeds KV-head count,
+replicate KV heads only with a validated integral replication factor; otherwise
+reject the configuration. Replicated KV consumes real memory on every copy.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant RT as Router (ReplicatedExecutor)
-    participant PE as Prefill Engine (tp=4)
-    participant KC as KvConnector
-    participant DE as Decode Engine (tp=2)
-
-    RT->>PE: Submit(prompt) [role=kPrefill]
-    PE->>PE: chunked prefill, publish blocks
-    PE->>KC: SaveKv(blocks, layers) + last-token logits
-    KC-->>DE: transfer (reshard tp4->tp2 or reject)
-    DE->>KC: Lookup + StartLoad (remote-pending adoption)
-    KC-->>DE: TransferState=arrived
-    DE->>DE: schedule decode with remote-cached tokens
-    DE-->>RT: stream tokens
-    RT-->>RT: subsequent turns route to DE (affinity)
+    participant E as ModelExecutor
+    participant A as TP rank 0 runner
+    participant B as TP rank 1 runner
+    participant C as TP communicator
+    E->>A: Same logical step and token order
+    E->>B: Same logical step and token order
+    par Local shard compute
+        A->>A: Column projection and local attention/MLP
+    and
+        B->>B: Column projection and local attention/MLP
+    end
+    A->>C: AllReduceSum(row projection partial)
+    B->>C: AllReduceSum(row projection partial)
+    C-->>A: Full hidden states
+    C-->>B: Full hidden states
+    Note over A,B: Repeat required collectives per layer
+    A->>C: AllGatherLastDim(vocabulary shard)
+    B->>C: AllGatherLastDim(vocabulary shard)
+    C-->>A: Full logits
+    C-->>B: Full logits
+    A->>A: Sample eligible rows
+    A-->>E: Samples after device completion
+    B-->>E: Completion
+    E->>B: ApplyAcceptedTokens
 ```
 
----
-
-## 12. Step-by-step implementation plan
-
-Phase graph (arrows are hard dependencies):
+SP retains only a token slice for replicated elementwise operations such as
+normalization/residual updates. Gather tokens before column-parallel projection;
+reduce-scatter row-parallel partials afterward. Pair residual operands in the
+same layout and preserve token order. This replaces a TP all-reduce with
+reduce-scatter plus all-gather across adjacent regions; it does not simply remove
+communication or shard persistent KV.
 
 ```mermaid
-flowchart LR
-    P0[Phase 0<br/>contracts + harness] --> P1[Phase 1<br/>single-device slice]
-    P1 --> P2[Phase 2<br/>TP executor]
-    P1 --> P3[Phase 3<br/>overlap + graphs]
-    P2 --> P5[Phase 5<br/>EP MoE]
-    P2 --> P6[Phase 6<br/>PP pipeline]
-    P2 --> P7[Phase 7<br/>DP router]
-    P3 --> P4[Phase 4<br/>weight service + quota]
-    P4 --> P5
-    P5 --> P10[Phase 10<br/>offload + PD disagg]
-    P6 --> P10
-    P7 --> P10
-    P3 --> P8[Phase 8<br/>spec + serving outputs]
-    P7 --> P8
-    P8 --> P9[Phase 9<br/>multimodal + pooling]
-    P8 --> P11[Phase 11<br/>advanced]
-    P10 --> P11
+sequenceDiagram
+    participant R as TP/SP ranks
+    participant C as TP communicator
+    R->>R: Normalize local token slice
+    R->>C: AllGatherTokens(local normalized tokens)
+    C-->>R: Full token order on each TP rank
+    R->>R: Column-parallel projection, local compute
+    R->>R: Row-parallel projection partial
+    R->>C: ReduceScatterTokensSum(partials)
+    C-->>R: Reduced local token slice
+    R->>R: Add matching residual slice
 ```
 
-Each phase: **Goal / API changes / Tasks / Depends on / Deliverables / Gate** (test IDs from §13). Backlog IDs (C/F/A/X) are referenced, not duplicated; a phase's gate includes its backlog items' acceptance lists.
+Pad each microbatch token count to a multiple of TP, carrying valid-row masks
+through attention, MoE routing, logits, and sampling. Padding writes no real KV
+and contributes no routed token. SP at a PP boundary is enabled only if both
+stages agree on token slicing; otherwise gather to the canonical replicated
+boundary layout. Decode batches smaller than TP may gain nothing from SP.
 
-**Phase 0 — Contracts and test harness (P0).**
-Goal: the §2 types exist and are testable before any behavior moves. API: `SchedulerOutput`, `PlanShard`, `StepResult`, `WorldMapping`, `Executor` interface, `Loopback` `CommGroup`. Tasks: (1) land value types with snapshot serialization; (2) `WorldMapping` + `ParallelConfig::Validate` with the §3.7 matrix as table tests; (3) plan round-trip + fuzz (random plans serialize/parse byte-stable). Depends on: nothing. Deliverables: `inferx::runtime` contracts lib + tests. Gate: T-CON green (debug + release).
+### 7.2 Pipeline parallelism
 
-**Phase 1 — Single-device vertical slice (P0).**
-Goal: the current engine behavior rebuilt on the new seams, one GPU, feature parity with today's serving path. API: `Engine`, `EventSink`, `Scheduler` over the existing cache manager (interface extracted), `TensorParallelExecutor` degenerate case, `ModelRunner` wrapping the existing model layer. Tasks: (1) extract `KVCacheManager` interface; (2) evolve `engine::SchedulerOutput` into `runtime::SchedulerOutput` (add `kind`/`dp_replica`; microbatch slots arrive with PP); (3) wire the gateway to `Engine`; (4) golden-trace parity (existing Qwen3-0.6B expected tokens). Depends on: Phase 0 + backlog C03/C05 fixes (correct publication and preemption semantics ride along). Deliverables: end-to-end single-GPU engine. Gate: T-VDX.
+Partition layers into explicit contiguous ranges; nonuniform ranges are allowed
+and need not divide the layer count evenly. Stage zero owns embeddings; the last
+stage owns final norm, logits, and sampling. Duplicate tied embeddings at the
+endpoints, accounting for their memory, unless a model-specific alternative is
+implemented. Local layer indices must map to global checkpoint names and KV
+regions. Intermediate stages must not run final norm or the language-model head.
 
-**Phase 2 — TP executor and communicator groups (P0).**
-Goal: real multi-GPU TP. API: `CommGroupSet`, worker-thread dispatch, rank-0 sampling + token broadcast. Tasks: (1) NCCL group construction in fixed order (§4.2); (2) head/vocab shard rules via `Model::DescribeWeightBindings`; (3) init-time cross-rank validation (pool capacity, spec digest — backlog A07's amendment); (4) determinism: seeded runs identical across TP shapes. Depends on: Phase 1. Deliverables: TP=N engine. Gate: T-TP, T-DET.
+The **proposed stage API** below is an additional model seam for PP. Existing
+single-stage models continue to use `Model::Forward`. A PP model implements both
+interfaces or supplies an adapter; the runner selects it during construction,
+not by a per-layer dynamic cast. `ForwardContext` must gain the parallel context
+and stage-local attention metadata before this API can support hybrid execution.
 
-**Phase 3 — Overlap scheduling and CUDA graphs (P0).**
-Goal: latency: SGLang-class overlap; vLLM-class decode graphs. API: `Executor::ExecuteAsync`, `AttentionBackend::QueryGraphSupport` (A12 contract), graph pool. Tasks: (1) two-thread loop with explicit commit point (§5.3); (2) stable device block tables + delta upload; (3) bucket capture + eager twin differential harness; (4) property tests: overlapped output == serial output under random schedules. Depends on: Phase 2 (graphs under TP eager until this phase). Deliverables: overlap + graphs on TP. Gate: T-OVL, T-GRP.
+```cpp
+#ifndef INFERX_MODELS_PIPELINE_STAGE_H_
+#define INFERX_MODELS_PIPELINE_STAGE_H_
 
-**Phase 4 — Weight service and memory quota (P1).**
-Goal: the §4 loading pipeline as the only load path. API: `CheckpointPlan`, `WeightService`, `MemoryQuota`. Tasks: (1) per-rank plan pure function + hash-compare; (2) pinned double-buffered staging; (3) on-load quantization (`QuantPlan`) for the first supported family; (4) quota order + TP-min KV budget + F11 validation rules. Depends on: Phase 3. Deliverables: reshard-capable loader, budget governor. Gate: T-WGT.
+#include <cstdint>
 
-**Phase 5 — Expert parallelism (P1).**
-Goal: MoE a2a + hybrid worlds. API: `ExpertPlacer`, dispatch/combine ops, `moe_dispatch` modes. Tasks: (1) expert placement (round-robin + hotness); (2) `kAllGather` mode end-to-end; (3) `kAllToAll` with capacity accounting; (4) graph interaction gates (§3.4); (5) hybrid `attn_tp × moe_ep` worlds. Depends on: Phases 2, 4. Deliverables: EP engine + Qwen3-MoE-class serving. Gate: T-EP.
+#include "inferx/core/status.h"
+#include "inferx/core/tensor.h"
+#include "inferx/models/model.h"
 
-**Phase 6 — Pipeline parallelism (P1).**
-Goal: PP microbatch executor. API: microbatch plan slots, `PipelineExecutor`, PP `SendRecv` channels. Tasks: (1) stage partition from `ModelSpec`; (2) 1F1B scheduler; (3) last-stage sampling contract; (4) per-stage KV capacity validation; (5) warmup pass; (6) prefix caching **disabled across stages** until F05 groups land (documented restriction, mirroring backlog honesty). Depends on: Phase 2. Deliverables: PP engine. Gate: T-PP.
+namespace inferx::models {
 
-**Phase 7 — DP replication router (P1).**
-Goal: scale-out identical replicas. API: `ReplicatedExecutor`, routing policies, DP stats side-channel. Tasks: (1) wait-projection routing; (2) cache-affinity hashing; (3) graceful replica drain for rolling restart; (4) stats merge. Depends on: Phase 2. Deliverables: DP engine + router. Gate: T-DP.
+enum class ActivationLayout {
+  kReplicatedTokens,
+  kTensorShardedTokens,
+};
 
-**Phase 8 — Speculation and serving outputs (P1).**
-Goal: the throughput/feature tier: spec decode, structured output, logprobs, n>1, priorities. API: `SpecController`, `GrammarEngine`, `OutputSpec` extension, fork (A02), `PreemptFor` policies (A10). Tasks: (1) controller with n-gram proposer; (2) draft-runner EAGLE-class path + draft cache group (A01/A13); (3) verify tree masks in backend; (4) grammar masks on sampling rank; (5) logprob plumbing; (6) fork/aggregate. Depends on: Phases 3, 7 (affinity for turn traffic). Deliverables: spec + structured-output engine. Gate: T-SPEC, T-SERVE.
+struct StageActivation {
+  Tensor hidden;
+  ActivationLayout layout = ActivationLayout::kReplicatedTokens;
+  int64_t valid_tokens = 0;
+  int64_t padded_tokens = 0;  // Total rows before any TP token slicing.
+};
 
-**Phase 9 — Multimodal, encoder–decoder, pooling (P1).**
-Goal: non-text-standard workloads. API: `MultimodalInputs`, cross-attention cache groups (A08), `PoolingOutput`. Tasks: (1) embed-span inputs through `Model::Forward`; (2) F04 identity for spans; (3) enc-dec group sizing + bypass rules; (4) pooling runner mode. Depends on: Phase 8 (output plumbing). Deliverables: VLM/enc-dec/embedding serving. Gate: T-MM, T-SERVE (pooling).
+// The caller owns and preallocates output storage. Methods enqueue work on
+// ctx's stream; all input/output storage must survive device completion.
+class PipelineStage {
+ public:
+  virtual ~PipelineStage() = default;
 
-**Phase 10 — Offload, external caches, PD disaggregation (P2).**
-Goal: the memory plane. API: `RoleConfig`, `KvConnector`, transfer states, A04 host tier. Tasks: (1) host offload + restore; (2) connector interface + one transport (A05's one-backend-first rule); (3) role engines + remote-pending adoption; (4) last-token handoff; (5) reshard-or-reject across layouts. Depends on: Phases 5–7 + backlog F02 leases. Deliverables: PD-disagg pair + offload tier. Gate: T-PD.
+  // First stage only: performs embedding and this stage's layer range.
+  virtual Status ForwardFirst(ForwardContext& ctx, const StepInputs& inputs,
+                              StageActivation* output) const = 0;
 
-**Phase 11 — Advanced tier (P2).**
-Goal: the remaining ○/long-tail ◐: DP attention (`DpPlanSplit`), CP (only with its cache semantics per A07), LoRA (`AdapterService`), sleep/wake (`ElasticityController`), virtual PP hook. Each ships behind its own startup gate and acceptance list — none enabled by default. Depends on: Phases 8, 10. Deliverables: per-feature opt-in modules. Gate: T-ADV.
+  // Later stages only: consumes the previous stage's activation.
+  virtual Status ForwardNext(ForwardContext& ctx, const StageActivation& input,
+                             StageActivation* output) const = 0;
+};
 
----
+}  // namespace inferx::models
 
-## 13. Testing and validation
+#endif  // INFERX_MODELS_PIPELINE_STAGE_H_
+```
 
-Suites are cumulative; every phase's gate runs in **debug and release** (assertions must not be load-bearing — the backlog's ground rule) and on the fixture families of the T04 matrix where a model shape is needed. Distributed tests use the `Loopback` transport first (deterministic, CI-cheap) and real multi-GPU runs as a nightly lane.
+Output pointers are non-null and refer to validated preallocated tensors. A
+method used on the wrong stage returns `FailedPrecondition`. The last stage
+applies final norm before the runner calls existing `Model::ComputeLogits`;
+all other stages omit it. Absolute positions and per-request attention metadata
+arrive in the plan, not just in the activation payload. A boundary descriptor
+includes dtype, shape, layout, microbatch ID, CP token partition, and valid mask.
+Uniform TP/CP sizes across stages are required initially.
 
-| Suite | Covers | Representative cases and acceptance criteria |
-| --- | --- | --- |
-| T-CON | Phase 0 contracts | `WorldMapping` coordinates for every §3.7 row; `Validate` rejects each illegal config **with the constraint named**; plan serialize/parse round-trip and fuzz (no device). |
-| T-VDX | Vertical slice | Golden Qwen3-0.6B token trace reproduced byte-for-byte (existing `model_test.cc` baseline); cache on/off output equality; cancel/abort/eos/length; chunk-boundary cases from backlog C03; preemption replay equals uninterrupted reference (post-C05). |
-| T-TP | TP executor | TP=2 Loopback logits ≈ TP=1 (existing pattern, ported); TP=8 real; head-divisibility rejects; replicated-KV byte equality across ranks; init validation catches induced capacity mismatch (T-FAULT-adjacent). |
-| T-DET | Determinism | Greedy and seeded runs bit-identical across {TP shapes, overlap on/off, graphs on/off}; sampler-rank swap invariance; collective reduction order pinned where required. |
-| T-OVL | Overlap | Overlapped == serial for randomized schedules (property test, fixed seeds); preemption during overlap commits exactly once; commit-point stress (finish/abort racing plan hand-off). |
-| T-GRP | CUDA graphs | Graph == eager twin token-for-token per bucket; block-table delta replay across adoption/preemption/slot reuse (A12 cases); padded-batch guards never touch foreign blocks. |
-| T-WGT | Weights | Per-rank plan hash equality; TP-4 checkpoint → TP-8 world reshard equals direct TP-8 load (logit tolerance); quantized-at-load tolerance; corrupted-shard detection names rank+tensor; budget precedence matrix (F11). |
-| T-EP | Expert parallel | a2a == allgather outputs (tolerance) for small worlds; expert placement deterministic given hotness; capacity overflow accounted, not dropped; hybrid `attn_tp×ep` world correctness; graph gates fire where declared. |
-| T-PP | Pipeline | Microbatch schedule conformance to 1F1B oracle; PP=4 == TP=1 outputs; bubble measurement within ` (pp-1)/(m+pp-1) ` ± tolerance; per-stage capacity mismatch rejected; stage-kill → clean group abort. |
-| T-DP | Router | Affinity hashing keeps a session on one replica's cache (hit-token counters); rolling drain loses no requests; stats merge correctness; slow-consumer policy. |
-| T-SPEC | Speculation | Accept none/some/all vs non-spec greedy reference (every fixture family); rejected-tail truncation leaks nothing (T01 oracle); recurrent-state restore exactness; draft-only hashes never published; spec+graphs twin. |
-| T-SERVE | Serving outputs | Logprobs vs reference scorer; grammar-mask output validity (schema conformance 100%); `n>1` fork aggregation; fork/prune order matrix (A02 cases); pooling/embedding equivalence vs FP32 reference. |
-| T-MM | Multimodal/enc-dec | Same tokens + different image digests never share (F04); enc-dec: different encoder inputs never share decoder prefix; encoder KV freed at completion; pooling-fraction models (P-08.7) or explicit rejection. |
-| T-PD | Disagg | Mock-connector transfer; partial local + remote hit; connector failure → deadline → recompute fallback (never indefinite wait); tp4→tp2 reshard equality or rejection; producer death mid-transfer; decode-side remote-pending scheduling. |
-| T-ADV | Advanced tier | Per-feature: DP-attention split/merge vs monolithic; sleep/wake round-trip (capacity re-validated, epoch stable); LoRA identity isolation; CP only if its cache-semantics acceptance exists. |
-| T-FAULT | Fault handling (cross-cutting) | Rank kill at each collective site → all ranks exit within timeout, no hang (multi-rank no-hang test per backlog A07); abort releases blocked collectives; engine surfaces `kUnavailable` for all pending; supervisor reroute. |
-| T-PARITY | vLLM parity | Scenario probes against recorded vLLM runs (extending the existing `tests/regression/vllm_parity_probe_test.cc` + `benchmarks/results` manifests): per UC-01…UC-20 a captured trace, divergence only at documented tolerance/ulps; new probe added with each phase. |
+For the first implementation, each request's scheduled tokens stay together in
+one microbatch. Microbatches have disjoint request sets; their union is the step.
+This avoids concurrent KV writes for the same request and ambiguous sampling
+rows. A stage processes microbatches in FIFO order with a bounded send/receive
+slot pool. Retire a slot only after both compute and outbound transfer complete.
 
-Acceptance rule: a phase is done when its gate suites pass in both build types, all prior gates still pass, and its T-PARITY probe is checked in. No suite may be weakened to make a gate pass.
+```mermaid
+sequenceDiagram
+    participant E as Executor / PipelineDriver
+    participant A as Stage 0 TP group
+    participant B as Stage 1 TP group
+    participant S as Scheduler
+    E->>A: Plan with microbatches 0 and 1
+    E->>B: Same plan, prepare receive slots
+    A->>A: ForwardFirst(microbatch 0), TP collectives
+    A->>B: Matching lane transfers, activation 0
+    par Pipeline overlap
+        A->>A: ForwardFirst(microbatch 1), TP collectives
+    and
+        B->>B: ForwardNext(0), final norm, logits, sample
+    end
+    A->>B: Matching lane transfers, activation 1
+    B->>B: ForwardNext(1), final norm, logits, sample
+    B-->>E: Last-stage owner samples + completion
+    A-->>E: Stage completion
+    E->>A: Accepted tokens for next step
+    E->>B: Accepted tokens for all last-stage peers
+    E-->>S: Reassemble samples in scheduler order
+```
 
----
+The canonical replicated boundary sends a full activation on every TP lane;
+this is simple but costs TP times the payload in aggregate. SP-compatible
+boundaries send one token shard per lane. Sending once then broadcasting in the
+next stage is another optimization, not the initial contract. PP bubbles depend
+on useful microbatch count; adding stages does not speed up a lone dependent
+decode request. With equal stage times and M independent microbatches over P
+stages, the idealized fill/drain bubble fraction is `(P - 1) / (M + P - 1)`.
 
-## 14. Implementation priorities
+### 7.3 Independent data parallelism
 
-| Priority | Phases | Rationale |
-| --- | --- | --- |
-| **P0** | 0–3 (contracts, vertical slice, TP, overlap+graphs) | Everything else composes on these; they carry the correctness invariants (plan-as-message, determinism, single-writer) that are expensive to retrofit. Also the largest coverage-per-effort step: dense TP + graphs + overlap is the vLLM baseline (UC-01…UC-03). |
-| **P1** | 4–9 (weights, EP, PP, DP, spec/outputs, multimodal) | The feature tier: each unlocks a distinct vLLM scenario family (MoE, pipeline scale-out, replication, speculation, structured/logprob serving, VLM/enc-dec/pooling) and is independently shippable behind its gate. |
-| **P2** | 10–11 (offload/PD disagg, advanced) | Highest coordination cost, lowest urgency for correctness of the core; depends on F02 leases and mature phases 5–7; each item (DP-attention, CP, LoRA, sleep/wake) is opt-in with its own acceptance list. |
+DP routes requests across complete model replicas. Each has its own scheduler,
+logical cache allocation, output owner, and progress clock. Pin an active request
+to its replica; migration requires explicit KV transfer or recomputation and is
+outside the initial implementation. Prefix-cache locality should inform routing.
 
-Sequencing rules: (1) never start a phase whose gate-dependencies are unmet (the phase graph); (2) phases 5/6/7 may proceed in parallel after 2+4 — separate executors, no shared files beyond contracts; (3) backlog P0 correctness items (C03–C08) are *prerequisites inside* phases 1–3, not competitors to them; (4) one T-PARITY probe per phase, added in the same change as the feature — coverage debt is tracked as failing tests, not TODOs.
+```mermaid
+sequenceDiagram
+    participant U as Request router
+    participant A as Replica 0 scheduler/executor
+    participant B as Replica 1 scheduler/executor
+    U->>A: Request X (sticky assignment)
+    U->>B: Request Y (sticky assignment)
+    par Independent progress
+        A->>A: Schedule and execute X with local TP/PP groups
+        A-->>U: X tokens
+    and
+        B->>B: Schedule and execute Y with local TP/PP groups
+        B-->>U: Y tokens
+    end
+    Note over A,B: No per-step DP collective or world barrier
+```
 
-Coverage accounting (against §10.2): after **P0**, the dense single-GPU/TP + overlap + graphs baseline is live (rows A1–A2, A11, A13, B1–B6, B8, E1, E5–E6, E12–E13, F1, F5, F7 — the vLLM default serving shape, UC-01…UC-03). After **P1**, every remaining ● row plus the ◐ rows owned by phases 4–9 (chunked-disable, priorities and cache-aware scheduling, speculation C1–C6, fine match unit, the FP8-KV path, logprobs/grammar/n-sampling, multimodal, encoder–decoder, pooling, and hybrid-attention cache groups as the backlog items land). **P2** closes D7/D9/G1–G5/F3. The four ○ rows (A4, A10, F2, C7) remain documented deferrals, each carrying its reason and upstream caveat in the matrix.
+### 7.4 Expert parallelism, including attention DP
+
+At each MoE boundary, define exactly one source owner per logical routed token.
+TP-replicated activations must not be dispatched once per replica copy. Either
+partition source tokens among EP senders or choose a designated sender, then
+explicitly replicate inputs within expert-TP subgroups. Count each top-k route
+once; reduce expert-TP partial outputs before combining weighted routes back to
+the original token. The combine path restores the layout required by attention
+TP/SP. Router decisions must be identical for duplicated token views.
+
+```mermaid
+sequenceDiagram
+    participant K as Coupled-domain coordinator
+    participant A as Attention replica / source 0
+    participant B as Attention replica / source 1
+    participant C as EP exchange groups
+    K->>A: Round ID and common microbatch schedule
+    K->>B: Same round, zero valid rows if idle
+    par Attention on local requests
+        A->>A: Local attention and route owned tokens
+    and
+        B->>B: Local attention and route owned tokens
+    end
+    A->>C: ExchangeCounts
+    B->>C: ExchangeCounts (participate even if zero)
+    C-->>A: Receive counts and validated capacity
+    C-->>B: Receive counts and validated capacity
+    A->>C: AllToAllV(dispatch tokens and route metadata)
+    B->>C: AllToAllV(dispatch tokens and route metadata)
+    C-->>A: Tokens for local experts
+    C-->>B: Tokens for local experts
+    A->>A: Expert compute, expert-TP reduction if needed
+    B->>B: Expert compute, expert-TP reduction if needed
+    A->>C: AllToAllV(return expert outputs)
+    B->>C: AllToAllV(return expert outputs)
+    C-->>A: Restore source order, weighted combine
+    C-->>B: Restore source order, weighted combine
+    A-->>K: Round completion
+    B-->>K: Round completion
+```
+
+The coordinator is required only when experts span DP replicas. It chooses a
+common microbatch/collective schedule from per-replica demand. Token counts may
+vary in eager mode, but every member participates, including zero-count peers.
+Idle replicas must process incoming expert tokens even if they have no attention
+requests. Masked rows must not update KV, RNG, or request progress. If the whole
+domain is idle, skip the round by common agreement.
+
+Expert skew may send every route to one rank. Bound capacity by admitted tokens
+and top-k, or negotiate capacity before payload submission. Never silently drop
+routes. On overflow, reject the round before forward mutation or fail the domain;
+mid-layer replay after KV mutation is not safe. Start with eager count exchange
+and preallocated capacity buckets. Fixed-capacity graph routing is deferred until
+its memory and overflow semantics are proven.
+
+With PP, the coupled coordinator assigns one round and microbatch order across
+all affected replicas and stages; it cannot independently advance a stage's EP
+round. Pad absent microbatches with zero valid rows. Cross-DP EP plus PP remains
+disabled until this schedule is implemented and failure-tested.
+
+## 8. Context parallelism and KV ownership
+
+CP requires more than a CP communicator. Start with a static block-to-CP-owner
+mapping shared by all TP lanes, e.g. logical block index modulo CP size. Track
+absolute sequence positions, local slots, and valid lengths explicitly. Weight
+shards are replicated across CP ranks; KV is partitioned by token ownership and
+then by TP head ownership. Do not treat the CP rank as another independent batch.
+
+For prefill, each CP rank computes its local queries and exchanges remote K/V
+chunks (or uses a correctness-first gather) to attend over all legal positions.
+Apply causal/sliding-window masks using absolute positions. A ring algorithm
+maintains an online softmax accumulator; averaging locally normalized outputs is
+incorrect. For decode, replicate the new query across CP ranks, append new KV
+only on its designated owner, and compute partial attention against local KV.
+
+For local scores `s`, compute `m_i = max(s)`, `l_i = sum(exp(s - m_i))`, and
+`u_i = sum(exp(s - m_i) * v)` per query/head. Reduce `m = max_i(m_i)`, then sum
+`exp(m_i - m) * l_i` and `exp(m_i - m) * u_i`; divide the latter by the former.
+Use FP32 accumulation. Empty/all-masked partitions contribute zero denominator
+and numerator; handle the all-empty case without evaluating `exp(-inf - -inf)`.
+
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant A as CP rank 0
+    participant B as CP rank 1
+    participant C as CP communicator
+    E->>A: Decode plan with absolute position and KV owner
+    E->>B: Same logical plan and placement
+    A->>A: Compute replicated query, append KV if owner
+    B->>B: Compute replicated query, append KV if owner
+    A->>A: Partial attention on local KV
+    B->>B: Partial attention on local KV
+    A->>C: AllReduceMax(local score maxima)
+    B->>C: AllReduceMax(local score maxima)
+    C-->>A: Global maxima
+    C-->>B: Global maxima
+    A->>C: AllReduceSum(rescaled FP32 numerator and denominator)
+    B->>C: AllReduceSum(rescaled FP32 numerator and denominator)
+    C-->>A: Globally normalized attention output
+    C-->>B: Globally normalized attention output
+    Note over A,B: One designated output owner samples after final-stage logits
+```
+
+During prefill, CP token shards persist through tokenwise FFNs. During decode,
+replicated query/output views must not duplicate EP routes or samples. The plan
+and model boundary must specify that change of layout. A prefill ring also needs
+matching exchange order and double-buffer lifetimes, not just the reductions
+shown for decode.
+
+### 8.1 Cache allocation and consistency
+
+For TP/PP without CP, retain shared logical block IDs per replica and use the
+minimum supported page count across participating stages/ranks after local
+memory profiling. PP stores only stage-local layers. This wastes capacity on
+larger stages but is a practical first policy. Move to per-stage capacities only
+if measurements justify more complex allocation.
+
+CP requires an explicit translation from logical block to CP owner and physical
+local page; the original flat block table is insufficient. Reserve capacity on
+all relevant owners atomically before issuing a step. One logical request
+watermark advances only when every required shard finishes its writes. Prefix
+hits, copy-on-write, eviction, and preemption must agree across shards. Prefix
+identity includes model/weight version and cache layout; a hit on one CP rank is
+not a complete distributed hit. Never use independent per-rank LRU decisions
+while the scheduler assumes globally valid blocks.
+
+SP does not independently own KV. With CP+SP, CP first selects a token subset;
+SP splits that subset across TP ranks around elementwise regions. A CP-local
+SP gather reconstructs only that CP subset. These strategies are not inherently
+incompatible, but nested mappings, padding, and attention boundaries must be
+implemented and tested. Initially disable CP+SP and CP+cross-DP EP as scope
+limits, not mathematical impossibilities. Recurrent/linear-attention state needs
+its own partition/merge semantics and is rejected under CP until provided.
+
+## 9. Weights, streams, graphs, and performance
+
+Reuse `WeightMap` row spans and column windows for TP, fused QKV/gate-up, expert
+subsets, and PP stage ranges. Stage-aware strict loading must explicitly classify
+other stages' checkpoint tensors as intentionally unused while still rejecting
+missing local weights and unexplained names. Validate local shapes against
+attention-head replication, expert ownership, and quantization packing. There
+is no generic slicing rule that automatically supports every quantized format.
+
+Persistent rank-driving threads and bounded queues can replace per-step
+`std::async` once correctness is retained. Each rank has one submission owner;
+compute and communication use events for dependencies. Preallocate bounded
+scratch and metadata per live microbatch slot. Existing scratch allocation
+patterns need profiling before promising allocation-free execution.
+
+CUDA Graphs are a later optimization: the current runner explicitly rejects them.
+A future graph key includes topology/model version, stage, layout, padded token
+and sequence counts, attention plan variant, and buffer slot. Captured addresses,
+workspace sizes, and communication order must stay stable. Peers agree on
+capture/replay versus eager execution before launch; a local graph-cache miss
+must not switch only one rank to a different collective schedule. Keep dynamic
+EP counts and unsupported CP kernels eager. Bound graph-cache memory and reserve
+it during initialization; backend capture support must be tested explicitly.
+
+Communication cost models guide placement; they are not performance promises.
+For T tokens, H hidden width, b bytes per element, and p TP ranks, a ring
+all-reduce moves approximately `2 * (p - 1) / p * T * H * b` bytes per rank.
+SP's corresponding reduce-scatter plus all-gather has similar aggregate traffic
+but lower retained activation memory. PP boundary traffic depends on replicated
+versus sharded lanes (§7.2). EP dispatch and return each scale with routed tokens
+× top-k × H × b, plus route metadata and any expert-TP replication. CP trades
+KV capacity for attention communication and may worsen short-context latency.
+
+Measure per-rank memory (weights, KV, scratch, activation slots, communicators,
+graphs), useful versus padded tokens, stage idle time, routed-token skew,
+collective latency, queue depth, prefill throughput, and decode tail latency.
+Do not add plan relays, custom all-reduce, multi-stream overlap, or dynamic expert
+placement until profiles identify a bottleneck. A shared process is also a
+shared failure boundary for independent replicas; process isolation is needed
+if host-process survival is a requirement.
+
+## 10. Hybrid configurations and admission rules
+
+Support must be gated by model, attention backend, communication backend, and
+schedule capabilities together. Topology representability alone is insufficient.
+
+| Combination | Design disposition | Key condition |
+|---|---|---|
+| TP | Existing path; harden | Matching local shapes, cache capacity, sampler ownership, eager mode. |
+| Independent DP × TP | Compose separate executors | Sticky routing; no cross-replica collective. |
+| PP × TP, with independent DP outside | First pipeline target | Uniform TP per stage, explicit layers, matching activation lanes, disjoint microbatches. |
+| TP × SP | Planned | Token collectives, residual alignment, padding masks. |
+| PP × TP × SP | After SP and PP parity | Identical boundary layout or explicit gather conversion. |
+| EP within TP, optionally PP | Planned | Expert-TP factorization, unique route ownership; EP groups stay within stages. |
+| Attention DP × EP | Planned, eager first | Coupled domain rounds, idle participants, capacity checks, shared failure fate. |
+| Attention DP × EP × PP | Gated | One global round/microbatch schedule for the coupled domain. |
+| CP × TP, optionally PP and independent DP | Later | CP attention/KV semantics; CP layout preserved across stage boundaries. |
+| CP × SP or CP × cross-DP EP | Disabled initially | Nested layouts and route ownership require separate implementation and validation. |
+| Different TP/CP widths per PP stage | Unsupported initially | Needs explicit repartitioning at stage boundaries. |
+| Elastic topology, expert migration, heterogeneous kernels within a collective group | Unsupported initially | Requires state migration or an agreed mixed-backend execution contract. |
+
+Example placement: 16 devices, DP=2, PP=2, CP=1, TP=4. Ranks 0–3 and 4–7 are
+replica 0's stages; ranks 8–11 and 12–15 are replica 1's stages. TP groups are
+those four ranges; pipeline lanes are `{0,4}`, `{1,5}`, ..., `{11,15}`. Two
+schedulers progress independently. If each replica fits on a node, all its
+traffic stays on that node, but link quality still comes from the placement
+inventory rather than rank numbering.
+
+Example EP refinement: TP=8, EP=4, expert-TP=2. Expert-TP groups are `{0,1}`,
+`{2,3}`, `{4,5}`, `{6,7}`; EP exchange groups are `{0,2,4,6}` and `{1,3,5,7}`.
+Replicated source tokens need explicit ownership and expert-TP input replication.
+Example attention DP: DP=8, TP=1, EP=8 gives eight attention request streams and
+one coupled expert plane at each stage. These are not eight independent failure
+or scheduling domains.
+
+Startup rejects nonpositive/overflowing sizes, missing/duplicate placements,
+invalid coordinates, inconsistent topology fingerprints, unavailable operations,
+unsupported model partitions, inconsistent TP/CP widths, unsafe buffer bounds,
+and unimplemented combinations. Model validation covers layers, heads, experts,
+intermediate width, tied weights, and cache format. Do not rely on the current
+`ParallelConfig::Validate` to do these checks.
+
+## 11. Failure handling and recovery
+
+Derive a failure domain from transitive execution dependencies: a PP replica
+includes its TP/CP ranks; cross-DP EP joins affected replicas and their stages.
+Independent replicas remain logically separate, subject to shared-process/device
+failure. An output owner's success alone is insufficient to commit a step.
+
+```mermaid
+sequenceDiagram
+    participant R as Failing rank
+    participant E as Executor / domain coordinator
+    participant C as Communication groups
+    participant P as Other domain ranks
+    participant S as Scheduler(s)
+    R-->>E: Error or health-monitor timeout
+    E->>E: Mark epoch failed, stop admission
+    E->>C: Abort all affected groups
+    C-->>P: Release waits / report failure
+    P-->>E: Failed completion or shutdown acknowledgement
+    E-->>S: Fail affected steps, discard partial results
+    S->>S: Invalidate domain KV and request execution state
+    Note over E,S: Restart with a new epoch, rebuild or recompute state
+```
+
+Backend abort and health checks must be safe under their documented threading
+contract; do not assume arbitrary NCCL methods can race on one handle. A
+watchdog signals an owning backend/controller that provides the required safe
+abort mechanism. Bound startup, collective progress, control transport, and
+shutdown waits. Preserve the first failure and include epoch, rank, group,
+step, microbatch, and operation sequence in diagnostics.
+
+Normal shutdown stops admission, drains work, releases graphs and tensors, then
+communicators and streams in dependency-safe order. On failure, abort first;
+normal synchronization can hang. Do not destroy resources that a device may
+still reference without backend-confirmed quiescence or process teardown.
+Recovery recreates the domain and recomputes/reloads state; no automatic replay
+against partially modified KV. Client retry/output deduplication is a separate
+service policy, especially if earlier tokens have already been streamed.
+
+## 12. Implementation sequence and validation
+
+Keep changes in the existing `include/inferx/{config,dist,engine,models,cache}`
+and corresponding `src` directories, with `.h`/`.cc` filenames. Add topology and
+communication roles under `dist`, pipeline coordination under `engine`, and
+stage execution under `models`. Avoid a parallel `src/exec` subsystem.
+
+| Phase | Work | Required evidence before enabling |
+|---|---|---|
+| 1 | Validate actual capabilities, harden TP group construction, persistent rank dispatch, explicit completion/failure contracts. | Existing single-rank/TP parity remains; invalid PP/DP/EP requests fail clearly; aborted ranks release peers. |
+| 2 | Named groups, stage-local weights/KV, activation P2P, FIFO microbatches; independent replica routing. | TP×PP output/logit parity, cache consistency, no buffer reuse races, replica progress independence. |
+| 3 | Token-axis collectives and SP layouts. | Eager SP parity, uneven/padded batches, PP boundary conversions. |
+| 4 | Static EP and expert TP; then attention-DP coordinator. | Top-k route conservation, skew/zero-token cases, expert-TP parity, idle-peer progress, coupled failure propagation. |
+| 5 | CP metadata, placement, attention reductions/ring, distributed cache accounting. | Long-context prefill/decode parity, causal masks, empty partitions, GQA, chunked prefill, prefix reuse and eviction. |
+| 6 | Gated hybrids, graph capture, overlap, and transport extensions. | Each enabled combination passes correctness/fault tests and demonstrates measured benefit. |
+
+Extend existing [`tests/unit/dist`](../tests/unit/dist) communication tests and
+[`tensor_parallel_test.cc`](../tests/integration/models/tensor_parallel_test.cc).
+A CPU reference backend can validate collective matching and PP schedules; it
+cannot establish CUDA stream or NCCL deadlock freedom. Test real devices too.
+
+Validation must include:
+
+- Topology/group golden cases, overflow/invalid configurations, ordered membership,
+  and model-specific shard reconstruction using actual weight bindings.
+- Single-rank versus distributed logits within dtype-appropriate tolerances;
+  greedy-token parity where logits have a stable margin, and deterministic
+  sampling ownership without assuming bitwise equality after reordered reductions.
+- Randomized microbatch counts, imbalanced stages, delayed ranks, metadata-only
+  steps, cancellation/preemption, slot poisoning, and duplicate/stale envelopes.
+- EP all-zero and one-active-source rounds, every token selecting one expert,
+  uneven counts, capacity exhaustion, and no duplicated/dropped top-k routes.
+- CP partition boundaries, all-masked local blocks, sliding-window capability
+  rejection, append ownership, full distributed prefix hits, and CP+TP head maps.
+- Process/rank loss during initialization, forward, P2P, counts exchange, and
+  shutdown; no stale success or partial cache commit after failure.
+- Graph/eager parity and mixed cache-hit scenarios only after capture is
+  implemented; memory accounting and long mixed-prefill/decode soaks.
+
+Collective trace checks should compare group, sequence, kind, shape, dtype, and
+peer pairing, with bounded diagnostic storage. The initial acceptance criterion
+is correct eager execution with explicit unsupported errors. Performance
+optimizations and broader hybrid support follow evidence, not configuration
+fields alone.

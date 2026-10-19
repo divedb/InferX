@@ -16,7 +16,6 @@ option(INFERX_BUILD_TESTS "Build the test suite" ${PROJECT_IS_TOP_LEVEL})
 option(INFERX_ENABLE_TOKENIZERS "Build tokenizer support" ON)
 option(INFERX_ENABLE_CUDA "Build CUDA components when available" ON)
 option(INFERX_BUILD_ENGINE "Build the inference engine and its dependencies" ON)
-option(INFERX_BUILD_KVCACHE_PLUGINS "Build bundled KV-cache providers" ON)
 
 # Resolve capabilities before configuring any CUDA consumers or engine dependencies.
 include(cmake/InferXCUDA.cmake)
@@ -37,15 +36,6 @@ endif()
 # subdirectory including the engine-independent ones below.
 include(cmake/InferxHelpers.cmake)
 
-# The public provider SDK and host provider need no engine dependencies.
-add_subdirectory(src/kvc)
-if(INFERX_BUILD_KVCACHE_PLUGINS)
-  add_subdirectory(plugins/kvcache/host)
-  if(INFERX_HAVE_CUDA_TOOLKIT)
-    add_subdirectory(plugins/kvcache/cuda)
-  endif()
-endif()
-
 if(INFERX_ENGINE_ENABLED)
   include(cmake/InferXDependencies.cmake)
   if(INFERX_ENABLE_TOKENIZERS)
@@ -57,7 +47,6 @@ if(INFERX_ENGINE_ENABLED)
 endif()
 
 if(INFERX_BUILD_TESTS)
-  add_subdirectory(tests/kvc)
   if(INFERX_ENGINE_ENABLED)
     add_subdirectory(tests)
   endif()

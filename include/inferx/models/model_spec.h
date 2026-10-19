@@ -5,9 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "inferx/cache/cache_spec.h"
 #include "inferx/core/device.h"
 #include "inferx/core/dtype.h"
-#include "inferx/models/requirements.h"
 #include "inferx/tokenizer/id.h"
 
 namespace inferx {
@@ -49,8 +49,8 @@ struct ModelSpec {
   /// Device the weights (and this rank's execution) live on.
   Device device;
 
-  /// Persistent per-layer state the runner must allocate.
-  StateRequirements state;
+  /// Per-layer cache requirements; the runner sizes its pools from this.
+  CacheRequirements cache;
 };
 
 }  // namespace models

@@ -12,7 +12,7 @@ inferx_add_library(
   PRIVATE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src
   DEPS
     inferx::core
-    inferx::cache
+    inferx::cache_manager
     inferx::models
     inferx::sampling
     inferx::comm
