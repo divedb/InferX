@@ -1,6 +1,12 @@
 #ifndef INFERX_CONFIG_PARALLEL_CONFIG_H_
 #define INFERX_CONFIG_PARALLEL_CONFIG_H_
 
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "inferx/core/status.h"
 
 namespace inferx {

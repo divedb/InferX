@@ -10,6 +10,18 @@ inferx_add_library(
   PRIVATE_DEPS ${CMAKE_DL_LIBS}
 )
 
+# inferx_topology -- the resolved rank mesh (docs/executor.md §5): the
+# immutable, deterministic rank/coordinate/device map and communicator
+# groups every rank agrees on.
+inferx_add_library(
+  NAME topology
+  SRCS
+    topology.cc
+  DEPS
+    inferx::core
+    inferx::config
+)
+
 # inferx_dist -- tensor-parallel worker topology: the controller-side
 # process pool (posix_spawn, one worker per device), the IPC wire protocol
 # over Boost.InterProcess message queues, and the worker-side engine loop.

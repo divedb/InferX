@@ -7,3 +7,9 @@ inferx_add_test(
   LABELS unit
   GPU
 )
+inferx_add_test(
+  NAME topology_test
+  SRCS topology_test.cc
+  DEPS inferx::topology
+  LABELS unit
+)
