@@ -8,6 +8,7 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/layers/rms_norm.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/qwen3/qwen3_attention.h"
 #include "inferx/models/qwen3_moe/qwen3_moe.h"
 #include "inferx/models/qwen3_moe/qwen3_moe_config.h"
@@ -37,6 +38,9 @@ class Qwen3MoeDecoderLayer {
                  bool fuse_input_norm, Tensor& residual, Tensor& out) const;
 
   Status BindWeights(const std::string& prefix, WeightMap& weights);
+
+  /// \brief The attention layer's spec.
+  [[nodiscard]] attn::AttentionSpec Spec() const { return self_attn_.Spec(); }
 
  private:
   Qwen3MoeDecoderLayer(RMSNorm input_layernorm, qwen3::Qwen3Attention self_attn,

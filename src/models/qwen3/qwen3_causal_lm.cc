@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "inferx/ops/attention/cache_spec_bridge.h"
 #include "inferx/ops/gather.h"
 
 namespace inferx {
@@ -42,10 +43,12 @@ StatusOr<std::unique_ptr<Qwen3ForCausalLM>> Qwen3ForCausalLM::Create(
     return InvalidArgumentError("kv heads (", config.num_key_value_heads,
                                 ") must divide tensor-parallel size ", tp);
   }
-  inferx::KvLayout layout;
-  layout.kv_heads = config.num_key_value_heads / tp;
-  layout.head_dim = config.head_dim;
-  spec.state.paged_kv.assign(config.num_hidden_layers, layout);
+  // Cache requirements derive from the attention specs (single source of
+  // truth, docs/attention.md §5.3): the runner plans pools from these.
+  std::vector<attn::AttentionSpec> specs = model.AttentionSpecs();
+  INFERX_ASSIGN_OR_RETURN(CacheRequirements requirements,
+                          attn::BuildCacheRequirements(specs));
+  spec.cache = std::move(requirements);
 
   return std::unique_ptr<Qwen3ForCausalLM>(
       new Qwen3ForCausalLM(std::move(embed_tokens), std::move(model), std::move(lm_head),

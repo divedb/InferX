@@ -27,12 +27,10 @@ TEST(SchedulerOutputTest, MixedStepCarriesNewCachedAndFinished) {
   NewRequestData new_req;
   new_req.request_id = 7;
   new_req.prompt_token_ids = absl::MakeConstSpan(prompt);
-  new_req.block_ids = {0, 1};
   new_req.num_computed_tokens = 0;
 
   CachedRequestUpdate cached;
   cached.request_id = 9;
-  cached.new_block_ids = {5};
   cached.num_computed_tokens = 41;
 
   SchedulerOutput output;
@@ -51,7 +49,7 @@ TEST(SchedulerOutputTest, MixedStepCarriesNewCachedAndFinished) {
   // than copying it.
   EXPECT_EQ(new_req.prompt_token_ids.data(), prompt.data());
   EXPECT_EQ(new_req.prompt_token_ids.size(), prompt.size());
-  EXPECT_TRUE(output.scheduled_cached_reqs[0].new_block_ids == std::vector<int32_t>{5});
+  EXPECT_EQ(output.scheduled_cached_reqs[0].num_computed_tokens, 41);
 }
 
 TEST(SchedulerOutputTest, SampledTokensFinishReasonIsOptional) {

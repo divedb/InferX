@@ -27,6 +27,8 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/models/load_options.h"
 #include "inferx/models/registry.h"
+#include "inferx/ops/attention/registry.h"
+#include "inferx/ops/attention/runtime.h"
 #include "inferx/models/scratch_arena.h"
 #include "inferx/ops/flash_attention.h"
 #include "inferx/tokenizer/tokenizer.h"
@@ -60,17 +62,35 @@ float Bf16ToFloat(uint16_t bits) {
 class SteppingSession {
  public:
   SteppingSession(Model& model, DeviceRuntime& runtime, DeviceStream stream,
-                  Allocator& scratch, ops::AttentionPlanWorkspace& plan, int64_t max_pages)
-      : model_(model), runtime_(runtime), stream_(stream), scratch_(scratch),
-        plan_(plan), max_pages_(max_pages) {
+                  Allocator& scratch, int64_t max_len)
+      : model_(model), runtime_(runtime), stream_(stream), scratch_(scratch) {
     const ModelSpec& spec = model_.GetModelSpec();
-    auto pool = KvBlockPool::Create(spec.state.paged_kv.size(), max_pages, kBlockSize,
-                                    spec.state.paged_kv.front(), spec.device);
-    if (!pool.ok()) {
-      ADD_FAILURE() << pool.status();
+    auto registry = std::make_unique<attn::BackendRegistry>();
+    attn::RegisterBuiltinBackends(*registry);
+    attn::AttentionConfig config;
+    config.block_size = kBlockSize;
+    config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, max_len);
+    config.max_seqs = 1;
+    config.max_batch_tokens = std::max<int64_t>(max_len, 4096);
+    config.cache_bytes_budget = 1LL << 32;
+    config.device = spec.device;
+    config.enable_prefix_caching = false;
+    config.forced_backend = "flash_dense";
+    auto attention = attn::AttentionRuntime::Create(std::move(registry), config,
+                                                     model_.GetAttentionSpecs());
+    if (!attention.ok()) {
+      ADD_FAILURE() << attention.status();
       return;
     }
-    pool_.emplace(std::move(*pool));
+    attention_ = std::move(*attention);
+    for (size_t l = 0; l < model_.GetAttentionSpecs().size(); ++l) {
+      auto op = attention_->MakeOp(static_cast<int64_t>(l));
+      if (!op.ok()) {
+        ADD_FAILURE() << op.status();
+        return;
+      }
+      ops_.push_back(std::move(*op));
+    }
     SingleRankComm comm;
     comm_ = std::move(comm);
   }
@@ -81,17 +101,8 @@ class SteppingSession {
     const ModelSpec& spec = model_.GetModelSpec();
     const int64_t tokens = static_cast<int64_t>(chunk.size());
     const int64_t kv_len = computed_ + tokens;
-    const int64_t pages = (kv_len + kBlockSize - 1) / kBlockSize;
-    if (pages > max_pages_) {
-      ADD_FAILURE() << "stepping session overflowed its KV budget";
-      return {};
-    }
-    std::vector<int32_t> ids(chunk.begin(), chunk.end()), positions(tokens),
-        batch(tokens, 0), qo{0, static_cast<int32_t>(tokens)},
-        kv{0, static_cast<int32_t>(pages)}, tables(pages),
-        last{(static_cast<int32_t>(kv_len) - 1) % kBlockSize + 1};
+    std::vector<int32_t> ids(chunk.begin(), chunk.end()), positions(tokens);
     for (int64_t i = 0; i < tokens; ++i) positions[i] = static_cast<int32_t>(computed_ + i);
-    for (int64_t i = 0; i < pages; ++i) tables[i] = static_cast<int32_t>(i);
 
     const auto upload = [&](const std::vector<int32_t>& values) -> StatusOr<Tensor> {
       INFERX_ASSIGN_OR_RETURN(auto tensor,
@@ -109,36 +120,41 @@ class SteppingSession {
     StepInputs inputs;
     auto ids_tensor = upload(ids);
     auto positions_tensor = upload(positions);
-    AttentionMetadata attn;
-    auto batch_tensor = upload(batch);
-    auto qo_tensor = upload(qo);
-    auto kv_tensor = upload(kv);
-    auto tables_tensor = upload(tables);
-    auto last_tensor = upload(last);
-    if (!ids_tensor.ok() || !positions_tensor.ok() || !batch_tensor.ok() ||
-        !qo_tensor.ok() || !kv_tensor.ok() || !tables_tensor.ok() || !last_tensor.ok()) {
+    if (!ids_tensor.ok() || !positions_tensor.ok()) {
       ADD_FAILURE() << "upload failed";
       return {};
     }
     inputs.token_ids = *std::move(ids_tensor);
     inputs.positions = *std::move(positions_tensor);
-    attn.batch_indices = *std::move(batch_tensor);
-    attn.qo_indptr = *std::move(qo_tensor);
-    attn.kv_indptr = *std::move(kv_tensor);
-    attn.kv_indices = *std::move(tables_tensor);
-    attn.last_page_len = *std::move(last_tensor);
-    attn.host_qo_indptr = absl::MakeConstSpan(qo);
-    attn.num_tokens = static_cast<int>(tokens);
-    attn.num_seqs = 1;
 
     ops::OpContext op(runtime_, stream_);
-    if (auto began = ops::BeginAttentionStep(op, *attn.kv_indptr, *attn.last_page_len,
-                                             kBlockSize, attn.num_tokens, 1, plan_);
-        !began.ok()) {
-      ADD_FAILURE() << began;
+    if (auto reserved =
+            attention_->Cache().Reserve(kRequestId, GrowthTarget{computed_, kv_len});
+        !reserved.ok()) {
+      ADD_FAILURE() << reserved;
       return {};
     }
-    ForwardContext ctx(op, attn, *pool_, comm_, scratch_, plan_);
+    const std::vector<std::int32_t> query_lens{static_cast<std::int32_t>(tokens)};
+    const std::vector<std::int32_t> seq_lens{static_cast<std::int32_t>(kv_len)};
+    attn::BatchDesc desc;
+    desc.num_reqs = 1;
+    desc.num_tokens = static_cast<std::int32_t>(tokens);
+    desc.query_lens = query_lens;
+    desc.seq_lens = seq_lens;
+    desc.max_query_len = static_cast<std::int32_t>(tokens);
+    desc.max_seq_len = static_cast<std::int32_t>(kv_len);
+    desc.block_size = static_cast<std::int32_t>(kBlockSize);
+    desc.num_prefills = tokens > 1 ? 1 : 0;
+    desc.num_prefill_tokens = static_cast<std::int32_t>(tokens);
+    const auto blocks = attention_->Cache().GroupBlocks(kRequestId, 0);
+    desc.block_ids[0] = blocks;
+    desc.block_ids_num_pages[0] = static_cast<std::int32_t>(blocks.size());
+    auto step = attention_->BeginStep(desc, op);
+    if (!step.ok()) {
+      ADD_FAILURE() << step.status();
+      return {};
+    }
+    ForwardContext ctx(op, *step, comm_, scratch_, absl::MakeConstSpan(ops_));
     auto hidden = Tensor::Empty(spec.dtype, Shape({tokens, spec.hidden_size}), &scratch_);
     if (!hidden.ok()) {
       ADD_FAILURE() << hidden.status();
@@ -175,13 +191,14 @@ class SteppingSession {
   }
 
  private:
+  static constexpr uint64_t kRequestId = 1;
+
   Model& model_;
   DeviceRuntime& runtime_;
   DeviceStream stream_;
   Allocator& scratch_;
-  ops::AttentionPlanWorkspace& plan_;
-  int64_t max_pages_ = 0;
-  std::optional<KvBlockPool> pool_;
+  std::unique_ptr<attn::AttentionRuntime> attention_;
+  std::vector<attn::AttentionOp> ops_;
   SingleRankComm comm_;
   int64_t computed_ = 0;
 };
@@ -210,9 +227,6 @@ class VllmParityProbeTest : public ::testing::Test {
     model_ = std::move(*made);
 
     scratch_ = std::make_unique<ScratchArena>(ScratchArena::Measuring(options.device));
-    auto plan = Tensor::Empty(DataType::kInt32, Shape({3 * 512 + 1}), scratch_.get());
-    ASSERT_TRUE(plan.ok()) << plan.status();
-    plan_.plan = std::move(*plan);
   }
 
   DeviceRuntime* runtime_ = nullptr;
@@ -221,7 +235,6 @@ class VllmParityProbeTest : public ::testing::Test {
   std::shared_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<Model> model_;
   std::unique_ptr<ScratchArena> scratch_;
-  ops::AttentionPlanWorkspace plan_;
 };
 
 TEST_F(VllmParityProbeTest, DivergenceDecisionPoints) {
@@ -265,7 +278,7 @@ TEST_F(VllmParityProbeTest, DivergenceDecisionPoints) {
     // (1) Single-chunk forward of the shared prefix: the cross-stack
     // view. Every divergence must sit at a <= 2-ulp near-tie, where the
     // two stacks' last-bit roundings each decide.
-    SteppingSession chunked(*model_, *runtime_, stream_, *scratch_, plan_, 256);
+    SteppingSession chunked(*model_, *runtime_, stream_, *scratch_, 512);
     const std::vector<uint16_t> bits = chunked.Append(prefix);
     ASSERT_EQ(bits.size(), static_cast<size_t>(model_->GetModelSpec().vocab_size));
     int64_t argmax = 0;
@@ -287,7 +300,7 @@ TEST_F(VllmParityProbeTest, DivergenceDecisionPoints) {
     // (2) Serving path: prompt prefill, then one-token decode steps --
     // the kernels the runner actually ran. The recorded choice must be
     // the argmax of THIS path's logits.
-    SteppingSession serving(*model_, *runtime_, stream_, *scratch_, plan_, 256);
+    SteppingSession serving(*model_, *runtime_, stream_, *scratch_, 512);
     // Prefill the original prompt exactly as the server tokenized it.
     const std::vector<TokenId> encoded_prompt = EncodeText(*tokenizer_, prompt);
     std::vector<uint16_t> step_bits = serving.Append(encoded_prompt);

@@ -40,6 +40,13 @@ Status Qwen3MoeModel::Forward(ForwardContext& ctx, const Tensor& positions,
   return norm_.AddForward(ctx.op, current, residual, out);
 }
 
+std::vector<attn::AttentionSpec> Qwen3MoeModel::AttentionSpecs() const {
+  std::vector<attn::AttentionSpec> specs;
+  specs.reserve(layers_.size());
+  for (const Qwen3MoeDecoderLayer& layer : layers_) specs.push_back(layer.Spec());
+  return specs;
+}
+
 Status Qwen3MoeModel::BindWeights(const std::string& prefix, WeightMap& weights) {
   for (size_t i = 0; i < layers_.size(); ++i) {
     INFERX_RETURN_IF_ERROR(layers_[i].BindWeights(

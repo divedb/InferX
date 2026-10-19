@@ -1,6 +1,7 @@
 #include "inferx/models/qwen3_moe/qwen3_moe_causal_lm.h"
 
 #include <utility>
+#include "inferx/ops/attention/cache_spec_bridge.h"
 
 #include "inferx/ops/gather.h"
 
@@ -40,10 +41,12 @@ StatusOr<std::unique_ptr<Qwen3MoeForCausalLM>> Qwen3MoeForCausalLM::Create(
     return InvalidArgumentError("kv heads (", config.base.num_key_value_heads,
                                 ") must divide tensor-parallel size ", tp);
   }
-  inferx::KvLayout layout;
-  layout.kv_heads = config.base.num_key_value_heads / tp;
-  layout.head_dim = config.base.head_dim;
-  spec.state.paged_kv.assign(config.base.num_hidden_layers, layout);
+  // Cache requirements derive from the attention specs (single source of
+  // truth, docs/attention.md §5.3); the MoE tower reuses Qwen3Model.
+  std::vector<attn::AttentionSpec> specs = model.AttentionSpecs();
+  INFERX_ASSIGN_OR_RETURN(CacheRequirements requirements,
+                          attn::BuildCacheRequirements(specs));
+  spec.cache = std::move(requirements);
 
   return std::unique_ptr<Qwen3MoeForCausalLM>(new Qwen3MoeForCausalLM(
       std::move(embed_tokens), std::move(model), std::move(lm_head),

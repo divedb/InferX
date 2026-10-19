@@ -40,6 +40,13 @@ Status LlamaModel::Forward(ForwardContext& ctx, const Tensor& positions,
   return norm_.AddForward(ctx.op, current, residual, out);
 }
 
+std::vector<attn::AttentionSpec> LlamaModel::AttentionSpecs() const {
+  std::vector<attn::AttentionSpec> specs;
+  specs.reserve(layers_.size());
+  for (const LlamaDecoderLayer& layer : layers_) specs.push_back(layer.Spec());
+  return specs;
+}
+
 Status LlamaModel::BindWeights(const std::string& prefix, WeightMap& weights) {
   for (size_t i = 0; i < layers_.size(); ++i) {
     INFERX_RETURN_IF_ERROR(layers_[i].BindWeights(

@@ -20,6 +20,7 @@
 #include "inferx/diagnostic/replay_logits.h"
 #include "inferx/dist/comm.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/cache_spec_bridge.h"
 #include "inferx/models/scratch_arena.h"
 #include "inferx/models/registry.h"
 #include "nlohmann/json.hpp"
@@ -30,60 +31,75 @@ namespace {
 
 using Json = nlohmann::json;
 
-/// One case's forward against a single-sequence paged layout.
+/// One case's forward against a single-sequence paged layout. The session
+/// owns the attention runtime; the facade drives its single request and
+/// the physical page order comes from the runtime's own block table.
 class ReplaySession {
  public:
   ReplaySession(std::unique_ptr<models::Model> model, DeviceRuntime& runtime, DeviceStream stream,
-                int page_size, int max_pages, std::vector<int32_t> pages)
+                int64_t max_len, int64_t page_size)
       : model_(std::move(model)),
         runtime_(runtime),
         stream_(stream),
-        page_size_(page_size),
-        pages_(std::move(pages)) {
-    const models::ModelSpec& spec = model_->GetModelSpec();
-    pool_.emplace(Take(KvBlockPool::Create(spec.state.paged_kv.size(), max_pages,
-                                          page_size, spec.state.paged_kv.front(),
-                                          runtime_.device())));
+        page_size_(page_size) {
     comm_ = std::make_unique<SingleRankComm>();
     op_ = std::make_unique<ops::OpContext>(runtime_, stream_);
     // Measured scratch: the session measures while it serves and never
     // freezes (the diagnostic replays no CUDA graphs).
     scratch_ = std::make_unique<models::ScratchArena>(
         models::ScratchArena::Measuring(runtime_.device()));
-    const int64_t max_chunk = 4096;
-    plan_.plan = Take(Tensor::Empty(DataType::kInt32, Shape({3 * max_chunk + 1}),
-                                     scratch_.get()));
+
+    auto registry = std::make_unique<attn::BackendRegistry>();
+    attn::RegisterBuiltinBackends(*registry);
+    attn::AttentionConfig config;
+    config.block_size = page_size;
+    config.max_model_len = max_len;
+    config.max_seqs = 1;
+    config.max_batch_tokens = std::max<int64_t>(max_len, 4096);
+    config.cache_bytes_budget = 1LL << 32;
+    config.device = runtime_.device();
+    config.enable_prefix_caching = false;
+    config.forced_backend = "flash_dense";
+    attention_ = Take(attn::AttentionRuntime::Create(std::move(registry), config,
+                                                     model_->GetAttentionSpecs()));
+    const std::vector<attn::AttentionSpec> specs = model_->GetAttentionSpecs();
+    for (size_t l = 0; l < specs.size(); ++l) {
+      ops_.push_back(Take(attention_->MakeOp(static_cast<int64_t>(l))));
+    }
   }
 
   /// \brief Runs tokens [start, end) as one chunk and returns the logits at
   ///        the chunk's last position.
   Tensor Forward(absl::Span<const int32_t> tokens, int start, int count) {
     const int end = start + count;
-    std::vector<int32_t> ids(tokens.begin() + start, tokens.begin() + end), positions(count),
-        batch(count, 0), qo{0, count};
+    std::vector<int32_t> ids(tokens.begin() + start, tokens.begin() + end),
+        positions(count);
     std::iota(positions.begin(), positions.end(), start);
-    const int used_pages = (end + page_size_ - 1) / page_size_;
-    std::vector<int32_t> kv{0, used_pages}, pages(pages_.begin(),
-                                                   pages_.begin() + used_pages);
-    std::vector<int32_t> last_page{(end - 1) % page_size_ + 1};
+
+    Check(attention_->Cache().Reserve(kRequestId, GrowthTarget{start, end}));
+    const std::vector<std::int32_t> query_lens{count};
+    const std::vector<std::int32_t> seq_lens{end};
+    attn::BatchDesc desc;
+    desc.num_reqs = 1;
+    desc.num_tokens = count;
+    desc.query_lens = query_lens;
+    desc.seq_lens = seq_lens;
+    desc.max_query_len = count;
+    desc.max_seq_len = end;
+    desc.block_size = static_cast<std::int32_t>(page_size_);
+    desc.num_prefills = count > 1 ? 1 : 0;
+    desc.num_prefill_tokens = count;
+    const auto blocks = attention_->Cache().GroupBlocks(kRequestId, 0);
+    desc.block_ids[0] = blocks;
+    desc.block_ids_num_pages[0] = static_cast<std::int32_t>(blocks.size());
 
     models::StepInputs inputs;
     inputs.token_ids = Upload(ids);
     inputs.positions = Upload(positions);
-    models::AttentionMetadata attn;
-    attn.batch_indices = Upload(batch);
-    attn.qo_indptr = Upload(qo);
-    attn.kv_indptr = Upload(kv);
-    attn.kv_indices = Upload(pages);
-    attn.last_page_len = Upload(last_page);
-    host_qo_ = qo;
-    attn.host_qo_indptr = absl::MakeConstSpan(host_qo_);
-    attn.num_tokens = count;
-    attn.num_seqs = 1;
+    attn::StepContext step = Take(attention_->BeginStep(desc, *op_));
 
-    Check(ops::BeginAttentionStep(*op_, *attn.kv_indptr, *attn.last_page_len, page_size_,
-                                  count, 1, plan_));
-    models::ForwardContext ctx(*op_, attn, *pool_, *comm_, *scratch_, plan_);
+    models::ForwardContext ctx(*op_, step, *comm_, *scratch_,
+                                absl::MakeConstSpan(ops_));
     const models::ModelSpec& spec = model_->GetModelSpec();
     Tensor hidden = Take(Tensor::Empty(spec.dtype, Shape({count, spec.hidden_size}),
                                        scratch_.get()));
@@ -95,9 +111,16 @@ class ReplaySession {
     return logits;
   }
 
-  const KvBlockPool& Pool() const { return *pool_; }
-  const std::vector<int32_t>& pages() const { return pages_; }
-  int page_size() const { return page_size_; }
+  const attn::AttentionRuntime& Attention() const { return *attention_; }
+  const KvBlockPool& Pool() const { return *attention_->BlockPool(); }
+  /// \brief The case's logical page table, in order.
+  std::vector<int32_t> PageTable() const {
+    const auto blocks = attention_->Cache().GroupBlocks(kRequestId, 0);
+    return std::vector<int32_t>(blocks.begin(), blocks.end());
+  }
+  int64_t page_size() const { return page_size_; }
+  /// \brief Releases the request between cases: each case starts fresh.
+  void Reset() { Check(attention_->Cache().Release(kRequestId)); }
 
  private:
   Tensor Upload(const std::vector<int32_t>& values) {
@@ -110,17 +133,17 @@ class ReplaySession {
     return tensor;
   }
 
+  static constexpr uint64_t kRequestId = 1;
+
   std::unique_ptr<models::Model> model_;
   DeviceRuntime& runtime_;
   DeviceStream stream_;
-  int page_size_ = 16;
-  std::vector<int32_t> pages_;
-  std::optional<KvBlockPool> pool_;
+  int64_t page_size_ = 16;
+  std::unique_ptr<attn::AttentionRuntime> attention_;
+  std::vector<attn::AttentionOp> ops_;
   std::unique_ptr<SingleRankComm> comm_;
   std::unique_ptr<ops::OpContext> op_;
   std::unique_ptr<models::ScratchArena> scratch_;
-  ops::AttentionPlanWorkspace plan_;
-  std::vector<int32_t> host_qo_;  ///< Borrowed by attention metadata spans.
 };
 
 void Replay(const ReplayLogitsParams& params) {
@@ -139,9 +162,11 @@ void Replay(const ReplayLogitsParams& params) {
   options.device = Device::Cuda(0);
   auto model = Take(models::LoadModel(options));
   const models::ModelSpec& info = model->GetModelSpec();
-  if (info.state.paged_kv.empty()) {
-    throw std::runtime_error("replay requires a paged-attention model");
-  }
+  const std::vector<attn::AttentionSpec> specs = model->GetAttentionSpecs();
+  // bytes/token = 2 (K and V) * kv_heads * head_dim * elem; the K or V
+  // plane width in bf16 elements is half that in elements.
+  const size_t plane_width =
+      static_cast<size_t>(Take(attn::CacheBytesPerToken(specs.front())) / 4);
 
   int max_length = 0;
   for (const auto& entry : fixture.at("cases")) {
@@ -157,19 +182,11 @@ void Replay(const ReplayLogitsParams& params) {
     }
     max_length = std::max(max_length, static_cast<int>(tokens.size()));
   }
+  // Page placement is the pool's, not the diagnostic's: the --page-order
+  // knob shaped a hand-built table the facade now owns. Physical order
+  // still varies through the LIFO free queue across cases.
   const int page_size = 16;
-  const int blocks = (max_length + page_size - 1) / page_size;
-  std::vector<int32_t> physical_pages(blocks);
-  std::iota(physical_pages.begin(), physical_pages.end(), 0);
-  if (params.page_order == "reverse") {
-    std::reverse(physical_pages.begin(), physical_pages.end());
-  } else if (params.page_order == "shuffle") {
-    std::mt19937 rng(20260922);
-    std::shuffle(physical_pages.begin(), physical_pages.end(), rng);
-  }
-
-  ReplaySession session(std::move(model), *runtime, stream, page_size, blocks,
-                        physical_pages);
+  ReplaySession session(std::move(model), *runtime, stream, max_length, page_size);
 
   std::ofstream file(params.output, std::ios::binary);
   file.exceptions(std::ios::badbit | std::ios::failbit);
@@ -178,6 +195,7 @@ void Replay(const ReplayLogitsParams& params) {
     const auto tokens = entry.at("tokens").get<std::vector<int32_t>>();
     const int prompt_length = entry.at("prompt_length");
     std::optional<Tensor> logits;
+    session.Reset();
     for (int start = 0; start < static_cast<int>(tokens.size());) {
       const int count = start < prompt_length
                             ? std::min(params.chunk_size, prompt_length - start)
@@ -204,12 +222,11 @@ void Replay(const ReplayLogitsParams& params) {
       if (!std::filesystem::create_directories(dir)) {
         throw std::runtime_error("cache dump directory exists");
       }
-      const int num_layers = static_cast<int>(info.state.paged_kv.size());
-      const KvLayout& layout = info.state.paged_kv.front();
+      const std::vector<int32_t> table = session.PageTable();
+      const int num_layers = static_cast<int>(specs.size());
       for (int layer = 0; layer < num_layers; ++layer) {
         for (bool key : {true, false}) {
-          Tensor cache = Take(key ? session.Pool().KeyCache(layer)
-                                  : session.Pool().ValueCache(layer));
+          Tensor cache = Take(session.Pool().LayerCache(layer));
           std::vector<uint16_t> raw(cache.Numel());
           Check(runtime->Memory().Copy(raw.data(), cache.Data(), cache.NBytes(),
                               CopyKind::kDeviceToHost));
@@ -217,10 +234,14 @@ void Replay(const ReplayLogitsParams& params) {
                                     (key ? ".k.bf16" : ".v.bf16")),
                              std::ios::binary);
           dump.exceptions(std::ios::badbit | std::ios::failbit);
-          const size_t width = layout.kv_heads * layout.head_dim;
+          // One page is [K plane, V plane]; each plane holds page_size
+          // rows of [kv_heads * head_dim] bf16 elements.
+          const size_t width = plane_width;
           for (size_t pos = 0; pos < tokens.size(); ++pos) {
+            const size_t page = static_cast<size_t>(table[pos / page_size]);
+            const size_t slot = pos % page_size;
             const size_t offset =
-                (physical_pages[pos / page_size] * page_size + pos % page_size) * width;
+                page * (2 * width) + slot * width + (key ? 0 : width);
             dump.write(reinterpret_cast<const char*>(raw.data() + offset), width * 2);
           }
         }

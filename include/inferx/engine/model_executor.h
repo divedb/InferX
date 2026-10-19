@@ -54,7 +54,8 @@ class ModelExecutor {
 
   /// \brief The KV pool of the coordinating rank (the scheduler allocates
   ///        from it; group ranks share logical page IDs).
-  KvBlockPool* KvPool();
+  /// \brief The rank-0 attention runtime (cache facade owner).
+  attn::AttentionRuntime* Attention();
 
   /// \brief The coordinating rank's engine-facing model facts.
   const models::ModelSpec& GetModelSpec() const;

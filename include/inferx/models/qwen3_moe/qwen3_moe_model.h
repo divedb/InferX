@@ -10,6 +10,7 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/layers/rms_norm.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/qwen3_moe/qwen3_moe_config.h"
 #include "inferx/models/qwen3_moe/qwen3_moe_decoder_layer.h"
 #include "inferx/models/weight_loader.h"
@@ -34,6 +35,9 @@ class Qwen3MoeModel {
   Status BindWeights(const std::string& prefix, WeightMap& weights);
 
   const std::vector<Qwen3MoeDecoderLayer>& Layers() const { return layers_; }
+
+  /// \brief One attention spec per decoder layer, in tower order.
+  [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
  private:
   Qwen3MoeModel(std::vector<Qwen3MoeDecoderLayer> layers, RMSNorm norm,

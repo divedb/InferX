@@ -13,11 +13,11 @@
 #include "inferx/core/stream.h"
 #include "inferx/core/tensor.h"
 #include "inferx/dist/comm.h"
-#include "inferx/models/layers/attention.h"
 #include "inferx/models/model_spec.h"
 #include "inferx/models/safetensors.h"
 #include "inferx/models/weight_loader.h"
-#include "inferx/ops/flash_attention.h"
+#include "inferx/ops/attention/op.h"
+#include "inferx/ops/attention/runtime.h"
 #include "inferx/ops/op_context.h"
 
 namespace inferx {
@@ -32,26 +32,31 @@ namespace models {
 /// live in the model; everything request-specific lives here.
 class ForwardContext {
  public:
-  ForwardContext(ops::OpContext& op, const AttentionMetadata& attn, const KvBlockPool& kv,
-                 CommBackend& comm, Allocator& scratch, ops::AttentionPlanWorkspace& plan)
-      : op(op), attn(attn), kv(kv), comm(comm), scratch(scratch), plan(plan) {}
+  ForwardContext(ops::OpContext& op, const attn::StepContext& step, CommBackend& comm,
+                 Allocator& scratch, std::span<const attn::AttentionOp> attention)
+      : op(op), step(step), comm(comm), scratch(scratch), attention(attention) {}
 
   /// Device, stream, and runtime the step executes on.
   ops::OpContext& op;
-  /// The step's batch plan, shared by every layer.
-  const AttentionMetadata& attn;
-  /// The paged KV pool; layers take their cache views from it.
-  const KvBlockPool& kv;
+  /// The step's attention metadata, one GroupMeta per cache group.
+  const attn::StepContext& step;
   /// The tensor-parallel group (identity at world size one).
   CommBackend& comm;
   /// Step-lifetime scratch; freed blocks are reused within the step.
   Allocator& scratch;
-  /// Attention planning state, shared across layers and steps.
-  ops::AttentionPlanWorkspace& plan;
+
+  /// The layer's attention executor, built by the runner's
+  /// attn::AttentionRuntime at init (docs/attention.md §6.1).
+  [[nodiscard]] const attn::AttentionOp& Attention(int64_t layer) const {
+    return attention[static_cast<size_t>(layer)];
+  }
 
   /// Index of the decoder layer currently executing; the tower sets it so
   /// attention modules address the right cache region.
   int64_t layer = 0;
+
+ private:
+  std::span<const attn::AttentionOp> attention;
 };
 
 /// \brief One step's token inputs. Positions ride with the tokens because
@@ -90,7 +95,13 @@ class Model {
  public:
   virtual ~Model() = default;
 
-  virtual const CacheRequirements& GetCacheRequirements() const = 0;
+  /// \brief The model's static description (device, vocab, eos, cache
+  ///        requirements); assembled by the family config.
+  virtual const ModelSpec& GetModelSpec() const = 0;
+
+  /// \brief One attention spec per attention layer, in tower order; the
+  ///        runner builds its attn::AttentionRuntime from these.
+  virtual std::vector<attn::AttentionSpec> GetAttentionSpecs() const = 0;
 
   virtual Status LoadWeights(CheckpointReader& checkpoint) = 0;
 

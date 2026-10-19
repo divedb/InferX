@@ -75,6 +75,11 @@ Status FlashPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo,
       return InvalidArgumentError("FlashInfer KV cache geometry mismatch");
     }
   }
+  if (p.page_stride_elements != 0 &&
+      (p.page_stride_elements < block_size * p.kv_heads * p.head_dim ||
+       p.page_stride_elements > std::numeric_limits<uint32_t>::max())) {
+    return InvalidArgumentError("FlashInfer KV page stride is out of range");
+  }
   const int64_t batch = last.Numel();
   if (block_size <= 0 || block_size > std::numeric_limits<int>::max() || batch <= 0 ||
       batch > std::numeric_limits<int>::max() || qo.Numel() != batch + 1 ||

@@ -8,7 +8,7 @@ namespace inferx::ops {
 Status ValidateAttentionGeometry(const AttentionParams& p) {
   if (p.query_heads <= 0 || p.kv_heads <= 0 || p.head_dim <= 0 ||
       p.query_heads % p.kv_heads != 0 || !std::isfinite(p.scale) || p.sliding_window < 0 ||
-      !std::isfinite(p.softcap) || p.softcap < 0.0f) {
+      !std::isfinite(p.softcap) || p.softcap < 0.0f || p.page_stride_elements < 0) {
     return InvalidArgumentError("invalid attention heads, head dimension, scale or window");
   }
   if (p.sinks != nullptr && (p.sinks->Rank() != 1 || p.sinks->Dim(0) != p.query_heads ||
@@ -71,7 +71,8 @@ Status CheckCache(const Tensor& key_cache, const Tensor& value_cache, int64_t bl
 Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
-                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size) {
+                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size,
+                    int64_t page_stride_elements) {
   if (k.Rank() != 2 || v.Rank() != 2 || k.GetDataType() != DataType::kBFloat16 ||
       v.GetDataType() != DataType::kBFloat16) {
     return InvalidArgumentError("WritePagedKv expects rank-2 bfloat16 k and v");
@@ -93,6 +94,10 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
     return InvalidArgumentError("WritePagedKv k width ", k.Dim(1), " disagrees with cache geometry ",
                                 kv_heads * head_dim);
   }
+  if (page_stride_elements != 0 &&
+      page_stride_elements < block_size * kv_heads * head_dim) {
+    return InvalidArgumentError("KV page stride is smaller than one plane");
+  }
   const Device device = ctx.GetDevice();
   INFERX_RETURN_IF_ERROR(
       CheckRaggedBatch(positions, batch_indices, kv_indptr, kv_indices, k.Dim(0)));
@@ -108,7 +113,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
   switch (device.Type()) {
     case DeviceType::kCuda:
       return cuda::WritePagedKv(ctx, k, v, positions, batch_indices, kv_indptr, kv_indices,
-                                key_cache, value_cache, block_size);
+                                key_cache, value_cache, block_size, page_stride_elements);
     default:
       return UnimplementedError("WritePagedKv has no implementation for device ",
                                 device.ToString());

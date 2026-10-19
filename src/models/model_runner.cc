@@ -1,5 +1,11 @@
 #include "inferx/models/model_runner.h"
 
+#include <algorithm>
+
+#include "inferx/ops/attention/cache_spec_bridge.h"
+#include "inferx/ops/attention/op.h"
+#include "inferx/ops/attention/registry.h"
+
 #include <utility>
 
 #include "inferx/models/registry.h"
@@ -21,15 +27,6 @@ StatusOr<Tensor> UploadInt32(DeviceRuntime& runtime, DeviceStream stream,
                                            values.size() * sizeof(int32_t),
                                            CopyKind::kHostToDevice, stream));
   return tensor;
-}
-
-/// Bytes one block occupies across every cached layer.
-int64_t BlockBytesAllLayers(const std::vector<KvLayout>& layouts, int64_t block_size) {
-  int64_t bytes = 0;
-  for (const KvLayout& layout : layouts) {
-    bytes += block_size * layout.BytesPerToken();
-  }
-  return bytes;
 }
 
 }  // namespace
@@ -82,8 +79,9 @@ ModelRunner::~ModelRunner() {
   op_.reset();
   requests_.clear();
   sampler_.reset();
-  attention_plan_ = ops::AttentionPlanWorkspace{};
-  scratch_.reset();  // Tensors carved from the region are gone by now.
+  ops_.clear();
+  attention_.reset();  // Frees pools while no step references them.
+  scratch_.reset();    // Tensors carved from the region are gone by now.
   if (runtime_ != nullptr && stream_.handle != nullptr) {
     (void)runtime_->Streams().SynchronizeStream(stream_);
     OwnedStream(stream_, &runtime_->Streams()).Reset();
@@ -134,10 +132,6 @@ Status ModelRunner::Initialize(const CacheConfig& cache, const SchedulerConfig& 
     INFERX_RETURN_IF_ERROR(arena.Freeze(spec.device, kScratchMargin));
     scratch_ = std::make_unique<ScratchArena>(std::move(arena));
   }
-  INFERX_ASSIGN_OR_RETURN(
-      attention_plan_.plan,
-      Tensor::Empty(DataType::kInt32, Shape({3 * max_tokens + 1}), scratch_.get()));
-
   INFERX_ASSIGN_OR_RETURN(std::unique_ptr<sampling::Sampler> sampler,
                           sampling::Sampler::Create(max_num_seqs_, spec.vocab_size,
                                                     spec.device));
@@ -157,71 +151,91 @@ Status ModelRunner::Initialize(const CacheConfig& cache, const SchedulerConfig& 
     INFERX_ASSIGN_OR_RETURN(kv_bytes, comm_->AllReduceMin(*op_, kv_bytes));
   }
 
-  INFERX_RETURN_IF_ERROR(AllocateKvPool(kv_bytes, cache));
+  INFERX_RETURN_IF_ERROR(CreateAttention(kv_bytes, cache, scheduler));
   return CaptureGraphs(execution);
 }
 
 Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens,
                                    int64_t max_seqs) {
   // One synthetic batch at the scheduler's ceiling: max_seqs sequences
-  // splitting max_tokens tokens. A throwaway pool holds the profile KV so
-  // attention runs the real kernels; it is destroyed before the pool that
-  // matters is sized.
+  // splitting max_tokens tokens. A throwaway attention runtime holds the
+  // profile KV so attention runs the real kernels; it is destroyed before
+  // the runtime that matters is sized.
   const ModelSpec& spec = model_->GetModelSpec();
-  const int64_t block_size = 16;
-  const std::vector<int32_t> blocks((max_tokens + block_size - 1) / block_size);
-  std::vector<int32_t> block_ids(blocks.size());
-  for (size_t i = 0; i < block_ids.size(); ++i) block_ids[i] = static_cast<int32_t>(i);
-  const int64_t tokens_per_seq = std::max<int64_t>(1, max_tokens / max_seqs);
-  std::vector<int32_t> token_ids, positions, batch_indices, qo_indptr{0}, kv_indptr{0},
-      kv_indices, last_page_len, sample_rows;
-  for (int64_t seq = 0; seq < max_seqs; ++seq) {
-    const int64_t begin = std::min(seq * tokens_per_seq, max_tokens);
-    const int64_t end = seq == max_seqs - 1 ? max_tokens
-                                            : std::min(begin + tokens_per_seq, max_tokens);
-    for (int64_t t = begin; t < end; ++t) {
-      token_ids.push_back(0);
-      positions.push_back(static_cast<int32_t>(t - begin));
-      batch_indices.push_back(static_cast<int32_t>(seq));
-    }
-    if (end <= begin) continue;
-    sample_rows.push_back(static_cast<int32_t>(token_ids.size() - 1));
-    const int64_t kv_len = end;
-    const int64_t pages = (kv_len + block_size - 1) / block_size;
-    kv_indices.insert(kv_indices.end(), block_ids.begin(), block_ids.begin() + pages);
-    qo_indptr.push_back(static_cast<int32_t>(token_ids.size()));
-    kv_indptr.push_back(static_cast<int32_t>(kv_indices.size()));
-    last_page_len.push_back(static_cast<int32_t>((kv_len - 1) % block_size + 1));
+
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig config;
+  config.block_size = 16;
+  config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, max_tokens);
+  config.max_seqs = max_seqs;
+  config.max_batch_tokens = max_tokens;
+  // Generous throwaway budget: this runtime exists to run the kernels, not
+  // to size anything; it dies before the measured freeze.
+  config.cache_bytes_budget = 1LL << 32;
+  config.device = spec.device;
+  config.enable_prefix_caching = false;
+  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<attn::AttentionRuntime> runtime,
+                          attn::AttentionRuntime::Create(std::move(registry), config,
+                                                         model_->GetAttentionSpecs()));
+
+  std::vector<attn::AttentionOp> ops;
+  for (size_t l = 0; l < model_->GetAttentionSpecs().size(); ++l) {
+    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op, runtime->MakeOp(static_cast<int64_t>(l)));
+    ops.push_back(std::move(op));
   }
 
-  INFERX_ASSIGN_OR_RETURN(
-      KvBlockPool pool,
-      KvBlockPool::Create(spec.state.paged_kv.size(), static_cast<int64_t>(blocks.size()),
-                          block_size, spec.state.paged_kv.front(), spec.device));
+  // Synthetic requests: tokens_per_seq each, registered through the facade
+  // exactly like a real step, so block tables and metadata are real.
+  const int64_t tokens_per_seq = std::max<int64_t>(1, max_tokens / max_seqs);
+  std::vector<TokenId> token_ids;
+  std::vector<std::int32_t> query_lens, seq_lens, sample_rows;
+  int64_t remaining = max_tokens;
+  uint64_t request_id = 1;
+  while (remaining > 0) {
+    const int64_t chunk = std::min<int64_t>(tokens_per_seq, remaining);
+    INFERX_RETURN_IF_ERROR(
+        runtime->Cache().Reserve(request_id, GrowthTarget{0, chunk}));
+    for (int64_t t = 0; t < chunk; ++t) token_ids.push_back(static_cast<TokenId>(0));
+    query_lens.push_back(static_cast<std::int32_t>(chunk));
+    seq_lens.push_back(static_cast<std::int32_t>(chunk));
+    sample_rows.push_back(static_cast<std::int32_t>(token_ids.size() - 1));
+    remaining -= chunk;
+    ++request_id;
+  }
+
+  attn::BatchDesc desc;
+  desc.num_reqs = static_cast<std::int32_t>(query_lens.size());
+  desc.num_tokens = static_cast<std::int32_t>(token_ids.size());
+  desc.query_lens = query_lens;
+  desc.seq_lens = seq_lens;
+  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
+  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
+  desc.block_size = static_cast<std::int32_t>(runtime->GetPlan().block_size);
+  desc.num_prefills = desc.num_reqs;
+  desc.num_prefill_tokens = desc.num_tokens;
+  // Flatten the per-group page tables; models here are single token-wise
+  // group, so group 0 carries the batch's whole table. The vector outlives
+  // BeginStep, whose BatchDesc borrows it.
+  std::vector<BlockId> flat;
+  for (uint64_t id = 1; id < request_id; ++id) {
+    const auto blocks = runtime->Cache().GroupBlocks(id, 0);
+    flat.insert(flat.end(), blocks.begin(), blocks.end());
+  }
+  desc.block_ids[0] = flat;
+  desc.block_ids_num_pages[0] = static_cast<std::int32_t>(flat.size());
+
+  INFERX_ASSIGN_OR_RETURN(attn::StepContext step, runtime->BeginStep(desc, *op_));
 
   StepInputs inputs;
-  INFERX_ASSIGN_OR_RETURN(inputs.token_ids, UploadInt32(*runtime_, stream_, token_ids));
+  INFERX_ASSIGN_OR_RETURN(inputs.token_ids,
+                          UploadInt32(*runtime_, stream_, token_ids));
+  std::vector<std::int32_t> positions(static_cast<size_t>(token_ids.size()), 0);
+  for (size_t i = 0; i < positions.size(); ++i) {
+    const std::int32_t seq = static_cast<std::int32_t>(i / tokens_per_seq);
+    positions[i] = static_cast<std::int32_t>(i - seq * tokens_per_seq);
+  }
   INFERX_ASSIGN_OR_RETURN(inputs.positions, UploadInt32(*runtime_, stream_, positions));
-  AttentionMetadata attn;
-  INFERX_ASSIGN_OR_RETURN(attn.batch_indices, UploadInt32(*runtime_, stream_, batch_indices));
-  INFERX_ASSIGN_OR_RETURN(attn.qo_indptr, UploadInt32(*runtime_, stream_, qo_indptr));
-  INFERX_ASSIGN_OR_RETURN(attn.kv_indptr, UploadInt32(*runtime_, stream_, kv_indptr));
-  INFERX_ASSIGN_OR_RETURN(attn.kv_indices, UploadInt32(*runtime_, stream_, kv_indices));
-  INFERX_ASSIGN_OR_RETURN(attn.last_page_len, UploadInt32(*runtime_, stream_, last_page_len));
-  attn.host_qo_indptr = absl::MakeConstSpan(qo_indptr);
-  attn.num_tokens = static_cast<int>(token_ids.size());
-  attn.num_seqs = static_cast<int>(max_seqs);
-
-  // The persistent plan lands in the frozen arena after measurement; the
-  // profile step carries its own, freed before Freeze demands an empty
-  // arena.
-  ops::AttentionPlanWorkspace plan;
-  INFERX_ASSIGN_OR_RETURN(plan.plan,
-                          Tensor::Empty(DataType::kInt32,
-                                        Shape({3 * max_tokens + 1}), &scratch));
-  INFERX_RETURN_IF_ERROR(ops::BeginAttentionStep(
-      *op_, *attn.kv_indptr, *attn.last_page_len, block_size, attn.num_tokens,
-      attn.num_seqs, plan));
 
   // The profile runs COMM-FREE through the world-of-one backend: tensor-
   // parallel ranks initialize sequentially (CreateGroup builds them one by
@@ -229,7 +243,7 @@ Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens,
   // The measurements -- arena bytes, cuBLAS workspaces -- are identical
   // either way; collective backends allocate nothing from this arena.
   SingleRankComm profile_comm;
-  ForwardContext ctx(*op_, attn, pool, profile_comm, scratch, plan);
+  ForwardContext ctx(*op_, step, profile_comm, scratch, absl::MakeConstSpan(ops));
   INFERX_ASSIGN_OR_RETURN(Tensor hidden,
                           Tensor::Empty(spec.dtype,
                                         Shape({static_cast<int64_t>(token_ids.size()),
@@ -257,32 +271,56 @@ Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens,
     (void)logits;
   }
   return runtime_->Streams().SynchronizeStream(stream_);
-  // `pool` dies here: its bytes return to the device before AllocateKvPool.
+  // `runtime` dies here: its bytes return to the device before
+  // CreateAttention sizes the real pools.
 }
 
-Status ModelRunner::AllocateKvPool(int64_t kv_bytes, const CacheConfig& cache) {
+Status ModelRunner::CreateAttention(int64_t kv_bytes, const CacheConfig& cache,
+                                    const SchedulerConfig& scheduler) {
   const ModelSpec& spec = model_->GetModelSpec();
-  const int64_t per_block = BlockBytesAllLayers(spec.state.paged_kv, cache.block_size);
-  if (per_block <= 0) {
-    return InvalidArgumentError("cannot size a KV pool for a model with no paged state");
+
+  // Byte budget: utilization leftover, explicit bytes, or blocks x block
+  // bytes (the facade + runtime derive the actual split).
+  int64_t budget = kv_bytes;
+  if (budget < 0) budget = cache.kv_cache_memory_bytes;
+  if (budget <= 0 && cache.num_kv_blocks > 0) {
+    // Convert the block count into a byte budget; the runtime rounds down
+    // to whole blocks from it.
+    int64_t per_block = 0;
+    for (const attn::AttentionSpec& attn_spec : model_->GetAttentionSpecs()) {
+      if (!attn::NeedsCache(attn_spec)) continue;
+      INFERX_ASSIGN_OR_RETURN(const int64_t per_token, attn::CacheBytesPerToken(attn_spec));
+      per_block += cache.block_size * per_token;
+    }
+    budget = cache.num_kv_blocks * per_block;
+  }
+  if (budget <= 0) {
+    return ResourceExhaustedError("KV budget of ", kv_bytes,
+                                  " bytes fits no cache; check the cache config");
   }
 
-  int64_t num_blocks = -1;
-  if (kv_bytes >= 0) {
-    num_blocks = kv_bytes / per_block;
-  } else if (cache.kv_cache_memory_bytes > 0) {
-    num_blocks = cache.kv_cache_memory_bytes / per_block;
-  } else {
-    num_blocks = cache.num_kv_blocks;
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig config;
+  config.block_size = cache.block_size;
+  config.max_model_len =
+      std::max<int64_t>(spec.max_position_embeddings, scheduler.max_num_batched_tokens);
+  config.max_seqs = max_num_seqs_;
+  config.max_batch_tokens = scheduler.max_num_batched_tokens;
+  config.cache_bytes_budget = budget;
+  config.device = spec.device;
+  config.enable_prefix_caching = cache.enable_prefix_caching;
+  INFERX_ASSIGN_OR_RETURN(attention_,
+                          attn::AttentionRuntime::Create(std::move(registry), config,
+                                                         model_->GetAttentionSpecs()));
+
+  ops_.clear();
+  const std::vector<attn::AttentionSpec> specs = model_->GetAttentionSpecs();
+  for (size_t l = 0; l < specs.size(); ++l) {
+    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op,
+                            attention_->MakeOp(static_cast<int64_t>(l)));
+    ops_.push_back(std::move(op));
   }
-  if (num_blocks <= 0) {
-    return ResourceExhaustedError("KV budget of ", kv_bytes,
-                                  " bytes fits zero blocks (one block is ", per_block, ")");
-  }
-  INFERX_ASSIGN_OR_RETURN(
-      auto pool, KvBlockPool::Create(num_blocks, cache.block_size, spec.state.paged_kv,
-                                     spec.device));
-  kv_pool_.emplace(std::move(pool));
   return OkStatus();
 }
 
@@ -307,30 +345,22 @@ Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out)
   for (const NewRequestData& fresh : step.scheduled_new_reqs) {
     RequestState state;
     state.tokens.assign(fresh.prompt_token_ids.begin(), fresh.prompt_token_ids.end());
-    state.blocks = fresh.block_ids;
     state.num_computed = fresh.num_computed_tokens;
     state.params = fresh.sampling_params;
     requests_[fresh.request_id] = std::move(state);
   }
-  for (const CachedRequestUpdate& update : step.scheduled_cached_reqs) {
-    auto it = requests_.find(update.request_id);
-    if (it == requests_.end()) {
-      return fail(InternalError("scheduler updated request ", update.request_id,
-                                " that was never introduced"));
-    }
-    it->second.blocks.insert(it->second.blocks.end(), update.new_block_ids.begin(),
-                             update.new_block_ids.end());
-  }
+  // CachedRequestUpdate carried the runner's mirrored block tables; the
+  // facade owns them now and the tables below read straight from it.
 
   if (step.scheduled.empty()) return OkStatus();
-  const int64_t block_size = kv_pool_->BlockSize();
+  const int64_t block_size = attention_->GetPlan().block_size;
+  const std::uint16_t num_groups = attention_->NumGroups();
 
-  // Flatten the step: token stream, positions, per-sequence CSRs, and the
-  // concatenated page tables. `kv_len` includes this step's new tokens --
-  // their cache slots are written during this forward.
-  std::vector<int32_t> input_ids, positions, batch_indices, kv_indices, last_page_len,
-      sample_rows;
-  std::vector<int32_t> qo_indptr{0}, kv_indptr{0};
+  // Flatten the step: token stream and positions. Page tables are NOT
+  // mirrored here -- they are read from the cache facade below, the single
+  // owner (docs/attention.md §8.3).
+  std::vector<int32_t> input_ids, positions, sample_rows;
+  std::vector<int32_t> query_lens, seq_lens;
   std::vector<RequestState*> batch;
   std::vector<int64_t> prompt_lens;
   int64_t total_new = 0;
@@ -347,59 +377,55 @@ Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out)
       return fail(InternalError("request ", scheduled.request_id, " schedules ", end,
                                 " tokens but only carries ", state.tokens.size()));
     }
-    const int seq = static_cast<int>(batch.size());
     for (int64_t t = state.num_computed; t < end; ++t) {
       input_ids.push_back(state.tokens[t]);
       positions.push_back(static_cast<int32_t>(t));
-      batch_indices.push_back(seq);
     }
     sample_rows.push_back(static_cast<int32_t>(total_new + scheduled.num_new_tokens - 1));
+    query_lens.push_back(static_cast<std::int32_t>(scheduled.num_new_tokens));
+    seq_lens.push_back(static_cast<std::int32_t>(end));
     total_new += scheduled.num_new_tokens;
-
-    const int64_t pages = (end + block_size - 1) / block_size;
-    if (pages > static_cast<int64_t>(state.blocks.size())) {
-      return fail(InternalError("request ", scheduled.request_id, " needs ", pages,
-                                " KV pages but holds ", state.blocks.size()));
-    }
-    kv_indices.insert(kv_indices.end(), state.blocks.begin(),
-                      state.blocks.begin() + pages);
-    qo_indptr.push_back(static_cast<int32_t>(total_new));
-    kv_indptr.push_back(static_cast<int32_t>(kv_indices.size()));
-    last_page_len.push_back(static_cast<int32_t>((end - 1) % block_size + 1));
-
     batch.push_back(&state);
     prompt_lens.push_back(static_cast<int64_t>(state.tokens.size()) - state.rng_offset);
   }
 
-  // Device mirrors of the plan, then the attention kernel selection pass.
   INFERX_ASSIGN_OR_RETURN(Tensor ids_tensor, UploadInt32(*runtime_, stream_, input_ids));
   INFERX_ASSIGN_OR_RETURN(Tensor positions_tensor, UploadInt32(*runtime_, stream_, positions));
-  INFERX_ASSIGN_OR_RETURN(Tensor batch_tensor, UploadInt32(*runtime_, stream_, batch_indices));
-  INFERX_ASSIGN_OR_RETURN(Tensor qo_tensor, UploadInt32(*runtime_, stream_, qo_indptr));
-  INFERX_ASSIGN_OR_RETURN(Tensor kv_indptr_tensor, UploadInt32(*runtime_, stream_, kv_indptr));
-  INFERX_ASSIGN_OR_RETURN(Tensor kv_indices_tensor, UploadInt32(*runtime_, stream_, kv_indices));
-  INFERX_ASSIGN_OR_RETURN(Tensor last_page_tensor, UploadInt32(*runtime_, stream_, last_page_len));
   INFERX_ASSIGN_OR_RETURN(Tensor sample_rows_tensor, UploadInt32(*runtime_, stream_, sample_rows));
 
   StepInputs inputs;
   inputs.token_ids = std::move(ids_tensor);
   inputs.positions = std::move(positions_tensor);
-  AttentionMetadata attn;
-  attn.batch_indices = std::move(batch_tensor);
-  attn.qo_indptr = std::move(qo_tensor);
-  attn.kv_indptr = std::move(kv_indptr_tensor);
-  attn.kv_indices = std::move(kv_indices_tensor);
-  attn.last_page_len = std::move(last_page_tensor);
-  attn.host_qo_indptr = absl::MakeConstSpan(qo_indptr);
-  attn.num_tokens = static_cast<int>(total_new);
-  attn.num_seqs = static_cast<int>(batch.size());
 
-  INFERX_RETURN_IF_ERROR(ops::BeginAttentionStep(
-      *op_, *attn.kv_indptr, *attn.last_page_len, block_size, attn.num_tokens,
-      attn.num_seqs, attention_plan_));
+  // The batch description over the facade's own tables; decodes-first
+  // ordering is the scheduler's contract.
+  attn::BatchDesc desc;
+  desc.num_reqs = static_cast<std::int32_t>(batch.size());
+  desc.num_tokens = static_cast<std::int32_t>(total_new);
+  desc.query_lens = query_lens;
+  desc.seq_lens = seq_lens;
+  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
+  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
+  desc.block_size = static_cast<std::int32_t>(block_size);
+  desc.num_decodes = static_cast<std::int32_t>(
+      std::count_if(query_lens.begin(), query_lens.end(), [](int32_t l) { return l == 1; }));
+  desc.num_decode_tokens = desc.num_decodes;
+  desc.num_prefills = desc.num_reqs - desc.num_decodes;
+  desc.num_prefill_tokens = desc.num_tokens - desc.num_decode_tokens;
+  // The batch description over the scheduler's published snapshot: the
+  // runner never reads the live facade tables for a step in flight
+  // (docs/attention.md §9).
+  for (std::uint16_t g = 0; g < num_groups; ++g) {
+    const std::vector<int32_t>& table =
+        step.group_block_ids[static_cast<size_t>(g < kMaxSchedulerGroups ? g : 0)];
+    desc.block_ids[g] = table;
+    desc.block_ids_num_pages[g] = static_cast<std::int32_t>(table.size());
+  }
+
+  INFERX_ASSIGN_OR_RETURN(attn::StepContext step_ctx, attention_->BeginStep(desc, *op_));
 
   const ModelSpec& spec = model_->GetModelSpec();
-  ForwardContext ctx(*op_, attn, *kv_pool_, *comm_, *scratch_, attention_plan_);
+  ForwardContext ctx(*op_, step_ctx, *comm_, *scratch_, absl::MakeConstSpan(ops_));
   INFERX_ASSIGN_OR_RETURN(
       Tensor hidden,
       Tensor::Empty(spec.dtype,
@@ -461,6 +487,8 @@ Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out)
     }
     out->samples.push_back(std::move(sample));
   }
+  // Prefix publication is the scheduler's job (UpdateFromOutput): the
+  // facade is single-threaded with it (docs/attention.md §9).
   return OkStatus();
 }
 

@@ -36,6 +36,8 @@ struct CacheView {
   std::int32_t block_tokens = 0;
   /// Bytes of this layer's page (token-wise kinds).
   std::int32_t page_bytes = 0;
+  /// Usable pages; rows in the region are num_pages + 1 (null row).
+  std::int32_t num_pages = 0;
   /// Slot i -> slot i+1 (recurrent kinds).
   std::int32_t slot_stride_bytes = 0;
   KvPageLayout layout = KvPageLayout::kKvPlanarNhd;

@@ -12,7 +12,6 @@
 #include "inferx/models/model.h"
 #include "inferx/models/qwen3/qwen3_config.h"
 #include "inferx/models/qwen3/qwen3_decoder_layer.h"
-#include "inferx/models/weight_loader.h"
 
 namespace inferx {
 namespace models {
@@ -42,6 +41,9 @@ class Qwen3Model {
   Status BindWeights(const std::string& prefix, WeightMap& weights);
 
   const std::vector<Qwen3DecoderLayer>& Layers() const { return layers_; }
+
+  /// \brief One attention spec per decoder layer, in tower order.
+  [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
  private:
   Qwen3Model(std::vector<Qwen3DecoderLayer> layers, RMSNorm norm)

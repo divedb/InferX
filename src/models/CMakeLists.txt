@@ -7,7 +7,6 @@ inferx_add_library(
   SRCS
     model.cc
     scratch_arena.cc
-    layers/attention.cc
     layers/embedding.cc
     layers/fused_moe.cc
     layers/linear.cc
@@ -41,6 +40,7 @@ inferx_add_library(
     inferx::core
     inferx::config
     inferx::ops
+    inferx::attn
     inferx::cache_manager
     inferx::comm
     inferx::util

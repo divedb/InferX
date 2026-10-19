@@ -8,7 +8,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "inferx/cache/kv_block_pool.h"
 #include "inferx/config/cache_config.h"
 #include "inferx/config/execution_config.h"
 #include "inferx/config/model_config.h"
@@ -63,7 +62,9 @@ class ModelRunner {
 
   ~ModelRunner();
 
-  KvBlockPool* KvPool() { return kv_pool_.has_value() ? &*kv_pool_ : nullptr; }
+  /// \brief The attention runtime owning the cache plan, pools, facade,
+  ///        kernels, and metadata builders (docs/attention.md §8.5).
+  attn::AttentionRuntime* Attention() { return attention_.get(); }
   const ModelSpec& GetModelSpec() const { return model_->GetModelSpec(); }
 
   /// \brief Executes one scheduler step and returns its samples.
@@ -92,12 +93,12 @@ class ModelRunner {
               std::unique_ptr<CommBackend> owned_comm, DeviceRuntime* runtime,
               DeviceStream stream);
 
-  /// \brief Runner-side per-request state: the full token history, the KV
-  ///        watermark, and the logical block table.
+  /// \brief Runner-side per-request state: the token history and sampling
+  ///        knobs. Block tables live in the cache facade, never mirrored
+  ///        here (docs/attention.md §8.3).
   struct RequestState {
     std::vector<TokenId> tokens;      ///< Prompt plus accepted outputs.
     int num_computed = 0;             ///< Tokens whose KV this rank wrote.
-    std::vector<int32_t> blocks;      ///< Logical block table, in order.
     sampling::SamplingParams params;  ///< Sampling knobs for this request.
     int64_t rng_offset = 0;           ///< Generated tokens so far.
   };
@@ -113,12 +114,15 @@ class ModelRunner {
   Status Initialize(const CacheConfig& cache, const SchedulerConfig& scheduler,
                     const ExecutionConfig& execution);
 
-  /// \brief One max-shape forward + logits through `scratch`, measuring.
+  /// \brief One max-shape forward + logits through `scratch`, measuring,
+  ///        against a throwaway attention runtime.
   Status RunProfileStep(Allocator& scratch, int64_t max_tokens, int64_t max_seqs);
 
-  /// \brief Creates the KV pool from the computed byte budget (or the
-  ///        explicit config fields when utilization sizing is off).
-  Status AllocateKvPool(int64_t kv_bytes, const CacheConfig& cache);
+  /// \brief Creates the attention runtime from the computed byte budget
+  ///        (or the explicit config fields when utilization sizing is off)
+  ///        and binds one op per attention layer.
+  Status CreateAttention(int64_t kv_bytes, const CacheConfig& cache,
+                         const SchedulerConfig& scheduler);
 
   /// \brief Captures decode graphs; not wired into the new model layer.
   Status CaptureGraphs(const ExecutionConfig& execution) const;
@@ -128,7 +132,8 @@ class ModelRunner {
   DeviceRuntime* runtime_ = nullptr;
   DeviceStream stream_{};
   std::unique_ptr<Model> model_;
-  std::optional<KvBlockPool> kv_pool_;
+  std::unique_ptr<attn::AttentionRuntime> attention_;
+  std::vector<attn::AttentionOp> ops_;
   std::unique_ptr<CommBackend> owned_comm_;
   SingleRankComm single_rank_comm_;
   CommBackend* comm_ = nullptr;
@@ -136,7 +141,6 @@ class ModelRunner {
 
   // Scratch_region must outlive the allocator carved from it.
   std::unique_ptr<ScratchArena> scratch_;
-  ops::AttentionPlanWorkspace attention_plan_;
   std::unique_ptr<sampling::Sampler> sampler_;
   int64_t max_num_seqs_ = 0;
 

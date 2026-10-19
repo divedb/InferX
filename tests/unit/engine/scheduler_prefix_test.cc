@@ -3,6 +3,11 @@
 
 #include "inferx/engine/scheduler.h"
 
+#include "inferx/ops/attention/registry.h"
+#include "inferx/ops/attention/runtime.h"
+#include "inferx/ops/attention/spec.h"
+
+
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -17,22 +22,42 @@ constexpr TokenId kEos = 99;
 constexpr TokenId kTok = 7;
 constexpr int64_t kBlockSize = 4;
 
+/// Two dense GQA layers over one CPU pool, the shape every scheduler test
+/// schedules against (matches the legacy 2-layer KvLayout pools).
+attn::AttentionSpec LayerSpec() {
+  attn::AttentionSpec spec;
+  spec.params = attn::DenseParams{.num_q_heads = 4, .num_kv_heads = 1, .head_dim = 8};
+  spec.q_dtype = DataType::kBFloat16;
+  spec.kv_dtype = DataType::kBFloat16;
+  return spec;
+}
+
+std::unique_ptr<attn::AttentionRuntime> MakeRuntime(bool enable_prefix_caching,
+                                                    int64_t blocks) {
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig config;
+  config.block_size = kBlockSize;
+  config.max_model_len = 4096;
+  config.max_seqs = 256;
+  config.max_batch_tokens = 4096;
+  // 2 layers x 2*1*8*2 bytes/token x 4 tokens/block = 256 bytes/block.
+  config.cache_bytes_budget = blocks * 256;
+  config.device = Device::Cpu();
+  config.enable_prefix_caching = enable_prefix_caching;
+  config.forced_backend = "reference";
+  const std::vector<attn::AttentionSpec> specs{LayerSpec(), LayerSpec()};
+  return std::move(
+      attn::AttentionRuntime::Create(std::move(registry), config, specs).value());
+}
+
+
 class SchedulerPrefixTest : public ::testing::Test {
  protected:
   void MakeScheduler(bool enable_prefix_caching, int64_t blocks = 64) {
-    KvLayout layout;
-    layout.entries_per_token = 2;
-    layout.kv_heads = 1;
-    layout.head_dim = 8;
-    layout.dtype = DataType::kBFloat16;
-    pool_ = std::make_unique<KvBlockPool>(std::move(KvBlockPool::Create(
-                                              /*num_layers=*/2, blocks, kBlockSize, layout,
-                                              Device::Cpu())
-                                              .value()));
-    CacheConfig cache;
-    cache.enable_prefix_caching = enable_prefix_caching;
-    scheduler_ = std::make_unique<Scheduler>(SchedulerConfig{}, cache, pool_.get(),
-                                             std::vector<TokenId>{kEos});
+    runtime_ = MakeRuntime(enable_prefix_caching, blocks);
+    scheduler_ = std::make_unique<Scheduler>(SchedulerConfig{}, std::vector<TokenId>{kEos},
+                                             *runtime_);
   }
 
   /// Drains the scheduler with a fake runner producing `kTok` forever.
@@ -65,7 +90,7 @@ class SchedulerPrefixTest : public ::testing::Test {
     return params;
   }
 
-  std::unique_ptr<KvBlockPool> pool_;
+  std::unique_ptr<attn::AttentionRuntime> runtime_;
   std::unique_ptr<Scheduler> scheduler_;
   SchedulerOutput last_plan_;
   std::vector<int> last_chunks_;
@@ -86,8 +111,8 @@ TEST_F(SchedulerPrefixTest, IdenticalPromptSkipsCachedBlocks) {
   RunToCompletion();
   // Three full prompt blocks + the blocks the decode tail needed are cached;
   // the release kept their bytes out of the free list.
-  const int64_t free_after_first = pool_->FreeBlocks();
-  EXPECT_LT(free_after_first, pool_->NumBlocks());
+  const int64_t free_after_first = runtime_->BlockPool()->FreeBlocks();
+  EXPECT_LT(free_after_first, runtime_->BlockPool()->NumBlocks());
   EXPECT_TRUE(scheduler_->PopFinished().has_value());
 
   // The second, identical request must adopt the cached prefix: its first
@@ -100,10 +125,11 @@ TEST_F(SchedulerPrefixTest, IdenticalPromptSkipsCachedBlocks) {
   const NewRequestData& fresh = plan->scheduled_new_reqs[0];
   EXPECT_EQ(fresh.num_computed_tokens, 8);
   EXPECT_EQ(plan->scheduled[0].num_new_tokens, 4);
-  ASSERT_EQ(fresh.block_ids.size(), 3u);  // 2 adopted + 1 granted.
+  // 2 adopted + 1 granted, read from the facade.
+  EXPECT_EQ(runtime_->Cache().GroupBlocks(fresh.request_id, 0).size(), 3u);
   // The adopted blocks are the pool blocks the first request published;
   // nothing new was allocated for them.
-  EXPECT_EQ(pool_->FreeBlocks(), free_after_first - 1);
+  EXPECT_EQ(runtime_->BlockPool()->FreeBlocks(), free_after_first - 1);
 
   ModelRunnerOutput result;
   result.samples.push_back({2, {kTok}});
@@ -112,7 +138,7 @@ TEST_F(SchedulerPrefixTest, IdenticalPromptSkipsCachedBlocks) {
 
   // The second request finished and its uncached tail stays cached; no
   // blocks leak: every block is either free or discoverable by hash.
-  EXPECT_EQ(pool_->UsedBlocks() + 0, pool_->NumBlocks() - pool_->FreeBlocks());
+  EXPECT_EQ(runtime_->BlockPool()->UsedBlocks() + 0, runtime_->BlockPool()->NumBlocks() - runtime_->BlockPool()->FreeBlocks());
 }
 
 TEST_F(SchedulerPrefixTest, FullPromptHitStillRecomputesTheLastToken) {
@@ -154,17 +180,8 @@ TEST_F(SchedulerPrefixTest, SaltedRequestSharesNothing) {
 TEST_F(SchedulerPrefixTest, PrefillChunksEndOnBlockBoundariesWhenCached) {
   SchedulerConfig config;
   config.max_num_batched_tokens = 6;  // Deliberately block-unaligned.
-  CacheConfig cache;                  // Prefix caching on by default.
-  cache.enable_prefix_caching = true;
-  KvLayout layout;
-  layout.entries_per_token = 2;
-  layout.kv_heads = 1;
-  layout.head_dim = 8;
-  layout.dtype = DataType::kBFloat16;
-  pool_ = std::make_unique<KvBlockPool>(std::move(
-      KvBlockPool::Create(2, 64, kBlockSize, layout, Device::Cpu()).value()));
-  scheduler_ = std::make_unique<Scheduler>(config, cache, pool_.get(),
-                                           std::vector<TokenId>{kEos});
+  runtime_ = MakeRuntime(/*prefix=*/true, /*blocks=*/64);
+  scheduler_ = std::make_unique<Scheduler>(config, std::vector<TokenId>{kEos}, *runtime_);
 
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, Tokens(12), ShortParams())).ok());
   std::vector<int> chunk_sizes;
@@ -181,17 +198,8 @@ TEST_F(SchedulerPrefixTest, PrefillChunksEndOnBlockBoundariesWhenCached) {
 TEST_F(SchedulerPrefixTest, ChunkAlignmentOffWithoutCaching) {
   SchedulerConfig config;
   config.max_num_batched_tokens = 6;
-  CacheConfig cache;
-  cache.enable_prefix_caching = false;
-  KvLayout layout;
-  layout.entries_per_token = 2;
-  layout.kv_heads = 1;
-  layout.head_dim = 8;
-  layout.dtype = DataType::kBFloat16;
-  pool_ = std::make_unique<KvBlockPool>(std::move(
-      KvBlockPool::Create(2, 64, kBlockSize, layout, Device::Cpu()).value()));
-  scheduler_ = std::make_unique<Scheduler>(config, cache, pool_.get(),
-                                           std::vector<TokenId>{kEos});
+  runtime_ = MakeRuntime(/*prefix=*/false, /*blocks=*/64);
+  scheduler_ = std::make_unique<Scheduler>(config, std::vector<TokenId>{kEos}, *runtime_);
 
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, Tokens(12), ShortParams())).ok());
   std::vector<int> chunk_sizes;
@@ -226,8 +234,8 @@ TEST_F(SchedulerPrefixTest, DisabledCachingRecomputesEverything) {
 
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, prompt, ShortParams())).ok());
   RunToCompletion();
-  const int64_t free_after_first = pool_->FreeBlocks();
-  EXPECT_EQ(free_after_first, pool_->NumBlocks());  // Everything returned.
+  const int64_t free_after_first = runtime_->BlockPool()->FreeBlocks();
+  EXPECT_EQ(free_after_first, runtime_->BlockPool()->NumBlocks());  // Everything returned.
 
   ASSERT_TRUE(scheduler_->AddRequest(Request(2, prompt, ShortParams())).ok());
   auto plan = scheduler_->Schedule();

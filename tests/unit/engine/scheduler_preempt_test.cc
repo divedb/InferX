@@ -4,6 +4,10 @@
 
 #include "inferx/engine/scheduler.h"
 
+#include "inferx/ops/attention/registry.h"
+#include "inferx/ops/attention/runtime.h"
+#include "inferx/ops/attention/spec.h"
+
 #include <gtest/gtest.h>
 
 #include <memory>
@@ -18,22 +22,42 @@ constexpr TokenId kEos = 99;
 constexpr TokenId kTok = 7;
 constexpr int64_t kBlockSize = 4;
 
+/// Two dense GQA layers over one CPU pool, the shape every scheduler test
+/// schedules against (matches the legacy 2-layer KvLayout pools).
+attn::AttentionSpec LayerSpec() {
+  attn::AttentionSpec spec;
+  spec.params = attn::DenseParams{.num_q_heads = 4, .num_kv_heads = 1, .head_dim = 8};
+  spec.q_dtype = DataType::kBFloat16;
+  spec.kv_dtype = DataType::kBFloat16;
+  return spec;
+}
+
+std::unique_ptr<attn::AttentionRuntime> MakeRuntime(bool enable_prefix_caching,
+                                                    int64_t blocks) {
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig config;
+  config.block_size = kBlockSize;
+  config.max_model_len = 4096;
+  config.max_seqs = 256;
+  config.max_batch_tokens = 4096;
+  // 2 layers x 2*1*8*2 bytes/token x 4 tokens/block = 256 bytes/block.
+  config.cache_bytes_budget = blocks * 256;
+  config.device = Device::Cpu();
+  config.enable_prefix_caching = enable_prefix_caching;
+  config.forced_backend = "reference";
+  const std::vector<attn::AttentionSpec> specs{LayerSpec(), LayerSpec()};
+  return std::move(
+      attn::AttentionRuntime::Create(std::move(registry), config, specs).value());
+}
+
+
 class SchedulerPreemptTest : public ::testing::Test {
  protected:
   void MakeScheduler(bool enable_prefix_caching, int64_t blocks) {
-    KvLayout layout;
-    layout.entries_per_token = 2;
-    layout.kv_heads = 1;
-    layout.head_dim = 8;
-    layout.dtype = DataType::kBFloat16;
-    pool_ = std::make_unique<KvBlockPool>(std::move(KvBlockPool::Create(
-                                              /*num_layers=*/2, blocks, kBlockSize, layout,
-                                              Device::Cpu())
-                                              .value()));
-    CacheConfig cache;
-    cache.enable_prefix_caching = enable_prefix_caching;
-    scheduler_ = std::make_unique<Scheduler>(SchedulerConfig{}, cache, pool_.get(),
-                                             std::vector<TokenId>{kEos});
+    runtime_ = MakeRuntime(enable_prefix_caching, blocks);
+    scheduler_ = std::make_unique<Scheduler>(SchedulerConfig{}, std::vector<TokenId>{kEos},
+                                             *runtime_);
   }
 
   bool Step() {
@@ -63,7 +87,7 @@ class SchedulerPreemptTest : public ::testing::Test {
     return tokens;
   }
 
-  std::unique_ptr<KvBlockPool> pool_;
+  std::unique_ptr<attn::AttentionRuntime> runtime_;
   std::unique_ptr<Scheduler> scheduler_;
   SchedulerOutput last_plan_;
 };
@@ -88,7 +112,7 @@ TEST_F(SchedulerPreemptTest, PressurePreemptsNewestAndVictimResumes) {
   while (scheduler_->PopFinished().has_value()) ++finished;
   EXPECT_EQ(finished, 2);
   EXPECT_GE(scheduler_->Stats().num_preempted, 1);
-  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());  // No leaks.
+  EXPECT_EQ(runtime_->BlockPool()->FreeBlocks(), runtime_->BlockPool()->NumBlocks());  // No leaks.
 }
 
 TEST_F(SchedulerPreemptTest, PreemptedRequestReadoptsItsOwnCachedPrefix) {
@@ -180,7 +204,7 @@ TEST_F(SchedulerPreemptTest, PreemptedVictimReplaysAcceptedOutput) {
   EXPECT_EQ(victim->NumOutputTokens(), 16);
   EXPECT_EQ(victim->NumTokens(), 8 + 16);
   EXPECT_GE(victim->NumPreemptions(), 1);
-  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());  // No leaks.
+  EXPECT_EQ(runtime_->BlockPool()->FreeBlocks(), runtime_->BlockPool()->NumBlocks());  // No leaks.
 }
 
 TEST_F(SchedulerPreemptTest, RunnerStateWouldDropPreemptedRequests) {

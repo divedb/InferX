@@ -79,44 +79,5 @@ struct StepViews {
   int32_t block_table_stride = 0;
 };
 
-enum class AttentionMode { kPrefill, kDecode, kMixed };
-
-/// \brief Per-step attention inputs. All pointers are device pointers into InputBuffers.
-struct AttentionMetadata {
-  AttentionMode mode = AttentionMode::kPrefill;
-  int32_t num_seqs = 0;
-  int32_t num_tokens = 0;
-  int32_t max_query_len = 0;
-  int32_t max_seq_len = 0;
-  const int32_t* query_start_loc = nullptr;
-  const int32_t* seq_lens = nullptr;
-  const int32_t* slot_mapping = nullptr;
-  const int32_t* block_table = nullptr;
-  int32_t block_table_stride = 0;
-};
-
-enum class KvLayout { kStandard, kMlaLatent };
-
-/// \brief Describes the KV layout a model needs. Returned by the model so the runner has no
-///        per-architecture branches.
-struct KvCacheSpec {
-  int num_layers = 0;
-  int64_t num_kv_heads = 0;  ///< Per rank (kStandard only).
-  int64_t head_dim = 0;      ///< (kStandard only)
-  DataType dtype{};
-  int block_size = 16;
-  KvLayout layout = KvLayout::kStandard;
-  int64_t kv_lora_rank = 0;  ///< kMlaLatent only.
-  int64_t rope_dim = 0;      ///< kMlaLatent only.
-
-  /// Bytes of one block in one layer.
-  size_t BytesPerBlockPerLayer() const;
-  /// Bytes of one block across all layers.
-  size_t BytesPerBlock() const {
-    return BytesPerBlockPerLayer() * static_cast<size_t>(num_layers);
-  }
-  /// How many whole blocks fit in `budget` bytes.
-  int64_t BlocksForBudget(size_t budget) const;
-};
 
 }  // namespace inferx

@@ -22,6 +22,8 @@
 #include "inferx/core/device_runtime.h"
 #include "inferx/dist/loopback_comm.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/registry.h"
+#include "inferx/ops/attention/runtime.h"
 #include "inferx/models/load_options.h"
 #include "inferx/models/registry.h"
 #include "inferx/models/scratch_arena.h"
@@ -292,7 +294,8 @@ struct DeviceStep {
   OwnedStream stream = OwnedStream(DeviceStream{}, nullptr);
   std::unique_ptr<ops::OpContext> op;
   std::unique_ptr<ScratchArena> scratch;
-  ops::AttentionPlanWorkspace plan;
+  std::unique_ptr<attn::AttentionRuntime> attention;
+  std::vector<attn::AttentionOp> ops;
 
   DeviceStream raw_stream() const { return stream.Get(); }
 };
@@ -324,20 +327,34 @@ std::vector<float> RunSingleRank(const std::string& dir, const std::vector<int32
 
   const ModelSpec& spec = model->GetModelSpec();
   const int64_t T = static_cast<int64_t>(ids.size());
-  const int pages = static_cast<int>((T + kBlockSize - 1) / kBlockSize);
-  KvBlockPool pool =
-      *KvBlockPool::Create(spec.state.paged_kv.size(), pages, kBlockSize,
-                           spec.state.paged_kv.front(), step.runtime->device());
 
   step.scratch = std::make_unique<ScratchArena>(
       ScratchArena::Measuring(step.runtime->device()));
-  step.plan.plan = *Tensor::Empty(DataType::kInt32, Shape({3 * T + 1}), step.scratch.get());
 
-  AttentionMetadata attn;
-  std::vector<int32_t> positions(T), batch(T, 0), qo{0, static_cast<int32_t>(T)},
-      kv{0, pages}, pages_out(pages), last{(static_cast<int32_t>(T) - 1) % kBlockSize + 1};
+  // The attention runtime owns pool + metadata + kernels; the facade
+  // registers this single request and the builder shapes its step.
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig attention_config;
+  attention_config.block_size = kBlockSize;
+  attention_config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, T);
+  attention_config.max_seqs = 1;
+  attention_config.max_batch_tokens = T;
+  attention_config.cache_bytes_budget = 1LL << 32;
+  attention_config.device = step.runtime->device();
+  attention_config.enable_prefix_caching = false;
+  attention_config.forced_backend = "flash_dense";
+  step.attention = std::move(
+      *attn::AttentionRuntime::Create(std::move(registry), attention_config,
+                                      model->GetAttentionSpecs()));
+  step.ops.clear();
+  for (size_t l = 0; l < model->GetAttentionSpecs().size(); ++l) {
+    step.ops.push_back(std::move(*step.attention->MakeOp(static_cast<int64_t>(l))));
+  }
+  EXPECT_TRUE(step.attention->Cache().Reserve(1, GrowthTarget{0, T}).ok());
+
+  std::vector<int32_t> positions(T);
   for (int64_t i = 0; i < T; ++i) positions[i] = static_cast<int32_t>(i);
-  for (int i = 0; i < pages; ++i) pages_out[i] = i;
   auto uploaded = [&](const std::vector<int32_t>& values) -> Tensor {
     auto tensor = Upload(*step.runtime, step.raw_stream(), values);
     if (!tensor.ok()) {
@@ -349,22 +366,27 @@ std::vector<float> RunSingleRank(const std::string& dir, const std::vector<int32
   StepInputs inputs;
   inputs.token_ids = uploaded(ids);
   inputs.positions = uploaded(positions);
-  attn.batch_indices = uploaded(batch);
-  attn.qo_indptr = uploaded(qo);
-  attn.kv_indptr = uploaded(kv);
-  attn.kv_indices = uploaded(pages_out);
-  attn.last_page_len = uploaded(last);
-  const std::vector<int32_t> host_qo = qo;
-  attn.host_qo_indptr = absl::MakeConstSpan(host_qo);
-  attn.num_tokens = static_cast<int>(T);
-  attn.num_seqs = 1;
 
-  EXPECT_TRUE(ops::BeginAttentionStep(*step.op, *attn.kv_indptr, *attn.last_page_len,
-                                      kBlockSize, attn.num_tokens, 1, step.plan)
-                  .ok());
+  const std::vector<std::int32_t> query_lens{static_cast<std::int32_t>(T)};
+  const std::vector<std::int32_t> seq_lens{static_cast<std::int32_t>(T)};
+  attn::BatchDesc desc;
+  desc.num_reqs = 1;
+  desc.num_tokens = static_cast<std::int32_t>(T);
+  desc.query_lens = query_lens;
+  desc.seq_lens = seq_lens;
+  desc.max_query_len = static_cast<std::int32_t>(T);
+  desc.max_seq_len = static_cast<std::int32_t>(T);
+  desc.block_size = static_cast<std::int32_t>(kBlockSize);
+  desc.num_prefills = 1;
+  desc.num_prefill_tokens = static_cast<std::int32_t>(T);
+  const auto blocks = step.attention->Cache().GroupBlocks(1, 0);
+  desc.block_ids[0] = blocks;
+  desc.block_ids_num_pages[0] = static_cast<std::int32_t>(blocks.size());
+  attn::StepContext step_ctx = std::move(*step.attention->BeginStep(desc, *step.op));
 
   SingleRankComm comm;
-  ForwardContext ctx(*step.op, attn, pool, comm, *step.scratch, step.plan);
+  ForwardContext ctx(*step.op, step_ctx, comm, *step.scratch,
+                     absl::MakeConstSpan(step.ops));
   Tensor hidden = *Tensor::Empty(spec.dtype, Shape({T, spec.hidden_size}), step.scratch.get());
   const Tensor sample_rows = uploaded({static_cast<int32_t>(T) - 1});
   { const auto fwd = model->Forward(ctx, inputs, hidden);
@@ -422,6 +444,42 @@ TEST_F(Qwen3ForwardTest, CudaLogitsMatchFp32Reference) {
   EXPECT_LT(max_abs, 0.25f) << "max |cuda - fp32 reference| = " << max_abs;
 }
 
+/// The golden-trace shape: short prefill, then many one-token decode
+/// steps through the full model stack, each compared against the FP32
+/// reference recomputed over the growing sequence.
+TEST_F(Qwen3ForwardTest, DecodeStepsMatchFp32Reference) {
+  DeviceStep step;
+  std::vector<int32_t> ids(ids_.begin(), ids_.begin() + 5);
+  std::mt19937 rng(99);
+  std::vector<float> logits = RunSingleRank(dir_, ids, step);
+  ASSERT_EQ(logits.size(), static_cast<size_t>(kVocab));
+
+  for (int decode = 0; decode < 12; ++decode) {
+    // Greedy continuation: take the engine's argmax as the next token.
+    size_t argmax = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+      if (logits[i] > logits[argmax]) argmax = i;
+    }
+    ids.push_back(static_cast<int32_t>(argmax));
+
+    // One decode step through the same runtime.
+    DeviceStep step2;
+    logits = RunSingleRank(dir_, ids, step2);
+    ASSERT_EQ(logits.size(), static_cast<size_t>(kVocab));
+
+    Reference reference(weights_, ids);
+    std::vector<float> expected = reference.LogitsAtLastToken();
+    float max_abs = 0.f;
+    for (size_t i = 0; i < logits.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(logits[i] - expected[i]));
+    }
+    // Same tolerance band as the prefill gate.
+    EXPECT_LT(max_abs, 0.5f) << "decode step " << decode << " (seq len " << ids.size()
+                             << ") drifted to " << max_abs;
+  }
+}
+
+
 namespace {
 
 /// One rank's sharded execution: own model, weights, stream, KV shard, and
@@ -445,15 +503,8 @@ Status RunShardedRank(const std::string& dir, const std::vector<int32_t>& ids,
 
   const ModelSpec& spec = model->GetModelSpec();
   const int64_t T = static_cast<int64_t>(ids.size());
-  const int pages = static_cast<int>((T + kBlockSize - 1) / kBlockSize);
-  INFERX_ASSIGN_OR_RETURN(
-      KvBlockPool pool, KvBlockPool::Create(spec.state.paged_kv.size(), pages, kBlockSize,
-                                            spec.state.paged_kv.front(), device));
 
   ScratchArena scratch = ScratchArena::Measuring(device);
-  ops::AttentionPlanWorkspace plan;
-  INFERX_ASSIGN_OR_RETURN(plan.plan,
-                          Tensor::Empty(DataType::kInt32, Shape({3 * T + 1}), &scratch));
 
   const auto upload_filled =
       [&](const std::vector<int32_t>& values) -> StatusOr<Tensor> {
@@ -470,27 +521,52 @@ Status RunShardedRank(const std::string& dir, const std::vector<int32_t>& ids,
   };
 
   INFERX_ASSIGN_OR_RETURN(Tensor ids_tensor, upload_filled(ids));
-  std::vector<int32_t> positions(T), batch(T, 0), qo{0, static_cast<int32_t>(T)},
-      kv{0, pages}, pages_out(pages), last{(static_cast<int32_t>(T) - 1) % kBlockSize + 1};
+  std::vector<int32_t> positions(T);
   for (int64_t i = 0; i < T; ++i) positions[i] = static_cast<int32_t>(i);
-  for (int i = 0; i < pages; ++i) pages_out[i] = i;
-
-  AttentionMetadata attn;
   INFERX_ASSIGN_OR_RETURN(Tensor positions_tensor, upload_filled(positions));
-  INFERX_ASSIGN_OR_RETURN(attn.batch_indices, upload_filled(batch));
-  INFERX_ASSIGN_OR_RETURN(attn.qo_indptr, upload_filled(qo));
-  INFERX_ASSIGN_OR_RETURN(attn.kv_indptr, upload_filled(kv));
-  INFERX_ASSIGN_OR_RETURN(attn.kv_indices, upload_filled(pages_out));
-  INFERX_ASSIGN_OR_RETURN(attn.last_page_len, upload_filled(last));
-  attn.host_qo_indptr = absl::MakeConstSpan(qo);
-  attn.num_tokens = static_cast<int>(T);
-  attn.num_seqs = 1;
 
   ops::OpContext op(*runtime, stream);
-  INFERX_RETURN_IF_ERROR(ops::BeginAttentionStep(op, *attn.kv_indptr, *attn.last_page_len,
-                                                kBlockSize, attn.num_tokens, 1, plan));
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig attention_config;
+  attention_config.block_size = kBlockSize;
+  attention_config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, T);
+  attention_config.max_seqs = 1;
+  attention_config.max_batch_tokens = T;
+  attention_config.cache_bytes_budget = 1LL << 32;
+  attention_config.device = device;
+  attention_config.enable_prefix_caching = false;
+  attention_config.forced_backend = "flash_dense";
+  INFERX_ASSIGN_OR_RETURN(
+      std::unique_ptr<attn::AttentionRuntime> attention,
+      attn::AttentionRuntime::Create(std::move(registry), attention_config,
+                                     model->GetAttentionSpecs()));
+  std::vector<attn::AttentionOp> ops;
+  for (size_t l = 0; l < model->GetAttentionSpecs().size(); ++l) {
+    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp layer_op,
+                            attention->MakeOp(static_cast<int64_t>(l)));
+    ops.push_back(std::move(layer_op));
+  }
+  INFERX_RETURN_IF_ERROR(attention->Cache().Reserve(1, GrowthTarget{0, T}));
 
-  ForwardContext ctx(op, attn, pool, comm, scratch, plan);
+  const std::vector<std::int32_t> query_lens{static_cast<std::int32_t>(T)};
+  const std::vector<std::int32_t> seq_lens{static_cast<std::int32_t>(T)};
+  attn::BatchDesc desc;
+  desc.num_reqs = 1;
+  desc.num_tokens = static_cast<std::int32_t>(T);
+  desc.query_lens = query_lens;
+  desc.seq_lens = seq_lens;
+  desc.max_query_len = static_cast<std::int32_t>(T);
+  desc.max_seq_len = static_cast<std::int32_t>(T);
+  desc.block_size = static_cast<std::int32_t>(kBlockSize);
+  desc.num_prefills = 1;
+  desc.num_prefill_tokens = static_cast<std::int32_t>(T);
+  const auto blocks = attention->Cache().GroupBlocks(1, 0);
+  desc.block_ids[0] = blocks;
+  desc.block_ids_num_pages[0] = static_cast<std::int32_t>(blocks.size());
+  INFERX_ASSIGN_OR_RETURN(attn::StepContext step_ctx, attention->BeginStep(desc, op));
+
+  ForwardContext ctx(op, step_ctx, comm, scratch, absl::MakeConstSpan(ops));
   StepInputs inputs;
   inputs.token_ids = ids_tensor;
   inputs.positions = positions_tensor;

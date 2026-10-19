@@ -93,6 +93,10 @@ Status FlashPagedAttentionImpl(OpContext& ctx, const Tensor& q, const Tensor& qo
   const int batch = qo.Numel() - 1;
   paged_kv_t<T, int> cache(p.kv_heads, block_size, HeadDim, batch, QKVLayout::kNHD, Ptr<T>(key),
                            Ptr<T>(value), Ptr<int>(indices), Ptr<int>(kv), Ptr<int>(last));
+  if (p.page_stride_elements != 0) {
+    cache.stride_page = p.page_stride_elements;
+    cache.v_stride_page = p.page_stride_elements;
+  }
   auto stream = ctx.GetStream().As<cudaStream_t>();
   // Ratios unsupported by the specialized decode dispatcher use FlashInfer
   // prefill with one query per sequence, which implements the same attention.

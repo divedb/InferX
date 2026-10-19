@@ -6,6 +6,7 @@
 // numerically meaningful, so a first divergence is accepted only at such a
 // tie, verified against the step's captured logits.
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -46,6 +47,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
 
   CacheConfig cache;
   cache.block_size = 16;
+  if (std::getenv("INFERX_TEST_NO_PREFIX") != nullptr) cache.enable_prefix_caching = false;
   cache.num_kv_blocks = 1024;
   SchedulerConfig scheduler_config;
   ExecutionConfig execution;
@@ -56,7 +58,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
   const models::ModelSpec& spec = runner->GetModelSpec();
   if (spec.eos_token_ids.empty()) return InternalError("checkpoint declares no eos");
 
-  Scheduler scheduler(scheduler_config, cache, runner->KvPool(), spec.eos_token_ids);
+  Scheduler scheduler(scheduler_config, spec.eos_token_ids, *runner->Attention());
   sampling::SamplingParams params;
   params.temperature = 0;  // Greedy: the trace was recorded greedily.
   params.max_tokens = max_tokens;

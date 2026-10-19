@@ -162,6 +162,20 @@ StatusOr<CacheSpec> BuildCacheSpec(const AttentionSpec& spec) {
       spec.params);
 }
 
+StatusOr<CacheRequirements> BuildCacheRequirements(std::span<const AttentionSpec> specs) {
+  CacheRequirements requirements;
+  requirements.layers.reserve(specs.size());
+  for (const AttentionSpec& spec : specs) {
+    if (!NeedsCache(spec)) {
+      requirements.layers.push_back(NoCache{});
+      continue;
+    }
+    INFERX_ASSIGN_OR_RETURN(CacheSpec cache_spec, BuildCacheSpec(spec));
+    requirements.layers.push_back(std::move(cache_spec));
+  }
+  return requirements;
+}
+
 StatusOr<int64_t> CacheBytesPerToken(const AttentionSpec& spec) {
   if (!NeedsCache(spec)) {
     return InvalidArgumentError("encoder-self attention caches nothing");

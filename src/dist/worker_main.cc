@@ -50,8 +50,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
   if (checkpoint.eos_token_ids.empty()) {
     return InternalError("checkpoint declares no eos token id");
   }
-  Scheduler scheduler(options.scheduler, options.cache, runner->KvPool(),
-                     checkpoint.eos_token_ids);
+  Scheduler scheduler(options.scheduler, checkpoint.eos_token_ids, *runner->Attention());
 
   INFERX_ASSIGN_OR_RETURN(auto commands, MessageChannel::Open(channels.commands));
   INFERX_ASSIGN_OR_RETURN(auto events, MessageChannel::Open(channels.events));

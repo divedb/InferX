@@ -14,12 +14,14 @@ namespace inferx::ops {
 /// table: block = kv_indices[kv_indptr[seq] + pos / block_size], slot =
 /// pos % block_size. `k` and `v` are [tokens, kv_heads * head_dim]; the
 /// caches are [num_blocks, block_size, kv_heads, head_dim] views for one
-/// layer (KvBlockPool::KeyCache/ValueCache shapes).
+/// layer. `page_stride_elements` is the distance between pages in each
+/// cache, in BF16 elements; zero selects tightly packed pages. A strided
+/// view must have backing storage covering every addressed page.
 Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
                     const Tensor& key_cache, const Tensor& value_cache,
-                    int64_t block_size);
+                    int64_t block_size, int64_t page_stride_elements = 0);
 
 /// \brief Parameters of one causal paged-attention call.
 struct AttentionParams {
@@ -34,6 +36,8 @@ struct AttentionParams {
   /// Logit soft cap c: scores become c * tanh(score / c); 0 disables
   /// (Gemma 2 lineage). Rides the FlashInfer soft-cap variant.
   float softcap = 0.0f;
+  /// Distance between KV pages in elements; zero means tightly packed.
+  int64_t page_stride_elements = 0;
 };
 
 /// \brief Checks `params` against what the kernel dispatcher supports.

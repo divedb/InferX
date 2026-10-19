@@ -55,6 +55,7 @@ StatusOr<CacheView> BindTokenWiseView(const KvBlockPool& pool, const AttentionSp
   view.block_tokens = static_cast<std::int32_t>(pool.BlockSize());
   view.page_bytes = static_cast<std::int32_t>(pool.BlockSize() * bytes_per_token);
   view.page_stride_bytes = view.page_bytes;
+  view.num_pages = static_cast<std::int32_t>(pool.NumBlocks());
   view.layout = spec.kv_layout;
   view.dtype = spec.kv_dtype;
   return view;

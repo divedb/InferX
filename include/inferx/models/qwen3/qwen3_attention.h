@@ -6,7 +6,7 @@
 #include "inferx/core/dtype.h"
 #include "inferx/core/status.h"
 #include "inferx/core/tensor.h"
-#include "inferx/models/layers/attention.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/layers/linear.h"
 #include "inferx/models/layers/rms_norm.h"
 #include "inferx/models/layers/rotary_embedding.h"
@@ -48,19 +48,23 @@ class Qwen3Attention {
 
   int64_t LocalQueryWidth() const { return local_heads_ * head_dim_; }
 
+  /// \brief This layer's attention spec: what the family writes and how it
+  ///        attends. The runner binds an executor for it at init.
+  [[nodiscard]] attn::AttentionSpec Spec() const;
+
  private:
   Qwen3Attention(Linear qkv_proj, RMSNorm q_norm, RMSNorm k_norm, RotaryEmbedding rope,
-                 Linear o_proj, Attention core, int64_t local_heads,
-                 int64_t local_kv_heads, int64_t head_dim, int64_t tp_rank)
+                 Linear o_proj, int64_t local_heads, int64_t local_kv_heads,
+                 int64_t head_dim, int64_t sliding_window, int64_t tp_rank)
       : qkv_proj_(std::move(qkv_proj)),
         q_norm_(std::move(q_norm)),
         k_norm_(std::move(k_norm)),
         rope_(std::move(rope)),
         o_proj_(std::move(o_proj)),
-        core_(std::move(core)),
         local_heads_(local_heads),
         local_kv_heads_(local_kv_heads),
         head_dim_(head_dim),
+        sliding_window_(sliding_window),
         tp_rank_(tp_rank) {}
 
   Linear qkv_proj_;  ///< [(qh + 2*kvh) * hd, hidden], rows [q | k | v]
@@ -68,11 +72,12 @@ class Qwen3Attention {
   RMSNorm k_norm_;   ///< Per-head key norm over head_dim.
   RotaryEmbedding rope_;
   Linear o_proj_;    ///< [hidden, qh * hd] (rank's column shard)
-  Attention core_;
 
   int64_t local_heads_ = 0;
   int64_t local_kv_heads_ = 0;
   int64_t head_dim_ = 0;
+  /// 0 disables windowing (also stored in the spec's mask).
+  int64_t sliding_window_ = 0;
   int64_t tp_rank_ = 0;
 };
 

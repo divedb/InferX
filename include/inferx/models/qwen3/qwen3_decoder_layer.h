@@ -10,6 +10,7 @@
 #include "inferx/core/tensor.h"
 #include "inferx/models/layers/rms_norm.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/qwen3/qwen3_attention.h"
 #include "inferx/models/qwen3/qwen3_config.h"
 #include "inferx/models/qwen3/qwen3_mlp.h"
@@ -51,6 +52,9 @@ class Qwen3DecoderLayer {
   /// \brief Binds `prefix.{input,post_attention}_layernorm.weight` and
   ///        everything the attention and MLP blocks declare.
   Status BindWeights(const std::string& prefix, WeightMap& weights);
+
+  /// \brief The attention layer's spec.
+  [[nodiscard]] attn::AttentionSpec Spec() const { return self_attn_.Spec(); }
 
  private:
   Qwen3DecoderLayer(RMSNorm input_layernorm, Qwen3Attention self_attn,

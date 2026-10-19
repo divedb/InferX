@@ -1,6 +1,8 @@
 #ifndef INFERX_ATTN_CACHE_SPEC_BRIDGE_H_
 #define INFERX_ATTN_CACHE_SPEC_BRIDGE_H_
 
+#include <span>
+
 #include "inferx/cache/cache_spec.h"
 #include "inferx/core/status.h"
 #include "inferx/ops/attention/spec.h"
@@ -29,6 +31,12 @@ namespace inferx::attn {
 /// state is per-sequence, not per-token). Used by BuildCacheSpec's callers
 /// and by the CacheView binding to cross-check a pool against its spec.
 [[nodiscard]] StatusOr<int64_t> CacheBytesPerToken(const AttentionSpec& spec);
+
+/// \brief Assembles a whole model's CacheRequirements from its attention
+///        specs: encoder-self layers contribute NoCache, everything else
+///        its BuildCacheSpec result. One call, one source of truth.
+[[nodiscard]] StatusOr<CacheRequirements> BuildCacheRequirements(
+    std::span<const AttentionSpec> specs);
 
 }  // namespace inferx::attn
 

@@ -24,7 +24,9 @@ struct ModelExecutor::Impl {
 ModelExecutor::ModelExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ModelExecutor::~ModelExecutor() = default;
 
-KvBlockPool* ModelExecutor::KvPool() { return impl_->ranks.front()->KvPool(); }
+attn::AttentionRuntime* ModelExecutor::Attention() {
+  return impl_->ranks.front()->Attention();
+}
 const models::ModelSpec& ModelExecutor::GetModelSpec() const {
   return impl_->ranks.front()->GetModelSpec();
 }

@@ -4,7 +4,6 @@
 #include <cstdint>
 
 #include "inferx/core/status.h"
-#include "inferx/models/requirements.h"
 #include "inferx/ops/rotary.h"
 #include "inferx/tokenizer/id.h"
 #include "inferx/util/hf_config.h"
@@ -45,13 +44,6 @@ struct LlamaConfig {
                                   ") must divide tensor-parallel size ", tp_size);
     }
     return num_key_value_heads / tp_size;
-  }
-
-  KvLayout KvLayoutFor(int64_t tp_size) const {
-    inferx::KvLayout layout;
-    layout.kv_heads = num_key_value_heads / tp_size;
-    layout.head_dim = head_dim;
-    return layout;
   }
 };
 

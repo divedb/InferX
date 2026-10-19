@@ -41,7 +41,8 @@ __global__ void GenericAttentionKernel(
     const int* __restrict__ kv_indices, const int* __restrict__ last_page_len,
     const __nv_bfloat16* __restrict__ key, const __nv_bfloat16* __restrict__ value,
     __nv_bfloat16* __restrict__ out, int query_heads, int kv_heads, int head_dim,
-    int block_size, float scale, long long window, float softcap) {
+    int block_size, float scale, long long window, float softcap,
+    int64_t page_stride_elements) {
   const int row = blockIdx.x;
   const int head = blockIdx.y;
   const int tid = threadIdx.x;
@@ -80,9 +81,10 @@ __global__ void GenericAttentionKernel(
     for (int slot = 0; slot < tokens; ++slot) {
       const long long j = static_cast<long long>(page) * block_size + slot;
       if (j > q_pos || j < floor_j) continue;
-      const int64_t token = static_cast<int64_t>(block) * block_size + slot;
+      const int64_t cache_offset = static_cast<int64_t>(block) * page_stride_elements +
+                                   (slot * kv_heads + kv_head) * head_dim;
       const __nv_bfloat16* k_row =
-          key + (token * kv_heads + kv_head) * head_dim;
+          key + cache_offset;
       float partial = 0.0f;
       for (int d = tid; d < head_dim; d += kThreads) {
         partial += __bfloat162float(q_row[d]) * __bfloat162float(k_row[d]);
@@ -99,7 +101,7 @@ __global__ void GenericAttentionKernel(
         const int d = tid + i * kThreads;
         if (d < head_dim) {
           const __nv_bfloat16* v_row =
-              value + (token * kv_heads + kv_head) * head_dim;
+              value + cache_offset;
           acc[i] = acc[i] * growth + weight * __bfloat162float(v_row[d]);
         }
       }
@@ -151,6 +153,12 @@ Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_i
   if (sink_f32 != nullptr) {
     return InvalidArgumentError("generic attention expects bf16 sinks");
   }
+  const int64_t page_stride = params.page_stride_elements == 0
+                                  ? block_size * params.kv_heads * params.head_dim
+                                  : params.page_stride_elements;
+  if (page_stride < block_size * params.kv_heads * params.head_dim) {
+    return InvalidArgumentError("generic attention KV page stride is too small");
+  }
   const int num_seqs = static_cast<int>(qo_indptr.Numel() - 1);
   dim3 grid(static_cast<uint32_t>(q.Dim(0)), static_cast<uint32_t>(params.query_heads),
             static_cast<uint32_t>(num_seqs));
@@ -164,7 +172,7 @@ Status GenericPagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_i
       static_cast<__nv_bfloat16*>(out.Data()), static_cast<int>(params.query_heads),
       static_cast<int>(params.kv_heads), static_cast<int>(params.head_dim),
       static_cast<int>(block_size), params.scale,
-      static_cast<long long>(params.sliding_window), params.softcap);
+      static_cast<long long>(params.sliding_window), params.softcap, page_stride);
   return CudaStatus(cudaGetLastError(), "generic attention launch");
 }
 

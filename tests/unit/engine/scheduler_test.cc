@@ -4,6 +4,11 @@
 
 #include "inferx/engine/scheduler.h"
 
+#include "inferx/ops/attention/registry.h"
+#include "inferx/ops/attention/runtime.h"
+#include "inferx/ops/attention/spec.h"
+
+
 #include <memory>
 #include <vector>
 
@@ -15,27 +20,44 @@ namespace {
 constexpr TokenId kEos = 99;
 constexpr int64_t kBlockSize = 4;
 
+/// Two dense GQA layers over one CPU pool, the shape every scheduler test
+/// schedules against (matches the legacy 2-layer KvLayout pools).
+attn::AttentionSpec LayerSpec() {
+  attn::AttentionSpec spec;
+  spec.params = attn::DenseParams{.num_q_heads = 4, .num_kv_heads = 1, .head_dim = 8};
+  spec.q_dtype = DataType::kBFloat16;
+  spec.kv_dtype = DataType::kBFloat16;
+  return spec;
+}
+
+std::unique_ptr<attn::AttentionRuntime> MakeRuntime(bool enable_prefix_caching,
+                                                    int64_t blocks) {
+  auto registry = std::make_unique<attn::BackendRegistry>();
+  attn::RegisterBuiltinBackends(*registry);
+  attn::AttentionConfig config;
+  config.block_size = kBlockSize;
+  config.max_model_len = 4096;
+  config.max_seqs = 256;
+  config.max_batch_tokens = 4096;
+  // 2 layers x 2*1*8*2 bytes/token x 4 tokens/block = 256 bytes/block.
+  config.cache_bytes_budget = blocks * 256;
+  config.device = Device::Cpu();
+  config.enable_prefix_caching = enable_prefix_caching;
+  config.forced_backend = "reference";
+  const std::vector<attn::AttentionSpec> specs{LayerSpec(), LayerSpec()};
+  return std::move(
+      attn::AttentionRuntime::Create(std::move(registry), config, specs).value());
+}
+
+
 class SchedulerTest : public ::testing::Test {
  protected:
-  void MakePool(int64_t blocks) {
-    KvLayout layout;
-    layout.entries_per_token = 2;
-    layout.kv_heads = 1;
-    layout.head_dim = 8;
-    layout.dtype = DataType::kBFloat16;
-    pool_ = std::make_unique<KvBlockPool>(
-        std::move(KvBlockPool::Create(/*num_layers=*/2, blocks, kBlockSize, layout,
-                                      Device::Cpu())
-                      .value()));
-  }
-
   void MakeScheduler(SchedulerConfig config) {
-    if (pool_ == nullptr) MakePool(64);
-    scheduler_ = std::make_unique<Scheduler>(config, CacheConfig{}, pool_.get(),
-                                          std::vector<TokenId>{kEos});
+    if (runtime_ == nullptr) runtime_ = MakeRuntime(/*prefix=*/true, /*blocks=*/64);
+    scheduler_ = std::make_unique<Scheduler>(config, std::vector<TokenId>{kEos}, *runtime_);
   }
 
-  std::unique_ptr<KvBlockPool> pool_;
+  std::unique_ptr<attn::AttentionRuntime> runtime_;
   std::unique_ptr<Scheduler> scheduler_;
 };
 
@@ -51,29 +73,31 @@ ModelRunnerOutput ResultFor(const SchedulerOutput& output, TokenId token) {
 }
 
 TEST_F(SchedulerTest, FailedAdmissionAndAbortDoNotLeakBlocks) {
-  MakePool(2);
+  runtime_ = MakeRuntime(/*prefix=*/true, /*blocks=*/2);
   MakeScheduler(SchedulerConfig{});
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, std::vector<TokenId>(12, 1))).ok());
   auto plan = scheduler_->Schedule();
   ASSERT_TRUE(plan.ok());
   EXPECT_TRUE(plan->scheduled.empty());
-  EXPECT_EQ(pool_->FreeBlocks(), 2);
+  EXPECT_EQ(runtime_->BlockPool()->FreeBlocks(), 2);
   EXPECT_EQ(scheduler_->AbortRequests({1}), std::vector<uint64_t>({1}));
-  EXPECT_EQ(pool_->FreeBlocks(), 2);
+  EXPECT_EQ(runtime_->BlockPool()->FreeBlocks(), 2);
   ASSERT_TRUE(scheduler_->AddRequest(Request(2, {1, 2, 3, 4, 5})).ok());
   auto next = scheduler_->Schedule();
   ASSERT_TRUE(next.ok());
   ASSERT_EQ(next->scheduled_new_reqs.size(), 1);
-  EXPECT_EQ(next->scheduled_new_reqs[0].block_ids.size(), 2);
+  // ceil(5 tokens / 4 per block) = 2 blocks, read from the facade.
+  EXPECT_EQ(runtime_->Cache().GroupBlocks(next->scheduled_new_reqs[0].request_id, 0).size(),
+            2u);
 }
 
 TEST_F(SchedulerTest, DestructionReleasesActiveAllocations) {
   MakeScheduler(SchedulerConfig{});
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3})).ok());
   ASSERT_TRUE(scheduler_->Schedule().ok());
-  EXPECT_LT(pool_->FreeBlocks(), pool_->NumBlocks());
+  EXPECT_LT(runtime_->BlockPool()->FreeBlocks(), runtime_->BlockPool()->NumBlocks());
   scheduler_.reset();
-  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
+  EXPECT_EQ(runtime_->BlockPool()->NumFreeBlocks(), runtime_->BlockPool()->NumBlocks());
 }
 
 TEST_F(SchedulerTest, PrefillSchedulesWholePromptAndGrantsBlocks) {
@@ -88,8 +112,8 @@ TEST_F(SchedulerTest, PrefillSchedulesWholePromptAndGrantsBlocks) {
 
   ASSERT_EQ(output->scheduled_new_reqs.size(), 1);
   EXPECT_EQ(output->scheduled_new_reqs[0].request_id, 1);
-  // ceil(5 tokens / 4 per block) = 2 blocks.
-  EXPECT_EQ(output->scheduled_new_reqs[0].block_ids.size(), 2);
+  // ceil(5 tokens / 4 per block) = 2 blocks, read from the facade.
+  EXPECT_EQ(runtime_->Cache().GroupBlocks(1, 0).size(), 2u);
 }
 
 TEST_F(SchedulerTest, DecodeStepsScheduleOneTokenEach) {
@@ -106,7 +130,7 @@ TEST_F(SchedulerTest, DecodeStepsScheduleOneTokenEach) {
   EXPECT_EQ(decode->scheduled[0].num_new_tokens, 1);
   ASSERT_EQ(decode->scheduled_cached_reqs.size(), 1);
   EXPECT_EQ(decode->scheduled_cached_reqs[0].num_computed_tokens, 4);
-  EXPECT_TRUE(decode->scheduled_cached_reqs[0].new_block_ids.empty());
+  EXPECT_EQ(runtime_->Cache().GroupBlocks(decode->scheduled[0].request_id, 0).size(), 1u);
 }
 
 TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
@@ -134,7 +158,7 @@ TEST_F(SchedulerTest, FinishesAtTokenCapAndFreesBlocks) {
   StatusOr<SchedulerOutput> drain = scheduler_->Schedule();
   ASSERT_TRUE(drain.ok());
   EXPECT_EQ(drain->finished_request_ids, std::vector<RequestId>({1}));
-  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
+  EXPECT_EQ(runtime_->BlockPool()->NumFreeBlocks(), runtime_->BlockPool()->NumBlocks());
 }
 
 TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
@@ -221,11 +245,11 @@ TEST_F(SchedulerTest, AbortFreesBlocksAndFinishesRequest) {
   ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3})).ok());
   StatusOr<SchedulerOutput> output = scheduler_->Schedule();
   ASSERT_TRUE(output.ok());
-  EXPECT_LT(pool_->FreeBlocks(), pool_->NumBlocks());
+  EXPECT_LT(runtime_->BlockPool()->FreeBlocks(), runtime_->BlockPool()->NumBlocks());
 
   EXPECT_EQ(scheduler_->AbortRequests({1}), std::vector<uint64_t>({1}));
   EXPECT_FALSE(scheduler_->HasRequests());
-  EXPECT_EQ(pool_->FreeBlocks(), pool_->NumBlocks());
+  EXPECT_EQ(runtime_->BlockPool()->NumFreeBlocks(), runtime_->BlockPool()->NumBlocks());
   std::optional<Request> aborted = scheduler_->PopFinished();
   ASSERT_TRUE(aborted.has_value());
   EXPECT_EQ(aborted->GetFinishReason(), FinishReason::kAborted);

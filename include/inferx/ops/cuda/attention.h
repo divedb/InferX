@@ -11,7 +11,8 @@ namespace inferx::ops::cuda {
 Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
-                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size);
+                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size,
+                    int64_t page_stride_elements);
 
 }  // namespace inferx::ops::cuda
 

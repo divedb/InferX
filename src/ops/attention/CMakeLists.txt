@@ -1,16 +1,20 @@
-# inferx_attn -- the unified attention architecture, host side
-# (docs/attention.md plan steps 1-2): spec vocabulary, the cache-spec
-# bridge, capability matching, and kernel-facing cache views. Kernels,
-# builders, and backends land in later plan steps.
+# inferx_attn -- the unified attention architecture (docs/attention.md):
+# spec vocabulary, cache-spec bridge, capability selection, metadata
+# builders, kernel-facing cache views, the runtime composition root, and
+# the reference + FlashInfer-backed dense backends.
 inferx_add_library(
   NAME attn
   SRCS
     cache_spec_bridge.cc
     capability.cc
     cache_view.cc
+    fill_common.cc
+    selector.cc
+    runtime.cc
+    backends/reference.cc
+    backends/flash_dense.cc
   DEPS
     inferx::core
-    inferx::cache_spec
-    inferx::kv_block_pool
-    inferx::recurrent_state_pool
+    inferx::cache_manager
+    inferx::ops
 )

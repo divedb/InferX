@@ -22,3 +22,22 @@ inferx_add_test(
   DEPS inferx::attn
   LABELS unit
 )
+inferx_add_test(
+  NAME attention_selector_test
+  SRCS attention_selector_test.cc
+  DEPS inferx::attn
+  LABELS unit
+)
+inferx_add_test(
+  NAME attention_runtime_test
+  SRCS attention_runtime_test.cc
+  DEPS inferx::attn
+  LABELS unit
+)
+inferx_add_test(
+  NAME attention_flash_gpu_test
+  SRCS attention_flash_gpu_test.cc
+  DEPS inferx::attn
+  LABELS unit
+  GPU
+)

@@ -6,11 +6,20 @@
 
 namespace inferx {
 
-Scheduler::Scheduler(SchedulerConfig config, const CacheConfig& cache,
-                     KvBlockPool* pool, std::vector<TokenId> eos_token_ids)
-    : config_(config), cache_manager_(pool, cache.enable_prefix_caching),
+Scheduler::Scheduler(SchedulerConfig config, std::vector<TokenId> eos_token_ids,
+                     attn::AttentionRuntime& attention)
+    : config_(config), attention_(&attention),
       eos_token_ids_(std::move(eos_token_ids)),
       waiting_(static_cast<size_t>(config.queue_capacity)) {}
+
+Scheduler::~Scheduler() {
+  if (attention_ == nullptr) return;
+  for (const Request& request : running_) {
+    const Status released = attention_->Cache().Release(request.GetRequestId());
+    assert(released.ok());
+    (void)released;
+  }
+}
 
 Status Scheduler::AddRequest(Request request) {
   INFERX_RETURN_IF_ERROR(request.GetSamplingParams().Validate());
@@ -32,10 +41,11 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
   // stranding KV in an unhashable partial block until the sequence finishes
   // (vLLM's block-aligned split; SGLang page-aligns chunk ends the same way).
   const auto clip_chunk = [this](int64_t base, int chunk, int total_len) -> int {
-    if (!cache_manager_.PrefixCachingEnabled()) return chunk;
+    if (!attention_->Cache().PrefixCachingEnabled()) return chunk;
     const int64_t end = base + chunk;
     if (end >= total_len) return chunk;  // The final chunk may end anywhere.
-    const int64_t aligned = end / cache_manager_.BlockSize() * cache_manager_.BlockSize();
+    const int64_t block_size = attention_->GetPlan().block_size;
+    const int64_t aligned = end / block_size * block_size;
     return aligned > base ? static_cast<int>(aligned - base) : chunk;
   };
 
@@ -54,20 +64,23 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
                                        std::min(budget, remaining_tokens), request.NumTokens())
                           : 1;
 
-    auto granted =
-        cache_manager_.Reserve(request.GetRequestId(), request.NumComputedTokens() + chunk);
-    while (!granted.ok() && PreemptNewestAfter(i, &output.preempted_request_ids)) {
-      granted =
-          cache_manager_.Reserve(request.GetRequestId(), request.NumComputedTokens() + chunk);
+    const int64_t target = request.NumComputedTokens() + chunk;
+    Status granted =
+        attention_->Cache().Reserve(request.GetRequestId(), GrowthTarget{target - chunk, target});
+    while (!granted.ok() &&
+           PreemptNewestAfter(i, &output.preempted_request_ids)) {
+      granted = attention_->Cache().Reserve(request.GetRequestId(),
+                                            GrowthTarget{target - chunk, target});
     }
     if (!granted.ok()) {
       continue;
     }
 
+    // Block tables are not mirrored into the output: the runner reads them
+    // from the facade, their single owner (docs/attention.md §8.3).
     CachedRequestUpdate update;
     update.request_id = request.GetRequestId();
-    update.new_block_ids = std::move(*granted);
-    update.num_computed_tokens = request.NumComputedTokens() + chunk;
+    update.num_computed_tokens = static_cast<int>(target);
     output.scheduled_cached_reqs.push_back(std::move(update));
 
     output.scheduled.push_back({request.GetRequestId(), chunk});
@@ -92,9 +105,11 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     // resumed victim; the cap keeps the sequence's last token recomputing
     // so its logits drive the next sample.
     const int total_tokens = request.NumTokens();
-    const CacheManager::PrefixAdoption adoption = cache_manager_.AdoptPrefix(
+    const StatusOr<CacheManager::PrefixAdoption> adopted = attention_->Cache().AdoptPrefix(
         request.GetRequestId(), request.AllTokenIds(), request.CacheSalt(), total_tokens - 1);
-    if (cache_manager_.PrefixCachingEnabled()) {
+    if (!adopted.ok()) return adopted.status();
+    const CacheManager::PrefixAdoption& adoption = *adopted;
+    if (attention_->Cache().PrefixCachingEnabled()) {
       ++stats_.prefix_queries;
       stats_.prefix_queried_tokens += total_tokens;
       if (adoption.cached_tokens > 0) {
@@ -108,13 +123,14 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
                    std::min(budget, total_tokens - static_cast<int>(adoption.cached_tokens)),
                    total_tokens);
 
-    auto granted =
-        cache_manager_.Reserve(request.GetRequestId(), adoption.cached_tokens + chunk);
+    const Status granted = attention_->Cache().Reserve(
+        request.GetRequestId(), GrowthTarget{adoption.cached_tokens,
+                                            adoption.cached_tokens + chunk});
     if (!granted.ok()) {
       // Not enough KV for even the first chunk: stop admitting this step and
       // put the request back at the head of the queue. The adoption must
       // come with it, so release the pinned blocks first.
-      const Status released = cache_manager_.Release(request.GetRequestId());
+      const Status released = attention_->Cache().Release(request.GetRequestId());
       assert(released.ok());
       (void)released;
       waiting_.PushFront(std::move(request));
@@ -125,8 +141,6 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     data.request_id = request.GetRequestId();
     data.prompt_token_ids = request.AllTokenIds();
     data.sampling_params = request.GetSamplingParams();
-    data.block_ids.assign(cache_manager_.Blocks(request.GetRequestId()).begin(),
-                          cache_manager_.Blocks(request.GetRequestId()).end());
     data.num_computed_tokens = static_cast<int>(adoption.cached_tokens);
     output.scheduled_new_reqs.push_back(std::move(data));
 
@@ -142,6 +156,19 @@ StatusOr<SchedulerOutput> Scheduler::Schedule() {
     (void)admitted;
     running_index_[request.GetRequestId()] = running_.size();
     running_.push_back(std::move(request));
+  }
+
+  // The immutable snapshot the runner executes against: each scheduled
+  // request's whole per-group table, in batch order. Publishing after all
+  // reserves means the facade is not read again while a step runs async.
+  for (const ScheduledRequest& scheduled : output.scheduled) {
+    for (std::uint16_t g = 0; g < attention_->NumGroups() &&
+                             g < static_cast<std::uint16_t>(kMaxSchedulerGroups);
+         ++g) {
+      const auto blocks = attention_->Cache().GroupBlocks(scheduled.request_id, g);
+      auto& table = output.group_block_ids[g];
+      table.insert(table.end(), blocks.begin(), blocks.end());
+    }
   }
 
   if (!output.IsEmpty()) {
@@ -171,8 +198,8 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
     // are the full sequence minus the token sampled below -- including a
     // resumed victim's retained output, whose KV the replay recomputed.
     {
-      const Status published =
-          cache_manager_.PublishComputed(id, request.Prompt(), request.Output());
+      const Status published = attention_->Cache().PublishComputed(
+          id, request.Prompt(), request.Output(), request.NumComputedTokens());
       if (!published.ok()) return published;
     }
 
@@ -213,7 +240,7 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
       continue;
     }
     const size_t index = it->second;
-    INFERX_RETURN_IF_ERROR(cache_manager_.Release(id));
+    INFERX_RETURN_IF_ERROR(attention_->Cache().Release(id));
     INFERX_RETURN_IF_ERROR(request.Finish(reason));
     pending_finish_notifications_.push_back(id);
     finished_.push_back(std::move(running_[index]));
@@ -240,7 +267,7 @@ bool Scheduler::PreemptNewestAfter(size_t keep, std::vector<RequestId>* preempte
 
   // Cached prefix blocks survive the release: preemption costs the private
   // tail, not the shared prefix, and resumption re-adopts what it can.
-  const Status released = cache_manager_.Release(victim.GetRequestId());
+  const Status released = attention_->Cache().Release(victim.GetRequestId());
   assert(released.ok());
   (void)released;
   // Admission marked the victim kRunning, so the transition is legal; the
@@ -280,7 +307,7 @@ std::vector<uint64_t> Scheduler::AbortRequests(absl::Span<const uint64_t> reques
     }
     const size_t index = it->second;
     Request& request = running_[index];
-    const Status released = cache_manager_.Release(id);
+    const Status released = attention_->Cache().Release(id);
     assert(released.ok());
     (void)released;
     const Status finished = request.Finish(FinishReason::kAborted);
@@ -304,7 +331,7 @@ SchedulerStats Scheduler::Stats() const {
   SchedulerStats stats = stats_;
   stats.num_running = static_cast<int>(running_.size());
   stats.num_waiting = static_cast<int>(waiting_.size());
-  stats.kv_cache_usage = cache_manager_.Usage();
+  stats.kv_cache_usage = attention_->Cache().Usage();
   return stats;
 }
 

@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "inferx/ops/elementwise.h"
+#include "inferx/ops/attention/types.h"
 #include "inferx/ops/rotary.h"
 
 namespace inferx {
@@ -25,17 +26,24 @@ StatusOr<LlamaAttention> LlamaAttention::Create(const LlamaConfig& config,
       Linear o_proj, Linear::Create(local_heads * head_dim, config.hidden_size, dtype,
                                     device));
 
-  Attention::Geometry geometry;
-  geometry.num_heads = local_heads;
-  geometry.num_kv_heads = local_kv_heads;
-  geometry.head_dim = head_dim;
-  geometry.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-  geometry.sliding_window = config.sliding_window;
-  INFERX_ASSIGN_OR_RETURN(Attention core, Attention::Create(geometry));
-
   return LlamaAttention(std::move(qkv_proj), RotaryEmbedding(config.rope),
-                        std::move(o_proj), std::move(core), local_heads, local_kv_heads,
-                        head_dim, parallel.tensor_parallel_rank);
+                        std::move(o_proj), local_heads, local_kv_heads, head_dim,
+                        config.sliding_window, parallel.tensor_parallel_rank);
+}
+
+attn::AttentionSpec LlamaAttention::Spec() const {
+  attn::AttentionSpec spec;
+  spec.params = attn::DenseParams{.num_q_heads = static_cast<std::int32_t>(local_heads_),
+                                  .num_kv_heads = static_cast<std::int32_t>(local_kv_heads_),
+                                  .head_dim = static_cast<std::int32_t>(head_dim_)};
+  spec.q_dtype = DataType::kBFloat16;
+  spec.kv_dtype = DataType::kBFloat16;
+  spec.kv_layout = attn::KvPageLayout::kKvPlanarNhd;  // What WritePagedKv writes.
+  if (sliding_window_ > 0) {
+    spec.mask = attn::MaskSpec{attn::MaskKind::kSlidingWindow,
+                               static_cast<std::int32_t>(sliding_window_), 0};
+  }
+  return spec;
 }
 
 Status LlamaAttention::Forward(ForwardContext& ctx, const Tensor& positions,
@@ -67,11 +75,25 @@ Status LlamaAttention::Forward(ForwardContext& ctx, const Tensor& positions,
   INFERX_RETURN_IF_ERROR(
       ops::ApplyRope(ctx.op, q_by_head, k_by_head, positions, rope_.Params()));
 
+  // Attention runs through the bound op: [T, H, D] views over the rank-2
+  // projections (no copies), fused KV write plus attention per the kernel.
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor q_by_dim, q.Reshape(Shape({tokens, local_heads_, head_dim_})));
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor k_by_dim, k.Reshape(Shape({tokens, local_kv_heads_, head_dim_})));
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor v_by_dim, v.Reshape(Shape({tokens, local_kv_heads_, head_dim_})));
   INFERX_ASSIGN_OR_RETURN(Tensor attn_out,
                           Tensor::Empty(dtype, Shape({tokens, q_width}), &ctx.scratch));
+  INFERX_ASSIGN_OR_RETURN(
+      Tensor out_by_dim, attn_out.Reshape(Shape({tokens, local_heads_, head_dim_})));
+
+  attn::Inputs in;
+  in.q = attn::ViewOf(q_by_dim);
+  in.k = attn::ViewOf(k_by_dim);
+  in.v = attn::ViewOf(v_by_dim);
   INFERX_RETURN_IF_ERROR(
-      core_.Forward(ctx.op, ctx.attn, ctx.kv, ctx.layer, ctx.plan, positions, q, k,
-                     v, attn_out));
+      ctx.Attention(ctx.layer).Forward(ctx.step, in, attn::ViewOf(out_by_dim)));
 
   INFERX_RETURN_IF_ERROR(o_proj_.Forward(ctx.op, attn_out, out));
   return ctx.comm.AllReduceSum(ctx.op, out);

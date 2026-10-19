@@ -1671,25 +1671,49 @@ attention backend selection failed for layer 17
 5. Provide `WorkspaceBytes` as a true upper bound for the configured `EngineLimits`.
 6. Ship a test against the reference backend (§15).
 
-**Source layout** (mirrors the tree's `include/inferx/<subsys>` + `src/<subsys>` split; the host-side files below are **implemented and tested** — plan steps 1–2 plus the §6.4 metadata types):
+**Source layout** (mirrors the tree's `include/inferx/<subsys>` + `src/<subsys>` split; everything below the "plan steps 3+" markers is **implemented and tested** — steps 1–2 plus the executable core of steps 3–4):
 
 ```
 include/inferx/ops/attention/
   types.h  spec.h  cache_spec_bridge.h  capability.h  metadata.h  cache_view.h
-  kernel.h  builder.h  backend.h  registry.h  op.h  runtime.h        # plan steps 3+
+  kernel.h  builder.h  backend.h  registry.h  op.h  runtime.h
 src/ops/attention/
-  cache_spec_bridge.cc  capability.cc  cache_view.cc                  # implemented
-  selector.cc  runtime.cc  common/ backends/                          # plan steps 3+
-tests/unit/attn/   (see §15; four suites, 26 tests, green)
+  cache_spec_bridge.cc  capability.cc  cache_view.cc  fill_common.cc
+  selector.cc  runtime.cc
+  backends/ reference.{h,cc}  flash_dense.{h,cc}
+tests/unit/attn/   (see §15; seven suites, 31+ tests, green)
 docs/attention.md
 ```
 
-Notes on the implemented slice: the vocabulary enums `GraphSupport` and
-`KvUpdateMode` live in `types.h` (they predate the kernel/builder headers
-that the doc's first sketch placed them in); `Capability` carries them by
-value, so its table stays a constexpr-friendly aggregate. The KV cache
-pieces live where they already are (`include/inferx/cache/`, `src/cache/`);
-attention adds nothing there.
+Landed with the executable core: `Kernel`/`MetadataBuilder` (with
+`FillCommonMetadata` + `MakeCommonBuilder`), `Backend`/`BackendRegistry`/
+`BackendSelector` (deterministic priority + forced selection + rejection
+trails), `AttentionOp`, and `AttentionRuntime` - the full composition root
+(specs -> `BuildCacheSpec` -> `PlanCacheGroups` -> pools -> `CacheManager`
+-> selection -> kernels/builders -> ops -> `BeginStep`). Backends:
+**reference** (CPU oracle; full dense family, every mask, fused KV write)
+and **flash_dense** (CUDA, reusing the vendored FlashInfer wrappers
+`ops::WritePagedKv` + `ops::PagedAttention` over the byte-denominated
+pool via `CacheView`, physical page strides plumbed through per the
+2026-10-19 fix in docs/bug.md). The GPU differential runs ungated and
+parameterized (prefill 5/20/32/48 plus a qwen-geometry long-decode case).
+**The legacy `models::Attention` layer is deleted** and every call site
+migrated (2026-10-19, second pass): `ForwardContext` carries the
+StepContext plus a span of per-layer ops; Qwen3/Llama/Qwen3-MoE layers,
+towers, and causal LMs derive `ModelSpec::cache` from their attention
+specs through `attn::BuildCacheRequirements`; `ModelRunner` owns the
+runtime (profile step + RunStep through BatchDesc/BeginStep); the
+scheduler, executor, gateway, bench, dist worker, replay diagnostic, and
+all tests borrow the facade. `SchedulerOutput` republishes per-group
+block-table snapshots - the runner never reads the live facade for an
+in-flight step (§9's immutable-snapshot rule; the async tensor-parallel
+executor relies on it). Remaining known divergences: the Qwen3 golden
+trace (242 bf16-ulps at one decode step; 32667 before the snapshot fix)
+and half the vLLM parity probes' serving path drift at block-crossing
+decodes - both compare against traces recorded by the pre-refactor
+engine; the attention subsystem itself verifies clean against float
+oracles at the exact qwen geometry (two dedicated GPU differentials), and
+single-chunk recompute matches vLLM to 1-2 ulps.
 
 ---
 
@@ -1731,7 +1755,8 @@ attention adds nothing there.
 The cache subsystem (old plan step 2) is **done and tested**; the plan now starts from selection and metadata, always landing behind the same `AttentionOp` interface:
 
 1. **(done)** `types.h`, `spec.h`, `cache_spec_bridge.h` (`BuildCacheSpec`, `NeedsCache`, `CacheBytesPerToken`), `capability.h`, `CheckCapability()` — with the full unit-test table (no GPU needed). Landed under `include/inferx/ops/attention/` + `src/ops/attention/`, target `inferx::attn`.
-2. **(done)** `cache_view.h` bindings over CPU pools (`BindTokenWiseView` / `BindRecurrentView`) + tests, including the pool-vs-spec byte cross-check; `metadata.h` (BatchDesc/GroupMeta/StepContext) landed as types. GPU variants land with step 3.
+2. **(done)** `cache_view.h` bindings over CPU pools (`BindTokenWiseView` / `BindRecurrentView`) + tests, including the pool-vs-spec byte cross cross-check; `metadata.h` (BatchDesc/GroupMeta/StepContext) landed as types.
+2a. **(done, 2026-10-19)** The executable core: `kernel.h`, `builder.h` (+`FillCommonMetadata`), `backend.h`, `registry.h` + selector, `op.h`, `runtime.{h,cc}`; reference backend (CPU oracle, dense family × all masks, fused write) and flash_dense backend (CUDA, FlashInfer wrappers). End-to-end CPU tests: prefill/decode/mixed, MHA/MQA/GQA, window roll-off, prefix adoption through the facade. The flash_dense prefill→decode regression now runs by default (fix and validation in [bug.md](bug.md)).
 3. `metadata.h` (`BatchDesc`, `GroupMeta`, `StepContext`) + `FillCommonMetadata()` generalizing the runner's existing single-group build; `kv_write` reusing `ops::WritePagedKv`; reference backend. First end-to-end: dense GQA, eager, decode + prefill, over the implemented `CacheManager`.
 4. `FlashDense` backend (mixed batches, fused or separate KV write), migrating `models::Attention` callers onto `AttentionOp`.
 5. CUDA Graph path: persistent buffers, `BuildForCapture`, padding with `kNullBlockId`, graph equivalence tests.

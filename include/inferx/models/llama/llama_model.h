@@ -12,6 +12,7 @@
 #include "inferx/models/llama/llama_config.h"
 #include "inferx/models/llama/llama_decoder_layer.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/weight_loader.h"
 
 namespace inferx {
@@ -31,6 +32,9 @@ class LlamaModel {
                  Tensor& residual, Tensor& out) const;
 
   Status BindWeights(const std::string& prefix, WeightMap& weights);
+
+  /// \brief One attention spec per decoder layer, in tower order.
+  [[nodiscard]] std::vector<attn::AttentionSpec> AttentionSpecs() const;
 
  private:
   LlamaModel(std::vector<LlamaDecoderLayer> layers, RMSNorm norm, int64_t hidden_size)

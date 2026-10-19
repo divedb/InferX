@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <array>
 #include <vector>
 
 #include "absl/types/span.h"
@@ -40,22 +41,28 @@ struct NewRequestData {
   RequestId request_id = 0;  ///< The request being introduced.
   absl::Span<const TokenId> prompt_token_ids;  ///< Replay sequence, borrowed.
   sampling::SamplingParams sampling_params;  ///< The request's sampling parameters.
-  std::vector<int32_t> block_ids;  ///< Initial KV block table, logical order.
   int num_computed_tokens = 0;     ///< Sequence tokens already computed.
 };
 
 /// \brief The diff for a request the model runner has seen before.
 struct CachedRequestUpdate {
   RequestId request_id = 0;  ///< The request being updated.
-  /// \brief Blocks granted since the runner last saw this request.
-  std::vector<int32_t> new_block_ids;
   int num_computed_tokens = 0;  ///< End position including this step's allocation.
 };
 
 /// \brief The scheduler's plan for one engine step.
+/// \brief Flattened per-group block tables for the scheduled batch, in
+///        batch order: the scheduler's immutable snapshot at publication
+///        (docs/attention.md §9). The runner never reads the live facade
+///        for a step it is executing.
+inline constexpr int kMaxSchedulerGroups = 8;
+
 struct SchedulerOutput {
   /// \brief This step's allocations, in batch order.
   std::vector<ScheduledRequest> scheduled;
+  /// \brief Per cache group: every scheduled request's whole table,
+  ///        concatenated in batch order.
+  std::array<std::vector<int32_t>, kMaxSchedulerGroups> group_block_ids;
   /// \brief Requests the model runner meets for the first time this step.
   std::vector<NewRequestData> scheduled_new_reqs;
   /// \brief Requests already known to the runner, with their diffs.

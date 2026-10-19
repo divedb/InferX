@@ -15,14 +15,16 @@ __global__ void WritePagedKvVectorKernel(const uint4* k, const uint4* v,
                                         const int32_t* positions, const int32_t* batches,
                                         const int32_t* indptr, const int32_t* indices,
                                         uint4* key_cache, uint4* value_cache,
-                                        int vectors_per_token, int block_size, int64_t count) {
+                                        int vectors_per_token, int block_size, int64_t count,
+                                        int64_t page_stride_vectors) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= count) return;
   const int token = i / vectors_per_token;
   const int column = i % vectors_per_token;
   const int pos = positions[token];
   const int block = indices[indptr[batches[token]] + pos / block_size];
-  const int64_t dst = (int64_t(block) * block_size + pos % block_size) * vectors_per_token + column;
+  const int64_t dst = int64_t(block) * page_stride_vectors +
+                      (pos % block_size) * vectors_per_token + column;
   key_cache[dst] = k[i];
   value_cache[dst] = v[i];
 }
@@ -37,19 +39,20 @@ __global__ void WritePagedKvKernel(const __nv_bfloat16* __restrict__ k,
                                    const int32_t* __restrict__ kv_indices,
                                    __nv_bfloat16* __restrict__ key_cache,
                                    __nv_bfloat16* __restrict__ value_cache, int kv_heads,
-                                   int head_dim, int64_t block_size) {
+                                   int head_dim, int64_t block_size,
+                                   int64_t page_stride_elements) {
   const int token = blockIdx.x;
   const int head = blockIdx.y;
   const int seq = batch_indices[token];
   const int32_t pos = positions[token];
   const int block = kv_indices[kv_indptr[seq] + pos / block_size];
   const int slot = pos % block_size;
-  const int64_t cache_row =
-      ((static_cast<int64_t>(block) * block_size) + slot) * kv_heads + head;
+  const int64_t cache_offset = static_cast<int64_t>(block) * page_stride_elements +
+                               (slot * kv_heads + head) * head_dim;
   const __nv_bfloat16* src_k = k + (static_cast<int64_t>(token) * kv_heads + head) * head_dim;
   const __nv_bfloat16* src_v = v + (static_cast<int64_t>(token) * kv_heads + head) * head_dim;
-  __nv_bfloat16* dst_k = key_cache + cache_row * head_dim;
-  __nv_bfloat16* dst_v = value_cache + cache_row * head_dim;
+  __nv_bfloat16* dst_k = key_cache + cache_offset;
+  __nv_bfloat16* dst_v = value_cache + cache_offset;
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
     dst_k[i] = src_k[i];
     dst_v[i] = src_v[i];
@@ -61,13 +64,17 @@ __global__ void WritePagedKvKernel(const __nv_bfloat16* __restrict__ k,
 Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
                     const Tensor& positions, const Tensor& batch_indices,
                     const Tensor& kv_indptr, const Tensor& kv_indices,
-                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size) {
+                    const Tensor& key_cache, const Tensor& value_cache, int64_t block_size,
+                    int64_t page_stride_elements) {
   INFERX_RETURN_IF_ERROR(ctx.Runtime().Activate());
+  if (page_stride_elements == 0) {
+    page_stride_elements = block_size * k.Dim(1);
+  }
   static const bool scalar_write = [] {
     const char* value = std::getenv("INFERX_DIAGNOSTIC_SCALAR_KV");
     return value != nullptr && std::string_view(value) == "1";
   }();
-  if (!scalar_write && k.Dim(0) >= 32 && k.Dim(1) % 8 == 0 &&
+  if (!scalar_write && k.Dim(0) >= 32 && k.Dim(1) % 8 == 0 && page_stride_elements % 8 == 0 &&
       reinterpret_cast<uintptr_t>(k.Data()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(v.Data()) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(key_cache.Data()) % 16 == 0 &&
@@ -79,7 +86,7 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
         kv_indptr.DataAs<int32_t>(), kv_indices.DataAs<int32_t>(),
         const_cast<uint4*>(static_cast<const uint4*>(key_cache.Data())),
         const_cast<uint4*>(static_cast<const uint4*>(value_cache.Data())),
-        k.Dim(1) / 8, block_size, count);
+        k.Dim(1) / 8, block_size, count, page_stride_elements / 8);
     return CudaStatus(cudaGetLastError(), "vector write paged kv launch");
   }
   const dim3 grid(static_cast<uint32_t>(k.Dim(0)), static_cast<uint32_t>(key_cache.Dim(2)));
@@ -93,7 +100,8 @@ Status WritePagedKv(OpContext& ctx, const Tensor& k, const Tensor& v,
       static_cast<const int32_t*>(kv_indices.Data()),
       const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(key_cache.Data())),
       const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(value_cache.Data())),
-      static_cast<int>(key_cache.Dim(2)), static_cast<int>(key_cache.Dim(3)), block_size);
+      static_cast<int>(key_cache.Dim(2)), static_cast<int>(key_cache.Dim(3)), block_size,
+      page_stride_elements);
   return CudaStatus(cudaGetLastError(), "write paged kv launch");
 }
 

@@ -14,6 +14,7 @@
 #include "inferx/models/llama/llama_model.h"
 #include "inferx/models/load_options.h"
 #include "inferx/models/model.h"
+#include "inferx/ops/attention/spec.h"
 #include "inferx/models/model_spec.h"
 #include "inferx/models/weight_loader.h"
 
@@ -32,6 +33,9 @@ class LlamaForCausalLM final : public Model, public WeightBindable {
                                                             Device device);
 
   const ModelSpec& GetModelSpec() const override { return spec_; }
+  std::vector<attn::AttentionSpec> GetAttentionSpecs() const override {
+    return model_.AttentionSpecs();
+  }
   Status LoadWeights(CheckpointReader& checkpoint) override;
   Status Forward(ForwardContext& ctx, const StepInputs& inputs, Tensor& hidden) const override;
   Status ComputeLogits(ForwardContext& ctx, const Tensor& hidden, const Tensor& rows,

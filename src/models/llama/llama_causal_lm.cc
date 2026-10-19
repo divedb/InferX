@@ -1,6 +1,7 @@
 #include "inferx/models/llama/llama_causal_lm.h"
 
 #include <utility>
+#include "inferx/ops/attention/cache_spec_bridge.h"
 
 #include "inferx/ops/gather.h"
 
@@ -35,7 +36,12 @@ StatusOr<std::unique_ptr<LlamaForCausalLM>> LlamaForCausalLM::Create(
   spec.tie_word_embeddings = config.tie_word_embeddings;
   spec.dtype = dtype;
   spec.device = device;
-  spec.state.paged_kv.assign(config.num_hidden_layers, config.KvLayoutFor(tp));
+  // Cache requirements derive from the attention specs (single source of
+  // truth, docs/attention.md §5.3).
+  std::vector<attn::AttentionSpec> specs = model.AttentionSpecs();
+  INFERX_ASSIGN_OR_RETURN(CacheRequirements requirements,
+                          attn::BuildCacheRequirements(specs));
+  spec.cache = std::move(requirements);
 
   return std::unique_ptr<LlamaForCausalLM>(
       new LlamaForCausalLM(std::move(embed_tokens), std::move(model), std::move(lm_head),

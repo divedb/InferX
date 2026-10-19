@@ -7,12 +7,12 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "inferx/cache/cache_manager.h"
-#include "inferx/config/cache_config.h"
+#include "inferx/config/scheduler_config.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/engine/request.h"
 #include "inferx/engine/request_queue.h"
 #include "inferx/engine/scheduler_output.h"
+#include "inferx/ops/attention/runtime.h"
 
 namespace inferx {
 
@@ -53,18 +53,25 @@ struct SchedulerStats {
 /// touches tensors.
 class Scheduler {
  public:
-  /// \brief Wires the scheduler to the KV block pool.
+  /// \brief Wires the scheduler to the attention runtime's cache facade.
   ///
-  /// \param config       Policy knobs.
-  /// \param cache        Cache policy; enables prefix caching when
-  ///                     cache.enable_prefix_caching is set.
-  /// \param pool         The KV block pool to allocate from; must outlive the
-  ///                     scheduler.
+  /// The facade is the single owner of request lifecycle state (block
+  /// tables, prefix adoption, publication); the scheduler drives it from
+  /// its own thread (docs/attention.md §9).
+  ///
+  /// \param config        Policy knobs.
   /// \param eos_token_ids Model's declared end-of-sequence tokens used for
-  ///                     finish detection; generation halts on any (requests
-  ///                     may override via ignore_eos).
-  Scheduler(SchedulerConfig config, const CacheConfig& cache, KvBlockPool* pool,
-            std::vector<TokenId> eos_token_ids);
+  ///                      finish detection; generation halts on any (requests
+  ///                      may override via ignore_eos).
+  /// \param attention     The runner's attention runtime; must outlive the
+  ///                      scheduler.
+  Scheduler(SchedulerConfig config, std::vector<TokenId> eos_token_ids,
+            attn::AttentionRuntime& attention);
+
+  /// \brief Releases every registered request's cache holdings. The facade
+  /// outlives the scheduler (the runner owns both), so outstanding
+  /// requests must be handed back here, not by facade destruction.
+  ~Scheduler();
 
   /// \brief Admits a request to the waiting queue.
   ///
@@ -110,7 +117,8 @@ class Scheduler {
 
  private:
   SchedulerConfig config_;
-  CacheManager cache_manager_;
+  /// The cache facade, borrowed from the runner's attention runtime.
+  attn::AttentionRuntime* attention_;
   std::vector<TokenId> eos_token_ids_;
 
   RequestQueue waiting_;

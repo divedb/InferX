@@ -29,6 +29,8 @@ struct BatchDesc {
   std::int32_t num_decodes = 0, num_decode_tokens = 0;
   std::int32_t num_prefills = 0, num_prefill_tokens = 0;
   std::int32_t max_query_len = 0, max_seq_len = 0;
+  /// The cache plan's block size (metadata builders need it).
+  std::int32_t block_size = 0;
   /// All requests share one query_len (graph-friendly).
   bool uniform_query_len = false;
   /// [num_reqs].
@@ -95,6 +97,9 @@ static_assert(std::is_trivially_copyable_v<GroupMeta>);
 /// \brief Passed to every layer of one step. Built once per step.
 struct StepContext {
   ops::OpContext* ctx = nullptr;
+  /// The batch this step was built from; host-side mirror for planners.
+  /// Null under graph replay. Must outlive the step's kernels.
+  const BatchDesc* desc = nullptr;
   std::array<GroupMeta, kMaxCacheGroups> groups{};
   std::uint16_t num_groups = 0;
   WorkspaceRef workspace{};
