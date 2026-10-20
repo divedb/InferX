@@ -28,7 +28,7 @@ Concretely:
    (full attention, sliding window, recurrent state), and a `CacheCoordinator`
    that reconciles cache hits across groups for hybrid models.
 3. Scope for this design: one GPU rank's local view (tensor-parallel ranks
-   already share logical block ids through `ModelExecutor::KvPool`), CPU pools
+   already share logical block ids through `ModelRunner::Attention`), CPU pools
    so all bookkeeping is unit-testable, no KV connectors or offload, no
    per-group page sizes, no dynamic pool growth. All are future extension
    points (§9), none are silently implied.
@@ -182,7 +182,7 @@ copies; §9 records which of them are deliberate non-goals for now.
 | `CacheManager` | `src/cache/cache_manager.cc` | Per-request logical allocations; `AdoptPrefix` / `PublishComputed` / `Reserve` / `Release` / `Fork` / `ResetPrefixCache` |
 | `RecurrentStatePool` | `src/cache/recurrent_state_pool.cc` | Fixed-slot per-layer state regions (delta-rule + conv), stream-ordered `ResetSlot` — **referenced by nothing** (T04 P-07: R) |
 | Scheduler driving | `src/engine/scheduler.cc:58,95,112,117` | Reserve per step, adopt at admission, publish on chunk completion, release on finish/preempt/abort |
-| Runner flattening | `src/models/model_runner.cc` (`RunStep`) | Per-step flat CSR (`kv_indices`, `kv_indptr`, `last_page_len`) + per-layer cache views via `ForwardContext` |
+| Runner flattening | `src/engine/model_runner.cc` (`RunStep`) | Per-step flat CSR (`kv_indices`, `kv_indptr`, `last_page_len`) + per-layer cache views via `ForwardContext` |
 | Attention kernels | `src/ops/attention.cc`, `flash_attention.cc`, `cuda/*` | FlashInfer fast path (incl. `window_left`), generic fallback (any GQA ratio, sinks, any head dim), `AssembleMlaCaches`, full GDN op set — MLA/GDN unwired |
 
 ### 3.2 Gaps this design closes
@@ -265,7 +265,7 @@ ModelConfig ──family config──> CacheRequirements (per-layer NoCache / Ca
 
 Ownership: `CacheManager` owns the coordinator, which owns the managers.
 Managers borrow the pools (`KvBlockPool*`, `RecurrentStatePool*`), which the
-`ModelRunner`/`ModelExecutor` owns today — unchanged. All pointers
+`ModelRunner` owns today — unchanged. All pointers
 non-owning; lifetimes bound to the scheduler's single thread.
 
 ### 4.3 Cache specification and grouping

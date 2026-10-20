@@ -4,7 +4,6 @@
 # 
 # This file includes the relevant testing commands required for 
 # testing this directory and lists subdirectories to be tested as well.
-subdirs("src/kvc")
 subdirs("third_party/abseil-cpp")
 subdirs("third_party/mimalloc")
 subdirs("third_party/nlohmann_json")
@@ -18,5 +17,4 @@ subdirs("integrations/tokenizers")
 subdirs("src")
 subdirs("apps")
 subdirs("adapters/inferx")
-subdirs("tests/kvc")
 subdirs("tests")

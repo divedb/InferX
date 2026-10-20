@@ -8,7 +8,7 @@
 #include "inferx/core/logging.h"
 #include "inferx/engine/request.h"
 #include "inferx/engine/scheduler.h"
-#include "inferx/models/model_runner.h"
+#include "inferx/engine/model_runner.h"
 #include "inferx/sampling/sampling_params.h"
 
 namespace inferx {
@@ -43,7 +43,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
   // parallel config names this worker's rank. Together they load exactly
   // this rank's weight shards.
   INFERX_ASSIGN_OR_RETURN(auto runner,
-                          models::ModelRunner::Create(options.model, options.cache,
+                          ModelRunner::Create(options.model, options.cache,
                                               options.scheduler, options.execution,
                                               options.parallel));
   const auto& checkpoint = runner->GetModelSpec();
@@ -103,7 +103,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels) 
     auto plan = scheduler.Schedule();
     if (!plan.ok()) return fail(plan.status().message());
     if (plan->scheduled.empty()) continue;
-    auto result = runner->Run(*plan);
+    auto result = runner->ExecuteModel(*plan);
     if (!result.ok()) return fail(result.status().message());
     if (const Status updated = scheduler.UpdateFromOutput(*plan, *result);
         !updated.ok()) {

@@ -5,6 +5,7 @@
 /build-unit/
 /build-debug/
 /build-rel/
+/build-dbg/
 compile_commands.json
 
 # Local editor state

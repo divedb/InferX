@@ -1,4 +1,4 @@
-#include "inferx/models/input_batch.h"
+#include "inferx/engine/input_batch.h"
 
 #include <algorithm>
 #include <cstring>
@@ -6,11 +6,6 @@
 #include <utility>
 
 namespace inferx {
-namespace models {
-
-// NOTE: Status construction below assumes free helpers InvalidArgument(),
-// AlreadyExists(), NotFound(), ResourceExhausted() and OkStatus() in
-// inferx/core/status.h. Adjust to the project's actual factory names.
 
 InputBatch::InputBatch(int max_num_reqs, int max_model_len)
     : max_num_reqs_(max_num_reqs),
@@ -26,13 +21,18 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len)
 }
 
 Status InputBatch::Add(const NewRequest& req) {
+  if (req.id == kFreeRow) return InvalidArgumentError("request id is reserved for free rows");
   if (id_to_row_.count(req.id) != 0) {
-    return AlreadyExists("request " + std::to_string(req.id) + " is already in the batch");
+    return absl::AlreadyExistsError("request " + std::to_string(req.id) +
+                                    " is already in the batch");
   }
   if (static_cast<int>(req.prompt_tokens.size()) > max_model_len_) {
-    return InvalidArgument("prompt of request " + std::to_string(req.id) +
-                           " exceeds max_model_len");
+    return InvalidArgumentError("prompt of request " + std::to_string(req.id) +
+                                " exceeds max_model_len");
   }
+
+  if (req.num_computed < 0 || req.num_computed > static_cast<int>(req.prompt_tokens.size()))
+    return InvalidArgumentError("invalid computed token count");
 
   int row;
   if (!free_rows_.empty()) {
@@ -43,7 +43,7 @@ Status InputBatch::Add(const NewRequest& req) {
     row = NumRows();
     row_to_id_.push_back(kFreeRow);
   } else {
-    return ResourceExhausted("input batch is full");
+    return ResourceExhaustedError("input batch is full");
   }
 
   const int n = static_cast<int>(req.prompt_tokens.size());
@@ -110,9 +110,9 @@ void InputBatch::Condense() {
 
 Status InputBatch::AppendToken(RequestId id, TokenId token) {
   auto row = RowOf(id);
-  if (!row) return NotFound("request " + std::to_string(id) + " is not in the batch");
+  if (!row) return NotFoundError("request " + std::to_string(id) + " is not in the batch");
   if (num_tokens_[*row] >= max_model_len_) {
-    return ResourceExhausted("request " + std::to_string(id) + " reached max_model_len");
+    return ResourceExhaustedError("request " + std::to_string(id) + " reached max_model_len");
   }
   token_ids_[static_cast<int64_t>(*row) * max_model_len_ + num_tokens_[*row]] = token;
   ++num_tokens_[*row];
@@ -121,7 +121,9 @@ Status InputBatch::AppendToken(RequestId id, TokenId token) {
 
 Status InputBatch::SetNumComputed(RequestId id, int num_computed) {
   auto row = RowOf(id);
-  if (!row) return NotFound("request " + std::to_string(id) + " is not in the batch");
+  if (!row) return NotFoundError("request " + std::to_string(id) + " is not in the batch");
+  if (num_computed < 0 || num_computed > num_tokens_[*row])
+    return InvalidArgumentError("invalid computed token count");
   num_computed_[*row] = num_computed;
   return OkStatus();
 }
@@ -132,5 +134,4 @@ std::optional<int> InputBatch::RowOf(RequestId id) const {
   return it->second;
 }
 
-}  // namespace models
 }  // namespace inferx

@@ -1,0 +1,2707 @@
+diff --git a/include/inferx/dist/worker_main.h b/include/inferx/dist/worker_main.h
+index e5965ed..1c6e721 100644
+--- a/include/inferx/dist/worker_main.h
++++ b/include/inferx/dist/worker_main.h
+@@ -25,7 +25,7 @@ struct WorkerOptions {
+ };
+ 
+ /// \brief Runs the worker until a shutdown message: builds the rank-local
+-///        engine (scheduler + models::ModelRunner on this rank's device), posts
++///        engine (scheduler + ModelRunner on this rank's device), posts
+ ///        Ready, then alternates between draining generation requests and
+ ///        stepping the scheduler, streaming generated token ids and
+ ///        terminal events back over the events channel.
+diff --git a/include/inferx/engine/input_batch.h b/include/inferx/engine/input_batch.h
+index 3c762d7..e468a58 100644
+--- a/include/inferx/engine/input_batch.h
++++ b/include/inferx/engine/input_batch.h
+@@ -1,5 +1,5 @@
+-#ifndef INFERX_MODELS_INPUT_BATCH_H_
+-#define INFERX_MODELS_INPUT_BATCH_H_
++#ifndef INFERX_ENGINE_INPUT_BATCH_H_
++#define INFERX_ENGINE_INPUT_BATCH_H_
+ 
+ #include <cstdint>
+ #include <optional>
+@@ -11,7 +11,6 @@
+ #include "inferx/sampling/sampler.h"
+ 
+ namespace inferx {
+-namespace models {
+ 
+ /// \brief Persistent, row-oriented per-request state for one rank.
+ ///
+@@ -50,7 +49,7 @@ class InputBatch {
+   void Condense();
+ 
+   /// \brief Appends an accepted token (sampled locally or received from
+-  ///        the driver rank via SchedulerOutput).
++  ///        the driver rank after a group execution).
+   Status AppendToken(RequestId id, TokenId token);
+   Status SetNumComputed(RequestId id, int num_computed);
+ 
+@@ -92,7 +91,6 @@ class InputBatch {
+   std::vector<int64_t> rng_offset_;
+ };
+ 
+-}  // namespace models
+ }  // namespace inferx
+ 
+-#endif  // INFERX_MODELS_INPUT_BATCH_H_
+\ No newline at end of file
++#endif  // INFERX_ENGINE_INPUT_BATCH_H_
+diff --git a/include/inferx/engine/model_executor.h b/include/inferx/engine/model_executor.h
+deleted file mode 100644
+index 92f3da6..0000000
+--- a/include/inferx/engine/model_executor.h
++++ /dev/null
+@@ -1,75 +0,0 @@
+-#ifndef INFERX_ENGINE_MODEL_EXECUTOR_H_
+-#define INFERX_ENGINE_MODEL_EXECUTOR_H_
+-
+-#include <functional>
+-#include <memory>
+-#include <vector>
+-
+-#include "inferx/config/cache_config.h"
+-#include "inferx/config/execution_config.h"
+-#include "inferx/config/model_config.h"
+-#include "inferx/config/parallel_config.h"
+-#include "inferx/config/scheduler_config.h"
+-#include "inferx/core/status.h"
+-#include "inferx/dist/comm.h"
+-#include "inferx/engine/scheduler_output.h"
+-#include "inferx/models/model_spec.h"
+-#include "inferx/models/model_runner.h"
+-
+-namespace inferx {
+-
+-/// \brief Executes one already-scheduled step across the participating
+-///        ranks. The executor is rank coordination, never a second
+-///        scheduler: admission, token budgets, and cache policy stay in
+-///        the Scheduler; each rank's models::ModelRunner owns local execution.
+-///
+-/// A local deployment uses the same object with a single rank. With no
+-/// communicator and tensor parallelism above one, the executor builds an
+-/// NCCL world across the model's devices and drives one rank-local runner
+-/// per device (multi-GPU serving is eager-only).
+-class ModelExecutor {
+- public:
+-  /// \brief Builds the executor for a model configuration: one rank-local
+-  ///        runner, or a rank group across devices for tensor parallelism.
+-  ///
+-  /// An explicit `comm` belongs to a rank-local runner and must match
+-  /// `parallel`; without one, size one uses a single-rank communicator.
+-  static StatusOr<std::unique_ptr<ModelExecutor>> Create(
+-      const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
+-      const ExecutionConfig& execution, const ParallelConfig& parallel = {},
+-      std::unique_ptr<CommBackend> comm = nullptr);
+-
+-  /// \brief Combines already-built rank runners behind one executor.
+-  ///
+-  /// Ranks must be ordered by communicator rank and use equal
+-  /// scheduling/cache capacities. Only rank zero samples; its tokens are
+-  /// applied to every rank before the next step. `abort` must release
+-  /// blocked collectives and be safe to call concurrently.
+-  static StatusOr<std::unique_ptr<ModelExecutor>> CreateGroup(
+-      std::vector<std::unique_ptr<models::ModelRunner>> ranks,
+-      std::function<void(const Status&)> abort,
+-      std::function<Status()> check_health = {});
+-
+-  ~ModelExecutor();
+-
+-  /// \brief The KV pool of the coordinating rank (the scheduler allocates
+-  ///        from it; group ranks share logical page IDs).
+-  /// \brief The rank-0 attention runtime (cache facade owner).
+-  attn::AttentionRuntime* Attention();
+-
+-  /// \brief The coordinating rank's engine-facing model facts.
+-  const models::ModelSpec& GetModelSpec() const;
+-
+-  /// \brief Executes one scheduler step across all participating ranks and
+-  ///        returns the output owner's samples.
+-  StatusOr<ModelRunnerOutput> Execute(const SchedulerOutput& output);
+-
+- private:
+-  struct Impl;
+-  explicit ModelExecutor(std::unique_ptr<Impl> impl);
+-  std::unique_ptr<Impl> impl_;
+-};
+-
+-}  // namespace inferx
+-
+-#endif  // INFERX_ENGINE_MODEL_EXECUTOR_H_
+diff --git a/include/inferx/engine/model_runner.h b/include/inferx/engine/model_runner.h
+index 977a0c4..4d4a1ee 100644
+--- a/include/inferx/engine/model_runner.h
++++ b/include/inferx/engine/model_runner.h
+@@ -1,154 +1,84 @@
+-#ifndef INFERX_MODELS_MODEL_RUNNER_H_
+-#define INFERX_MODELS_MODEL_RUNNER_H_
++#ifndef INFERX_ENGINE_MODEL_RUNNER_H_
++#define INFERX_ENGINE_MODEL_RUNNER_H_
+ 
+-#include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
++#include "inferx/config/cache_config.h"
++#include "inferx/config/execution_config.h"
++#include "inferx/config/model_config.h"
++#include "inferx/config/parallel_config.h"
+ #include "inferx/config/scheduler_config.h"
+-#include "inferx/core/device.h"
+-#include "inferx/core/device_runtime.h"
+-#include "inferx/core/status.h"
+-#include "inferx/core/stream.h"
+-#include "inferx/core/tensor.h"
+-#include "inferx/dist/comm.h"
+ #include "inferx/engine/input_batch.h"
+-#include "inferx/engine/scheduler_output.h"
+ #include "inferx/models/load_options.h"
+ #include "inferx/models/model.h"
+-#include "inferx/models/model_spec.h"
+ #include "inferx/models/scratch_arena.h"
+-#include "inferx/ops/flash_attention.h"
+-#include "inferx/ops/op_context.h"
+ #include "inferx/sampling/sampler.h"
+ 
+ namespace inferx {
+-namespace models {
++class Worker;
+ 
+-/// \brief Test/triage hooks, fixed at construction so the public API does
+-///        not grow per debug feature.
+-struct RunnerDebugOptions {
+-  /// Keep a copy of every step's [sequences, vocab] logits.
+-  bool capture_logits = false;
+-};
+-
+-/// \brief Result of the profile step, consumed by Worker to size the KV pool.
+-struct ProfileResult {
+-  int64_t weights_bytes = 0;
+-  int64_t peak_activation_bytes = 0;  ///< Scratch + library workspaces.
+-};
+-
+-/// \brief Per-step execution on one rank: model, attention, sampler, and the
+-///        persistent InputBatch.
+-///
+-/// Lifecycle is driven by Worker, in this order:
+-///   LoadModel -> ProfileRun -> InitializeKVCache -> CaptureGraphs
+-///   -> ExecuteModel (repeatedly).
+-/// Device, stream, communicator, memory budgeting, and failure poisoning
+-/// belong to Worker/Executor, not here. Scheduling and cache policy live
+-/// above; kernel dispatch lives below.
+-///
+-/// Single-threaded. Device work runs on one stream; ExecuteModel
+-/// synchronizes it before returning, so a returned ModelRunnerOutput is
+-/// complete.
++/// Executes scheduler steps. Create builds a group of rank-local Workers;
++/// each Worker drives a local runner's lifecycle and owns its device resources.
++/// Local runners own the model, attention, sampling, and persistent InputBatch.
++/// Only the driver samples; accepted tokens are applied to every peer.
+ class ModelRunner {
+  public:
+-  /// \param model          Constructed but not yet loaded.
+-  /// \param runtime        Not owned; must outlive the runner.
+-  /// \param stream         Stream all device work runs on.
+-  /// \param comm           Not owned; never null (Worker supplies
+-  ///                       SingleRankComm for a world of one).
+-  /// \param is_driver_rank True if this rank samples; other ranks only
+-  ///                       keep state for their shard.
+-  /// \param debug          Test/triage hooks.
+-  ModelRunner(std::unique_ptr<Model> model, DeviceRuntime* runtime, DeviceStream stream,
+-              CommBackend* comm, bool is_driver_rank, RunnerDebugOptions debug = {});
++  static StatusOr<std::unique_ptr<ModelRunner>> Create(
++      const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
++      const ExecutionConfig& execution, const ParallelConfig& parallel = {},
++      std::unique_ptr<CommBackend> comm = nullptr);
++  static StatusOr<std::unique_ptr<ModelRunner>> CreateGroup(
++      std::vector<std::unique_ptr<Worker>> ranks, const CacheConfig& cache,
++      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
++      std::function<void(const Status&)> abort, std::function<Status()> check_health = {});
++
++  ModelRunner(std::unique_ptr<models::Model> model, DeviceRuntime* runtime, DeviceStream stream,
++              CommBackend* comm, bool is_driver_rank);
+   ~ModelRunner();
+-
+   ModelRunner(const ModelRunner&) = delete;
+   ModelRunner& operator=(const ModelRunner&) = delete;
+ 
+-  /// \brief Loads weights onto the device.
+-  Status LoadModel(const LoadOptions& options);
+-
+-  /// \brief One max-shape forward + logits through a scratch arena, forcing
+-  ///        every scratch block and library workspace (cuBLAS, ...) to
+-  ///        materialize, and measuring peak usage. Runs against a throwaway
+-  ///        attention runtime.
+-  StatusOr<ProfileResult> ProfileRun(const SchedulerConfig& scheduler);
+-
+-  /// \brief Creates the attention runtime from the engine-computed config
+-  ///        and binds one op per attention layer.
+-  Status InitializeKVCache(const KVCacheConfig& kv, const SchedulerConfig& scheduler);
+-
+-  /// \brief Captures decode graphs. Not wired into the new model layer yet;
+-  ///        currently a no-op.
+-  Status CaptureGraphs();
+-
+-  /// \brief Applies the scheduler diff, runs forward, samples, and returns
+-  ///        samples in scheduler order.
++  // Worker-driven rank-local lifecycle, in this order.
++  Status LoadModel(const models::ModelLoadOptions& options);
++  Status ProfileRun(const SchedulerConfig& scheduler);
++  Status InitializeKVCache(int64_t kv_bytes, const CacheConfig& cache,
++                           const SchedulerConfig& scheduler);
++  Status CaptureGraphs(const ExecutionConfig& execution) const;
+   StatusOr<ModelRunnerOutput> ExecuteModel(const SchedulerOutput& step);
+ 
+-  /// \brief The attention runtime owning the cache plan, pools, facade,
+-  ///        kernels, and metadata builders (docs/attention.md §8.5).
+-  attn::AttentionRuntime* Attention() { return attention_.get(); }
+-  const ModelSpec& GetModelSpec() const { return model_->GetModelSpec(); }
+-
+-  /// \brief One [sequences, vocab] tensor per step; empty unless
+-  ///        RunnerDebugOptions::capture_logits was set.
+-  const std::vector<Tensor>& CapturedLogits() const { return captured_logits_; }
++  attn::AttentionRuntime* Attention();
++  const models::ModelSpec& GetModelSpec() const;
++  void EnableLogitsCapture();
++  const std::vector<Tensor>& CapturedLogits() const;
++  Status ApplyAcceptedTokens(RequestId id, TokenId token);
+ 
+  private:
+-  /// \brief Flattened batch tensors every layer reads for one step.
+-  struct StepInputs {
+-    Tensor token_ids;
+-    Tensor positions;
+-    Tensor slot_mapping;
+-    Tensor block_tables;
+-    Tensor query_start_loc;
+-    Tensor logits_indices;           ///< Last scheduled token of each sequence.
+-    std::vector<RequestId> req_ids;  ///< Scheduler order.
+-    std::vector<int> rows;           ///< InputBatch row per sequence.
+-    std::vector<int> num_tokens;     ///< Tokens scheduled per sequence.
+-  };
+-
+-  /// \brief Adds new requests, applies cached-request updates (including
+-  ///        tokens accepted on the driver rank, which non-driver ranks
+-  ///        receive here), and removes finished ids.
+-  Status UpdateStates(const SchedulerOutput& step);
+-
+-  /// \brief Builds token ids, positions, slot mapping, and block tables
+-  ///        from the InputBatch and the cache facade.
+-  Status PrepareInputs(const SchedulerOutput& step, StepInputs* inputs);
+-
+-  StatusOr<Tensor> Forward(const StepInputs& inputs);
+-  StatusOr<Tensor> ComputeLogits(const Tensor& hidden, const StepInputs& inputs);
+-
+-  /// \brief Samples one token per sequence and appends it to the
+-  ///        InputBatch. No-op (empty samples) on non-driver ranks.
+-  Status Sample(const Tensor& logits, const StepInputs& inputs, ModelRunnerOutput* out);
+-
+-  DeviceRuntime* runtime_;
+-  DeviceStream stream_;
+-  CommBackend* comm_;
+-  const bool is_driver_rank_;
+-  const RunnerDebugOptions debug_;
+-
+-  std::unique_ptr<Model> model_;
+-
+-  // Declaration order is the lifetime contract: ScratchArena owns both the
+-  // region and the allocator carved from it, so nothing else to keep in sync.
+-  std::unique_ptr<ScratchArena> scratch_;
++  ModelRunner();  // Group facade; local runners use the constructor above.
++  StatusOr<ModelRunnerOutput> ExecuteGroup(const SchedulerOutput& step);
++  Status RunProfileStep(Allocator& scratch, int64_t max_tokens, int64_t max_seqs);
++  Status RunStep(const SchedulerOutput& step, ModelRunnerOutput* out);
++
++  std::vector<std::unique_ptr<Worker>> workers_;
++  std::function<void(const Status&)> abort_;
++  std::function<Status()> check_health_;
++
++  DeviceRuntime* runtime_ = nullptr;  // Borrowed from Worker.
++  DeviceStream stream_{};
++  CommBackend* comm_ = nullptr;
++  bool is_driver_rank_ = false;
++  std::unique_ptr<models::Model> model_;
++  // Scratch must outlive all tensors allocated from it.
++  std::unique_ptr<models::ScratchArena> scratch_;
+   std::unique_ptr<attn::AttentionRuntime> attention_;
+   std::vector<attn::AttentionOp> ops_;
+   std::unique_ptr<ops::OpContext> op_;
+-  std::unique_ptr<sampling::Sampler> sampler_;  ///< Null unless driver rank.
+-
+-  std::unique_ptr<InputBatch> input_batch_;  ///< Sized in InitializeKVCache.
++  std::unique_ptr<sampling::Sampler> sampler_;
++  std::unique_ptr<InputBatch> input_batch_;
++  int64_t max_num_seqs_ = 0;
++  bool capture_logits_ = false;
+   std::vector<Tensor> captured_logits_;
+ };
+-
+-}  // namespace models
+ }  // namespace inferx
+-
+-#endif  // INFERX_MODELS_MODEL_RUNNER_H_
+\ No newline at end of file
++#endif  // INFERX_ENGINE_MODEL_RUNNER_H_
+diff --git a/include/inferx/engine/worker.h b/include/inferx/engine/worker.h
+index 6b4c76e..151b49c 100644
+--- a/include/inferx/engine/worker.h
++++ b/include/inferx/engine/worker.h
+@@ -1,108 +1,51 @@
+-#ifndef INFERX_MODELS_WORKER_H_
+-#define INFERX_MODELS_WORKER_H_
++#ifndef INFERX_ENGINE_WORKER_H_
++#define INFERX_ENGINE_WORKER_H_
+ 
+-#include <cstdint>
+-#include <functional>
+-#include <memory>
+-
+-#include "inferx/config/cache_config.h"
+-#include "inferx/config/execution_config.h"
+-#include "inferx/config/kv_cache_config.h"
+-#include "inferx/config/model_config.h"
+-#include "inferx/config/parallel_config.h"
+-#include "inferx/config/scheduler_config.h"
+-#include "inferx/core/device_runtime.h"
+-#include "inferx/core/status.h"
+-#include "inferx/core/stream.h"
+-#include "inferx/dist/comm.h"
+-#include "inferx/engine/scheduler_output.h"
+-#include "inferx/models/load_options.h"
+-#include "inferx/models/model_runner.h"
++#include "inferx/engine/model_runner.h"
+ 
+ namespace inferx {
+-namespace models {
+-
+-/// \brief Rank-local lifecycle owner: device, stream, communicator, memory
+-///        profiling, and failure signalling. Wraps one ModelRunner.
+-///
+-/// The Executor drives every Worker through the same sequence:
+-///
+-///   InitDevice -> LoadModel -> DetermineAvailableMemory
+-///   -> (engine: min across ranks, BuildKVCacheConfig)
+-///   -> InitializeFromConfig -> WarmUp -> ExecuteModel (repeatedly)
+-///
+-/// so each phase is testable alone and no collective hides inside the runner.
++/// Rank-local owner of device, stream, communicator, memory budgeting, and
++/// failure propagation. ModelRunner groups drive each phase across all ranks
++/// before allocating caches from the minimum available budget.
+ class Worker {
+  public:
+-  /// \param model    Checkpoint/device config; the device must be CUDA.
+-  /// \param parallel This rank's tensor-parallel geometry.
+-  /// \param comm     This rank's communicator; null uses a world-of-one.
+   static StatusOr<std::unique_ptr<Worker>> Create(const ModelConfig& model,
+                                                   const ParallelConfig& parallel = {},
+                                                   std::unique_ptr<CommBackend> comm = nullptr);
+-
+   ~Worker();
+-
+-  Worker(const Worker&) = delete;
+-  Worker& operator=(const Worker&) = delete;
+-
+-  /// \brief Acquires the device runtime and stream and builds the runner.
+   Status InitDevice();
+-
+-  /// \brief Loads weights (runner_->LoadModel).
+-  Status LoadModel(const LoadOptions& options);
+-
+-  /// \brief Runs the profile step and returns this rank's KV byte budget:
+-  ///        utilization * device memory - weights - peak activations.
++  Status LoadModel();
+   StatusOr<int64_t> DetermineAvailableMemory(const CacheConfig& cache,
+                                              const SchedulerConfig& scheduler);
+-
+-  /// \brief Allocates the KV pool from the engine-agreed config
+-  ///        (runner_->InitializeKVCache).
+-  Status InitializeFromConfig(const KVCacheConfig& kv, const SchedulerConfig& scheduler);
+-
+-  /// \brief Final warm-up; captures graphs once they are wired.
++  // Used when a caller supplies one rank of an externally driven world.
++  StatusOr<int64_t> AgreeAvailableMemory(int64_t bytes);
++  Status InitializeFromConfig(int64_t kv_bytes, const CacheConfig& cache,
++                              const SchedulerConfig& scheduler);
+   Status WarmUp(const ExecutionConfig& execution);
+-
+   StatusOr<ModelRunnerOutput> ExecuteModel(const SchedulerOutput& step);
+-
+-  /// \brief Hooks the executor uses to poison a rank group on failure.
+-  ///        ExecuteModel reports errors through `abort` and checks
+-  ///        `check_health` before each step.
+   void SetFailureHooks(std::function<void(const Status&)> abort,
+                        std::function<Status()> check_health);
+-
+-  bool IsDriverRank() const { return is_driver_rank_; }
++  bool IsDriverRank() const { return parallel_.tensor_parallel_rank == 0; }
+   const ParallelConfig& Parallel() const { return parallel_; }
+-
+-  /// \brief Valid after InitDevice(). Exposed for tests and the attention
+-  ///        runtime accessor; not for lifecycle control.
+-  ModelRunner* Runner() { return runner_.get(); }
++  ModelRunner* Runner() const { return runner_.get(); }
+ 
+  private:
+   Worker(const ModelConfig& model, const ParallelConfig& parallel,
+          std::unique_ptr<CommBackend> comm);
+-
+-  const ModelConfig model_config_;
+-  const ParallelConfig parallel_;
+-  const bool is_driver_rank_;
+-
++  ModelConfig model_config_;
++  ParallelConfig parallel_;
++  models::ModelLoadOptions load_options_;
+   DeviceRuntime* runtime_ = nullptr;
+-  DeviceStream stream_{};
+-
+-  // comm_ always points at either owned_comm_ or single_rank_comm_.
++  OwnedStream stream_;
+   std::unique_ptr<CommBackend> owned_comm_;
+   SingleRankComm single_rank_comm_;
+   CommBackend* comm_ = nullptr;
+-
+-  int64_t weights_bytes_ = 0;
+   std::unique_ptr<ModelRunner> runner_;
+-
++  enum class Phase { kCreated, kDevice, kLoaded, kProfiled, kCache, kReady };
++  Phase phase_ = Phase::kCreated;
++  Status failure_;
+   std::function<void(const Status&)> abort_;
+   std::function<Status()> check_health_;
+ };
+-
+-}  // namespace models
+ }  // namespace inferx
+-
+-#endif  // INFERX_MODELS_WORKER_H_
+\ No newline at end of file
++#endif  // INFERX_ENGINE_WORKER_H_
+diff --git a/include/inferx/models/model_runner.h b/include/inferx/models/model_runner.h
+deleted file mode 100644
+index 9bb5fae..0000000
+--- a/include/inferx/models/model_runner.h
++++ /dev/null
+@@ -1,159 +0,0 @@
+-#ifndef INFERX_MODELS_MODEL_RUNNER_H_
+-#define INFERX_MODELS_MODEL_RUNNER_H_
+-
+-#include <cstdint>
+-#include <functional>
+-#include <memory>
+-#include <optional>
+-#include <unordered_map>
+-#include <vector>
+-
+-#include "inferx/config/cache_config.h"
+-#include "inferx/config/execution_config.h"
+-#include "inferx/config/model_config.h"
+-#include "inferx/config/parallel_config.h"
+-#include "inferx/config/scheduler_config.h"
+-#include "inferx/core/device.h"
+-#include "inferx/core/device_buffer.h"
+-#include "inferx/core/device_runtime.h"
+-#include "inferx/core/status.h"
+-#include "inferx/core/stream.h"
+-#include "inferx/core/tensor.h"
+-#include "inferx/dist/comm.h"
+-#include "inferx/engine/scheduler_output.h"
+-#include "inferx/models/load_options.h"
+-#include "inferx/models/scratch_arena.h"
+-#include "inferx/models/model.h"
+-#include "inferx/models/model_spec.h"
+-#include "inferx/ops/flash_attention.h"
+-#include "inferx/ops/op_context.h"
+-#include "inferx/sampling/sampler.h"
+-
+-namespace inferx {
+-namespace models {
+-
+-/// \brief Rank-local execution: owns the model, the KV pool, the scratch
+-///        workspace, and the sampler, and drives one scheduler step.
+-///
+-/// This is the runtime seam the model layer hangs from. Per step it
+-/// flattens the SchedulerOutput into the batch tensors every layer reads
+-/// (token ids, positions, page tables), runs the model's forward, samples
+-/// one token per sequence, and hands the samples back in scheduler order.
+-/// Scheduling, admission, and cache policy live above it; kernel dispatch
+-/// lives below it.
+-///
+-/// Single-threaded like its callers (the scheduler and executor). Device
+-/// work runs on one stream; Run() synchronizes that stream before
+-/// returning, so a returned ModelRunnerOutput is complete.
+-class ModelRunner {
+- public:
+-  /// \brief Builds the runner for one rank.
+-  ///
+-  /// \param model     Checkpoint/device config; the device must be CUDA.
+-  /// \param cache     KV pool sizing.
+-  /// \param scheduler Concurrency bounds (max sequences, token budget).
+-  /// \param execution Execution options (CUDA graphs are not wired yet).
+-  /// \param parallel  This rank's tensor-parallel geometry.
+-  /// \param comm      This rank's communicator; null uses the world-of-one.
+-  static StatusOr<std::unique_ptr<ModelRunner>> Create(
+-      const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
+-      const ExecutionConfig& execution, const ParallelConfig& parallel = {},
+-      std::unique_ptr<CommBackend> comm = nullptr);
+-
+-  ~ModelRunner();
+-
+-  /// \brief The attention runtime owning the cache plan, pools, facade,
+-  ///        kernels, and metadata builders (docs/attention.md §8.5).
+-  attn::AttentionRuntime* Attention() { return attention_.get(); }
+-  const ModelSpec& GetModelSpec() const { return model_->GetModelSpec(); }
+-
+-  /// \brief Executes one scheduler step and returns its samples.
+-  StatusOr<ModelRunnerOutput> Run(const SchedulerOutput& step);
+-
+-  /// \brief Hooks the executor uses to poison a rank group on failure.
+-  void SetFailureHooks(std::function<void(const Status&)> abort,
+-                       std::function<Status()> check_health);
+-
+-  /// \brief Stops sampling; this rank only maintains state for its shard.
+-  void DisableSampling() { sampler_.reset(); }
+-
+-  /// \brief Keeps a copy of every step's logits for numerical triage and
+-  ///        tests (greedy tie analysis, parity harnesses).
+-  void EnableLogitsCapture() { capture_logits_ = true; }
+-
+-  /// \brief One [sequences, vocab] tensor per executed step, in order.
+-  const std::vector<Tensor>& CapturedLogits() const { return captured_logits_; }
+-
+-  /// \brief Appends a token sampled elsewhere (rank zero of a TP group) to
+-  ///        this rank's view of the sequence.
+-  Status ApplyAcceptedTokens(RequestId request_id, TokenId token);
+-
+- private:
+-  ModelRunner(std::unique_ptr<Model> model,
+-              std::unique_ptr<CommBackend> owned_comm, DeviceRuntime* runtime,
+-              DeviceStream stream);
+-
+-  /// \brief Runner-side per-request state: the token history and sampling
+-  ///        knobs. Block tables live in the cache facade, never mirrored
+-  ///        here (docs/attention.md §8.3).
+-  struct RequestState {
+-    std::vector<TokenId> tokens;      ///< Prompt plus accepted outputs.
+-    int num_computed = 0;             ///< Tokens whose KV this rank wrote.
+-    sampling::SamplingParams params;  ///< Sampling knobs for this request.
+-    int64_t rng_offset = 0;           ///< Generated tokens so far.
+-  };
+-
+-  /// \brief Load weights, size and allocate the KV pool, prepare graphs.
+-  ///
+-  /// vLLM-shaped initialization: after the weights land, a profile step at
+-  /// the largest shape the scheduler can produce forces every scratch
+-  /// block and library workspace (cuBLAS, ...) to materialize; the KV pool
+-  /// then takes the utilization budget's leftover, minimum taken across
+-  /// the tensor-parallel group so every rank agrees on the block count.
+-  /// CUDA-graph capture would run last; it is not wired yet.
+-  Status Initialize(const CacheConfig& cache, const SchedulerConfig& scheduler,
+-                    const ExecutionConfig& execution);
+-
+-  /// \brief One max-shape forward + logits through `scratch`, measuring,
+-  ///        against a throwaway attention runtime.
+-  Status RunProfileStep(Allocator& scratch, int64_t max_tokens, int64_t max_seqs);
+-
+-  /// \brief Creates the attention runtime from the computed byte budget
+-  ///        (or the explicit config fields when utilization sizing is off)
+-  ///        and binds one op per attention layer.
+-  Status CreateAttention(int64_t kv_bytes, const CacheConfig& cache,
+-                         const SchedulerConfig& scheduler);
+-
+-  /// \brief Captures decode graphs; not wired into the new model layer.
+-  Status CaptureGraphs(const ExecutionConfig& execution) const;
+-
+-  Status RunStep(const SchedulerOutput& step, ModelRunnerOutput* out);
+-
+-  DeviceRuntime* runtime_ = nullptr;
+-  DeviceStream stream_{};
+-  std::unique_ptr<Model> model_;
+-  std::unique_ptr<attn::AttentionRuntime> attention_;
+-  std::vector<attn::AttentionOp> ops_;
+-  std::unique_ptr<CommBackend> owned_comm_;
+-  SingleRankComm single_rank_comm_;
+-  CommBackend* comm_ = nullptr;
+-  std::unique_ptr<ops::OpContext> op_;
+-
+-  // Scratch_region must outlive the allocator carved from it.
+-  std::unique_ptr<ScratchArena> scratch_;
+-  std::unique_ptr<sampling::Sampler> sampler_;
+-  int64_t max_num_seqs_ = 0;
+-
+-  std::unordered_map<RequestId, RequestState> requests_;
+-  std::string checkpoint_dir_;
+-  bool capture_logits_ = false;
+-  std::vector<Tensor> captured_logits_;
+-
+-  std::function<void(const Status&)> abort_;
+-  std::function<Status()> check_health_;
+-};
+-
+-}  // namespace models
+-}  // namespace inferx
+-
+-#endif  // INFERX_MODELS_MODEL_RUNNER_H_
+diff --git a/include/inferx/server/engine_gateway.h b/include/inferx/server/engine_gateway.h
+index fdc0a3b..e627e2b 100644
+--- a/include/inferx/server/engine_gateway.h
++++ b/include/inferx/server/engine_gateway.h
+@@ -24,7 +24,7 @@
+ #include "inferx/engine/request.h"
+ #include "inferx/config/scheduler_config.h"
+ #include "inferx/config/model_config.h"
+-#include "inferx/engine/model_executor.h"
++#include "inferx/engine/model_runner.h"
+ #include "inferx/sampling/sampling_params.h"
+ #include "inferx/tokenizer/tokenizer.h"
+ 
+diff --git a/src/bench/workload.cc b/src/bench/workload.cc
+index de4fb8c..072591d 100644
+--- a/src/bench/workload.cc
++++ b/src/bench/workload.cc
+@@ -10,7 +10,7 @@
+ #include "inferx/bench/workload.h"
+ #include "inferx/core/status_util.h"
+ #include "inferx/engine/scheduler.h"
+-#include "inferx/engine/model_executor.h"
++#include "inferx/engine/model_runner.h"
+ #include "nlohmann/json.hpp"
+ 
+ namespace inferx::bench {
+@@ -29,9 +29,9 @@ void Run(const WorkloadParams& params) {
+   cc.num_kv_blocks = suite_json.value("kv_blocks", cc.num_kv_blocks);
+   cc.block_size = suite_json.value("block_size", cc.block_size);
+   const int batch = sc.max_num_seqs;
+-  auto executor = Take(ModelExecutor::Create(params.model, cc, sc, params.execution,
++  auto runner = Take(ModelRunner::Create(params.model, cc, sc, params.execution,
+                                              params.parallel));
+-  Scheduler scheduler(sc, executor->GetModelSpec().eos_token_ids, *executor->Attention());
++  Scheduler scheduler(sc, runner->GetModelSpec().eos_token_ids, *runner->Attention());
+   uint64_t next_id = 1;
+   for (const auto& c : suite_json.at("cases")) {
+     if (c.at("batch") != batch) continue;
+@@ -40,12 +40,11 @@ void Run(const WorkloadParams& params) {
+     for (int repeat = -1; repeat < params.repeats; ++repeat) {
+       // Complete full, identical warmup for every shape, excluding it from timing.
+       auto flush = Take(scheduler.Schedule());
+-      Take(executor->Execute(flush));
++      Take(runner->ExecuteModel(flush));
+       const auto base = next_id;
+       next_id += count;
+       std::vector<std::vector<int>> outputs(count);
+       std::vector<std::vector<double>> arrivals(count);
+-      std::vector<int> computed(count, 0);
+       int step = 0;
+       auto start = Clock::now();
+       for (int i = 0; i < count; ++i) {
+@@ -60,7 +59,7 @@ void Run(const WorkloadParams& params) {
+         auto plan = Take(scheduler.Schedule());
+         if (repeat == 0 && step == params.profile_step) cudaProfilerStart();
+         const auto run_start = Clock::now();
+-        auto result = Take(executor->Execute(plan));
++        auto result = Take(runner->ExecuteModel(plan));
+         const auto run_end = Clock::now();
+         if (repeat == 0 && step == params.profile_step) cudaProfilerStop();
+         if (params.step_timings && repeat >= 0) {
+@@ -76,8 +75,8 @@ void Run(const WorkloadParams& params) {
+         for (size_t j = 0; j < plan.scheduled.size(); ++j) {
+           const auto& sr = plan.scheduled[j];
+           const auto i = sr.request_id - base;
+-          computed[i] += sr.num_new_tokens;
+-          if (computed[i] < static_cast<int>(prompts[i].size())) continue;
++          // The runner emits no samples for unfinished prefill chunks.
++          // Prefix-cache hits may skip prompt tokens entirely.
+           for (int t : result.samples[j].token_ids) {
+             outputs[i].push_back(t);
+             arrivals[i].push_back(ms);
+diff --git a/src/dist/worker_main.cc b/src/dist/worker_main.cc
+index 8c740e8..7d9bcbd 100644
+--- a/src/dist/worker_main.cc
++++ b/src/dist/worker_main.cc
+@@ -8,7 +8,7 @@
+ #include "inferx/core/logging.h"
+ #include "inferx/engine/request.h"
+ #include "inferx/engine/scheduler.h"
+-#include "inferx/models/model_runner.h"
++#include "inferx/engine/model_runner.h"
+ #include "inferx/sampling/sampling_params.h"
+ 
+ namespace inferx {
+@@ -43,7 +43,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels)
+   // parallel config names this worker's rank. Together they load exactly
+   // this rank's weight shards.
+   INFERX_ASSIGN_OR_RETURN(auto runner,
+-                          models::ModelRunner::Create(options.model, options.cache,
++                          ModelRunner::Create(options.model, options.cache,
+                                               options.scheduler, options.execution,
+                                               options.parallel));
+   const auto& checkpoint = runner->GetModelSpec();
+@@ -103,7 +103,7 @@ Status RunWorker(const WorkerOptions& options, const IpcChannelNames& channels)
+     auto plan = scheduler.Schedule();
+     if (!plan.ok()) return fail(plan.status().message());
+     if (plan->scheduled.empty()) continue;
+-    auto result = runner->Run(*plan);
++    auto result = runner->ExecuteModel(*plan);
+     if (!result.ok()) return fail(result.status().message());
+     if (const Status updated = scheduler.UpdateFromOutput(*plan, *result);
+         !updated.ok()) {
+diff --git a/src/engine/CMakeLists.txt b/src/engine/CMakeLists.txt
+index e0781fb..7365362 100644
+--- a/src/engine/CMakeLists.txt
++++ b/src/engine/CMakeLists.txt
+@@ -1,13 +1,15 @@
+ # inferx_engine -- architecture, scheduling, and orchestration are ordinary
+ # C++. The tokenizer front end (tokenizer/tokenizer.cc) belongs to this
+-# layer; the model layer ships its own library with the runner.
++# layer, along with ModelRunner, Worker, and persistent InputBatch state.
+ inferx_add_library(
+   NAME engine
+   SRCS
+     request.cc
+     request_queue.cc
+     scheduler.cc
+-    model_executor.cc
++    model_runner.cc
++    worker.cc
++    input_batch.cc
+     ../tokenizer/tokenizer.cc
+   PRIVATE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src
+   DEPS
+diff --git a/src/engine/input_batch.cc b/src/engine/input_batch.cc
+index 904f646..21e717d 100644
+--- a/src/engine/input_batch.cc
++++ b/src/engine/input_batch.cc
+@@ -1,4 +1,4 @@
+-#include "inferx/models/input_batch.h"
++#include "inferx/engine/input_batch.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -6,11 +6,6 @@
+ #include <utility>
+ 
+ namespace inferx {
+-namespace models {
+-
+-// NOTE: Status construction below assumes free helpers InvalidArgument(),
+-// AlreadyExists(), NotFound(), ResourceExhausted() and OkStatus() in
+-// inferx/core/status.h. Adjust to the project's actual factory names.
+ 
+ InputBatch::InputBatch(int max_num_reqs, int max_model_len)
+     : max_num_reqs_(max_num_reqs),
+@@ -26,14 +21,19 @@ InputBatch::InputBatch(int max_num_reqs, int max_model_len)
+ }
+ 
+ Status InputBatch::Add(const NewRequest& req) {
++  if (req.id == kFreeRow) return InvalidArgumentError("request id is reserved for free rows");
+   if (id_to_row_.count(req.id) != 0) {
+-    return AlreadyExists("request " + std::to_string(req.id) + " is already in the batch");
++    return absl::AlreadyExistsError("request " + std::to_string(req.id) +
++                                    " is already in the batch");
+   }
+   if (static_cast<int>(req.prompt_tokens.size()) > max_model_len_) {
+-    return InvalidArgument("prompt of request " + std::to_string(req.id) +
+-                           " exceeds max_model_len");
++    return InvalidArgumentError("prompt of request " + std::to_string(req.id) +
++                                " exceeds max_model_len");
+   }
+ 
++  if (req.num_computed < 0 || req.num_computed > static_cast<int>(req.prompt_tokens.size()))
++    return InvalidArgumentError("invalid computed token count");
++
+   int row;
+   if (!free_rows_.empty()) {
+     auto it = std::min_element(free_rows_.begin(), free_rows_.end());
+@@ -43,7 +43,7 @@ Status InputBatch::Add(const NewRequest& req) {
+     row = NumRows();
+     row_to_id_.push_back(kFreeRow);
+   } else {
+-    return ResourceExhausted("input batch is full");
++    return ResourceExhaustedError("input batch is full");
+   }
+ 
+   const int n = static_cast<int>(req.prompt_tokens.size());
+@@ -110,9 +110,9 @@ void InputBatch::Condense() {
+ 
+ Status InputBatch::AppendToken(RequestId id, TokenId token) {
+   auto row = RowOf(id);
+-  if (!row) return NotFound("request " + std::to_string(id) + " is not in the batch");
++  if (!row) return NotFoundError("request " + std::to_string(id) + " is not in the batch");
+   if (num_tokens_[*row] >= max_model_len_) {
+-    return ResourceExhausted("request " + std::to_string(id) + " reached max_model_len");
++    return ResourceExhaustedError("request " + std::to_string(id) + " reached max_model_len");
+   }
+   token_ids_[static_cast<int64_t>(*row) * max_model_len_ + num_tokens_[*row]] = token;
+   ++num_tokens_[*row];
+@@ -121,7 +121,9 @@ Status InputBatch::AppendToken(RequestId id, TokenId token) {
+ 
+ Status InputBatch::SetNumComputed(RequestId id, int num_computed) {
+   auto row = RowOf(id);
+-  if (!row) return NotFound("request " + std::to_string(id) + " is not in the batch");
++  if (!row) return NotFoundError("request " + std::to_string(id) + " is not in the batch");
++  if (num_computed < 0 || num_computed > num_tokens_[*row])
++    return InvalidArgumentError("invalid computed token count");
+   num_computed_[*row] = num_computed;
+   return OkStatus();
+ }
+@@ -132,5 +134,4 @@ std::optional<int> InputBatch::RowOf(RequestId id) const {
+   return it->second;
+ }
+ 
+-}  // namespace models
+-}  // namespace inferx
+\ No newline at end of file
++}  // namespace inferx
+diff --git a/src/engine/model_executor.cc b/src/engine/model_executor.cc
+deleted file mode 100644
+index 55ab7d6..0000000
+--- a/src/engine/model_executor.cc
++++ /dev/null
+@@ -1,168 +0,0 @@
+-#include "inferx/engine/model_executor.h"
+-
+-#include <future>
+-#include <limits>
+-#include <utility>
+-
+-#include "inferx/cache/kv_block_pool.h"
+-#include "inferx/core/logging.h"
+-#include "inferx/dist/nccl_comm.h"
+-#include "inferx/models/registry.h"
+-#include "inferx/util/hf_config.h"
+-
+-namespace inferx {
+-
+-struct ModelExecutor::Impl {
+-  /// Rank-local runners, ordered by communicator rank; ranks_[0] is the
+-  /// coordinating and (initially sole) sampling rank.
+-  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
+-  std::function<void(const Status&)> abort;
+-  std::function<Status()> check_health;
+-  bool group = false;  ///< True when more than one rank participates.
+-};
+-
+-ModelExecutor::ModelExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+-ModelExecutor::~ModelExecutor() = default;
+-
+-attn::AttentionRuntime* ModelExecutor::Attention() {
+-  return impl_->ranks.front()->Attention();
+-}
+-const models::ModelSpec& ModelExecutor::GetModelSpec() const {
+-  return impl_->ranks.front()->GetModelSpec();
+-}
+-
+-StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::Create(
+-    const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
+-    const ExecutionConfig& execution, const ParallelConfig& parallel,
+-    std::unique_ptr<CommBackend> comm) {
+-  INFERX_RETURN_IF_ERROR(parallel.Validate());
+-  INFERX_RETURN_IF_ERROR(model.device.Validate());
+-  if (comm || parallel.tensor_parallel_size == 1) {
+-    // Rank-local execution: one runner, with this rank's communicator.
+-    auto runner =
+-        models::ModelRunner::Create(model, cache, scheduler, execution, parallel, std::move(comm));
+-    INFERX_RETURN_IF_ERROR(runner.status());
+-    auto impl = std::make_unique<Impl>();
+-    impl->ranks.push_back(*std::move(runner));
+-    return std::unique_ptr<ModelExecutor>(new ModelExecutor(std::move(impl)));
+-  }
+-
+-  // Multi-rank world construction: one rank-local runner per device.
+-  if (parallel.tensor_parallel_rank != 0) {
+-    return InvalidArgumentError("the tensor-parallel coordinator must have rank zero");
+-  }
+-  if (model.device.device != "cuda") {
+-    return InvalidArgumentError("multi-GPU tensor parallelism requires CUDA");
+-  }
+-  if (execution.enable_cuda_graphs) {
+-    return UnimplementedError("tensor-parallel serving currently requires eager execution");
+-  }
+-  std::vector<int> ids = model.device.device_ids;
+-  if (ids.empty()) {
+-    for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) ids.push_back(rank);
+-  }
+-  if (ids.size() != static_cast<size_t>(parallel.tensor_parallel_size)) {
+-    return InvalidArgumentError("device-ids must contain one device per tensor-parallel rank");
+-  }
+-  std::vector<Device> devices;
+-  for (const int id : ids) {
+-    if (id > std::numeric_limits<int8_t>::max()) {
+-      return InvalidArgumentError("CUDA device ordinal is out of range");
+-    }
+-    devices.push_back(Device::Cuda(static_cast<int8_t>(id)));
+-  }
+-  // Reject unknown architectures before creating the communication world.
+-  INFERX_ASSIGN_OR_RETURN(auto hf, HfConfig::FromFile(model.model_dir + "/config.json"));
+-  INFERX_RETURN_IF_ERROR(models::ArchitectureRegistry::Builtins()
+-                             .Resolve(hf.ModelType(), hf.Architecture())
+-                             .status());
+-  INFERX_ASSIGN_OR_RETURN(auto world, NcclWorld::Create(devices));
+-  std::vector<std::unique_ptr<models::ModelRunner>> ranks;
+-  for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) {
+-    ModelConfig local = model;
+-    local.device.device_ids = {ids[rank]};
+-    ParallelConfig rank_parallel;
+-    rank_parallel.tensor_parallel_size = parallel.tensor_parallel_size;
+-    rank_parallel.tensor_parallel_rank = rank;
+-    auto made = models::ModelRunner::Create(local, cache, scheduler, execution,
+-                                            rank_parallel, world->MakeRank(rank));
+-    if (!made.ok()) {
+-      world->Abort(made.status());
+-      return made.status();
+-    }
+-    ranks.push_back(*std::move(made));
+-  }
+-  return CreateGroup(std::move(ranks), [world](const Status& status) { world->Abort(status); },
+-                     [world] { return world->CheckHealth(); });
+-}
+-
+-StatusOr<std::unique_ptr<ModelExecutor>> ModelExecutor::CreateGroup(
+-    std::vector<std::unique_ptr<models::ModelRunner>> ranks,
+-    std::function<void(const Status&)> abort, std::function<Status()> check_health) {
+-  if (ranks.empty() || !abort) {
+-    return InvalidArgumentError("rank group needs runners and abort");
+-  }
+-  for (size_t rank = 0; rank < ranks.size(); ++rank) {
+-    if (!ranks[rank]) return InvalidArgumentError("rank group contains a null runner");
+-    if (rank == 0) continue;
+-    if (ranks[rank]->GetModelSpec().vocab_size !=
+-        ranks.front()->GetModelSpec().vocab_size) {
+-      const auto status = InvalidArgumentError("rank group topology or capacities disagree");
+-      abort(status);
+-      return status;
+-    }
+-  }
+-  auto impl = std::make_unique<Impl>();
+-  impl->ranks = std::move(ranks);
+-  impl->abort = abort;
+-  impl->check_health = check_health;
+-  impl->group = impl->ranks.size() > 1;
+-  for (size_t rank = 0; rank < impl->ranks.size(); ++rank) {
+-    impl->ranks[rank]->SetFailureHooks(impl->abort, impl->check_health);
+-    if (rank != 0) impl->ranks[rank]->DisableSampling();
+-  }
+-  return std::unique_ptr<ModelExecutor>(new ModelExecutor(std::move(impl)));
+-}
+-
+-StatusOr<ModelRunnerOutput> ModelExecutor::Execute(const SchedulerOutput& output) {
+-  if (!impl_->group) return impl_->ranks.front()->Run(output);
+-
+-  // Dispatch the same logical step to every rank. Each rank's runner
+-  // validates and binds its rank-local state; a failure on any rank
+-  // poisons the group rather than retrying mutated state.
+-  std::vector<std::future<StatusOr<ModelRunnerOutput>>> pending;
+-  try {
+-    for (size_t rank = 1; rank < impl_->ranks.size(); ++rank) {
+-      pending.push_back(std::async(std::launch::async,
+-                                   [runner = impl_->ranks[rank].get(), &output] {
+-                                     return runner->Run(output);
+-                                   }));
+-    }
+-  } catch (const std::exception& error) {
+-    const Status failure = InternalError("could not start rank execution: ", error.what());
+-    impl_->abort(failure);
+-    return failure;  // Futures join before the borrowed output expires.
+-  }
+-  auto result = impl_->ranks.front()->Run(output);
+-  Status failure = result.status();
+-  for (auto& future : pending) {
+-    auto peer_result = future.get();
+-    if (failure.ok() && !peer_result.ok()) failure = peer_result.status();
+-  }
+-  if (!failure.ok()) {
+-    impl_->abort(failure);
+-    return failure;
+-  }
+-  // Only rank zero draws tokens. Share those exact ids with every rank,
+-  // including stochastic sampling, before admitting the next scheduler step.
+-  for (const auto& sample : result->samples) {
+-    if (sample.token_ids.empty()) continue;
+-    for (size_t rank = 1; rank < impl_->ranks.size(); ++rank) {
+-      INFERX_RETURN_IF_ERROR(impl_->ranks[rank]->ApplyAcceptedTokens(
+-          sample.request_id, sample.token_ids.back()));
+-    }
+-  }
+-  return result;
+-}
+-
+-}  // namespace inferx
+diff --git a/src/engine/model_runner.cc b/src/engine/model_runner.cc
+index 3294919..69d9932 100644
+--- a/src/engine/model_runner.cc
++++ b/src/engine/model_runner.cc
+@@ -1,352 +1,603 @@
+-#include "inferx/models/model_runner.h"
++#include "inferx/engine/model_runner.h"
+ 
+ #include <algorithm>
+-#include <cstdint>
+-#include <string>
++#include <future>
++#include <limits>
+ #include <utility>
+-#include <vector>
++
++#include "inferx/dist/nccl_comm.h"
++#include "inferx/engine/worker.h"
++#include "inferx/models/registry.h"
++#include "inferx/ops/attention/cache_spec_bridge.h"
++#include "inferx/ops/attention/op.h"
++#include "inferx/ops/attention/registry.h"
++#include "inferx/util/hf_config.h"
+ 
+ namespace inferx {
+-namespace models {
+-
+-// ---------------------------------------------------------------------------
+-// Assumed APIs. Everything below that touches the device, the model, the
+-// attention runtime, or the sampler goes through the calls listed here, so
+-// adapting to the real signatures is a local edit.
+-//
+-// SchedulerOutput (vLLM-shaped):
+-//   step.scheduled_new_reqs     [{req_id, prompt_token_ids, num_computed_tokens,
+-//                                 sampling_params}]
+-//   step.scheduled_cached_reqs  [{req_id, new_token_ids, num_computed_tokens}]
+-//   step.finished_req_ids       RequestId set/vector
+-//   step.num_scheduled_tokens   unordered_map<RequestId, int>
+-//   step.total_num_scheduled_tokens
+-//   ModelRunnerOutput { std::vector<RequestId> req_ids;
+-//                       std::vector<std::vector<TokenId>> sampled_token_ids; }
+-//
+-// Device:
+-//   Tensor::FromHostI32(runtime, stream, data, shape)
+-//   runtime->Synchronize(stream), runtime->ResetPeakMemory(),
+-//   runtime->PeakMemoryBytes(), runtime->AllocatedBytes()
+-//
+-// Model:
+-//   Load(options), WeightsBytes(), Forward(op, ops, token_ids, positions, meta),
+-//   ComputeLogits(op, hidden, logits_indices)
+-//
+-// Attention (attn::AttentionRuntime):
+-//   Create(spec, kv_config, scheduler, runtime, stream), CreateForProfile(...),
+-//   MakeOp(layer), BlockTable(req_id), BlockSize(), MaxBlocksPerSeq(),
+-//   BuildMetadata(req_ids, num_tokens, num_computed)
+-//
+-// Sampler:
+-//   Sample(logits, params, rng_offsets) -> StatusOr<std::vector<TokenId>>
+-//
+-// ScratchArena::Create(runtime, stream, spec, max_tokens, max_seqs);
+-// ops::OpContext(runtime, stream, comm, allocator)
+-// ---------------------------------------------------------------------------
+-
+-#define MR_RETURN_IF_ERROR(expr)   \
+-  do {                             \
+-    ::inferx::Status _st = (expr); \
+-    if (!_st.ok()) return _st;     \
+-  } while (0)
++using namespace models;
+ 
+ namespace {
+ 
+-StatusOr<Tensor> UploadI32(DeviceRuntime* runtime, DeviceStream stream,
+-                           const std::vector<int32_t>& data, std::vector<int64_t> shape) {
+-  return Tensor::FromHostI32(runtime, stream, data, std::move(shape));
++/// Uploads one host int32 array as a device tensor.
++StatusOr<Tensor> UploadInt32(DeviceRuntime& runtime, DeviceStream stream,
++                             const std::vector<int32_t>& values) {
++  INFERX_ASSIGN_OR_RETURN(
++      Tensor tensor,
++      Tensor::Empty(DataType::kInt32, Shape({static_cast<int64_t>(values.size())}),
++                    runtime.device()));
++  if (values.empty()) return tensor;
++  INFERX_RETURN_IF_ERROR(runtime.Memory().CopyAsync(tensor.Data(), values.data(),
++                                                    values.size() * sizeof(int32_t),
++                                                    CopyKind::kHostToDevice, stream));
++  return tensor;
+ }
+ 
+ }  // namespace
+ 
+-ModelRunner::ModelRunner(std::unique_ptr<Model> model, DeviceRuntime* runtime,
+-                         DeviceStream stream, CommBackend* comm, bool is_driver_rank,
+-                         RunnerDebugOptions debug)
++ModelRunner::ModelRunner(std::unique_ptr<models::Model> model, DeviceRuntime* runtime,
++                         DeviceStream stream, CommBackend* comm, bool is_driver_rank)
+     : runtime_(runtime),
+       stream_(stream),
+       comm_(comm),
+       is_driver_rank_(is_driver_rank),
+-      debug_(debug),
+-      model_(std::move(model)) {}
++      model_(std::move(model)) {
++  op_ = std::make_unique<ops::OpContext>(*runtime_, stream_);
++}
+ 
+ ModelRunner::~ModelRunner() = default;
+ 
+-// ---------------------------------------------------------------------------
+-// Lifecycle
+-// ---------------------------------------------------------------------------
+-
+-Status ModelRunner::LoadModel(const LoadOptions& options) { return model_->Load(options); }
+-
+-StatusOr<ProfileResult> ModelRunner::ProfileRun(const SchedulerConfig& scheduler) {
+-  const int64_t max_tokens = scheduler.max_num_batched_tokens;
+-  const int64_t max_seqs = scheduler.max_num_seqs;
+-
+-  auto scratch = ScratchArena::Create(runtime_, stream_, GetModelSpec(), max_tokens, max_seqs);
+-  if (!scratch.ok()) return scratch.status();
+-  scratch_ = std::move(*scratch);
+-  op_ = std::make_unique<ops::OpContext>(runtime_, stream_, comm_, scratch_->allocator());
+-
+-  // Throwaway attention runtime: just enough cache to run the largest step.
+-  auto profile_attn =
+-      attn::AttentionRuntime::CreateForProfile(GetModelSpec(), scheduler, runtime_, stream_);
+-  if (!profile_attn.ok()) return profile_attn.status();
+-
+-  runtime_->ResetPeakMemory();
+-  const int64_t before = runtime_->AllocatedBytes();
+-
+-  // Worst-case shape: one sequence per slot, tokens split evenly.
+-  const int64_t per_seq = std::max<int64_t>(1, max_tokens / std::max<int64_t>(1, max_seqs));
+-  std::vector<RequestId> ids;
+-  std::vector<int> num_tokens(max_seqs, static_cast<int>(per_seq));
+-  std::vector<int> num_computed(max_seqs, 0);
+-  for (int64_t i = 0; i < max_seqs; ++i) ids.push_back(static_cast<RequestId>(i));
+-
+-  std::vector<int32_t> tokens(max_tokens, 0), positions(max_tokens, 0);
+-  for (int64_t s = 0, t = 0; s < max_seqs; ++s)
+-    for (int64_t i = 0; i < per_seq && t < max_tokens; ++i, ++t) positions[t] = i;
+-  std::vector<int32_t> last_idx(max_seqs);
+-  for (int64_t s = 0; s < max_seqs; ++s)
+-    last_idx[s] = static_cast<int32_t>((s + 1) * per_seq - 1);
+-
+-  auto tok_t = UploadI32(runtime_, stream_, tokens, {max_tokens});
+-  if (!tok_t.ok()) return tok_t.status();
+-  auto pos_t = UploadI32(runtime_, stream_, positions, {max_tokens});
+-  if (!pos_t.ok()) return pos_t.status();
+-  auto idx_t = UploadI32(runtime_, stream_, last_idx, {max_seqs});
+-  if (!idx_t.ok()) return idx_t.status();
+-
+-  auto meta = (*profile_attn)->BuildMetadata(ids, num_tokens, num_computed);
+-  if (!meta.ok()) return meta.status();
+-
+-  std::vector<attn::AttentionOp> profile_ops;
+-  for (int i = 0; i < GetModelSpec().num_layers; ++i)
+-    profile_ops.push_back((*profile_attn)->MakeOp(i));
+-
+-  auto hidden = model_->Forward(*op_, profile_ops, *tok_t, *pos_t, *meta);
+-  if (!hidden.ok()) return hidden.status();
+-  auto logits = model_->ComputeLogits(*op_, *hidden, *idx_t);
+-  if (!logits.ok()) return logits.status();
+-  MR_RETURN_IF_ERROR(runtime_->Synchronize(stream_));
+-
+-  ProfileResult result;
+-  result.weights_bytes = model_->WeightsBytes();
+-  result.peak_activation_bytes = std::max<int64_t>(0, runtime_->PeakMemoryBytes() - before);
+-  return result;
++Status ModelRunner::LoadModel(const models::ModelLoadOptions& options) {
++  if (!model_) return FailedPreconditionError("LoadModel requires a local runner");
++  INFERX_ASSIGN_OR_RETURN(auto checkpoint, models::CheckpointReader::Open(options.directory));
++  return model_->LoadWeights(checkpoint);
+ }
+ 
+-Status ModelRunner::InitializeKVCache(const KVCacheConfig& kv,
+-                                      const SchedulerConfig& scheduler) {
+-  if (!scratch_) return Internal("InitializeKVCache called before ProfileRun");
+-
+-  auto attention =
+-      attn::AttentionRuntime::Create(GetModelSpec(), kv, scheduler, runtime_, stream_);
+-  if (!attention.ok()) return attention.status();
+-  attention_ = std::move(*attention);
+-
+-  ops_.clear();
+-  for (int layer = 0; layer < GetModelSpec().num_layers; ++layer) {
+-    ops_.push_back(attention_->MakeOp(layer));
++Status ModelRunner::ProfileRun(const SchedulerConfig& scheduler) {
++  if (!model_) return FailedPreconditionError("ProfileRun requires a local runner");
++  if (scheduler.max_num_seqs <= 0 || scheduler.max_num_batched_tokens <= 0)
++    return InvalidArgumentError("profile requires positive sequence and token limits");
++  max_num_seqs_ = scheduler.max_num_seqs;
++  const auto& spec = model_->GetModelSpec();
++  ScratchArena arena = ScratchArena::Measuring(spec.device);
++  INFERX_RETURN_IF_ERROR(
++      RunProfileStep(arena, scheduler.max_num_batched_tokens,
++                     std::min<int64_t>(max_num_seqs_, scheduler.max_num_batched_tokens)));
++  INFERX_RETURN_IF_ERROR(arena.Freeze(spec.device, 0.25));
++  scratch_ = std::make_unique<ScratchArena>(std::move(arena));
++  if (is_driver_rank_) {
++    INFERX_ASSIGN_OR_RETURN(
++        sampler_, sampling::Sampler::Create(max_num_seqs_, spec.vocab_size, spec.device));
+   }
+-
+-  input_batch_ = std::make_unique<InputBatch>(static_cast<int>(scheduler.max_num_seqs),
+-                                              GetModelSpec().max_model_len);
+-  if (is_driver_rank_) sampler_ = std::make_unique<sampling::Sampler>(runtime_, stream_);
+   return OkStatus();
+ }
+ 
+-Status ModelRunner::CaptureGraphs() {
+-  // CUDA graphs are not wired into the new model layer yet.
++Status ModelRunner::ApplyAcceptedTokens(RequestId id, TokenId token) {
++  if (!input_batch_) return FailedPreconditionError("local input batch is not initialized");
++  INFERX_RETURN_IF_ERROR(input_batch_->AppendToken(id, token));
++  input_batch_->AdvanceRngOffset(*input_batch_->RowOf(id));
+   return OkStatus();
+ }
+ 
+-// ---------------------------------------------------------------------------
+-// Per-step execution
+-// ---------------------------------------------------------------------------
+-
+ StatusOr<ModelRunnerOutput> ModelRunner::ExecuteModel(const SchedulerOutput& step) {
+-  if (!attention_ || !input_batch_) {
+-    return Internal("ExecuteModel called before InitializeKVCache");
++  if (!workers_.empty()) return ExecuteGroup(step);
++  if (!attention_ || !input_batch_) return FailedPreconditionError("runner is not initialized");
++  ModelRunnerOutput output;
++  INFERX_RETURN_IF_ERROR(RunStep(step, &output));
++  return output;
++}
++
++Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens, int64_t max_seqs) {
++  // One synthetic batch at the scheduler's ceiling: max_seqs sequences
++  // splitting max_tokens tokens. A throwaway attention runtime holds the
++  // profile KV so attention runs the real kernels; it is destroyed before
++  // the runtime that matters is sized.
++  const ModelSpec& spec = model_->GetModelSpec();
++
++  auto registry = std::make_unique<attn::BackendRegistry>();
++  attn::RegisterBuiltinBackends(*registry);
++  attn::AttentionConfig config;
++  config.block_size = 16;
++  config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, max_tokens);
++  config.max_seqs = max_seqs;
++  config.max_batch_tokens = max_tokens;
++  // Generous throwaway budget: this runtime exists to run the kernels, not
++  // to size anything; it dies before the measured freeze.
++  config.cache_bytes_budget = 1LL << 32;
++  config.device = spec.device;
++  config.enable_prefix_caching = false;
++  INFERX_ASSIGN_OR_RETURN(
++      std::unique_ptr<attn::AttentionRuntime> runtime,
++      attn::AttentionRuntime::Create(std::move(registry), config, model_->GetAttentionSpecs()));
++
++  std::vector<attn::AttentionOp> ops;
++  for (size_t l = 0; l < model_->GetAttentionSpecs().size(); ++l) {
++    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op, runtime->MakeOp(static_cast<int64_t>(l)));
++    ops.push_back(std::move(op));
+   }
+ 
+-  MR_RETURN_IF_ERROR(UpdateStates(step));
++  // Synthetic requests: tokens_per_seq each, registered through the facade
++  // exactly like a real step, so block tables and metadata are real.
++  const int64_t tokens_per_seq = std::max<int64_t>(1, max_tokens / max_seqs);
++  std::vector<TokenId> token_ids;
++  std::vector<std::int32_t> query_lens, seq_lens, sample_rows;
++  int64_t remaining = max_tokens;
++  uint64_t request_id = 1;
++  while (remaining > 0) {
++    const int64_t chunk =
++        tokens_per_seq + (request_id <= static_cast<uint64_t>(max_tokens % max_seqs) ? 1 : 0);
++    INFERX_RETURN_IF_ERROR(runtime->Cache().Reserve(request_id, GrowthTarget{0, chunk}));
++    for (int64_t t = 0; t < chunk; ++t) token_ids.push_back(static_cast<TokenId>(0));
++    query_lens.push_back(static_cast<std::int32_t>(chunk));
++    seq_lens.push_back(static_cast<std::int32_t>(chunk));
++    sample_rows.push_back(static_cast<std::int32_t>(token_ids.size() - 1));
++    remaining -= chunk;
++    ++request_id;
++  }
+ 
+-  ModelRunnerOutput out;
+-  if (step.total_num_scheduled_tokens == 0) return out;
++  attn::BatchDesc desc;
++  desc.num_reqs = static_cast<std::int32_t>(query_lens.size());
++  desc.num_tokens = static_cast<std::int32_t>(token_ids.size());
++  desc.query_lens = query_lens;
++  desc.seq_lens = seq_lens;
++  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
++  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
++  desc.block_size = static_cast<std::int32_t>(runtime->GetPlan().block_size);
++  desc.num_prefills = desc.num_reqs;
++  desc.num_prefill_tokens = desc.num_tokens;
++  // Flatten the per-group page tables; models here are single token-wise
++  // group, so group 0 carries the batch's whole table. The vector outlives
++  // BeginStep, whose BatchDesc borrows it.
++  std::vector<BlockId> flat;
++  for (uint64_t id = 1; id < request_id; ++id) {
++    const auto blocks = runtime->Cache().GroupBlocks(id, 0);
++    flat.insert(flat.end(), blocks.begin(), blocks.end());
++  }
++  desc.block_ids[0] = flat;
++  desc.block_ids_num_pages[0] = static_cast<std::int32_t>(flat.size());
+ 
+-  StepInputs inputs;
+-  MR_RETURN_IF_ERROR(PrepareInputs(step, &inputs));
++  INFERX_ASSIGN_OR_RETURN(attn::StepContext step, runtime->BeginStep(desc, *op_));
+ 
+-  auto hidden = Forward(inputs);
+-  if (!hidden.ok()) return hidden.status();
+-  auto logits = ComputeLogits(*hidden, inputs);
+-  if (!logits.ok()) return logits.status();
++  StepInputs inputs;
++  INFERX_ASSIGN_OR_RETURN(inputs.token_ids, UploadInt32(*runtime_, stream_, token_ids));
++  std::vector<std::int32_t> positions(static_cast<size_t>(token_ids.size()), 0);
++  size_t offset = 0;
++  for (int32_t len : query_lens)
++    for (int32_t pos = 0; pos < len; ++pos) positions[offset++] = pos;
++  INFERX_ASSIGN_OR_RETURN(inputs.positions, UploadInt32(*runtime_, stream_, positions));
++
++  // The profile runs COMM-FREE through the world-of-one backend: tensor-
++  // parallel ranks initialize sequentially (CreateGroup builds them one by
++  // one), so a real collective here would deadlock the loopback barrier.
++  // The measurements -- arena bytes, cuBLAS workspaces -- are identical
++  // either way; collective backends allocate nothing from this arena.
++  SingleRankComm profile_comm;
++  ForwardContext ctx(*op_, step, profile_comm, scratch, absl::MakeConstSpan(ops));
++  INFERX_ASSIGN_OR_RETURN(
++      Tensor hidden,
++      Tensor::Empty(spec.dtype,
++                    Shape({static_cast<int64_t>(token_ids.size()), spec.hidden_size}),
++                    &scratch));
++  INFERX_RETURN_IF_ERROR(model_->Forward(ctx, inputs, hidden));
++  // The head path's buffers, measured by allocation: the gathered sample
++  // rows and the [rows, vocab] logits. Running ComputeLogits itself would
++  // issue the TP all-gather tail, which the identity comm rejects on
++  // shape; the bytes are what the measurement needs, not the GEMM.
++  {
++    INFERX_ASSIGN_OR_RETURN(
++        Tensor sampled,
++        Tensor::Empty(spec.dtype,
++                      Shape({static_cast<int64_t>(sample_rows.size()), spec.hidden_size}),
++                      &scratch));
++    INFERX_ASSIGN_OR_RETURN(
++        Tensor logits,
++        Tensor::Empty(spec.dtype,
++                      Shape({static_cast<int64_t>(sample_rows.size()), spec.vocab_size}),
++                      &scratch));
++    (void)sampled;
++    (void)logits;
++  }
++  return runtime_->Streams().SynchronizeStream(stream_);
++  // `runtime` dies here: its bytes return to the device before
++  // CreateAttention sizes the real pools.
++}
+ 
+-  if (debug_.capture_logits) captured_logits_.push_back(*logits);
++Status ModelRunner::InitializeKVCache(int64_t kv_bytes, const CacheConfig& cache,
++                                      const SchedulerConfig& scheduler) {
++  if (!scratch_) return FailedPreconditionError("cache initialization requires profiling");
++  const ModelSpec& spec = model_->GetModelSpec();
++
++  // Byte budget: utilization leftover, explicit bytes, or blocks x block
++  // bytes (the facade + runtime derive the actual split).
++  int64_t budget = kv_bytes;
++  if (budget < 0) budget = cache.kv_cache_memory_bytes;
++  if (budget <= 0 && cache.num_kv_blocks > 0) {
++    // Convert the block count into a byte budget; the runtime rounds down
++    // to whole blocks from it.
++    int64_t per_block = 0;
++    for (const attn::AttentionSpec& attn_spec : model_->GetAttentionSpecs()) {
++      if (!attn::NeedsCache(attn_spec)) continue;
++      INFERX_ASSIGN_OR_RETURN(const int64_t per_token, attn::CacheBytesPerToken(attn_spec));
++      per_block += cache.block_size * per_token;
++    }
++    budget = cache.num_kv_blocks * per_block;
++  }
++  if (budget <= 0) {
++    return ResourceExhaustedError("KV budget of ", kv_bytes,
++                                  " bytes fits no cache; check the cache config");
++  }
+ 
+-  MR_RETURN_IF_ERROR(Sample(*logits, inputs, &out));
++  auto registry = std::make_unique<attn::BackendRegistry>();
++  attn::RegisterBuiltinBackends(*registry);
++  attn::AttentionConfig config;
++  config.block_size = cache.block_size;
++  config.max_model_len =
++      std::max<int64_t>(spec.max_position_embeddings, scheduler.max_num_batched_tokens);
++  config.max_seqs = max_num_seqs_;
++  config.max_batch_tokens = scheduler.max_num_batched_tokens;
++  config.cache_bytes_budget = budget;
++  config.device = spec.device;
++  config.enable_prefix_caching = cache.enable_prefix_caching;
++  INFERX_ASSIGN_OR_RETURN(
++      attention_,
++      attn::AttentionRuntime::Create(std::move(registry), config, model_->GetAttentionSpecs()));
+ 
+-  // Advance computed counts only after sampling, which needs the old values
+-  // to tell whether a sequence reached the tip of its token history.
+-  for (size_t i = 0; i < inputs.rows.size(); ++i) {
+-    const int row = inputs.rows[i];
+-    MR_RETURN_IF_ERROR(input_batch_->SetNumComputed(
+-        inputs.req_ids[i], input_batch_->NumComputed(row) + inputs.num_tokens[i]));
++  ops_.clear();
++  const std::vector<attn::AttentionSpec> specs = model_->GetAttentionSpecs();
++  for (size_t l = 0; l < specs.size(); ++l) {
++    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op, attention_->MakeOp(static_cast<int64_t>(l)));
++    ops_.push_back(std::move(op));
+   }
+-
+-  MR_RETURN_IF_ERROR(runtime_->Synchronize(stream_));
+-  return out;
++  input_batch_ = std::make_unique<InputBatch>(max_num_seqs_, config.max_model_len + 1);
++  return OkStatus();
+ }
+ 
+-Status ModelRunner::UpdateStates(const SchedulerOutput& step) {
+-  // Finished first so their rows can be reused by new requests.
+-  for (RequestId id : step.finished_req_ids) input_batch_->Remove(id);
++Status ModelRunner::CaptureGraphs(const ExecutionConfig& execution) const {
++  if (execution.enable_cuda_graphs) {
++    return UnimplementedError("CUDA graph replay is not wired into the new model layer yet");
++  }
++  return OkStatus();
++}
+ 
+-  for (const auto& r : step.scheduled_new_reqs) {
++Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out) {
++  for (RequestId id : step.finished_request_ids) input_batch_->Remove(id);
++  for (RequestId id : step.preempted_request_ids) input_batch_->Remove(id);
++  for (const auto& fresh : step.scheduled_new_reqs) {
+     InputBatch::NewRequest req;
+-    req.id = r.req_id;
+-    req.prompt_tokens = r.prompt_token_ids;
+-    req.num_computed = r.num_computed_tokens;
+-    req.params = r.sampling_params;
+-    MR_RETURN_IF_ERROR(input_batch_->Add(req));
++    req.id = fresh.request_id;
++    req.prompt_tokens.assign(fresh.prompt_token_ids.begin(), fresh.prompt_token_ids.end());
++    req.num_computed = fresh.num_computed_tokens;
++    req.params = fresh.sampling_params;
++    INFERX_RETURN_IF_ERROR(input_batch_->Add(req));
+   }
++  // CachedRequestUpdate's watermark includes this step, so advance it only
++  // after execution. Accepted peer tokens arrive through ApplyAcceptedTokens.
++  input_batch_->Condense();
+ 
+-  for (const auto& r : step.scheduled_cached_reqs) {
+-    if (!input_batch_->RowOf(r.req_id)) {
+-      return NotFound("cached request " + std::to_string(r.req_id) + " is not in the batch");
+-    }
+-    // The driver rank appended its own samples in Sample(); only other ranks
+-    // learn accepted tokens through the scheduler diff.
+-    if (!is_driver_rank_) {
+-      for (TokenId t : r.new_token_ids) {
+-        MR_RETURN_IF_ERROR(input_batch_->AppendToken(r.req_id, t));
+-      }
++  if (step.scheduled.empty()) return OkStatus();
++  const int64_t block_size = attention_->GetPlan().block_size;
++  const std::uint16_t num_groups = attention_->NumGroups();
++
++  // Flatten the step: token stream and positions. Page tables are NOT
++  // mirrored here -- they are read from the cache facade below, the single
++  // owner (docs/attention.md §8.3).
++  std::vector<int32_t> input_ids, positions, sample_rows;
++  std::vector<int32_t> query_lens, seq_lens;
++  std::vector<int> batch;
++  std::vector<int64_t> prompt_lens;
++  int64_t total_new = 0;
++
++  for (const ScheduledRequest& scheduled : step.scheduled) {
++    auto found = input_batch_->RowOf(scheduled.request_id);
++    if (!found)
++      return InternalError("scheduled request has no runner state: ", scheduled.request_id);
++    const int row = *found;
++    const int64_t end = input_batch_->NumComputed(row) + scheduled.num_new_tokens;
++    if (scheduled.num_new_tokens <= 0 || end > input_batch_->NumTokens(row))
++      return InternalError("scheduled token range exceeds request history");
++    for (int64_t t = input_batch_->NumComputed(row); t < end; ++t) {
++      input_ids.push_back(input_batch_->TokensAt(row)[t]);
++      positions.push_back(static_cast<int32_t>(t));
+     }
+-    // The scheduler is authoritative for how much KV exists.
+-    MR_RETURN_IF_ERROR(input_batch_->SetNumComputed(r.req_id, r.num_computed_tokens));
++    sample_rows.push_back(static_cast<int32_t>(total_new + scheduled.num_new_tokens - 1));
++    query_lens.push_back(static_cast<std::int32_t>(scheduled.num_new_tokens));
++    seq_lens.push_back(static_cast<std::int32_t>(end));
++    total_new += scheduled.num_new_tokens;
++    batch.push_back(row);
++    prompt_lens.push_back(input_batch_->NumTokens(row));
+   }
+ 
+-  input_batch_->Condense();
+-  return OkStatus();
+-}
++  INFERX_ASSIGN_OR_RETURN(Tensor ids_tensor, UploadInt32(*runtime_, stream_, input_ids));
++  INFERX_ASSIGN_OR_RETURN(Tensor positions_tensor, UploadInt32(*runtime_, stream_, positions));
++  INFERX_ASSIGN_OR_RETURN(Tensor sample_rows_tensor,
++                          UploadInt32(*runtime_, stream_, sample_rows));
+ 
+-Status ModelRunner::PrepareInputs(const SchedulerOutput& step, StepInputs* inputs) {
+-  // Scheduler order: new requests, then cached requests.
+-  for (const auto& r : step.scheduled_new_reqs) inputs->req_ids.push_back(r.req_id);
+-  for (const auto& r : step.scheduled_cached_reqs) inputs->req_ids.push_back(r.req_id);
+-
+-  const int num_seqs = static_cast<int>(inputs->req_ids.size());
+-  const int block_size = attention_->BlockSize();
+-  const int max_blocks = attention_->MaxBlocksPerSeq();
+-
+-  std::vector<int32_t> token_ids, positions, slot_mapping, query_start_loc{0}, logits_idx;
+-  std::vector<int32_t> block_tables(static_cast<size_t>(num_seqs) * max_blocks, 0);
+-  token_ids.reserve(step.total_num_scheduled_tokens);
+-  positions.reserve(step.total_num_scheduled_tokens);
+-  slot_mapping.reserve(step.total_num_scheduled_tokens);
+-
+-  for (int s = 0; s < num_seqs; ++s) {
+-    const RequestId id = inputs->req_ids[s];
+-    auto row = input_batch_->RowOf(id);
+-    if (!row) return Internal("scheduled request " + std::to_string(id) + " has no batch row");
+-
+-    auto it = step.num_scheduled_tokens.find(id);
+-    if (it == step.num_scheduled_tokens.end()) {
+-      return Internal("request " + std::to_string(id) + " has no scheduled token count");
+-    }
+-    const int n = it->second;
+-    const int start = input_batch_->NumComputed(*row);
+-    if (start + n > input_batch_->NumTokens(*row)) {
+-      return Internal("request " + std::to_string(id) + " schedules past its token history");
+-    }
++  StepInputs inputs;
++  inputs.token_ids = std::move(ids_tensor);
++  inputs.positions = std::move(positions_tensor);
++
++  // The batch description over the facade's own tables; decodes-first
++  // ordering is the scheduler's contract.
++  attn::BatchDesc desc;
++  desc.num_reqs = static_cast<std::int32_t>(batch.size());
++  desc.num_tokens = static_cast<std::int32_t>(total_new);
++  desc.query_lens = query_lens;
++  desc.seq_lens = seq_lens;
++  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
++  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
++  desc.block_size = static_cast<std::int32_t>(block_size);
++  desc.num_decodes = static_cast<std::int32_t>(
++      std::count_if(query_lens.begin(), query_lens.end(), [](int32_t l) { return l == 1; }));
++  desc.num_decode_tokens = desc.num_decodes;
++  desc.num_prefills = desc.num_reqs - desc.num_decodes;
++  desc.num_prefill_tokens = desc.num_tokens - desc.num_decode_tokens;
++  // The batch description over the scheduler's published snapshot: the
++  // runner never reads the live facade tables for a step in flight
++  // (docs/attention.md §9).
++  for (std::uint16_t g = 0; g < num_groups; ++g) {
++    const std::vector<int32_t>& table =
++        step.group_block_ids[static_cast<size_t>(g < kMaxSchedulerGroups ? g : 0)];
++    desc.block_ids[g] = table;
++    desc.block_ids_num_pages[g] = static_cast<std::int32_t>(table.size());
++  }
+ 
+-    const std::vector<int32_t>& table = attention_->BlockTable(id);
+-    for (int i = 0; i < n; ++i) {
+-      const int pos = start + i;
+-      const int block_idx = pos / block_size;
+-      if (block_idx >= static_cast<int>(table.size())) {
+-        return Internal("request " + std::to_string(id) + " has no block for position " +
+-                        std::to_string(pos));
+-      }
+-      token_ids.push_back(input_batch_->TokensAt(*row)[pos]);
+-      positions.push_back(pos);
+-      slot_mapping.push_back(table[block_idx] * block_size + pos % block_size);
+-    }
+-    std::copy(table.begin(), table.begin() + std::min<size_t>(table.size(), max_blocks),
+-              block_tables.begin() + static_cast<size_t>(s) * max_blocks);
++  INFERX_ASSIGN_OR_RETURN(attn::StepContext step_ctx, attention_->BeginStep(desc, *op_));
++
++  const ModelSpec& spec = model_->GetModelSpec();
++  ForwardContext ctx(*op_, step_ctx, *comm_, *scratch_, absl::MakeConstSpan(ops_));
++  INFERX_ASSIGN_OR_RETURN(
++      Tensor hidden,
++      Tensor::Empty(spec.dtype, Shape({static_cast<int64_t>(total_new), spec.hidden_size}),
++                    scratch_.get()));
++  INFERX_RETURN_IF_ERROR(model_->Forward(ctx, inputs, hidden));
++  INFERX_ASSIGN_OR_RETURN(
++      Tensor logits,
++      Tensor::Empty(spec.dtype, Shape({static_cast<int64_t>(batch.size()), spec.vocab_size}),
++                    scratch_.get()));
++  INFERX_RETURN_IF_ERROR(model_->ComputeLogits(ctx, hidden, sample_rows_tensor, logits));
++
++  if (capture_logits_) {
++    // Snapshot into ordinary device memory: the scratch block returns to
++    // the step pool when the step's tensors go out of scope.
++    INFERX_ASSIGN_OR_RETURN(Tensor snapshot,
++                            Tensor::Empty(spec.dtype, logits.GetShape(), op_->GetDevice()));
++    INFERX_RETURN_IF_ERROR(logits.CopyTo(snapshot));
++    captured_logits_.push_back(std::move(snapshot));
++  }
+ 
+-    query_start_loc.push_back(query_start_loc.back() + n);
+-    logits_idx.push_back(query_start_loc.back() - 1);
+-    inputs->rows.push_back(*row);
+-    inputs->num_tokens.push_back(n);
++  // Sample one token per sequence. A sequence still inside its (chunked)
++  // prompt has no valid next-token distribution; its row samples garbage
++  // that the watermark check below discards.
++  std::vector<int32_t> sampled(batch.size(), -1);
++  if (sampler_ != nullptr) {
++    std::vector<sampling::SamplingMetadata::PerRequest> rows;
++    rows.reserve(batch.size());
++    std::vector<std::vector<TokenId>> histories(batch.size());
++    for (size_t i = 0; i < batch.size(); ++i) {
++      const int batch_row = batch[i];
++      histories[i].assign(
++          input_batch_->TokensAt(batch_row),
++          input_batch_->TokensAt(batch_row) + input_batch_->NumTokens(batch_row));
++      sampling::SamplingMetadata::PerRequest row;
++      row.params = &input_batch_->ParamsAt(batch_row);
++      row.rng_offset = input_batch_->RngOffset(batch_row);
++      row.history = &histories[i];
++      rows.push_back(row);
++    }
++    sampling::SamplingMetadata metadata =
++        sampling::SamplingMetadata::Build(spec.vocab_size, absl::MakeConstSpan(rows));
++    INFERX_ASSIGN_OR_RETURN(sampling::SamplerOutput result,
++                            sampler_->Sample(*op_, logits, metadata));
++    INFERX_RETURN_IF_ERROR(runtime_->Memory().CopyAsync(
++        sampled.data(), result.sampled_token_ids.Data(), sampled.size() * sizeof(int32_t),
++        CopyKind::kDeviceToHost, stream_));
+   }
+ 
+-  const int64_t total = static_cast<int64_t>(token_ids.size());
+-  auto upload = [&](const std::vector<int32_t>& v, std::vector<int64_t> shape,
+-                    Tensor* dst) -> Status {
+-    auto t = UploadI32(runtime_, stream_, v, std::move(shape));
+-    if (!t.ok()) return t.status();
+-    *dst = std::move(*t);
+-    return OkStatus();
+-  };
+-  MR_RETURN_IF_ERROR(upload(token_ids, {total}, &inputs->token_ids));
+-  MR_RETURN_IF_ERROR(upload(positions, {total}, &inputs->positions));
+-  MR_RETURN_IF_ERROR(upload(slot_mapping, {total}, &inputs->slot_mapping));
+-  MR_RETURN_IF_ERROR(upload(block_tables, {num_seqs, max_blocks}, &inputs->block_tables));
+-  MR_RETURN_IF_ERROR(upload(query_start_loc, {num_seqs + 1}, &inputs->query_start_loc));
+-  MR_RETURN_IF_ERROR(upload(logits_idx, {num_seqs}, &inputs->logits_indices));
++  // Everything downstream reads host values; one sync retires the step.
++  INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_));
++
++  out->samples.reserve(batch.size());
++  for (size_t i = 0; i < batch.size(); ++i) {
++    const int row = batch[i];
++    const int computed = input_batch_->NumComputed(row) + step.scheduled[i].num_new_tokens;
++    INFERX_RETURN_IF_ERROR(input_batch_->SetNumComputed(input_batch_->IdAt(row), computed));
++    SampledTokens sample;
++    sample.request_id = step.scheduled[i].request_id;
++    if (sampled[i] >= 0 && computed >= prompt_lens[i]) {
++      sample.token_ids.push_back(sampled[i]);
++      INFERX_RETURN_IF_ERROR(ApplyAcceptedTokens(sample.request_id, sampled[i]));
++    }
++    out->samples.push_back(std::move(sample));
++  }
++  // Prefix publication is the scheduler's job (UpdateFromOutput): the
++  // facade is single-threaded with it (docs/attention.md §9).
+   return OkStatus();
+ }
+ 
+-StatusOr<Tensor> ModelRunner::Forward(const StepInputs& inputs) {
+-  std::vector<int> num_computed;
+-  num_computed.reserve(inputs.rows.size());
+-  for (int row : inputs.rows) num_computed.push_back(input_batch_->NumComputed(row));
++}  // namespace inferx
+ 
+-  auto meta = attention_->BuildMetadata(inputs.req_ids, inputs.num_tokens, num_computed);
+-  if (!meta.ok()) return meta.status();
+-  return model_->Forward(*op_, ops_, inputs.token_ids, inputs.positions, *meta);
++namespace inferx {
++ModelRunner::ModelRunner() = default;
++attn::AttentionRuntime* ModelRunner::Attention() {
++  return workers_.empty() ? attention_.get() : workers_.front()->Runner()->Attention();
+ }
+-
+-StatusOr<Tensor> ModelRunner::ComputeLogits(const Tensor& hidden, const StepInputs& inputs) {
+-  return model_->ComputeLogits(*op_, hidden, inputs.logits_indices);
++const models::ModelSpec& ModelRunner::GetModelSpec() const {
++  return workers_.empty() ? model_->GetModelSpec() : workers_.front()->Runner()->GetModelSpec();
++}
++void ModelRunner::EnableLogitsCapture() {
++  if (workers_.empty())
++    capture_logits_ = true;
++  else
++    workers_.front()->Runner()->EnableLogitsCapture();
++}
++const std::vector<Tensor>& ModelRunner::CapturedLogits() const {
++  return workers_.empty() ? captured_logits_ : workers_.front()->Runner()->CapturedLogits();
+ }
+ 
+-Status ModelRunner::Sample(const Tensor& logits, const StepInputs& inputs,
+-                           ModelRunnerOutput* out) {
+-  const size_t num_seqs = inputs.rows.size();
+-  out->req_ids = inputs.req_ids;
+-  out->sampled_token_ids.assign(num_seqs, {});
+-
+-  // Non-driver ranks only maintain state for their shard.
+-  if (!sampler_) return OkStatus();
+-
+-  std::vector<sampling::SamplingParams> params;
+-  std::vector<int64_t> rng_offsets;
+-  for (int row : inputs.rows) {
+-    params.push_back(input_batch_->ParamsAt(row));
+-    rng_offsets.push_back(input_batch_->RngOffset(row));
++StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(const ModelConfig& model,
++                                                           const CacheConfig& cache,
++                                                           const SchedulerConfig& scheduler,
++                                                           const ExecutionConfig& execution,
++                                                           const ParallelConfig& parallel,
++                                                           std::unique_ptr<CommBackend> comm) {
++  INFERX_RETURN_IF_ERROR(parallel.Validate());
++  INFERX_RETURN_IF_ERROR(model.device.Validate());
++  if (comm || parallel.tensor_parallel_size == 1) {
++    INFERX_ASSIGN_OR_RETURN(auto worker, Worker::Create(model, parallel, std::move(comm)));
++    std::vector<std::unique_ptr<Worker>> ranks;
++    ranks.push_back(std::move(worker));
++    return CreateGroup(std::move(ranks), cache, scheduler, execution, [](const Status&) {});
+   }
+ 
+-  auto sampled = sampler_->Sample(logits, params, rng_offsets);
+-  if (!sampled.ok()) return sampled.status();
+-
+-  for (size_t i = 0; i < num_seqs; ++i) {
+-    const int row = inputs.rows[i];
+-    // A chunked prefill that has not reached the tip produces no token.
+-    const bool at_tip =
+-        input_batch_->NumComputed(row) + inputs.num_tokens[i] == input_batch_->NumTokens(row);
+-    if (!at_tip) continue;
++  // Multi-rank world construction: one rank-local runner per device.
++  if (parallel.tensor_parallel_rank != 0) {
++    return InvalidArgumentError("the tensor-parallel coordinator must have rank zero");
++  }
++  if (model.device.device != "cuda") {
++    return InvalidArgumentError("multi-GPU tensor parallelism requires CUDA");
++  }
++  if (execution.enable_cuda_graphs) {
++    return UnimplementedError("tensor-parallel serving currently requires eager execution");
++  }
++  std::vector<int> ids = model.device.device_ids;
++  if (ids.empty()) {
++    for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) ids.push_back(rank);
++  }
++  if (ids.size() != static_cast<size_t>(parallel.tensor_parallel_size)) {
++    return InvalidArgumentError("device-ids must contain one device per tensor-parallel rank");
++  }
++  std::vector<Device> devices;
++  for (const int id : ids) {
++    if (id > std::numeric_limits<int8_t>::max()) {
++      return InvalidArgumentError("CUDA device ordinal is out of range");
++    }
++    devices.push_back(Device::Cuda(static_cast<int8_t>(id)));
++  }
++  // Reject unknown architectures before creating the communication world.
++  INFERX_ASSIGN_OR_RETURN(auto hf, HfConfig::FromFile(model.model_dir + "/config.json"));
++  INFERX_RETURN_IF_ERROR(models::ArchitectureRegistry::Builtins()
++                             .Resolve(hf.ModelType(), hf.Architecture())
++                             .status());
++  INFERX_ASSIGN_OR_RETURN(auto world, NcclWorld::Create(devices));
++  std::vector<std::unique_ptr<Worker>> ranks;
++  for (int rank = 0; rank < parallel.tensor_parallel_size; ++rank) {
++    ModelConfig local = model;
++    local.device.device_ids = {ids[rank]};
++    ParallelConfig rank_parallel;
++    rank_parallel.tensor_parallel_size = parallel.tensor_parallel_size;
++    rank_parallel.tensor_parallel_rank = rank;
++    auto made = Worker::Create(local, rank_parallel, world->MakeRank(rank));
++    if (!made.ok()) {
++      world->Abort(made.status());
++      return made.status();
++    }
++    ranks.push_back(*std::move(made));
++  }
++  return CreateGroup(
++      std::move(ranks), cache, scheduler, execution,
++      [world](const Status& status) { world->Abort(status); },
++      [world] { return world->CheckHealth(); });
++}
+ 
+-    const TokenId token = (*sampled)[i];
+-    MR_RETURN_IF_ERROR(input_batch_->AppendToken(inputs.req_ids[i], token));
+-    input_batch_->AdvanceRngOffset(row);
+-    out->sampled_token_ids[i].push_back(token);
++StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::CreateGroup(
++    std::vector<std::unique_ptr<Worker>> ranks, const CacheConfig& cache,
++    const SchedulerConfig& scheduler, const ExecutionConfig& execution,
++    std::function<void(const Status&)> abort, std::function<Status()> check_health) {
++  if (ranks.empty() || !abort)
++    return InvalidArgumentError("rank group needs workers and abort");
++  for (size_t i = 0; i < ranks.size(); ++i) {
++    if (!ranks[i]) return InvalidArgumentError("rank group contains a null worker");
++    if (ranks.size() > 1 &&
++        (ranks[i]->Parallel().tensor_parallel_rank != static_cast<int>(i) ||
++         ranks[i]->Parallel().tensor_parallel_size != static_cast<int>(ranks.size())))
++      return InvalidArgumentError("rank group topology disagrees");
+   }
+-  return OkStatus();
++  auto runner = std::unique_ptr<ModelRunner>(new ModelRunner());
++  runner->workers_ = std::move(ranks);
++  runner->abort_ = std::move(abort);
++  runner->check_health_ = std::move(check_health);
++  auto initialize = [&]() -> Status {
++    int64_t budget = std::numeric_limits<int64_t>::max();
++    for (auto& worker : runner->workers_) {
++      worker->SetFailureHooks(runner->abort_, runner->check_health_);
++      INFERX_RETURN_IF_ERROR(worker->InitDevice());
++      INFERX_RETURN_IF_ERROR(worker->LoadModel());
++      INFERX_ASSIGN_OR_RETURN(auto available,
++                              worker->DetermineAvailableMemory(cache, scheduler));
++      budget = std::min(budget, available);
++    }
++    const auto& driver = runner->workers_.front()->Runner()->GetModelSpec();
++    for (const auto& worker : runner->workers_) {
++      const auto& spec = worker->Runner()->GetModelSpec();
++      if (spec.architecture != driver.architecture || spec.vocab_size != driver.vocab_size ||
++          spec.hidden_size != driver.hidden_size || spec.num_layers != driver.num_layers ||
++          spec.max_position_embeddings != driver.max_position_embeddings ||
++          spec.dtype != driver.dtype || spec.eos_token_ids != driver.eos_token_ids)
++        return InvalidArgumentError("rank group model specifications disagree");
++    }
++    if (runner->workers_.size() == 1 && budget >= 0 &&
++        runner->workers_.front()->Parallel().tensor_parallel_size > 1) {
++      INFERX_ASSIGN_OR_RETURN(budget, runner->workers_.front()->AgreeAvailableMemory(budget));
++    }
++    // All local ranks have profiled before cache allocation. No collective
++    // runs during sequential initialization.
++    for (auto& worker : runner->workers_) {
++      INFERX_RETURN_IF_ERROR(worker->InitializeFromConfig(budget, cache, scheduler));
++      INFERX_RETURN_IF_ERROR(worker->WarmUp(execution));
++    }
++    return OkStatus();
++  };
++  const Status status = initialize();
++  if (!status.ok()) {
++    runner->abort_(status);
++    return status;
++  }
++  return runner;
+ }
+ 
+-#undef MR_RETURN_IF_ERROR
++StatusOr<ModelRunnerOutput> ModelRunner::ExecuteGroup(const SchedulerOutput& output) {
++  if (check_health_) INFERX_RETURN_IF_ERROR(check_health_());
++  if (workers_.size() == 1) return workers_.front()->ExecuteModel(output);
++
++  // Dispatch the same logical step to every rank. Each rank's runner
++  // validates and binds its rank-local state; a failure on any rank
++  // poisons the group rather than retrying mutated state.
++  std::vector<std::future<StatusOr<ModelRunnerOutput>>> pending;
++  try {
++    pending.reserve(workers_.size() - 1);
++    for (size_t rank = 1; rank < workers_.size(); ++rank) {
++      pending.push_back(std::async(
++          std::launch::async,
++          [runner = workers_[rank].get(), &output] { return runner->ExecuteModel(output); }));
++    }
++  } catch (const std::exception& error) {
++    const Status failure = InternalError("could not start rank execution: ", error.what());
++    abort_(failure);
++    return failure;  // Futures join before the borrowed output expires.
++  }
++  auto result = workers_.front()->ExecuteModel(output);
++  Status failure = result.status();
++  for (auto& future : pending) {
++    auto peer_result = future.get();
++    if (failure.ok() && !peer_result.ok()) failure = peer_result.status();
++  }
++  if (!failure.ok()) {
++    abort_(failure);
++    return failure;
++  }
++  // Only rank zero draws tokens. Share those exact ids with every rank,
++  // including stochastic sampling, before admitting the next scheduler step.
++  for (const auto& sample : result->samples) {
++    if (sample.token_ids.empty()) continue;
++    for (size_t rank = 1; rank < workers_.size(); ++rank) {
++      const auto status = workers_[rank]->Runner()->ApplyAcceptedTokens(
++          sample.request_id, sample.token_ids.back());
++      if (!status.ok()) {
++        abort_(status);
++        return status;
++      }
++    }
++  }
++  return result;
++}
+ 
+-}  // namespace models
+-}  // namespace inferx
+\ No newline at end of file
++}  // namespace inferx
+diff --git a/src/engine/worker.cc b/src/engine/worker.cc
+index b02b95e..d27ab23 100644
+--- a/src/engine/worker.cc
++++ b/src/engine/worker.cc
+@@ -1,104 +1,135 @@
+-#include "inferx/models/worker.h"
++#include "inferx/engine/worker.h"
+ 
+-#include <algorithm>
+-#include <string>
++#include <exception>
+ #include <utility>
+ 
+-namespace inferx {
+-namespace models {
+-
+-// ASSUMED APIs (adjust to the real ones):
+-//   DeviceRuntime::ForDevice(Device) -> StatusOr<DeviceRuntime*>
+-//   DeviceRuntime::CreateStream()    -> StatusOr<DeviceStream>
+-//   DeviceRuntime::TotalMemoryBytes()
+-//   Model::Create(config, parallel, comm, runtime, stream)
+-//       -> StatusOr<std::unique_ptr<Model>>
+-//   ParallelConfig::tp_rank; CacheConfig::gpu_memory_utilization
++#include "inferx/models/registry.h"
+ 
++namespace inferx {
+ StatusOr<std::unique_ptr<Worker>> Worker::Create(const ModelConfig& model,
+                                                  const ParallelConfig& parallel,
+                                                  std::unique_ptr<CommBackend> comm) {
++  INFERX_RETURN_IF_ERROR(parallel.Validate());
++  INFERX_RETURN_IF_ERROR(model.device.Validate());
++  if ((comm && (comm->rank() != parallel.tensor_parallel_rank ||
++                comm->size() != parallel.tensor_parallel_size)) ||
++      (!comm && parallel.tensor_parallel_size != 1)) {
++    return InvalidArgumentError("worker communicator does not match parallel config");
++  }
+   return std::unique_ptr<Worker>(new Worker(model, parallel, std::move(comm)));
+ }
+ 
+ Worker::Worker(const ModelConfig& model, const ParallelConfig& parallel,
+                std::unique_ptr<CommBackend> comm)
+-    : model_config_(model),
+-      parallel_(parallel),
+-      is_driver_rank_(parallel.tp_rank == 0),
+-      owned_comm_(std::move(comm)),
+-      comm_(owned_comm_ ? owned_comm_.get() : static_cast<CommBackend*>(&single_rank_comm_)) {}
++    : model_config_(model), parallel_(parallel), owned_comm_(std::move(comm)) {
++  comm_ = owned_comm_ ? owned_comm_.get() : &single_rank_comm_;
++}
+ 
+-Worker::~Worker() = default;
++Worker::~Worker() {
++  if (runtime_) {
++    (void)runtime_->Activate();
++    if (stream_) (void)runtime_->Streams().SynchronizeStream(stream_.Get());
++  }
++  runner_.reset();
++  stream_.Reset();
++}
+ 
+ Status Worker::InitDevice() {
+-  if (runner_) return Internal("InitDevice called twice");
+-
+-  auto runtime = DeviceRuntime::ForDevice(model_config_.device);
+-  if (!runtime.ok()) return runtime.status();
+-  runtime_ = *runtime;
+-
+-  auto stream = runtime_->CreateStream();
+-  if (!stream.ok()) return stream.status();
+-  stream_ = *stream;
+-
+-  auto model = Model::Create(model_config_, parallel_, comm_, runtime_, stream_);
+-  if (!model.ok()) return model.status();
+-
+-  runner_ = std::make_unique<ModelRunner>(std::move(*model), runtime_, stream_, comm_,
+-                                          is_driver_rank_);
++  if (phase_ != Phase::kCreated)
++    return FailedPreconditionError("InitDevice called out of order");
++  INFERX_ASSIGN_OR_RETURN(auto devices, model_config_.device.Resolve());
++  const Device device = devices.front();
++  if (!device.IsCuda()) return InvalidArgumentError("model execution requires CUDA");
++  INFERX_ASSIGN_OR_RETURN(runtime_, RuntimeFor(device));
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  INFERX_ASSIGN_OR_RETURN(stream_, runtime_->Streams().CreateStream(StreamPriority::kNormal));
++  load_options_.directory = model_config_.model_dir;
++  load_options_.device = device;
++  load_options_.parallel = parallel_;
++  INFERX_ASSIGN_OR_RETURN(load_options_.dtype,
++                          models::ModelLoadOptions::ParseDType(model_config_.dtype));
++  INFERX_ASSIGN_OR_RETURN(auto model, models::BuildModel(load_options_));
++  runner_ = std::make_unique<ModelRunner>(std::move(model), runtime_, stream_.Get(), comm_,
++                                          IsDriverRank());
++  phase_ = Phase::kDevice;
+   return OkStatus();
+ }
+ 
+-Status Worker::LoadModel(const LoadOptions& options) {
+-  if (!runner_) return Internal("LoadModel called before InitDevice");
+-  return runner_->LoadModel(options);
++Status Worker::LoadModel() {
++  if (phase_ != Phase::kDevice) return FailedPreconditionError("LoadModel called out of order");
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  INFERX_RETURN_IF_ERROR(runner_->LoadModel(load_options_));
++  phase_ = Phase::kLoaded;
++  return OkStatus();
+ }
+ 
+ StatusOr<int64_t> Worker::DetermineAvailableMemory(const CacheConfig& cache,
+                                                    const SchedulerConfig& scheduler) {
+-  if (!runner_) return Internal("DetermineAvailableMemory called before InitDevice");
+-
+-  // The profile step runs regardless, so scratch blocks and library
+-  // workspaces (cuBLAS, ...) exist before the KV pool is carved out.
+-  auto profile = runner_->ProfileRun(scheduler);
+-  if (!profile.ok()) return profile.status();
+-  weights_bytes_ = profile->weights_bytes;
+-
+-  // Explicit block count: the engine ignores the byte budget.
+-  if (cache.gpu_memory_utilization <= 0) return int64_t{0};
+-
++  if (phase_ != Phase::kLoaded) return FailedPreconditionError("profile called out of order");
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  INFERX_RETURN_IF_ERROR(runner_->ProfileRun(scheduler));
++  phase_ = Phase::kProfiled;
++  if (cache.gpu_memory_utilization <= 0) return int64_t{-1};
++  INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_.Get()));
++  INFERX_ASSIGN_OR_RETURN(auto memory, runtime_->Memory().GetMemoryInfo());
++  const int64_t used = static_cast<int64_t>(memory.total_bytes - memory.free_bytes);
+   const int64_t budget =
+-      static_cast<int64_t>(cache.gpu_memory_utilization * runtime_->TotalMemoryBytes());
+-  const int64_t available = budget - profile->weights_bytes - profile->peak_activation_bytes;
+-  if (available <= 0) {
+-    return ResourceExhausted("memory budget (" + std::to_string(budget) +
+-                             " bytes) is smaller than weights plus peak activations");
+-  }
+-  return available;
++      static_cast<int64_t>(memory.total_bytes * cache.gpu_memory_utilization) - used;
++  if (budget <= 0)
++    return ResourceExhaustedError("no memory remains for KV cache after profiling");
++  return budget;
+ }
+ 
+-Status Worker::InitializeFromConfig(const KVCacheConfig& kv, const SchedulerConfig& scheduler) {
+-  if (!runner_) return Internal("InitializeFromConfig called before InitDevice");
+-  return runner_->InitializeKVCache(kv, scheduler);
++StatusOr<int64_t> Worker::AgreeAvailableMemory(int64_t bytes) {
++  if (phase_ != Phase::kProfiled)
++    return FailedPreconditionError("budget agreement before profile");
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  ops::OpContext op(*runtime_, stream_.Get());
++  return comm_->AllReduceMin(op, bytes);
+ }
+ 
+-Status Worker::WarmUp(const ExecutionConfig& /*execution*/) {
+-  if (!runner_) return Internal("WarmUp called before InitDevice");
+-  return runner_->CaptureGraphs();
++Status Worker::InitializeFromConfig(int64_t kv_bytes, const CacheConfig& cache,
++                                    const SchedulerConfig& scheduler) {
++  if (phase_ != Phase::kProfiled)
++    return FailedPreconditionError("cache init called out of order");
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  INFERX_RETURN_IF_ERROR(runner_->InitializeKVCache(kv_bytes, cache, scheduler));
++  phase_ = Phase::kCache;
++  return OkStatus();
+ }
+ 
+-StatusOr<ModelRunnerOutput> Worker::ExecuteModel(const SchedulerOutput& step) {
+-  if (!runner_) return Internal("ExecuteModel called before InitDevice");
++Status Worker::WarmUp(const ExecutionConfig& execution) {
++  if (phase_ != Phase::kCache) return FailedPreconditionError("WarmUp called out of order");
++  INFERX_RETURN_IF_ERROR(runtime_->Activate());
++  INFERX_RETURN_IF_ERROR(runner_->CaptureGraphs(execution));
++  phase_ = Phase::kReady;
++  return OkStatus();
++}
+ 
++StatusOr<ModelRunnerOutput> Worker::ExecuteModel(const SchedulerOutput& step) {
++  if (phase_ != Phase::kReady) return FailedPreconditionError("worker is not ready");
++  if (!failure_.ok()) return failure_;
+   if (check_health_) {
+-    Status health = check_health_();
+-    if (!health.ok()) return health;
++    auto status = check_health_();
++    if (!status.ok()) return status;
++  }
++  auto execute = [&]() -> StatusOr<ModelRunnerOutput> {
++    INFERX_RETURN_IF_ERROR(runtime_->Activate());
++    return runner_->ExecuteModel(step);
++  };
++  try {
++    auto result = execute();
++    if (!result.ok()) {
++      failure_ = result.status();
++      if (abort_) abort_(failure_);
++    }
++    return result;
++  } catch (const std::exception& error) {
++    auto status = InternalError("rank execution threw: ", error.what());
++    failure_ = status;
++    if (abort_) abort_(failure_);
++    return failure_;
+   }
+-
+-  auto out = runner_->ExecuteModel(step);
+-  if (!out.ok() && abort_) abort_(out.status());
+-  return out;
+ }
+ 
+ void Worker::SetFailureHooks(std::function<void(const Status&)> abort,
+@@ -106,6 +137,4 @@ void Worker::SetFailureHooks(std::function<void(const Status&)> abort,
+   abort_ = std::move(abort);
+   check_health_ = std::move(check_health);
+ }
+-
+-}  // namespace models
+-}  // namespace inferx
+\ No newline at end of file
++}  // namespace inferx
+diff --git a/src/models/CMakeLists.txt b/src/models/CMakeLists.txt
+index f02cd6e..3e1528d 100644
+--- a/src/models/CMakeLists.txt
++++ b/src/models/CMakeLists.txt
+@@ -1,7 +1,6 @@
+ # inferx_models -- the model layer: family-specific architectures (Qwen3,
+ # Qwen3-MoE, Llama) built from the reusable modules under models/layers,
+-# plus the architecture registry, checkpoint loading, and the rank-local
+-# ModelRunner that binds a scheduler step to a forward pass.
++# plus the architecture registry and checkpoint loading.
+ inferx_add_library(
+   NAME models
+   SRCS
+@@ -18,7 +17,6 @@ inferx_add_library(
+     weight_loader.cc
+     config_utils.cc
+     registry.cc
+-    model_runner.cc
+     qwen3/qwen3_config.cc
+     qwen3/qwen3_attention.cc
+     qwen3/qwen3_mlp.cc
+diff --git a/src/models/model_runner.cc b/src/models/model_runner.cc
+deleted file mode 100644
+index 324bcbd..0000000
+--- a/src/models/model_runner.cc
++++ /dev/null
+@@ -1,496 +0,0 @@
+-#include "inferx/models/model_runner.h"
+-
+-#include <algorithm>
+-
+-#include "inferx/ops/attention/cache_spec_bridge.h"
+-#include "inferx/ops/attention/op.h"
+-#include "inferx/ops/attention/registry.h"
+-
+-#include <utility>
+-
+-#include "inferx/models/registry.h"
+-
+-namespace inferx {
+-namespace models {
+-
+-namespace {
+-
+-/// Uploads one host int32 array as a device tensor.
+-StatusOr<Tensor> UploadInt32(DeviceRuntime& runtime, DeviceStream stream,
+-                             const std::vector<int32_t>& values) {
+-  INFERX_ASSIGN_OR_RETURN(
+-      Tensor tensor,
+-      Tensor::Empty(DataType::kInt32,
+-                    Shape({static_cast<int64_t>(values.size())}), runtime.device()));
+-  if (values.empty()) return tensor;
+-  INFERX_RETURN_IF_ERROR(runtime.Memory().CopyAsync(tensor.Data(), values.data(),
+-                                           values.size() * sizeof(int32_t),
+-                                           CopyKind::kHostToDevice, stream));
+-  return tensor;
+-}
+-
+-}  // namespace
+-
+-StatusOr<std::unique_ptr<ModelRunner>> ModelRunner::Create(
+-    const ModelConfig& model_config, const CacheConfig& cache,
+-    const SchedulerConfig& scheduler, const ExecutionConfig& execution,
+-    const ParallelConfig& parallel, std::unique_ptr<CommBackend> comm) {
+-  INFERX_RETURN_IF_ERROR(parallel.Validate());
+-  INFERX_RETURN_IF_ERROR(model_config.device.Validate());
+-  INFERX_ASSIGN_OR_RETURN(const std::vector<Device> devices, model_config.device.Resolve());
+-  const Device device = devices.front();
+-  if (!device.IsCuda()) {
+-    return InvalidArgumentError("the model layer executes on CUDA, requested ",
+-                                device.ToString());
+-  }
+-
+-  ModelLoadOptions options;
+-  options.directory = model_config.model_dir;
+-  options.device = device;
+-  INFERX_ASSIGN_OR_RETURN(options.dtype, ModelLoadOptions::ParseDType(model_config.dtype));
+-  options.parallel = parallel;
+-  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<Model> model, BuildModel(options));
+-
+-  INFERX_ASSIGN_OR_RETURN(DeviceRuntime* runtime, RuntimeFor(device));
+-  INFERX_RETURN_IF_ERROR(runtime->Activate());
+-  auto owned_stream = runtime->Streams().CreateStream(StreamPriority::kNormal);
+-  INFERX_RETURN_IF_ERROR(owned_stream.status());
+-  const DeviceStream stream = owned_stream->Release();
+-
+-  std::unique_ptr<ModelRunner> runner(
+-      new ModelRunner(std::move(model), std::move(comm), runtime, stream));
+-  runner->checkpoint_dir_ = model_config.model_dir;
+-  INFERX_RETURN_IF_ERROR(runner->Initialize(cache, scheduler, execution));
+-  return runner;
+-}
+-
+-ModelRunner::ModelRunner(std::unique_ptr<Model> model,
+-                         std::unique_ptr<CommBackend> owned_comm,
+-                         DeviceRuntime* runtime, DeviceStream stream)
+-    : runtime_(runtime),
+-      stream_(stream),
+-      model_(std::move(model)),
+-      owned_comm_(std::move(owned_comm)) {
+-  comm_ = owned_comm_ != nullptr ? owned_comm_.get() : &single_rank_comm_;
+-  op_ = std::make_unique<ops::OpContext>(*runtime_, stream_);
+-}
+-
+-ModelRunner::~ModelRunner() {
+-  op_.reset();
+-  requests_.clear();
+-  sampler_.reset();
+-  ops_.clear();
+-  attention_.reset();  // Frees pools while no step references them.
+-  scratch_.reset();    // Tensors carved from the region are gone by now.
+-  if (runtime_ != nullptr && stream_.handle != nullptr) {
+-    (void)runtime_->Streams().SynchronizeStream(stream_);
+-    OwnedStream(stream_, &runtime_->Streams()).Reset();
+-  }
+-}
+-
+-void ModelRunner::SetFailureHooks(std::function<void(const Status&)> abort,
+-                                  std::function<Status()> check_health) {
+-  abort_ = std::move(abort);
+-  check_health_ = std::move(check_health);
+-}
+-
+-Status ModelRunner::ApplyAcceptedTokens(RequestId request_id, TokenId token) {
+-  auto it = requests_.find(request_id);
+-  if (it == requests_.end()) {
+-    return NotFoundError("apply-tokens for unknown request ", request_id);
+-  }
+-  it->second.tokens.push_back(token);
+-  return OkStatus();
+-}
+-
+-StatusOr<ModelRunnerOutput> ModelRunner::Run(const SchedulerOutput& step) {
+-  ModelRunnerOutput output;
+-  INFERX_RETURN_IF_ERROR(RunStep(step, &output));
+-  return output;
+-}
+-
+-Status ModelRunner::Initialize(const CacheConfig& cache, const SchedulerConfig& scheduler,
+-                               const ExecutionConfig& execution) {
+-  max_num_seqs_ = scheduler.max_num_seqs;
+-
+-  // Weights first: they are the floor of every budget below.
+-  INFERX_ASSIGN_OR_RETURN(CheckpointReader checkpoint,
+-                          CheckpointReader::Open(checkpoint_dir_));
+-  INFERX_RETURN_IF_ERROR(model_->LoadWeights(checkpoint));
+-
+-  // Scratch is measured, not computed: the profile step below runs the
+-  // largest shape the scheduler can produce through a measuring arena, and
+-  // the arena freezes at its high-water mark (plus margin). The frozen
+-  // region stays allocated, so the KV budget math below sees it as used.
+-  const ModelSpec& spec = model_->GetModelSpec();
+-  const int64_t max_tokens = scheduler.max_num_batched_tokens;
+-  constexpr double kScratchMargin = 0.25;
+-  {
+-    ScratchArena arena = ScratchArena::Measuring(spec.device);
+-    INFERX_RETURN_IF_ERROR(RunProfileStep(arena, max_tokens,
+-                                          std::min<int64_t>(max_num_seqs_, max_tokens)));
+-    INFERX_RETURN_IF_ERROR(arena.Freeze(spec.device, kScratchMargin));
+-    scratch_ = std::make_unique<ScratchArena>(std::move(arena));
+-  }
+-  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<sampling::Sampler> sampler,
+-                          sampling::Sampler::Create(max_num_seqs_, spec.vocab_size,
+-                                                    spec.device));
+-  sampler_ = std::move(sampler);
+-
+-  // Memory-based KV sizing: profile one max-shape step, measure what stays
+-  // allocated, and give the utilization budget's leftover to the pool. The
+-  // minimum across the tensor-parallel group keeps block counts uniform.
+-  int64_t kv_bytes = -1;
+-  if (cache.gpu_memory_utilization > 0.0f) {
+-    INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_));
+-    INFERX_ASSIGN_OR_RETURN(const DeviceMemoryInfo after, runtime_->Memory().GetMemoryInfo());
+-    const int64_t used = static_cast<int64_t>(after.total_bytes) -
+-                         static_cast<int64_t>(after.free_bytes);
+-    kv_bytes = static_cast<int64_t>(static_cast<double>(after.total_bytes) *
+-                                    cache.gpu_memory_utilization) - used;
+-    INFERX_ASSIGN_OR_RETURN(kv_bytes, comm_->AllReduceMin(*op_, kv_bytes));
+-  }
+-
+-  INFERX_RETURN_IF_ERROR(CreateAttention(kv_bytes, cache, scheduler));
+-  return CaptureGraphs(execution);
+-}
+-
+-Status ModelRunner::RunProfileStep(Allocator& scratch, int64_t max_tokens,
+-                                   int64_t max_seqs) {
+-  // One synthetic batch at the scheduler's ceiling: max_seqs sequences
+-  // splitting max_tokens tokens. A throwaway attention runtime holds the
+-  // profile KV so attention runs the real kernels; it is destroyed before
+-  // the runtime that matters is sized.
+-  const ModelSpec& spec = model_->GetModelSpec();
+-
+-  auto registry = std::make_unique<attn::BackendRegistry>();
+-  attn::RegisterBuiltinBackends(*registry);
+-  attn::AttentionConfig config;
+-  config.block_size = 16;
+-  config.max_model_len = std::max<int64_t>(spec.max_position_embeddings, max_tokens);
+-  config.max_seqs = max_seqs;
+-  config.max_batch_tokens = max_tokens;
+-  // Generous throwaway budget: this runtime exists to run the kernels, not
+-  // to size anything; it dies before the measured freeze.
+-  config.cache_bytes_budget = 1LL << 32;
+-  config.device = spec.device;
+-  config.enable_prefix_caching = false;
+-  INFERX_ASSIGN_OR_RETURN(std::unique_ptr<attn::AttentionRuntime> runtime,
+-                          attn::AttentionRuntime::Create(std::move(registry), config,
+-                                                         model_->GetAttentionSpecs()));
+-
+-  std::vector<attn::AttentionOp> ops;
+-  for (size_t l = 0; l < model_->GetAttentionSpecs().size(); ++l) {
+-    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op, runtime->MakeOp(static_cast<int64_t>(l)));
+-    ops.push_back(std::move(op));
+-  }
+-
+-  // Synthetic requests: tokens_per_seq each, registered through the facade
+-  // exactly like a real step, so block tables and metadata are real.
+-  const int64_t tokens_per_seq = std::max<int64_t>(1, max_tokens / max_seqs);
+-  std::vector<TokenId> token_ids;
+-  std::vector<std::int32_t> query_lens, seq_lens, sample_rows;
+-  int64_t remaining = max_tokens;
+-  uint64_t request_id = 1;
+-  while (remaining > 0) {
+-    const int64_t chunk = std::min<int64_t>(tokens_per_seq, remaining);
+-    INFERX_RETURN_IF_ERROR(
+-        runtime->Cache().Reserve(request_id, GrowthTarget{0, chunk}));
+-    for (int64_t t = 0; t < chunk; ++t) token_ids.push_back(static_cast<TokenId>(0));
+-    query_lens.push_back(static_cast<std::int32_t>(chunk));
+-    seq_lens.push_back(static_cast<std::int32_t>(chunk));
+-    sample_rows.push_back(static_cast<std::int32_t>(token_ids.size() - 1));
+-    remaining -= chunk;
+-    ++request_id;
+-  }
+-
+-  attn::BatchDesc desc;
+-  desc.num_reqs = static_cast<std::int32_t>(query_lens.size());
+-  desc.num_tokens = static_cast<std::int32_t>(token_ids.size());
+-  desc.query_lens = query_lens;
+-  desc.seq_lens = seq_lens;
+-  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
+-  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
+-  desc.block_size = static_cast<std::int32_t>(runtime->GetPlan().block_size);
+-  desc.num_prefills = desc.num_reqs;
+-  desc.num_prefill_tokens = desc.num_tokens;
+-  // Flatten the per-group page tables; models here are single token-wise
+-  // group, so group 0 carries the batch's whole table. The vector outlives
+-  // BeginStep, whose BatchDesc borrows it.
+-  std::vector<BlockId> flat;
+-  for (uint64_t id = 1; id < request_id; ++id) {
+-    const auto blocks = runtime->Cache().GroupBlocks(id, 0);
+-    flat.insert(flat.end(), blocks.begin(), blocks.end());
+-  }
+-  desc.block_ids[0] = flat;
+-  desc.block_ids_num_pages[0] = static_cast<std::int32_t>(flat.size());
+-
+-  INFERX_ASSIGN_OR_RETURN(attn::StepContext step, runtime->BeginStep(desc, *op_));
+-
+-  StepInputs inputs;
+-  INFERX_ASSIGN_OR_RETURN(inputs.token_ids,
+-                          UploadInt32(*runtime_, stream_, token_ids));
+-  std::vector<std::int32_t> positions(static_cast<size_t>(token_ids.size()), 0);
+-  for (size_t i = 0; i < positions.size(); ++i) {
+-    const std::int32_t seq = static_cast<std::int32_t>(i / tokens_per_seq);
+-    positions[i] = static_cast<std::int32_t>(i - seq * tokens_per_seq);
+-  }
+-  INFERX_ASSIGN_OR_RETURN(inputs.positions, UploadInt32(*runtime_, stream_, positions));
+-
+-  // The profile runs COMM-FREE through the world-of-one backend: tensor-
+-  // parallel ranks initialize sequentially (CreateGroup builds them one by
+-  // one), so a real collective here would deadlock the loopback barrier.
+-  // The measurements -- arena bytes, cuBLAS workspaces -- are identical
+-  // either way; collective backends allocate nothing from this arena.
+-  SingleRankComm profile_comm;
+-  ForwardContext ctx(*op_, step, profile_comm, scratch, absl::MakeConstSpan(ops));
+-  INFERX_ASSIGN_OR_RETURN(Tensor hidden,
+-                          Tensor::Empty(spec.dtype,
+-                                        Shape({static_cast<int64_t>(token_ids.size()),
+-                                               spec.hidden_size}),
+-                                        &scratch));
+-  INFERX_RETURN_IF_ERROR(model_->Forward(ctx, inputs, hidden));
+-  // The head path's buffers, measured by allocation: the gathered sample
+-  // rows and the [rows, vocab] logits. Running ComputeLogits itself would
+-  // issue the TP all-gather tail, which the identity comm rejects on
+-  // shape; the bytes are what the measurement needs, not the GEMM.
+-  {
+-    INFERX_ASSIGN_OR_RETURN(
+-        Tensor sampled,
+-        Tensor::Empty(spec.dtype,
+-                      Shape({static_cast<int64_t>(sample_rows.size()),
+-                             spec.hidden_size}),
+-                      &scratch));
+-    INFERX_ASSIGN_OR_RETURN(
+-        Tensor logits,
+-        Tensor::Empty(spec.dtype,
+-                      Shape({static_cast<int64_t>(sample_rows.size()),
+-                             spec.vocab_size}),
+-                      &scratch));
+-    (void)sampled;
+-    (void)logits;
+-  }
+-  return runtime_->Streams().SynchronizeStream(stream_);
+-  // `runtime` dies here: its bytes return to the device before
+-  // CreateAttention sizes the real pools.
+-}
+-
+-Status ModelRunner::CreateAttention(int64_t kv_bytes, const CacheConfig& cache,
+-                                    const SchedulerConfig& scheduler) {
+-  const ModelSpec& spec = model_->GetModelSpec();
+-
+-  // Byte budget: utilization leftover, explicit bytes, or blocks x block
+-  // bytes (the facade + runtime derive the actual split).
+-  int64_t budget = kv_bytes;
+-  if (budget < 0) budget = cache.kv_cache_memory_bytes;
+-  if (budget <= 0 && cache.num_kv_blocks > 0) {
+-    // Convert the block count into a byte budget; the runtime rounds down
+-    // to whole blocks from it.
+-    int64_t per_block = 0;
+-    for (const attn::AttentionSpec& attn_spec : model_->GetAttentionSpecs()) {
+-      if (!attn::NeedsCache(attn_spec)) continue;
+-      INFERX_ASSIGN_OR_RETURN(const int64_t per_token, attn::CacheBytesPerToken(attn_spec));
+-      per_block += cache.block_size * per_token;
+-    }
+-    budget = cache.num_kv_blocks * per_block;
+-  }
+-  if (budget <= 0) {
+-    return ResourceExhaustedError("KV budget of ", kv_bytes,
+-                                  " bytes fits no cache; check the cache config");
+-  }
+-
+-  auto registry = std::make_unique<attn::BackendRegistry>();
+-  attn::RegisterBuiltinBackends(*registry);
+-  attn::AttentionConfig config;
+-  config.block_size = cache.block_size;
+-  config.max_model_len =
+-      std::max<int64_t>(spec.max_position_embeddings, scheduler.max_num_batched_tokens);
+-  config.max_seqs = max_num_seqs_;
+-  config.max_batch_tokens = scheduler.max_num_batched_tokens;
+-  config.cache_bytes_budget = budget;
+-  config.device = spec.device;
+-  config.enable_prefix_caching = cache.enable_prefix_caching;
+-  INFERX_ASSIGN_OR_RETURN(attention_,
+-                          attn::AttentionRuntime::Create(std::move(registry), config,
+-                                                         model_->GetAttentionSpecs()));
+-
+-  ops_.clear();
+-  const std::vector<attn::AttentionSpec> specs = model_->GetAttentionSpecs();
+-  for (size_t l = 0; l < specs.size(); ++l) {
+-    INFERX_ASSIGN_OR_RETURN(attn::AttentionOp op,
+-                            attention_->MakeOp(static_cast<int64_t>(l)));
+-    ops_.push_back(std::move(op));
+-  }
+-  return OkStatus();
+-}
+-
+-Status ModelRunner::CaptureGraphs(const ExecutionConfig& execution) const {
+-  if (execution.enable_cuda_graphs) {
+-    return UnimplementedError(
+-        "CUDA graph replay is not wired into the new model layer yet");
+-  }
+-  return OkStatus();
+-}
+-
+-Status ModelRunner::RunStep(const SchedulerOutput& step, ModelRunnerOutput* out) {
+-  const auto fail = [this](Status status) {
+-    if (abort_) abort_(status);
+-    return status;
+-  };
+-
+-  for (const RequestId id : step.finished_request_ids) requests_.erase(id);
+-  for (const RequestId id : step.preempted_request_ids) requests_.erase(id);
+-
+-  // New requests first: the batch walk below needs their state to exist.
+-  for (const NewRequestData& fresh : step.scheduled_new_reqs) {
+-    RequestState state;
+-    state.tokens.assign(fresh.prompt_token_ids.begin(), fresh.prompt_token_ids.end());
+-    state.num_computed = fresh.num_computed_tokens;
+-    state.params = fresh.sampling_params;
+-    requests_[fresh.request_id] = std::move(state);
+-  }
+-  // CachedRequestUpdate carried the runner's mirrored block tables; the
+-  // facade owns them now and the tables below read straight from it.
+-
+-  if (step.scheduled.empty()) return OkStatus();
+-  const int64_t block_size = attention_->GetPlan().block_size;
+-  const std::uint16_t num_groups = attention_->NumGroups();
+-
+-  // Flatten the step: token stream and positions. Page tables are NOT
+-  // mirrored here -- they are read from the cache facade below, the single
+-  // owner (docs/attention.md §8.3).
+-  std::vector<int32_t> input_ids, positions, sample_rows;
+-  std::vector<int32_t> query_lens, seq_lens;
+-  std::vector<RequestState*> batch;
+-  std::vector<int64_t> prompt_lens;
+-  int64_t total_new = 0;
+-
+-  for (const ScheduledRequest& scheduled : step.scheduled) {
+-    auto it = requests_.find(scheduled.request_id);
+-    if (it == requests_.end()) {
+-      return fail(InternalError("scheduled request ", scheduled.request_id,
+-                                " has no runner state"));
+-    }
+-    RequestState& state = it->second;
+-    const int64_t end = state.num_computed + scheduled.num_new_tokens;
+-    if (scheduled.num_new_tokens <= 0 || end > static_cast<int64_t>(state.tokens.size())) {
+-      return fail(InternalError("request ", scheduled.request_id, " schedules ", end,
+-                                " tokens but only carries ", state.tokens.size()));
+-    }
+-    for (int64_t t = state.num_computed; t < end; ++t) {
+-      input_ids.push_back(state.tokens[t]);
+-      positions.push_back(static_cast<int32_t>(t));
+-    }
+-    sample_rows.push_back(static_cast<int32_t>(total_new + scheduled.num_new_tokens - 1));
+-    query_lens.push_back(static_cast<std::int32_t>(scheduled.num_new_tokens));
+-    seq_lens.push_back(static_cast<std::int32_t>(end));
+-    total_new += scheduled.num_new_tokens;
+-    batch.push_back(&state);
+-    prompt_lens.push_back(static_cast<int64_t>(state.tokens.size()) - state.rng_offset);
+-  }
+-
+-  INFERX_ASSIGN_OR_RETURN(Tensor ids_tensor, UploadInt32(*runtime_, stream_, input_ids));
+-  INFERX_ASSIGN_OR_RETURN(Tensor positions_tensor, UploadInt32(*runtime_, stream_, positions));
+-  INFERX_ASSIGN_OR_RETURN(Tensor sample_rows_tensor, UploadInt32(*runtime_, stream_, sample_rows));
+-
+-  StepInputs inputs;
+-  inputs.token_ids = std::move(ids_tensor);
+-  inputs.positions = std::move(positions_tensor);
+-
+-  // The batch description over the facade's own tables; decodes-first
+-  // ordering is the scheduler's contract.
+-  attn::BatchDesc desc;
+-  desc.num_reqs = static_cast<std::int32_t>(batch.size());
+-  desc.num_tokens = static_cast<std::int32_t>(total_new);
+-  desc.query_lens = query_lens;
+-  desc.seq_lens = seq_lens;
+-  desc.max_query_len = *std::max_element(query_lens.begin(), query_lens.end());
+-  desc.max_seq_len = *std::max_element(seq_lens.begin(), seq_lens.end());
+-  desc.block_size = static_cast<std::int32_t>(block_size);
+-  desc.num_decodes = static_cast<std::int32_t>(
+-      std::count_if(query_lens.begin(), query_lens.end(), [](int32_t l) { return l == 1; }));
+-  desc.num_decode_tokens = desc.num_decodes;
+-  desc.num_prefills = desc.num_reqs - desc.num_decodes;
+-  desc.num_prefill_tokens = desc.num_tokens - desc.num_decode_tokens;
+-  // The batch description over the scheduler's published snapshot: the
+-  // runner never reads the live facade tables for a step in flight
+-  // (docs/attention.md §9).
+-  for (std::uint16_t g = 0; g < num_groups; ++g) {
+-    const std::vector<int32_t>& table =
+-        step.group_block_ids[static_cast<size_t>(g < kMaxSchedulerGroups ? g : 0)];
+-    desc.block_ids[g] = table;
+-    desc.block_ids_num_pages[g] = static_cast<std::int32_t>(table.size());
+-  }
+-
+-  INFERX_ASSIGN_OR_RETURN(attn::StepContext step_ctx, attention_->BeginStep(desc, *op_));
+-
+-  const ModelSpec& spec = model_->GetModelSpec();
+-  ForwardContext ctx(*op_, step_ctx, *comm_, *scratch_, absl::MakeConstSpan(ops_));
+-  INFERX_ASSIGN_OR_RETURN(
+-      Tensor hidden,
+-      Tensor::Empty(spec.dtype,
+-                    Shape({static_cast<int64_t>(total_new), spec.hidden_size}),
+-                    scratch_.get()));
+-  INFERX_RETURN_IF_ERROR(model_->Forward(ctx, inputs, hidden));
+-  INFERX_ASSIGN_OR_RETURN(
+-      Tensor logits,
+-      Tensor::Empty(spec.dtype, Shape({static_cast<int64_t>(batch.size()), spec.vocab_size}),
+-                    scratch_.get()));
+-  INFERX_RETURN_IF_ERROR(model_->ComputeLogits(ctx, hidden, sample_rows_tensor, logits));
+-
+-  if (capture_logits_) {
+-    // Snapshot into ordinary device memory: the scratch block returns to
+-    // the step pool when the step's tensors go out of scope.
+-    INFERX_ASSIGN_OR_RETURN(Tensor snapshot,
+-                            Tensor::Empty(spec.dtype, logits.GetShape(), op_->GetDevice()));
+-    INFERX_RETURN_IF_ERROR(logits.CopyTo(snapshot));
+-    captured_logits_.push_back(std::move(snapshot));
+-  }
+-
+-  // Sample one token per sequence. A sequence still inside its (chunked)
+-  // prompt has no valid next-token distribution; its row samples garbage
+-  // that the watermark check below discards.
+-  std::vector<int32_t> sampled(batch.size(), -1);
+-  if (sampler_ != nullptr) {
+-    std::vector<sampling::SamplingMetadata::PerRequest> rows;
+-    rows.reserve(batch.size());
+-    for (size_t i = 0; i < batch.size(); ++i) {
+-      const RequestState& state = *batch[i];
+-      sampling::SamplingMetadata::PerRequest row;
+-      row.params = &state.params;
+-      row.rng_offset = state.rng_offset;
+-      row.history = &state.tokens;
+-      rows.push_back(row);
+-    }
+-    sampling::SamplingMetadata metadata =
+-        sampling::SamplingMetadata::Build(spec.vocab_size, absl::MakeConstSpan(rows));
+-    INFERX_ASSIGN_OR_RETURN(sampling::SamplerOutput result,
+-                            sampler_->Sample(*op_, logits, metadata));
+-    INFERX_RETURN_IF_ERROR(runtime_->Memory().CopyAsync(
+-      sampled.data(), result.sampled_token_ids.Data(), sampled.size() * sizeof(int32_t),
+-      CopyKind::kDeviceToHost, stream_));
+-  }
+-
+-  // Everything downstream reads host values; one sync retires the step.
+-  INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_));
+-
+-  out->samples.reserve(batch.size());
+-  for (size_t i = 0; i < batch.size(); ++i) {
+-    RequestState& state = *batch[i];
+-    state.num_computed += step.scheduled[i].num_new_tokens;
+-    SampledTokens sample;
+-    sample.request_id = step.scheduled[i].request_id;
+-    if (sampled[i] >= 0 && state.num_computed >= prompt_lens[i]) {
+-      sample.token_ids.push_back(sampled[i]);
+-      state.tokens.push_back(sampled[i]);
+-      state.rng_offset += 1;
+-    }
+-    out->samples.push_back(std::move(sample));
+-  }
+-  // Prefix publication is the scheduler's job (UpdateFromOutput): the
+-  // facade is single-threaded with it (docs/attention.md §9).
+-  return OkStatus();
+-}
+-
+-}  // namespace models
+-}  // namespace inferx
+diff --git a/src/server/engine_gateway.cc b/src/server/engine_gateway.cc
+index 6309735..69a9be1 100644
+--- a/src/server/engine_gateway.cc
++++ b/src/server/engine_gateway.cc
+@@ -41,21 +41,21 @@ struct EngineGateway::Impl {
+        ExecutionConfig execution_config, std::shared_ptr<Tokenizer> tokenizer_arg,
+        ParallelConfig parallel_config)
+       : io(io_arg), tokenizer(std::move(tokenizer_arg)) {
+-    executor = Take(ModelExecutor::Create(model_config, cache_config, scheduler_config,
++    runner = Take(ModelRunner::Create(model_config, cache_config, scheduler_config,
+                                           execution_config, parallel_config));
+-    const std::vector<TokenId> eos = executor->GetModelSpec().eos_token_ids;
++    const std::vector<TokenId> eos = runner->GetModelSpec().eos_token_ids;
+     if (eos.empty()) {
+       throw std::runtime_error("model config declares no eos_token_id");
+     }
+     scheduler_config.queue_capacity = std::max(scheduler_config.queue_capacity, 1);
+     capacity = scheduler_config.queue_capacity + scheduler_config.max_num_seqs;
+     scheduler = std::make_unique<Scheduler>(scheduler_config, eos,
+-                                          *executor->Attention());
++                                          *runner->Attention());
+   }
+ 
+   boost::asio::io_context& io;
+   std::shared_ptr<Tokenizer> tokenizer;
+-  std::unique_ptr<ModelExecutor> executor;
++  std::unique_ptr<ModelRunner> runner;
+   std::unique_ptr<Scheduler> scheduler;
+   int capacity = 0;
+ 
+@@ -192,7 +192,7 @@ struct EngineGateway::Impl {
+         FailAll(plan.status().message());
+         break;
+       }
+-      auto result = executor->Execute(*plan);
++      auto result = runner->ExecuteModel(*plan);
+       if (!result.ok()) {
+         FailAll(result.status().message());
+         break;

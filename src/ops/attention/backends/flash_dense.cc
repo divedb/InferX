@@ -1,6 +1,8 @@
 #include "inferx/ops/attention/backends/flash_dense.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "absl/types/span.h"
@@ -59,6 +61,23 @@ class FlashDenseKernel final : public Kernel {
     Tensor q = Flat2D(args.in.q.data, tokens, q_width, spec_.q_dtype, device);
     Tensor out = Flat2D(args.out.data, tokens, q_width, spec_.q_dtype, device);
 
+    if (std::getenv("INFERX_DUMP_META") && args.meta.num_reqs > 0) {
+      std::vector<int32_t> qo(args.meta.num_reqs + 1), ki(args.meta.num_reqs + 1), lp(args.meta.num_reqs), ib(args.meta.num_tokens);
+      auto& mem = args.ctx.Runtime().Memory();
+      mem.Copy(qo.data(), args.meta.qo_indptr, qo.size() * 4, CopyKind::kDeviceToHost);
+      mem.Copy(ki.data(), args.meta.kv_indptr, ki.size() * 4, CopyKind::kDeviceToHost);
+      mem.Copy(lp.data(), args.meta.last_page_len, lp.size() * 4, CopyKind::kDeviceToHost);
+      mem.Copy(ib.data(), args.meta.batch_indices, ib.size() * 4, CopyKind::kDeviceToHost);
+      std::fprintf(stderr, "META qo=");
+      for (auto v : qo) std::fprintf(stderr, "%d,", v);
+      std::fprintf(stderr, " kvi=");
+      for (auto v : ki) std::fprintf(stderr, "%d,", v);
+      std::fprintf(stderr, " lp=");
+      for (auto v : lp) std::fprintf(stderr, "%d,", v);
+      std::fprintf(stderr, " bi=");
+      for (size_t i = 0; i < ib.size() && i < 80; ++i) std::fprintf(stderr, "%d,", ib[i]);
+      std::fprintf(stderr, "\n");
+    }
     Tensor positions = Flat1D(args.meta.positions, args.meta.num_tokens, device);
     Tensor batch_indices = Flat1D(args.meta.batch_indices, args.meta.num_tokens, device);
     Tensor qo_indptr = Flat1D(args.meta.qo_indptr, args.meta.num_reqs + 1, device);

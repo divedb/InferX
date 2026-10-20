@@ -88,7 +88,7 @@ Relevant files:
 | Embedding, layer loop, final norm | `src/models/causal/decoder_stack.cc` |
 | Requested-row gather and vocabulary projection | `src/models/causal/causal_lm.cc` |
 | Attention and MLP components | `src/models/components/attention.cc`, `mlp.cc`, `decoder_layer.cc` |
-| Batching, graph cache, staging, result synchronization | `src/models/model_runner.cc` |
+| Batching, graph cache, staging, result synchronization | `src/engine/model_runner.cc` |
 | Admission, chunked prefill, block allocation | `src/engine/scheduler.cc`, `include/inferx/engine/execution_config.h` |
 
 `qwen3::TranslateConfig` enables per-head Q/K normalization. The family code can translate some MoE/Next configurations, but `DecoderConfig::ValidateExecutable` rejects unimplemented execution forms. A mega backend must require the exact supported dense configuration, not just the `qwen3` family name.
@@ -337,7 +337,7 @@ All paths in this section are future changes. Only this plan is added during the
 | Files or area | Planned change |
 |---|---|
 | `include/inferx/engine/execution_config.h`; `apps/cli/args/engine_args.h`; launch argument plumbing | Add explicit model execution strategy and deterministic capability/fallback reporting; keep individual attention-kernel selection internal rather than restoring the removed selector. |
-| `include/inferx/models/model.h`; `src/models/model_runner.cc` | Add preparation/plan identity contract; graph keys include selected plan; preserve pinned input lifetime, sampling, host synchronization, and failure semantics. |
+| `include/inferx/models/model.h`; `src/engine/model_runner.cc` | Add preparation/plan identity contract; graph keys include selected plan; preserve pinned input lifetime, sampling, host synchronization, and failure semantics. |
 | `src/models/qwen3/qwen3.cc`; `include/inferx/models/qwen3/qwen3.h` | Validate exact supported geometry/dtype/normalization/RoPE configuration and assemble optional executor. |
 | `src/models/causal/causal_lm.cc`; corresponding header | Compose optional decode executor with the fallback; maintain logits and state contracts and tied head ownership. |
 | `src/models/causal/weight_mapping.cc`; `include/inferx/models/causal/weight_mapping.h` | Make weight ownership reusable by both paths; construct device descriptors; reuse existing packing or justify a separate packed representation. |

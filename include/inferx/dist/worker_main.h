@@ -25,7 +25,7 @@ struct WorkerOptions {
 };
 
 /// \brief Runs the worker until a shutdown message: builds the rank-local
-///        engine (scheduler + models::ModelRunner on this rank's device), posts
+///        engine (scheduler + ModelRunner on this rank's device), posts
 ///        Ready, then alternates between draining generation requests and
 ///        stepping the scheduler, streaming generated token ids and
 ///        terminal events back over the events channel.

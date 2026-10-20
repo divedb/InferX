@@ -41,21 +41,21 @@ struct EngineGateway::Impl {
        ExecutionConfig execution_config, std::shared_ptr<Tokenizer> tokenizer_arg,
        ParallelConfig parallel_config)
       : io(io_arg), tokenizer(std::move(tokenizer_arg)) {
-    executor = Take(ModelExecutor::Create(model_config, cache_config, scheduler_config,
+    runner = Take(ModelRunner::Create(model_config, cache_config, scheduler_config,
                                           execution_config, parallel_config));
-    const std::vector<TokenId> eos = executor->GetModelSpec().eos_token_ids;
+    const std::vector<TokenId> eos = runner->GetModelSpec().eos_token_ids;
     if (eos.empty()) {
       throw std::runtime_error("model config declares no eos_token_id");
     }
     scheduler_config.queue_capacity = std::max(scheduler_config.queue_capacity, 1);
     capacity = scheduler_config.queue_capacity + scheduler_config.max_num_seqs;
     scheduler = std::make_unique<Scheduler>(scheduler_config, eos,
-                                          *executor->Attention());
+                                          *runner->Attention());
   }
 
   boost::asio::io_context& io;
   std::shared_ptr<Tokenizer> tokenizer;
-  std::unique_ptr<ModelExecutor> executor;
+  std::unique_ptr<ModelRunner> runner;
   std::unique_ptr<Scheduler> scheduler;
   int capacity = 0;
 
@@ -192,7 +192,7 @@ struct EngineGateway::Impl {
         FailAll(plan.status().message());
         break;
       }
-      auto result = executor->Execute(*plan);
+      auto result = runner->ExecuteModel(*plan);
       if (!result.ok()) {
         FailAll(result.status().message());
         break;

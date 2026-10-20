@@ -16,8 +16,9 @@ Status Upload(ops::OpContext& ctx, const DeviceBuffer& buffer,
   if (bytes > buffer.size()) {
     return InternalError("metadata buffer too small: need ", bytes, " have ", buffer.size());
   }
-  return ctx.Runtime().Memory().CopyAsync(buffer.data(), values.data(), bytes,
-                                          CopyKind::kHostToDevice, ctx.GetStream());
+  INFERX_RETURN_IF_ERROR(ctx.Runtime().Memory().CopyAsync(buffer.data(), values.data(), bytes,
+                                                          CopyKind::kHostToDevice, ctx.GetStream()));
+  return ctx.Runtime().Streams().SynchronizeStream(ctx.GetStream());
 }
 
 }  // namespace

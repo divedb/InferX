@@ -1,5 +1,5 @@
-#ifndef INFERX_MODELS_INPUT_BATCH_H_
-#define INFERX_MODELS_INPUT_BATCH_H_
+#ifndef INFERX_ENGINE_INPUT_BATCH_H_
+#define INFERX_ENGINE_INPUT_BATCH_H_
 
 #include <cstdint>
 #include <optional>
@@ -11,7 +11,6 @@
 #include "inferx/sampling/sampler.h"
 
 namespace inferx {
-namespace models {
 
 /// \brief Persistent, row-oriented per-request state for one rank.
 ///
@@ -50,7 +49,7 @@ class InputBatch {
   void Condense();
 
   /// \brief Appends an accepted token (sampled locally or received from
-  ///        the driver rank via SchedulerOutput).
+  ///        the driver rank after a group execution).
   Status AppendToken(RequestId id, TokenId token);
   Status SetNumComputed(RequestId id, int num_computed);
 
@@ -92,7 +91,6 @@ class InputBatch {
   std::vector<int64_t> rng_offset_;
 };
 
-}  // namespace models
 }  // namespace inferx
 
-#endif  // INFERX_MODELS_INPUT_BATCH_H_
+#endif  // INFERX_ENGINE_INPUT_BATCH_H_

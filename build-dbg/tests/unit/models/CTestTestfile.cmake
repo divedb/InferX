@@ -18,3 +18,5 @@ add_test([=[model_registry_test]=] "/home/gc/InferX/build-dbg/tests/unit/models/
 set_tests_properties([=[model_registry_test]=] PROPERTIES  LABELS "unit" _BACKTRACE_TRIPLES "/home/gc/InferX/cmake/InferxHelpers.cmake;169;add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;43;inferx_add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;0;")
 add_test([=[qwen3_forward_test]=] "/home/gc/InferX/build-dbg/tests/unit/models/inferx_qwen3_forward_test")
 set_tests_properties([=[qwen3_forward_test]=] PROPERTIES  ENVIRONMENT "LD_LIBRARY_PATH=/usr/lib/wsl/lib" LABELS "unit" _BACKTRACE_TRIPLES "/home/gc/InferX/cmake/InferxHelpers.cmake;169;add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;50;inferx_add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;0;")
+add_test([=[describe_params_test]=] "/home/gc/InferX/build-dbg/tests/unit/models/inferx_describe_params_test")
+set_tests_properties([=[describe_params_test]=] PROPERTIES  LABELS "unit" _BACKTRACE_TRIPLES "/home/gc/InferX/cmake/InferxHelpers.cmake;169;add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;57;inferx_add_test;/home/gc/InferX/tests/unit/models/CMakeLists.txt;0;")

@@ -30,3 +30,17 @@ inferx_add_test(
   DEPS inferx::engine
   LABELS unit
 )
+
+inferx_add_test(
+  NAME input_batch_test
+  SRCS input_batch_test.cc
+  DEPS inferx::engine
+  LABELS unit
+)
+
+inferx_add_test(
+  NAME worker_test
+  SRCS worker_test.cc
+  DEPS inferx::engine
+  LABELS unit
+)

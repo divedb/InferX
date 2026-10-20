@@ -24,7 +24,7 @@
 #include "inferx/engine/request.h"
 #include "inferx/config/scheduler_config.h"
 #include "inferx/config/model_config.h"
-#include "inferx/engine/model_executor.h"
+#include "inferx/engine/model_runner.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/tokenizer/tokenizer.h"
 

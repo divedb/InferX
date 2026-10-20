@@ -1,154 +1,84 @@
-#ifndef INFERX_MODELS_MODEL_RUNNER_H_
-#define INFERX_MODELS_MODEL_RUNNER_H_
+#ifndef INFERX_ENGINE_MODEL_RUNNER_H_
+#define INFERX_ENGINE_MODEL_RUNNER_H_
 
-#include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
+#include "inferx/config/cache_config.h"
+#include "inferx/config/execution_config.h"
+#include "inferx/config/model_config.h"
+#include "inferx/config/parallel_config.h"
 #include "inferx/config/scheduler_config.h"
-#include "inferx/core/device.h"
-#include "inferx/core/device_runtime.h"
-#include "inferx/core/status.h"
-#include "inferx/core/stream.h"
-#include "inferx/core/tensor.h"
-#include "inferx/dist/comm.h"
 #include "inferx/engine/input_batch.h"
-#include "inferx/engine/scheduler_output.h"
 #include "inferx/models/load_options.h"
 #include "inferx/models/model.h"
-#include "inferx/models/model_spec.h"
 #include "inferx/models/scratch_arena.h"
-#include "inferx/ops/flash_attention.h"
-#include "inferx/ops/op_context.h"
 #include "inferx/sampling/sampler.h"
 
 namespace inferx {
-namespace models {
+class Worker;
 
-/// \brief Test/triage hooks, fixed at construction so the public API does
-///        not grow per debug feature.
-struct RunnerDebugOptions {
-  /// Keep a copy of every step's [sequences, vocab] logits.
-  bool capture_logits = false;
-};
-
-/// \brief Result of the profile step, consumed by Worker to size the KV pool.
-struct ProfileResult {
-  int64_t weights_bytes = 0;
-  int64_t peak_activation_bytes = 0;  ///< Scratch + library workspaces.
-};
-
-/// \brief Per-step execution on one rank: model, attention, sampler, and the
-///        persistent InputBatch.
-///
-/// Lifecycle is driven by Worker, in this order:
-///   LoadModel -> ProfileRun -> InitializeKVCache -> CaptureGraphs
-///   -> ExecuteModel (repeatedly).
-/// Device, stream, communicator, memory budgeting, and failure poisoning
-/// belong to Worker/Executor, not here. Scheduling and cache policy live
-/// above; kernel dispatch lives below.
-///
-/// Single-threaded. Device work runs on one stream; ExecuteModel
-/// synchronizes it before returning, so a returned ModelRunnerOutput is
-/// complete.
+/// Executes scheduler steps. Create builds a group of rank-local Workers;
+/// each Worker drives a local runner's lifecycle and owns its device resources.
+/// Local runners own the model, attention, sampling, and persistent InputBatch.
+/// Only the driver samples; accepted tokens are applied to every peer.
 class ModelRunner {
  public:
-  /// \param model          Constructed but not yet loaded.
-  /// \param runtime        Not owned; must outlive the runner.
-  /// \param stream         Stream all device work runs on.
-  /// \param comm           Not owned; never null (Worker supplies
-  ///                       SingleRankComm for a world of one).
-  /// \param is_driver_rank True if this rank samples; other ranks only
-  ///                       keep state for their shard.
-  /// \param debug          Test/triage hooks.
-  ModelRunner(std::unique_ptr<Model> model, DeviceRuntime* runtime, DeviceStream stream,
-              CommBackend* comm, bool is_driver_rank, RunnerDebugOptions debug = {});
-  ~ModelRunner();
+  static StatusOr<std::unique_ptr<ModelRunner>> Create(
+      const ModelConfig& model, const CacheConfig& cache, const SchedulerConfig& scheduler,
+      const ExecutionConfig& execution, const ParallelConfig& parallel = {},
+      std::unique_ptr<CommBackend> comm = nullptr);
+  static StatusOr<std::unique_ptr<ModelRunner>> CreateGroup(
+      std::vector<std::unique_ptr<Worker>> ranks, const CacheConfig& cache,
+      const SchedulerConfig& scheduler, const ExecutionConfig& execution,
+      std::function<void(const Status&)> abort, std::function<Status()> check_health = {});
 
+  ModelRunner(std::unique_ptr<models::Model> model, DeviceRuntime* runtime, DeviceStream stream,
+              CommBackend* comm, bool is_driver_rank);
+  ~ModelRunner();
   ModelRunner(const ModelRunner&) = delete;
   ModelRunner& operator=(const ModelRunner&) = delete;
 
-  /// \brief Loads weights onto the device.
-  Status LoadModel(const LoadOptions& options);
-
-  /// \brief One max-shape forward + logits through a scratch arena, forcing
-  ///        every scratch block and library workspace (cuBLAS, ...) to
-  ///        materialize, and measuring peak usage. Runs against a throwaway
-  ///        attention runtime.
-  StatusOr<ProfileResult> ProfileRun(const SchedulerConfig& scheduler);
-
-  /// \brief Creates the attention runtime from the engine-computed config
-  ///        and binds one op per attention layer.
-  Status InitializeKVCache(const KVCacheConfig& kv, const SchedulerConfig& scheduler);
-
-  /// \brief Captures decode graphs. Not wired into the new model layer yet;
-  ///        currently a no-op.
-  Status CaptureGraphs();
-
-  /// \brief Applies the scheduler diff, runs forward, samples, and returns
-  ///        samples in scheduler order.
+  // Worker-driven rank-local lifecycle, in this order.
+  Status LoadModel(const models::ModelLoadOptions& options);
+  Status ProfileRun(const SchedulerConfig& scheduler);
+  Status InitializeKVCache(int64_t kv_bytes, const CacheConfig& cache,
+                           const SchedulerConfig& scheduler);
+  Status CaptureGraphs(const ExecutionConfig& execution) const;
   StatusOr<ModelRunnerOutput> ExecuteModel(const SchedulerOutput& step);
 
-  /// \brief The attention runtime owning the cache plan, pools, facade,
-  ///        kernels, and metadata builders (docs/attention.md §8.5).
-  attn::AttentionRuntime* Attention() { return attention_.get(); }
-  const ModelSpec& GetModelSpec() const { return model_->GetModelSpec(); }
-
-  /// \brief One [sequences, vocab] tensor per step; empty unless
-  ///        RunnerDebugOptions::capture_logits was set.
-  const std::vector<Tensor>& CapturedLogits() const { return captured_logits_; }
+  attn::AttentionRuntime* Attention();
+  const models::ModelSpec& GetModelSpec() const;
+  void EnableLogitsCapture();
+  const std::vector<Tensor>& CapturedLogits() const;
+  Status ApplyAcceptedTokens(RequestId id, TokenId token);
 
  private:
-  /// \brief Flattened batch tensors every layer reads for one step.
-  struct StepInputs {
-    Tensor token_ids;
-    Tensor positions;
-    Tensor slot_mapping;
-    Tensor block_tables;
-    Tensor query_start_loc;
-    Tensor logits_indices;           ///< Last scheduled token of each sequence.
-    std::vector<RequestId> req_ids;  ///< Scheduler order.
-    std::vector<int> rows;           ///< InputBatch row per sequence.
-    std::vector<int> num_tokens;     ///< Tokens scheduled per sequence.
-  };
+  ModelRunner();  // Group facade; local runners use the constructor above.
+  StatusOr<ModelRunnerOutput> ExecuteGroup(const SchedulerOutput& step);
+  Status RunProfileStep(Allocator& scratch, int64_t max_tokens, int64_t max_seqs);
+  Status RunStep(const SchedulerOutput& step, ModelRunnerOutput* out);
 
-  /// \brief Adds new requests, applies cached-request updates (including
-  ///        tokens accepted on the driver rank, which non-driver ranks
-  ///        receive here), and removes finished ids.
-  Status UpdateStates(const SchedulerOutput& step);
+  std::vector<std::unique_ptr<Worker>> workers_;
+  std::function<void(const Status&)> abort_;
+  std::function<Status()> check_health_;
 
-  /// \brief Builds token ids, positions, slot mapping, and block tables
-  ///        from the InputBatch and the cache facade.
-  Status PrepareInputs(const SchedulerOutput& step, StepInputs* inputs);
-
-  StatusOr<Tensor> Forward(const StepInputs& inputs);
-  StatusOr<Tensor> ComputeLogits(const Tensor& hidden, const StepInputs& inputs);
-
-  /// \brief Samples one token per sequence and appends it to the
-  ///        InputBatch. No-op (empty samples) on non-driver ranks.
-  Status Sample(const Tensor& logits, const StepInputs& inputs, ModelRunnerOutput* out);
-
-  DeviceRuntime* runtime_;
-  DeviceStream stream_;
-  CommBackend* comm_;
-  const bool is_driver_rank_;
-  const RunnerDebugOptions debug_;
-
-  std::unique_ptr<Model> model_;
-
-  // Declaration order is the lifetime contract: ScratchArena owns both the
-  // region and the allocator carved from it, so nothing else to keep in sync.
-  std::unique_ptr<ScratchArena> scratch_;
+  DeviceRuntime* runtime_ = nullptr;  // Borrowed from Worker.
+  DeviceStream stream_{};
+  CommBackend* comm_ = nullptr;
+  bool is_driver_rank_ = false;
+  std::unique_ptr<models::Model> model_;
+  // Scratch must outlive all tensors allocated from it.
+  std::unique_ptr<models::ScratchArena> scratch_;
   std::unique_ptr<attn::AttentionRuntime> attention_;
   std::vector<attn::AttentionOp> ops_;
   std::unique_ptr<ops::OpContext> op_;
-  std::unique_ptr<sampling::Sampler> sampler_;  ///< Null unless driver rank.
-
-  std::unique_ptr<InputBatch> input_batch_;  ///< Sized in InitializeKVCache.
+  std::unique_ptr<sampling::Sampler> sampler_;
+  std::unique_ptr<InputBatch> input_batch_;
+  int64_t max_num_seqs_ = 0;
+  bool capture_logits_ = false;
   std::vector<Tensor> captured_logits_;
 };
-
-}  // namespace models
 }  // namespace inferx
-
-#endif  // INFERX_MODELS_MODEL_RUNNER_H_
+#endif  // INFERX_ENGINE_MODEL_RUNNER_H_

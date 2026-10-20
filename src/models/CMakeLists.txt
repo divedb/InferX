@@ -1,7 +1,6 @@
 # inferx_models -- the model layer: family-specific architectures (Qwen3,
 # Qwen3-MoE, Llama) built from the reusable modules under models/layers,
-# plus the architecture registry, checkpoint loading, and the rank-local
-# ModelRunner that binds a scheduler step to a forward pass.
+# plus the architecture registry and checkpoint loading.
 inferx_add_library(
   NAME models
   SRCS
@@ -18,7 +17,6 @@ inferx_add_library(
     weight_loader.cc
     config_utils.cc
     registry.cc
-    model_runner.cc
     qwen3/qwen3_config.cc
     qwen3/qwen3_attention.cc
     qwen3/qwen3_mlp.cc

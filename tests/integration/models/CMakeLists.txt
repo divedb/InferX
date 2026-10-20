@@ -1,6 +1,6 @@
 # Whole-model integration: the golden-trace gate runs the scheduler and
 # runner over the repository's Qwen3-0.6B checkpoint; the tensor-parallel
-# gate drives a LoopbackWorld rank group through ModelExecutor.
+# gate drives a LoopbackWorld rank group through ModelRunner.
 inferx_add_test(
   NAME model_test
   SRCS model_test.cc

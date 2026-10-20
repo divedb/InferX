@@ -1,104 +1,135 @@
-#include "inferx/models/worker.h"
+#include "inferx/engine/worker.h"
 
-#include <algorithm>
-#include <string>
+#include <exception>
 #include <utility>
 
+#include "inferx/models/registry.h"
+
 namespace inferx {
-namespace models {
-
-// ASSUMED APIs (adjust to the real ones):
-//   DeviceRuntime::ForDevice(Device) -> StatusOr<DeviceRuntime*>
-//   DeviceRuntime::CreateStream()    -> StatusOr<DeviceStream>
-//   DeviceRuntime::TotalMemoryBytes()
-//   Model::Create(config, parallel, comm, runtime, stream)
-//       -> StatusOr<std::unique_ptr<Model>>
-//   ParallelConfig::tp_rank; CacheConfig::gpu_memory_utilization
-
 StatusOr<std::unique_ptr<Worker>> Worker::Create(const ModelConfig& model,
                                                  const ParallelConfig& parallel,
                                                  std::unique_ptr<CommBackend> comm) {
+  INFERX_RETURN_IF_ERROR(parallel.Validate());
+  INFERX_RETURN_IF_ERROR(model.device.Validate());
+  if ((comm && (comm->rank() != parallel.tensor_parallel_rank ||
+                comm->size() != parallel.tensor_parallel_size)) ||
+      (!comm && parallel.tensor_parallel_size != 1)) {
+    return InvalidArgumentError("worker communicator does not match parallel config");
+  }
   return std::unique_ptr<Worker>(new Worker(model, parallel, std::move(comm)));
 }
 
 Worker::Worker(const ModelConfig& model, const ParallelConfig& parallel,
                std::unique_ptr<CommBackend> comm)
-    : model_config_(model),
-      parallel_(parallel),
-      is_driver_rank_(parallel.tp_rank == 0),
-      owned_comm_(std::move(comm)),
-      comm_(owned_comm_ ? owned_comm_.get() : static_cast<CommBackend*>(&single_rank_comm_)) {}
+    : model_config_(model), parallel_(parallel), owned_comm_(std::move(comm)) {
+  comm_ = owned_comm_ ? owned_comm_.get() : &single_rank_comm_;
+}
 
-Worker::~Worker() = default;
+Worker::~Worker() {
+  if (runtime_) {
+    (void)runtime_->Activate();
+    if (stream_) (void)runtime_->Streams().SynchronizeStream(stream_.Get());
+  }
+  runner_.reset();
+  stream_.Reset();
+}
 
 Status Worker::InitDevice() {
-  if (runner_) return Internal("InitDevice called twice");
-
-  auto runtime = DeviceRuntime::ForDevice(model_config_.device);
-  if (!runtime.ok()) return runtime.status();
-  runtime_ = *runtime;
-
-  auto stream = runtime_->CreateStream();
-  if (!stream.ok()) return stream.status();
-  stream_ = *stream;
-
-  auto model = Model::Create(model_config_, parallel_, comm_, runtime_, stream_);
-  if (!model.ok()) return model.status();
-
-  runner_ = std::make_unique<ModelRunner>(std::move(*model), runtime_, stream_, comm_,
-                                          is_driver_rank_);
+  if (phase_ != Phase::kCreated)
+    return FailedPreconditionError("InitDevice called out of order");
+  INFERX_ASSIGN_OR_RETURN(auto devices, model_config_.device.Resolve());
+  const Device device = devices.front();
+  if (!device.IsCuda()) return InvalidArgumentError("model execution requires CUDA");
+  INFERX_ASSIGN_OR_RETURN(runtime_, RuntimeFor(device));
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  INFERX_ASSIGN_OR_RETURN(stream_, runtime_->Streams().CreateStream(StreamPriority::kNormal));
+  load_options_.directory = model_config_.model_dir;
+  load_options_.device = device;
+  load_options_.parallel = parallel_;
+  INFERX_ASSIGN_OR_RETURN(load_options_.dtype,
+                          models::ModelLoadOptions::ParseDType(model_config_.dtype));
+  INFERX_ASSIGN_OR_RETURN(auto model, models::BuildModel(load_options_));
+  runner_ = std::make_unique<ModelRunner>(std::move(model), runtime_, stream_.Get(), comm_,
+                                          IsDriverRank());
+  phase_ = Phase::kDevice;
   return OkStatus();
 }
 
-Status Worker::LoadModel(const LoadOptions& options) {
-  if (!runner_) return Internal("LoadModel called before InitDevice");
-  return runner_->LoadModel(options);
+Status Worker::LoadModel() {
+  if (phase_ != Phase::kDevice) return FailedPreconditionError("LoadModel called out of order");
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  INFERX_RETURN_IF_ERROR(runner_->LoadModel(load_options_));
+  phase_ = Phase::kLoaded;
+  return OkStatus();
 }
 
 StatusOr<int64_t> Worker::DetermineAvailableMemory(const CacheConfig& cache,
                                                    const SchedulerConfig& scheduler) {
-  if (!runner_) return Internal("DetermineAvailableMemory called before InitDevice");
-
-  // The profile step runs regardless, so scratch blocks and library
-  // workspaces (cuBLAS, ...) exist before the KV pool is carved out.
-  auto profile = runner_->ProfileRun(scheduler);
-  if (!profile.ok()) return profile.status();
-  weights_bytes_ = profile->weights_bytes;
-
-  // Explicit block count: the engine ignores the byte budget.
-  if (cache.gpu_memory_utilization <= 0) return int64_t{0};
-
+  if (phase_ != Phase::kLoaded) return FailedPreconditionError("profile called out of order");
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  INFERX_RETURN_IF_ERROR(runner_->ProfileRun(scheduler));
+  phase_ = Phase::kProfiled;
+  if (cache.gpu_memory_utilization <= 0) return int64_t{-1};
+  INFERX_RETURN_IF_ERROR(runtime_->Streams().SynchronizeStream(stream_.Get()));
+  INFERX_ASSIGN_OR_RETURN(auto memory, runtime_->Memory().GetMemoryInfo());
+  const int64_t used = static_cast<int64_t>(memory.total_bytes - memory.free_bytes);
   const int64_t budget =
-      static_cast<int64_t>(cache.gpu_memory_utilization * runtime_->TotalMemoryBytes());
-  const int64_t available = budget - profile->weights_bytes - profile->peak_activation_bytes;
-  if (available <= 0) {
-    return ResourceExhausted("memory budget (" + std::to_string(budget) +
-                             " bytes) is smaller than weights plus peak activations");
-  }
-  return available;
+      static_cast<int64_t>(memory.total_bytes * cache.gpu_memory_utilization) - used;
+  if (budget <= 0)
+    return ResourceExhaustedError("no memory remains for KV cache after profiling");
+  return budget;
 }
 
-Status Worker::InitializeFromConfig(const KVCacheConfig& kv, const SchedulerConfig& scheduler) {
-  if (!runner_) return Internal("InitializeFromConfig called before InitDevice");
-  return runner_->InitializeKVCache(kv, scheduler);
+StatusOr<int64_t> Worker::AgreeAvailableMemory(int64_t bytes) {
+  if (phase_ != Phase::kProfiled)
+    return FailedPreconditionError("budget agreement before profile");
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  ops::OpContext op(*runtime_, stream_.Get());
+  return comm_->AllReduceMin(op, bytes);
 }
 
-Status Worker::WarmUp(const ExecutionConfig& /*execution*/) {
-  if (!runner_) return Internal("WarmUp called before InitDevice");
-  return runner_->CaptureGraphs();
+Status Worker::InitializeFromConfig(int64_t kv_bytes, const CacheConfig& cache,
+                                    const SchedulerConfig& scheduler) {
+  if (phase_ != Phase::kProfiled)
+    return FailedPreconditionError("cache init called out of order");
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  INFERX_RETURN_IF_ERROR(runner_->InitializeKVCache(kv_bytes, cache, scheduler));
+  phase_ = Phase::kCache;
+  return OkStatus();
+}
+
+Status Worker::WarmUp(const ExecutionConfig& execution) {
+  if (phase_ != Phase::kCache) return FailedPreconditionError("WarmUp called out of order");
+  INFERX_RETURN_IF_ERROR(runtime_->Activate());
+  INFERX_RETURN_IF_ERROR(runner_->CaptureGraphs(execution));
+  phase_ = Phase::kReady;
+  return OkStatus();
 }
 
 StatusOr<ModelRunnerOutput> Worker::ExecuteModel(const SchedulerOutput& step) {
-  if (!runner_) return Internal("ExecuteModel called before InitDevice");
-
+  if (phase_ != Phase::kReady) return FailedPreconditionError("worker is not ready");
+  if (!failure_.ok()) return failure_;
   if (check_health_) {
-    Status health = check_health_();
-    if (!health.ok()) return health;
+    auto status = check_health_();
+    if (!status.ok()) return status;
   }
-
-  auto out = runner_->ExecuteModel(step);
-  if (!out.ok() && abort_) abort_(out.status());
-  return out;
+  auto execute = [&]() -> StatusOr<ModelRunnerOutput> {
+    INFERX_RETURN_IF_ERROR(runtime_->Activate());
+    return runner_->ExecuteModel(step);
+  };
+  try {
+    auto result = execute();
+    if (!result.ok()) {
+      failure_ = result.status();
+      if (abort_) abort_(failure_);
+    }
+    return result;
+  } catch (const std::exception& error) {
+    auto status = InternalError("rank execution threw: ", error.what());
+    failure_ = status;
+    if (abort_) abort_(failure_);
+    return failure_;
+  }
 }
 
 void Worker::SetFailureHooks(std::function<void(const Status&)> abort,
@@ -106,6 +137,4 @@ void Worker::SetFailureHooks(std::function<void(const Status&)> abort,
   abort_ = std::move(abort);
   check_health_ = std::move(check_health);
 }
-
-}  // namespace models
 }  // namespace inferx

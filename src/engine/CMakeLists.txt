@@ -1,13 +1,15 @@
 # inferx_engine -- architecture, scheduling, and orchestration are ordinary
 # C++. The tokenizer front end (tokenizer/tokenizer.cc) belongs to this
-# layer; the model layer ships its own library with the runner.
+# layer, along with ModelRunner, Worker, and persistent InputBatch state.
 inferx_add_library(
   NAME engine
   SRCS
     request.cc
     request_queue.cc
     scheduler.cc
-    model_executor.cc
+    model_runner.cc
+    worker.cc
+    input_batch.cc
     ../tokenizer/tokenizer.cc
   PRIVATE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src
   DEPS

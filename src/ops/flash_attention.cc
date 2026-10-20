@@ -1,6 +1,9 @@
 #include "inferx/ops/flash_attention.h"
 
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 
 #include "inferx/ops/cuda/flash_attention.h"
 #include "inferx/ops/cuda/generic_attention.h"
@@ -148,6 +151,13 @@ Status PagedAttention(OpContext& ctx, const Tensor& q, const Tensor& qo_indptr,
     }
     INFERX_RETURN_IF_ERROR(PrepareFlashAttention(ctx, qo_indptr, *ws.plan, group,
                                                  ws.attention_tiles, ws.prefill_tile_rows));
+    if (std::getenv("INFERX_DUMP_PLAN")) {
+      std::vector<int32_t> p(3 * ws.attention_tiles + 1);
+      ctx.Runtime().Memory().Copy(p.data(), ws.plan->Data(), p.size() * 4, CopyKind::kDeviceToHost);
+      std::fprintf(stderr, "PLAN tiles=%d rows=%d:", ws.attention_tiles, ws.prefill_tile_rows);
+      for (size_t i = 0; i < p.size(); ++i) std::fprintf(stderr, "%d,", p[i]);
+      std::fprintf(stderr, "\n");
+    }
     ws.planned_group = group;
   }
   return FlashPagedAttention(ctx, q, qo_indptr, kv_indptr, kv_indices, last_page_len, key_cache,

@@ -14,9 +14,8 @@
 
 #include "gtest/gtest.h"
 #include "inferx/core/device_runtime.h"
-#include "inferx/engine/model_executor.h"
+#include "inferx/engine/model_runner.h"
 #include "inferx/engine/scheduler.h"
-#include "inferx/models/model_runner.h"
 
 namespace inferx {
 namespace {
@@ -35,7 +34,7 @@ std::vector<TokenId> ReadCsv(const std::string& path) {
 }
 
 struct Generation {
-  std::unique_ptr<models::ModelRunner> runner;
+  std::unique_ptr<ModelRunner> runner;
   std::vector<TokenId> output;
 };
 
@@ -52,7 +51,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
   SchedulerConfig scheduler_config;
   ExecutionConfig execution;
   INFERX_ASSIGN_OR_RETURN(auto runner,
-                          models::ModelRunner::Create(model, cache, scheduler_config,
+                          ModelRunner::Create(model, cache, scheduler_config,
                                                       execution));
   if (capture_logits) runner->EnableLogitsCapture();
   const models::ModelSpec& spec = runner->GetModelSpec();
@@ -68,7 +67,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
   while (scheduler.HasRequests()) {
     INFERX_ASSIGN_OR_RETURN(SchedulerOutput plan, scheduler.Schedule());
     if (plan.IsEmpty()) continue;
-    INFERX_ASSIGN_OR_RETURN(ModelRunnerOutput result, generation.runner->Run(plan));
+    INFERX_ASSIGN_OR_RETURN(ModelRunnerOutput result, generation.runner->ExecuteModel(plan));
     INFERX_RETURN_IF_ERROR(scheduler.UpdateFromOutput(plan, result));
     for (const SampledTokens& sample : result.samples) {
       for (TokenId token : sample.token_ids) generation.output.push_back(token);
