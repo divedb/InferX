@@ -5,7 +5,7 @@
 
 #include "nlohmann/json.hpp"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
 /// \brief Reads an optional numeric JSON field; absent or null stays unset.
@@ -68,4 +68,4 @@ StatusOr<std::optional<GenerationConfig>> GenerationConfig::Resolve(
   return loaded.status();
 }
 
-}  // namespace inferx::server
+}  // namespace inferx

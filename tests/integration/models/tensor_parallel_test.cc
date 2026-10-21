@@ -37,7 +37,7 @@ StatusOr<std::unique_ptr<ModelRunner>> MakeRunner(int world) {
   model.device.device = "cuda";
   CacheConfig cache;
   cache.block_size = 16;
-  cache.num_kv_blocks = 512;
+  cache.num_gpu_blocks_override = 512;
   SchedulerConfig scheduler_config;
   ExecutionConfig execution;
 

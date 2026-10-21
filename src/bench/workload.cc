@@ -27,7 +27,8 @@ void Run(const WorkloadParams& params) {
   SchedulerConfig sc = params.scheduler;
   CacheConfig cc = params.cache;
   sc.max_num_batched_tokens = suite_json.value("token_budget", sc.max_num_batched_tokens);
-  cc.num_kv_blocks = suite_json.value("kv_blocks", cc.num_kv_blocks);
+  cc.num_gpu_blocks_override =
+      suite_json.value("kv_blocks", cc.num_gpu_blocks_override);
   cc.block_size = suite_json.value("block_size", cc.block_size);
   if (std::getenv("INFERX_NO_PREFIX")) cc.enable_prefix_caching = false;
   const int batch = sc.max_num_seqs;

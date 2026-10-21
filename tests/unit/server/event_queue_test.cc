@@ -9,7 +9,7 @@
 
 #include "gtest/gtest.h"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
 namespace net = boost::asio;
@@ -192,4 +192,4 @@ INSTANTIATE_TEST_SUITE_P(TerminalEvents, EventQueueTest,
                                         CompletionEvent::Kind::kError));
 
 }  // namespace
-}  // namespace inferx::server
+}  // namespace inferx

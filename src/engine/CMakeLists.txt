@@ -1,6 +1,7 @@
 # inferx_engine -- architecture, scheduling, and orchestration are ordinary
-# C++. The tokenizer front end (tokenizer/tokenizer.cc) belongs to this
-# layer, along with ModelRunner, Worker, and persistent InputBatch state.
+# C++. ModelRunner, Worker, persistent InputBatch state, and the request/
+# queue types live here. Tokenizer-facing serving components live in the
+# prompt_service library under src/server (docs/tokenizer_design.md).
 inferx_add_library(
   NAME engine
   SRCS
@@ -10,7 +11,6 @@ inferx_add_library(
     model_runner.cc
     worker.cc
     input_batch.cc
-    ../tokenizer/tokenizer.cc
   PRIVATE_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/src
   DEPS
     inferx::core
@@ -23,7 +23,3 @@ inferx_add_library(
     absl::statusor
     absl::strings
 )
-
-if(INFERX_ENABLE_TOKENIZERS)
-  target_link_libraries(inferx_engine PUBLIC inferx::tokenizers)
-endif()

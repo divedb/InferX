@@ -221,19 +221,20 @@ Status Scheduler::UpdateFromOutput(const SchedulerOutput& output,
     const sampling::SamplingParams& params = request.GetSamplingParams();
     bool finish = false;
     FinishReason reason = FinishReason::kStopped;
-    if (request.NumOutputTokens() >= request.MaxNewTokens()) {
-      finish = true;
-      reason = FinishReason::kLengthCapped;
-    } else if ((!params.ignore_eos && std::find(eos_token_ids_.begin(), eos_token_ids_.end(),
+    if ((!params.ignore_eos && std::find(eos_token_ids_.begin(), eos_token_ids_.end(),
                                                 token) != eos_token_ids_.end()) ||
                (request.NumOutputTokens() >= static_cast<int>(params.min_tokens) &&
                 std::find(params.stop_token_ids.begin(), params.stop_token_ids.end(), token) !=
                     params.stop_token_ids.end())) {
       finish = true;
     }
-    if (sample.finish_reason.has_value() && !finish) {
+    if (sample.finish_reason.has_value()) {
       finish = true;
       reason = *sample.finish_reason;
+    }
+    if (!finish && request.NumOutputTokens() >= request.MaxNewTokens()) {
+      finish = true;
+      reason = FinishReason::kLengthCapped;
     }
 
     if (!finish) {

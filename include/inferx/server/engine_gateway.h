@@ -28,7 +28,7 @@
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/tokenizer/tokenizer.h"
 
-namespace inferx::server {
+namespace inferx {
 
 /// \brief One event for a submitted completion.
 struct CompletionEvent {
@@ -157,6 +157,6 @@ class EngineGateway {
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx
 
 #endif  // INFERX_SERVER_ENGINE_GATEWAY_H_

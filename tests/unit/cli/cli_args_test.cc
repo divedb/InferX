@@ -52,7 +52,7 @@ TEST(EngineArgsTest, BuildsConsistentConfigs) {
   const CacheConfig cache = args.BuildCacheConfig();
   const SchedulerConfig scheduler = args.BuildSchedulerConfig();
   EXPECT_EQ(built.model_dir, "models/foo");
-  EXPECT_EQ(cache.num_kv_blocks, args.num_kv_blocks);
+  EXPECT_EQ(cache.num_gpu_blocks_override, args.num_gpu_blocks_override);
   EXPECT_EQ(scheduler.max_num_seqs, args.max_num_seqs);
   EXPECT_EQ(scheduler.max_num_batched_tokens, args.max_num_batched_tokens);
 }
@@ -186,17 +186,17 @@ TEST(ModelConfigArgsTest, RejectsInvalidValues) {
 
 TEST(GenerationConfigResolveTest, ModeSemantics) {
   // "vllm" always keeps engine defaults.
-  auto none = server::GenerationConfig::Resolve("models/foo", "vllm");
+  auto none = GenerationConfig::Resolve("models/foo", "vllm");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // "auto" with no generation_config.json is normal, not an error.
-  none = server::GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
+  none = GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
   ASSERT_TRUE(none.ok());
   EXPECT_FALSE(none->has_value());
 
   // An explicit directory must exist and load.
-  auto missing = server::GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
+  auto missing = GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
                                            "/nonexistent-inferx-model-dir");
   EXPECT_FALSE(missing.ok());
 }
@@ -205,7 +205,7 @@ TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
   const std::string dir = "/tmp/inferx_generation_config_test";
   std::filesystem::create_directories(dir);
   { std::ofstream(dir + "/generation_config.json") << R"({"temperature": 0.7})"; }
-  auto loaded = server::GenerationConfig::Resolve("models/foo", dir);
+  auto loaded = GenerationConfig::Resolve("models/foo", dir);
   ASSERT_TRUE(loaded.ok());
   ASSERT_TRUE(loaded->has_value());
   ASSERT_TRUE((*loaded)->temperature.has_value());
@@ -213,7 +213,7 @@ TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
 }
 
 TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
-  auto gen = server::GenerationConfig::FromJson(
+  auto gen = GenerationConfig::FromJson(
       R"({"temperature": 0.6, "top_p": 0.95, "top_k": 20,)"
       R"( "repetition_penalty": 1.05, "max_new_tokens": 512})");
   ASSERT_TRUE(gen.ok());
@@ -221,7 +221,7 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
   EXPECT_FLOAT_EQ(*gen->temperature, 0.6f);
 
   sampling::SamplingParams merged;
-  inferx::server::MergeGenerationConfig(*gen, &merged);
+  inferx::MergeGenerationConfig(*gen, &merged);
   EXPECT_FLOAT_EQ(merged.temperature, 0.6f);
   EXPECT_FLOAT_EQ(merged.top_p, 0.95f);
   EXPECT_EQ(merged.top_k, 20u);
@@ -232,26 +232,26 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
   sampling::SamplingParams explicit_wins;
   explicit_wins.temperature = 0.1f;
   explicit_wins.max_tokens = 8;
-  inferx::server::MergeGenerationConfig(*gen, &explicit_wins, {"temperature", "max-tokens"});
+  inferx::MergeGenerationConfig(*gen, &explicit_wins, {"temperature", "max-tokens"});
   EXPECT_FLOAT_EQ(explicit_wins.temperature, 0.1f);
   EXPECT_EQ(explicit_wins.max_tokens, 8u);
   EXPECT_FLOAT_EQ(explicit_wins.top_p, 0.95f);
 }
 
 TEST(GenerationConfigTest, HfDisabledTopKMapsToZero) {
-  auto gen = server::GenerationConfig::FromJson(R"({"top_k": -1})");
+  auto gen = GenerationConfig::FromJson(R"({"top_k": -1})");
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams merged;
-  inferx::server::MergeGenerationConfig(*gen, &merged);
+  inferx::MergeGenerationConfig(*gen, &merged);
   EXPECT_EQ(merged.top_k, 0u);
 }
 
 TEST(GenerationConfigTest, EmptyJsonKeepsDefaults) {
-  auto gen = server::GenerationConfig::FromJson("{}");
+  auto gen = GenerationConfig::FromJson("{}");
   ASSERT_TRUE(gen.ok());
   sampling::SamplingParams defaults;
   const sampling::SamplingParams untouched = defaults;
-  inferx::server::MergeGenerationConfig(*gen, &defaults);
+  inferx::MergeGenerationConfig(*gen, &defaults);
   EXPECT_EQ(defaults.temperature, untouched.temperature);
   EXPECT_EQ(defaults.top_p, untouched.top_p);
 }

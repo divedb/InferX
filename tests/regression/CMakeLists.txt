@@ -13,7 +13,7 @@ inferx_add_test(
 inferx_add_test(
   NAME vllm_parity_probe_test
   SRCS vllm_parity_probe_test.cc
-  DEPS inferx::engine inferx::tokenizers
+  DEPS inferx::engine inferx::prompt_service
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
   TIMEOUT 300
   LABELS regression

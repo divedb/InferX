@@ -184,6 +184,28 @@ TEST_F(SchedulerTest, FinishesOnEosUnlessIgnored) {
   EXPECT_TRUE(scheduler_->HasRequests());
 }
 
+TEST_F(SchedulerTest, ExplicitStopsOverrideLengthAndReleaseCache) {
+  MakeScheduler(SchedulerConfig{});
+  for (bool text_stop : {false, true}) {
+    sampling::SamplingParams params;
+    params.max_tokens = 1;
+    params.ignore_eos = true;
+    if (!text_stop) params.stop_token_ids = {7};
+    ASSERT_TRUE(scheduler_->AddRequest(Request(1, {1, 2, 3}, params)).ok());
+    auto plan = scheduler_->Schedule();
+    ASSERT_TRUE(plan.ok());
+    auto result = ResultFor(*plan, 7);
+    if (text_stop) result.samples[0].finish_reason = FinishReason::kStopped;
+    ASSERT_TRUE(scheduler_->UpdateFromOutput(*plan, result).ok());
+    auto finished = scheduler_->PopFinished();
+    ASSERT_TRUE(finished.has_value());
+    EXPECT_EQ(finished->GetFinishReason(), FinishReason::kStopped);
+    EXPECT_EQ(finished->NumOutputTokens(), 1);  // Includes the stopping token.
+    EXPECT_FALSE(scheduler_->HasRequests());
+    EXPECT_EQ(runtime_->BlockPool()->NumFreeBlocks(), runtime_->BlockPool()->NumBlocks());
+  }
+}
+
 TEST_F(SchedulerTest, MidPromptChunkSamplesAreDropped) {
   SchedulerConfig config;
   config.max_num_batched_tokens = 3;

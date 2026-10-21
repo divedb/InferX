@@ -8,7 +8,7 @@
 
 #include "gtest/gtest.h"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
 sampling::SamplingParams Defaults() {
@@ -82,10 +82,106 @@ TEST(CompletionsParseTest, WrongModelIsNotFound) {
   EXPECT_EQ(parsed.code, "model_not_found");
 }
 
+TEST(ChatParseTest, ValidatesMessagesOptionsAndSampling) {
+  auto parsed = ParseChatRequest(R"({"messages":[{"role":"user","content":"hi"}],
+    "max_completion_tokens":8,"stop":"END","logprobs":false,
+    "chat_template_kwargs":{"enable_thinking":false}})", Defaults(), "m0");
+  ASSERT_TRUE(parsed.ok) << parsed.message;
+  ASSERT_TRUE(parsed.request.chat.has_value());
+  EXPECT_FALSE(parsed.request.chat->options.enable_thinking);
+  EXPECT_EQ(parsed.request.params.max_tokens, 8);
+  EXPECT_EQ(parsed.request.params.stop_strings, std::vector<std::string>{"END"});
+  for (const auto* body : {
+      R"({"messages":[]})", R"({"messages":[null]})",
+      R"({"messages":[{"role":"user","content":[]}]})",
+      R"({"messages":[{"role":"tool","content":"x"}]})",
+      R"({"messages":[{"role":"assistant","content":"x","tool_calls":[]}]})",
+      R"({"messages":[{"role":"user","content":"x"}],"tools":[]})",
+      R"({"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{"enable_thinking":1}})",
+      R"({"messages":[{"role":"user","content":"x"}],"chat_template_kwargs":{"other":true}})",
+      R"({"messages":[{"role":"user","content":"x"}],"max_tokens":1,"max_completion_tokens":2})"}) {
+    auto invalid = ParseChatRequest(body, Defaults(), "m0");
+    EXPECT_FALSE(invalid.ok) << body;
+    EXPECT_EQ(invalid.http_status, 400) << body;
+  }
+}
+
+TEST(CompletionsParseTest, StopControlsAreParsedAndValidated) {
+  auto parsed = ParseCompletionsRequest(
+      R"({"prompt":"x","stop":["END","done"],"stop_token_ids":[0,42],"ignore_eos":true})",
+      Defaults(), "m0");
+  ASSERT_TRUE(parsed.ok) << parsed.message;
+  EXPECT_EQ(parsed.request.params.stop_strings, (std::vector<std::string>{"END", "done"}));
+  EXPECT_EQ(parsed.request.params.stop_token_ids, (std::vector<std::int32_t>{0, 42}));
+  EXPECT_TRUE(parsed.request.params.ignore_eos);
+  for (const auto* body : {
+           R"({"prompt":"x","stop":"END"})", R"({"prompt":"x","stop":null})",
+           R"({"prompt":"x","stop":[],"stop_token_ids":[]})",
+           R"({"prompt":"x","stop_token_ids":null})"}) {
+    EXPECT_TRUE(ParseCompletionsRequest(body, Defaults(), "m0").ok) << body;
+  }
+  for (const auto* body : {
+           R"({"prompt":"x","stop":""})", R"({"prompt":"x","stop":[""]})",
+           R"({"prompt":"x","stop":3})", R"({"prompt":"x","stop":[3]})",
+           R"({"prompt":"x","stop":["a","b","c","d","e"]})",
+           R"({"prompt":"x","stop_token_ids":[-1]})",
+           R"({"prompt":"x","stop_token_ids":[1.5]})",
+           R"({"prompt":"x","stop_token_ids":[2147483648]})",
+           R"({"prompt":"x","stop_token_ids":[18446744073709551615]})",
+           R"({"prompt":"x","stop_token_ids":42})"}) {
+    const auto invalid = ParseCompletionsRequest(body, Defaults(), "m0");
+    EXPECT_FALSE(invalid.ok) << body;
+    EXPECT_EQ(invalid.http_status, 400) << body;
+  }
+}
+
 TEST(CompletionsParseTest, UnknownFieldsAreIgnored) {
   const ParseResult parsed = ParseCompletionsRequest(
-      R"({"model":"m0","prompt":"x","echo":true,"best_of":3})", Defaults(), "m0");
+      R"({"model":"m0","prompt":"x","future_thing":[1,2]})", Defaults(), "m0");
   EXPECT_TRUE(parsed.ok);
+}
+
+TEST(CompletionsParseTest, RejectsUnsupportedGenerationControls) {
+  const Json fields = {
+      {"best_of", 3},
+      {"include_stop_str_in_output", true}, {"min_tokens", 4},
+      {"logit_bias", {{"42", 10}}}, {"allowed_token_ids", {42}},
+      {"prompt_logprobs", 2}, {"top_logprobs", 2},
+      {"response_format", {{"type", "json_object"}}},
+      {"structured_outputs", {{"choice", {"yes", "no"}}}},
+      {"guided_json", Json::object()}, {"guided_regex", "[a-z]+"},
+      {"guided_choice", {"yes", "no"}}, {"guided_grammar", "root ::= 'yes'"},
+      {"guided_whitespace_pattern", " *"}, {"guided_decoding_backend", "xgrammar"},
+      {"tools", Json::array()}, {"tool_choice", "auto"},
+      {"parallel_tool_calls", false}, {"max_completion_tokens", 32},
+      {"truncate_prompt_tokens", 8}, {"return_token_ids", true},
+      {"return_tokens_as_token_ids", true}, {"use_beam_search", true},
+      {"length_penalty", 1.0}, {"early_stopping", true},
+      {"echo", false}, {"suffix", ""}};
+  for (auto it = fields.begin(); it != fields.end(); ++it) {
+    for (const Json& value : {it.value(), Json(nullptr)}) {
+      Json request = {{"prompt", "x"}, {it.key(), value}};
+      SCOPED_TRACE(request.dump());
+      const auto parsed = ParseCompletionsRequest(request.dump(), Defaults(), "m0");
+      ASSERT_FALSE(parsed.ok);
+      EXPECT_EQ(parsed.http_status, 400);
+      EXPECT_EQ(parsed.param, it.key());
+      EXPECT_EQ(parsed.code, "unsupported_parameter");
+    }
+  }
+}
+
+TEST(CompletionsParseTest, EchoIsExplicitlyUnsupported) {
+  // Known OpenAI fields the engine does not implement must surface as a
+  // 400 unsupported_parameter, not be silently dropped
+  // (docs/inference_server_design.md §2.1/§8.2).
+  const ParseResult parsed =
+      ParseCompletionsRequest(R"({"model":"m0","prompt":"x","echo":true})", Defaults(),
+                              "m0");
+  ASSERT_FALSE(parsed.ok);
+  EXPECT_EQ(parsed.http_status, 400);
+  EXPECT_EQ(parsed.param, "echo");
+  EXPECT_EQ(parsed.code, "unsupported_parameter");
 }
 
 TEST(SseFramingTest, ChunkBytesAreExact) {
@@ -187,4 +283,4 @@ TEST(FinishReasonTest, MapsToApiSpellings) {
 }
 
 }  // namespace
-}  // namespace inferx::server
+}  // namespace inferx

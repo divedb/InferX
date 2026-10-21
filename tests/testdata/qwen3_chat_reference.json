@@ -1,0 +1,290 @@
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be brief."
+      },
+      {
+        "role": "user",
+        "content": "你好 👋"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n你好 👋<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": "Be brief."
+      },
+      {
+        "role": "user",
+        "content": "你好 👋"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n你好 👋<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "first"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nold reasoning\n</think>\n\nanswer"
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "first"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nold reasoning\n</think>\n\nanswer"
+      },
+      {
+        "role": "user",
+        "content": "next"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "answer"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "answer"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nx\n</think>\n\nanswer"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\nx\n</think>\n\nanswer"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "assistant",
+        "content": "\nhello"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>assistant\n\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "assistant",
+        "content": "\nhello"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>assistant\n\nhello<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": ""
+      },
+      {
+        "role": "user",
+        "content": ""
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "system",
+        "content": ""
+      },
+      {
+        "role": "user",
+        "content": ""
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "system",
+        "content": "later system"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>system\nlater system<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "system",
+        "content": "later system"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>system\nlater system<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>x</think>answer"
+      },
+      {
+        "role": "assistant",
+        "content": "next"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nnext<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>x</think>answer"
+      },
+      {
+        "role": "assistant",
+        "content": "next"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nnext<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>x</think>answer"
+      },
+      {
+        "role": "user",
+        "content": "<tool_response>ok</tool_response>"
+      }
+    ],
+    "enable_thinking": false,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>user\n<tool_response>ok</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>x</think>answer"
+      },
+      {
+        "role": "user",
+        "content": "<tool_response>ok</tool_response>"
+      }
+    ],
+    "enable_thinking": true,
+    "rendered": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nx\n</think>\n\nanswer<|im_end|>\n<|im_start|>user\n<tool_response>ok</tool_response><|im_end|>\n<|im_start|>assistant\n"
+  }
+]

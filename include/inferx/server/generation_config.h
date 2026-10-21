@@ -12,7 +12,7 @@
 
 #include "inferx/core/status.h"
 
-namespace inferx::server {
+namespace inferx {
 
 /// \brief Sampling defaults a checkpoint ships for itself. Absent fields
 ///        stay unset so engine defaults win.
@@ -38,6 +38,6 @@ struct GenerationConfig {
                                                            const std::string& generation_config);
 };
 
-}  // namespace inferx::server
+}  // namespace inferx
 
 #endif  // INFERX_SERVER_GENERATION_CONFIG_H_

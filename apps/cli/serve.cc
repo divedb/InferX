@@ -26,8 +26,8 @@ struct ServeArgs {
   int tokenizer_request_timeout_ms = 10000;
   int tokenizer_startup_timeout_ms = 30000;
 
-  server::ServeParams Build() const {
-    server::ServeParams p;
+  ServeParams Build() const {
+    ServeParams p;
     p.engine.model = model.Build();
     p.engine.cache = engine.BuildCacheConfig();
     p.engine.scheduler = engine.BuildSchedulerConfig();
@@ -52,15 +52,15 @@ struct ServeArgs {
   ///        last regardless.
   void ApplyGenerationConfig(sampling::SamplingParams* defaults) const {
     auto resolved =
-        server::GenerationConfig::Resolve(model.config.model_dir, model.config.generation_config);
+        GenerationConfig::Resolve(model.config.model_dir, model.config.generation_config);
     if (!resolved.ok()) throw CommandError(resolved.status());
     if (resolved->has_value()) {
-      server::MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
+      MergeGenerationConfig(**resolved, defaults, sampling.ExplicitFields());
     }
     if (!model.config.override_generation_config.empty()) {
-      auto overrides = server::GenerationConfig::FromJson(model.config.override_generation_config);
+      auto overrides = GenerationConfig::FromJson(model.config.override_generation_config);
       if (!overrides.ok()) throw CommandError(overrides.status());
-      server::MergeGenerationConfig(*overrides, defaults);
+      MergeGenerationConfig(*overrides, defaults);
     }
     ThrowIfError(defaults->Validate());
   }
@@ -119,7 +119,7 @@ void RegisterServe(CLI::App& root) {
       ->group("Advanced")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  sub->callback([args] { ThrowIfError(server::RunServe(args->Build())); });
+  sub->callback([args] { ThrowIfError(RunServe(args->Build())); });
 }
 
 }  // namespace inferx::cli

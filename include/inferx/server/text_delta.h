@@ -6,7 +6,7 @@
 
 #include "inferx/server/utf8.h"
 
-namespace inferx::server {
+namespace inferx {
 
 /// \brief Incremental text delta over full re-decodes of a growing token
 /// list.
@@ -60,6 +60,6 @@ class TextDelta {
   std::size_t emitted_ = 0;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx
 
 #endif  // INFERX_SERVER_TEXT_DELTA_H_

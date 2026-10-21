@@ -24,8 +24,9 @@
 #include "inferx/engine/scheduler.h"
 #include "inferx/server/completion_signal.h"
 #include "inferx/server/text_delta.h"
+#include "inferx/server/stop_text.h"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
 // Undelivered events tolerated per request before the consumer is judged
@@ -43,7 +44,9 @@ struct EngineGateway::Impl {
       : io(io_arg), tokenizer(std::move(tokenizer_arg)) {
     runner = Take(ModelRunner::Create(model_config, cache_config, scheduler_config,
                                           execution_config, parallel_config));
-    const std::vector<TokenId> eos = runner->GetModelSpec().eos_token_ids;
+    vocab_size = runner->GetModelSpec().vocab_size;
+    eos_token_ids = runner->GetModelSpec().eos_token_ids;
+    const auto& eos = eos_token_ids;
     if (eos.empty()) {
       throw std::runtime_error("model config declares no eos_token_id");
     }
@@ -58,6 +61,8 @@ struct EngineGateway::Impl {
   std::unique_ptr<ModelRunner> runner;
   std::unique_ptr<Scheduler> scheduler;
   int capacity = 0;
+  int64_t vocab_size = 0;
+  std::vector<TokenId> eos_token_ids;
 
   std::thread engine;
   std::atomic<bool> stopping{false};
@@ -82,10 +87,23 @@ struct EngineGateway::Impl {
     std::shared_ptr<EventQueue> events;
     std::vector<int> generated;  // Tokens produced so far.
     TextDelta text;              // Suffix of `generated`'s decode already emitted.
+    StopText stop_text;
+    sampling::SamplingParams params;
     int prompt_len = 0;
     int computed = 0;  // Prompt tokens with KV computed (prefill progress).
   };
   absl::flat_hash_map<std::uint64_t, Live> live;
+
+  StatusOr<std::string> DecodeOutput(const Live& entry) {
+    auto tokens = absl::MakeConstSpan(entry.generated);
+    // EOS ends generation but is protocol syntax, not assistant content.
+    // Keep it in generated/usage while excluding it from the decoded text.
+    if (!entry.params.ignore_eos && !tokens.empty() &&
+        std::find(eos_token_ids.begin(), eos_token_ids.end(), tokens.back()) != eos_token_ids.end())
+      tokens.remove_suffix(1);
+    return tokenizer->Decode(tokens);
+  }
+
 
   /// One step's outbound events. Queues are unbounded and never drop, so a
   /// terminal event always reaches a live consumer; each Push arms the
@@ -172,6 +190,8 @@ struct EngineGateway::Impl {
         Live entry;
         entry.events = submit.events;
         entry.prompt_len = prompt_len;
+        entry.params = submit.spec.params;
+        entry.stop_text = StopText(entry.params.stop_strings);
         live.emplace(submit.id, std::move(entry));
       }
       if (!aborts.empty()) {
@@ -197,43 +217,67 @@ struct EngineGateway::Impl {
         FailAll(result.status().message());
         break;
       }
-      if (const Status updated = scheduler->UpdateFromOutput(*plan, *result);
-          !updated.ok()) {
-        FailAll(updated.message());
-        break;
+      // Reset the computed watermark on admission/resumption, including
+      // prefix-cache adoption; cached updates already include this step.
+      for (const auto& req : plan->scheduled_new_reqs) {
+        auto it = live.find(req.request_id);
+        if (it != live.end()) it->second.computed = req.num_computed_tokens;
+      }
+      for (const auto& req : plan->scheduled_cached_reqs) {
+        auto it = live.find(req.request_id);
+        if (it != live.end()) it->second.computed = req.num_computed_tokens;
       }
 
       // Fan out new tokens. The computed-token guard mirrors the workload
       // loop: samples are real output only once the whole prompt has KV.
       for (std::size_t i = 0; i < plan->scheduled.size(); ++i) {
         const ScheduledRequest& sr = plan->scheduled[i];
-        const SampledTokens& samples = result->samples[i];
+        SampledTokens& samples = result->samples[i];
         auto it = live.find(sr.request_id);
         if (it == live.end()) continue;
         Live& entry = it->second;
-        entry.computed += sr.num_new_tokens;
-        if (entry.computed < entry.prompt_len || samples.token_ids.empty()) continue;
+        const bool is_new = std::any_of(
+            plan->scheduled_new_reqs.begin(), plan->scheduled_new_reqs.end(),
+            [&](const auto& req) { return req.request_id == sr.request_id; });
+        if (is_new) entry.computed += sr.num_new_tokens;
+        if (entry.computed < entry.prompt_len + static_cast<int>(entry.generated.size()) ||
+            samples.token_ids.empty()) continue;
+        const auto token = samples.token_ids.back();
+        const bool stop_token =
+            entry.generated.size() + 1 >= entry.params.min_tokens &&
+            std::find(entry.params.stop_token_ids.begin(), entry.params.stop_token_ids.end(),
+                      token) != entry.params.stop_token_ids.end();
+        if (stop_token) {
+          samples.finish_reason = FinishReason::kStopped;
+        }
         entry.generated.insert(entry.generated.end(), samples.token_ids.begin(),
                                samples.token_ids.end());
         // Phase-1 detokenizer: full re-decode, emit the new suffix
         // (server.md §7); empty deltas are still events so token timing
         // stays honest.
-        auto text = tokenizer->Decode(entry.generated);
+        auto text = DecodeOutput(entry);
         if (!text.ok()) {
           CompletionEvent event;
           event.kind = CompletionEvent::Kind::kError;
           event.message = std::string(text.status().message());
           batch.push_back({sr.request_id, entry.events, std::move(event)});
-          scheduler->AbortRequests({sr.request_id});
+          samples.finish_reason = FinishReason::kError;
           continue;
         }
-        const std::string_view delta = entry.text.NextDelta(*text);
+        const std::string delta = entry.stop_text.Append(entry.text.NextDelta(*text));
+        if (entry.stop_text.stopped()) samples.finish_reason = FinishReason::kStopped;
         if (!delta.empty()) {
           CompletionEvent event;
           event.kind = CompletionEvent::Kind::kDelta;
           event.delta = std::string(delta);
           batch.push_back({sr.request_id, entry.events, std::move(event)});
         }
+      }
+
+      if (const Status updated = scheduler->UpdateFromOutput(*plan, *result);
+          !updated.ok()) {
+        FailAll(updated.message());
+        break;
       }
 
       // Slow-consumer aborts move requests to the finished list; running
@@ -255,8 +299,10 @@ struct EngineGateway::Impl {
         } else {
           // Emit any text held back for UTF-8 settling before the finish,
           // so a finished request's deltas concatenate to its final decode.
-          if (auto text = tokenizer->Decode(it->second.generated); text.ok()) {
-            const std::string_view rest = it->second.text.Flush(*text);
+          if (auto text = DecodeOutput(it->second); text.ok()) {
+            auto& entry = it->second;
+            std::string rest = entry.stop_text.Append(entry.text.Flush(*text));
+            rest += entry.stop_text.Finish();
             if (!rest.empty()) {
               CompletionEvent flush;
               flush.kind = CompletionEvent::Kind::kDelta;
@@ -265,7 +311,7 @@ struct EngineGateway::Impl {
             }
           }
           event.kind = CompletionEvent::Kind::kFinish;
-          event.reason = reason;
+          event.reason = it->second.stop_text.stopped() ? FinishReason::kStopped : reason;
           event.prompt_tokens = static_cast<int>(finished->Prompt().size());
           event.completion_tokens = static_cast<int>(finished->Output().size());
         }
@@ -306,6 +352,13 @@ EngineGateway::EngineGateway(boost::asio::io_context& io, ModelConfig model_conf
 EngineGateway::~EngineGateway() { Shutdown(); }
 
 StatusOr<SubmitResult> EngineGateway::Submit(CompletionSpec spec) {
+  const Status valid = spec.params.Validate();
+  if (!valid.ok()) return valid;
+  for (const auto token : spec.params.stop_token_ids) {
+    if (token >= impl_->vocab_size) {
+      return InvalidArgumentError("stop_token_ids contains a token outside the model vocabulary");
+    }
+  }
   if (impl_->stopping.load()) {
     return ResourceExhaustedError("server is shutting down");
   }
@@ -342,4 +395,4 @@ void EngineGateway::Shutdown() {
   if (impl_->engine.joinable()) impl_->engine.join();
 }
 
-}  // namespace inferx::server
+}  // namespace inferx

@@ -47,7 +47,7 @@ StatusOr<Generation> Generate(const std::vector<TokenId>& prompt, int max_tokens
   CacheConfig cache;
   cache.block_size = 16;
   if (std::getenv("INFERX_TEST_NO_PREFIX") != nullptr) cache.enable_prefix_caching = false;
-  cache.num_kv_blocks = 1024;
+  cache.num_gpu_blocks_override = 1024;
   SchedulerConfig scheduler_config;
   ExecutionConfig execution;
   INFERX_ASSIGN_OR_RETURN(auto runner,

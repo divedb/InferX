@@ -99,7 +99,7 @@ TEST_F(ConsoleHelpTest, NormalHelpHidesAdvancedOptions) {
   ASSERT_EQ(code, 0);
   // Signatures, not substrings: descriptions may cross-reference hidden
   // options ("0 derives it from --num-kv-blocks").
-  EXPECT_EQ(help.find("\n  --num-kv-blocks <"), std::string::npos);
+  EXPECT_EQ(help.find("\n  --num-gpu-blocks-override <"), std::string::npos);
   EXPECT_EQ(help.find("\n  --tensor-parallel-size <"), std::string::npos);
   EXPECT_EQ(help.find("Advanced:"), std::string::npos);
 }
@@ -113,7 +113,7 @@ TEST_F(ConsoleHelpTest, FooterPointsToHelpAllAndHelpAllOmitsIt) {
   const auto [all_code, all] = Render({"bench", "latency", "--help=all"});
   ASSERT_EQ(all_code, 0);
   EXPECT_EQ(all.find("for more information"), std::string::npos);
-  EXPECT_NE(all.find("\n  --num-kv-blocks <"), std::string::npos);
+  EXPECT_NE(all.find("\n  --num-gpu-blocks-override <"), std::string::npos);
   EXPECT_NE(all.find("Advanced:"), std::string::npos);
 }
 

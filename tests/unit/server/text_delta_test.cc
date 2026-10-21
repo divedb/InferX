@@ -6,18 +6,60 @@
 // shrink between steps. The delta tracker must emit chunks that concatenate
 // to the final decode and must never throw, whatever the decode sequence.
 #include "inferx/server/text_delta.h"
+#include "inferx/server/stop_text.h"
 
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
 // The UTF-8 replacement character, EF BF BD: what a byte-level decoder
 // substitutes for a partial multi-byte character.
 constexpr const char* kReplacement = "\xEF\xBF\xBD";
+
+TEST(StopTextTest, EveryPartitionSuppressesStopAndTrailingText) {
+  const std::string input = "helloENDtail";
+  for (unsigned cuts = 0; cuts < (1u << (input.size() - 1)); ++cuts) {
+    StopText stop({"END"});
+    std::string output, chunk;
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      chunk += input[i];
+      if (i + 1 < input.size() && !(cuts & (1u << i))) continue;
+      output += stop.Append(chunk);
+      chunk.clear();
+    }
+    output += stop.Finish();
+    EXPECT_EQ(output, "hello");
+    EXPECT_TRUE(stop.stopped());
+    EXPECT_EQ(stop.Append("more"), "");
+  }
+}
+
+TEST(StopTextTest, OverlappingStopsEarliestMatchAndIncompleteTail) {
+  StopText stop({"abcd", "bc", "xyz"});
+  EXPECT_EQ(stop.Append("helloab"), "hello");
+  EXPECT_EQ(stop.Append("cxyz"), "a");
+  EXPECT_TRUE(stop.stopped());
+  EXPECT_EQ(stop.Finish(), "");
+  StopText partial({"END"});
+  EXPECT_EQ(partial.Append("helloEN"), "hello");
+  EXPECT_EQ(partial.Finish(), "EN");
+  EXPECT_FALSE(partial.stopped());
+}
+
+TEST(StopTextTest, UnicodeMatchesAfterDecoderSettles) {
+  TextDelta delta;
+  StopText stop({"é!"});
+  EXPECT_EQ(stop.Append(delta.NextDelta("hello\xEF\xBF\xBD")), "hello");
+  EXPECT_EQ(stop.Append(delta.NextDelta("helloé")), "");
+  EXPECT_EQ(stop.Append(delta.NextDelta("helloé!tail")), "");
+  EXPECT_TRUE(stop.stopped());
+  EXPECT_EQ(stop.Append(delta.Flush("helloé!tail")), "");
+  EXPECT_EQ(stop.Finish(), "");
+}
 
 // Feeds `decodes` through the tracker and returns the concatenated output
 // plus the final flush, so every test asserts the same end-to-end property.
@@ -113,4 +155,4 @@ TEST(TextDeltaTest, ConcatenatedDeltasEqualFinalDecode) {
 }
 
 }  // namespace
-}  // namespace inferx::server
+}  // namespace inferx

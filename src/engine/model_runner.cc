@@ -206,24 +206,31 @@ Status ModelRunner::InitializeKVCache(int64_t kv_bytes, const CacheConfig& cache
   if (!scratch_) return FailedPreconditionError("cache initialization requires profiling");
   const ModelSpec& spec = model_->GetModelSpec();
 
-  // Byte budget: utilization leftover, explicit bytes, or blocks x block
-  // bytes (the facade + runtime derive the actual split).
-  int64_t budget = kv_bytes;
-  if (budget < 0) budget = cache.kv_cache_memory_bytes;
-  if (budget <= 0 && cache.num_kv_blocks > 0) {
-    // Convert the block count into a byte budget; the runtime rounds down
-    // to whole blocks from it.
-    int64_t per_block = 0;
+  // Byte budget resolution, first match wins (CacheConfig doc order):
+  //   1. num_gpu_blocks_override > 0: exactly that many blocks.
+  //   2. kv_bytes >= 0: the gpu-memory-utilization leftover from profiling.
+  //   3. kv_cache_memory_bytes: explicit per-device byte budget.
+  // The runtime rounds every budget down to whole blocks.
+  int64_t per_block = 0;
+  if (cache.num_gpu_blocks_override > 0) {
     for (const attn::AttentionSpec& attn_spec : model_->GetAttentionSpecs()) {
       if (!attn::NeedsCache(attn_spec)) continue;
       INFERX_ASSIGN_OR_RETURN(const int64_t per_token, attn::CacheBytesPerToken(attn_spec));
       per_block += cache.block_size * per_token;
     }
-    budget = cache.num_kv_blocks * per_block;
+  }
+  int64_t budget = 0;
+  if (cache.num_gpu_blocks_override > 0) {
+    budget = cache.num_gpu_blocks_override * per_block;
+  } else if (kv_bytes >= 0) {
+    budget = kv_bytes;
+  } else {
+    budget = cache.kv_cache_memory_bytes;
   }
   if (budget <= 0) {
-    return ResourceExhaustedError("KV budget of ", kv_bytes,
-                                  " bytes fits no cache; check the cache config");
+    return ResourceExhaustedError(
+        "no usable KV budget; set one of --num-gpu-blocks-override, "
+        "--kv-cache-memory-bytes, or --gpu-memory-utilization");
   }
 
   auto registry = std::make_unique<attn::BackendRegistry>();

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <string_view>
 
-namespace inferx::server::detail {
+namespace inferx::detail {
 
 /// Length of the prefix ending on a complete UTF-8 character boundary.
 /// Keep the remaining bytes for the next detokenized suffix. This is a
@@ -28,6 +28,6 @@ inline std::size_t Utf8Boundary(std::string_view text) {
   return lead;
 }
 
-}  // namespace inferx::server::detail
+}  // namespace inferx::detail
 
 #endif  // INFERX_SERVER_UTF8_H_

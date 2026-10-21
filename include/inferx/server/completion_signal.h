@@ -14,7 +14,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/concurrent_channel.hpp>
 
-namespace inferx::server {
+namespace inferx {
 
 class CompletionSignal {
  public:
@@ -66,6 +66,6 @@ class CompletionSignal {
   std::vector<std::shared_ptr<Waiter>> waiters_;
 };
 
-}  // namespace inferx::server
+}  // namespace inferx
 
 #endif  // INFERX_SERVER_COMPLETION_SIGNAL_H_

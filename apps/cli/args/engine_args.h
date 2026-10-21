@@ -19,12 +19,14 @@ namespace inferx::cli {
 struct EngineArgs {
   int max_num_seqs = 32;                // vLLM: --max-num-seqs
   int max_num_batched_tokens = 4096;    // vLLM: --max-num-batched-tokens
-  int64_t num_kv_blocks = 2048;         // InferX: explicit pool size (vLLM derives it
-                                        //             from --gpu-memory-utilization)
+  double gpu_memory_utilization = 0.9;  // vLLM: --gpu-memory-utilization;
+                                        // default KV sizing path
   int64_t block_size = 16;              // vLLM: --block-size
   bool cuda_graphs = false;             // vLLM analog: --enforce-eager, inverted
   int64_t kv_cache_memory_bytes = 0;    // vLLM: --kv-cache-memory-bytes; 0
-                                        //             derives from num_kv_blocks
+                                        //             derives from utilization
+  int64_t num_gpu_blocks_override = 0;  // vLLM: --num-gpu-blocks-override; 0 =
+                                        //             derive; wins over all else
   bool chunked_prefill = true;          // vLLM: --enable-chunked-prefill
   std::vector<int> cudagraph_capture_sizes;   // vLLM: --cudagraph-capture-sizes
   int max_cudagraph_capture_size = 0;         // vLLM: --max-cudagraph-capture-size
@@ -47,12 +49,18 @@ struct EngineArgs {
         ->type_name("N")
         ->capture_default_str()
         ->check(CLI::Range(16, 1 << 20));
-    g->add_option("--num-kv-blocks", num_kv_blocks,
-                  "InferX: total KV cache blocks preallocated across all layers")
+    g->add_option("--gpu-memory-utilization", gpu_memory_utilization,
+                  "Fraction of device memory for weights, activations and KV")
+        ->type_name("F")
+        ->capture_default_str()
+        ->check(CLI::Range(0.01, 1.0));
+    g->add_option("--num-gpu-blocks-override", num_gpu_blocks_override,
+                  "Force the total KV cache block count; 0 derives it from "
+                  "--gpu-memory-utilization (vLLM: --num-gpu-blocks-override)")
         ->type_name("N")
         ->group("Advanced")
         ->capture_default_str()
-        ->check(CLI::PositiveNumber);
+        ->check(CLI::Range(int64_t{0}, int64_t{1} << 24));
     g->add_option("--block-size", block_size, "Token capacity of one KV cache block")
         ->type_name("N")
         ->group("Advanced")
@@ -63,7 +71,7 @@ struct EngineArgs {
         ->group("Advanced");
     g->add_option("--kv-cache-memory-bytes", kv_cache_memory_bytes,
                   "Exact KV cache size in bytes; 0 derives it from "
-                  "--num-kv-blocks")
+                  "--gpu-memory-utilization")
         ->type_name("BYTES")
         ->capture_default_str()
         ->check(CLI::Range(int64_t{0}, int64_t{1} << 40));
@@ -100,9 +108,10 @@ struct EngineArgs {
   /// \brief KV cache pool sizing (vLLM CacheConfig analogue).
   CacheConfig BuildCacheConfig() const {
     CacheConfig cfg;
-    cfg.num_kv_blocks = num_kv_blocks;
+    cfg.gpu_memory_utilization = static_cast<float>(gpu_memory_utilization);
     cfg.block_size = block_size;
     cfg.kv_cache_memory_bytes = kv_cache_memory_bytes;
+    cfg.num_gpu_blocks_override = num_gpu_blocks_override;
     return cfg;
   }
 

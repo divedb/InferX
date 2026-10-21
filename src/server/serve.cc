@@ -1,300 +1,123 @@
-// `inferx serve` assembly (server.md §4): coroutine HTTP front end over
-// the EngineGateway. This file owns API semantics (dispatch, the
-// completions request path, SSE writing); http_server.cc owns connection
-// plumbing and engine_gateway.cc owns the engine thread.
 #include "inferx/server/serve.h"
 
 #include <algorithm>
 #include <atomic>
+#include <boost/asio.hpp>
 #include <chrono>
-#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "inferx/core/status_util.h"
-#include "inferx/server/api.h"
+#include "inferx/server/engine_client.h"
 #include "inferx/server/engine_gateway.h"
 #include "inferx/server/http_server.h"
-#include "inferx/server/tokenizer_pool.h"
+#include "inferx/server/metrics.h"
+#include "inferx/server/openai_handlers.h"
+#include "inferx/server/request_model.h"
 #include "inferx/tokenizer/tokenizer.h"
 
-namespace inferx::server {
+namespace inferx {
 namespace {
 
-/// Aborts the engine request if the coroutine exits for any reason
-/// (response complete, client disconnect, write error).
-struct CancelGuard {
-  EngineGateway& gateway;
-  std::uint64_t id;
-  ~CancelGuard() { gateway.Cancel(id); }
-};
+namespace net = boost::asio;
 
-/// Abandons pool preprocessing on coroutine exit (disconnect while awaiting
-/// the encode); release() hands ownership to the engine CancelGuard once
-/// submission succeeded.
-struct PoolCancelGuard {
-  TokenizerPool* pool;
-  std::uint64_t id;
-  bool active = true;
-  void release() { active = false; }
-  ~PoolCancelGuard() {
-    if (active) pool->Cancel(id);
-  }
-};
-
-net::awaitable<void> WriteJsonResponse(beast::tcp_stream& stream,
-                                       const http::request<http::string_body>& req, int status,
-                                       const Json& body, const char* retry_after = nullptr) {
-  http::response<http::string_body> res{static_cast<http::status>(status), req.version()};
-  res.set(http::field::server, "inferx");
-  res.set(http::field::content_type, "application/json");
-  if (retry_after != nullptr) res.set("Retry-After", retry_after);
-  res.keep_alive(req.keep_alive());
-  res.body() = body.dump();
-  res.prepare_payload();
-  co_await http::async_write(stream, res, net::use_awaitable);
-}
-
-net::awaitable<void> WriteSseHeader(beast::tcp_stream& stream,
-                                    const http::request<http::string_body>& req) {
-  http::response<http::empty_body> res{http::status::ok, req.version()};
-  res.set(http::field::server, "inferx");
-  res.set(http::field::content_type, "text/event-stream");
-  res.set(http::field::cache_control, "no-cache");
-  res.keep_alive(req.keep_alive());
-  res.chunked(true);
-  http::response_serializer<http::empty_body> serializer{res};
-  co_await http::async_write_header(stream, serializer, net::use_awaitable);
-}
-
-/// One HTTP chunk carrying `payload`; flushed immediately so per-event
-/// timing stays honest.
-net::awaitable<void> WriteChunk(beast::tcp_stream& stream, std::string payload) {
-  if (payload.empty()) co_return;
-  char prefix[32];
-  const int digits = std::snprintf(prefix, sizeof(prefix), "%zX\r\n", payload.size());
-  std::string frame;
-  frame.reserve(payload.size() + digits + 2);
-  frame.append(prefix, digits);
-  frame += payload;
-  frame += "\r\n";
-  co_await net::async_write(stream, net::buffer(frame), net::use_awaitable);
-}
-
-net::awaitable<void> FinishChunkedBody(beast::tcp_stream& stream) {
-  co_await net::async_write(stream, net::buffer("0\r\n\r\n", 5), net::use_awaitable);
-}
-
-/// Per-request streaming state; the held-back delta lets the finish reason
-/// ride on the last content chunk, exactly like OpenAI streams.
-struct StreamState {
-  bool header_written = false;
-  std::string held_delta;
-};
-
-class InferxDispatcher : public RequestDispatcher {
+/// \brief Pull-adapter from the gateway's push EventQueue onto
+/// IEngineEventStream (the doc's in-process transport): events keep
+/// arrival order and gain strict sequence numbers; TakeAll() closing
+/// (cancel/shutdown) surfaces as a stream error, waking any pending
+/// Next().
+class GatewayEventStream : public IEngineEventStream {
  public:
-  InferxDispatcher(const ServeParams& params, EngineGateway& gateway,
-                   TokenizerPool& tokenizer_pool)
-      : model_(params.engine.model.ServedName()),
-        defaults_(params.frontend.default_sampling),
-        gateway_(gateway),
-        pool_(tokenizer_pool),
-        created_(static_cast<std::int64_t>(std::time(nullptr))) {}
+  explicit GatewayEventStream(std::shared_ptr<EventQueue> events)
+      : events_(std::move(events)) {}
 
-  bool HandleAdmin(const std::string& method, const std::string& target, int& status,
-                   std::string& content_type, std::string& body) override {
-    if (target == "/health" && method == "GET") {
-      status = 200;
-      content_type = "application/json";
-      const PoolHealth health = pool_.Health();
-      Json pool_json = Json::object({{"workers_ready", health.workers_ready},
-                                     {"workers_busy", health.workers_busy},
-                                     {"workers_down", health.workers_down},
-                                     {"queued_requests", health.queued_requests},
-                                     {"draining", health.draining},
-                                     {"unready", health.unready}});
-      body = Json({{"status", "ok"}, {"tokenizer_pool", pool_json}}).dump();
-      return true;
+  net::awaitable<StatusOr<EngineEvent>> Next() override {
+    for (;;) {
+      while (index_ < pending_.size()) {
+        co_return MapEvent(pending_[index_++]);
+      }
+      auto batch = co_await events_->TakeAll();
+      if (!batch.has_value()) {
+        co_return absl::UnavailableError("engine stream closed");
+      }
+      pending_ = std::move(*batch);
+      index_ = 0;
     }
-    if (target == "/v1/models" && method == "GET") {
-      status = 200;
-      content_type = "application/json";
-      body = MakeModelList(model_, created_).dump();
-      return true;
-    }
-    return false;
   }
 
-  net::awaitable<void> HandleCompletions(beast::tcp_stream& stream,
-                                         const http::request<http::string_body>& req) override {
-    const ParseResult parsed = ParseCompletionsRequest(req.body(), defaults_, model_);
-    if (!parsed.ok) {
-      co_await WriteJsonResponse(
-          stream, req, parsed.http_status,
-          MakeError(parsed.http_status, parsed.message, parsed.param, parsed.code));
-      co_return;
+  void Close() override {}  // The gateway closes queues via Cancel.
+
+ private:
+  EngineEvent MapEvent(const CompletionEvent& event) {
+    EngineEvent out;
+    out.seq = seq_++;
+    switch (event.kind) {
+      case CompletionEvent::Kind::kDelta:
+        out.kind = EngineEvent::Kind::kDelta;
+        out.text = event.delta;
+        break;
+      case CompletionEvent::Kind::kFinish:
+        out.kind = EngineEvent::Kind::kFinished;
+        out.reason = event.reason;
+        out.prompt_tokens = event.prompt_tokens;
+        out.completion_tokens = event.completion_tokens;
+        break;
+      case CompletionEvent::Kind::kError:
+        out.kind = EngineEvent::Kind::kError;
+        out.admission = event.admission;
+        out.error = absl::InternalError(event.message);
+        break;
     }
-    const std::uint64_t prep_id = next_prep_id_.fetch_add(1);
-    PoolCancelGuard pool_guard{&pool_, prep_id};
-    StatusOr<PreparedPrompt> encoded = co_await pool_.Prepare(prep_id, parsed.request.prompt);
-    if (!encoded.ok()) {
-      co_await WriteEncodeError(stream, req, encoded.status());
-      co_return;
-    }
-    StatusOr<SubmitResult> submit =
-        gateway_.Submit({std::move(encoded->token_ids), parsed.request.params});
-    if (!submit.ok()) {
-      co_await WriteJsonResponse(
-          stream, req, 503,
-          MakeError(503, std::string(submit.status().message()), "", "overloaded"), "1");
-      co_return;
-    }
-    pool_guard.release();  // The engine CancelGuard owns cancellation now.
-    CancelGuard guard{gateway_, submit->id};
-    if (parsed.request.stream) {
-      co_await RunStreaming(stream, req, *submit);
-    } else {
-      co_await RunNonStreaming(stream, req, *submit);
-    }
+    return out;
+  }
+
+  std::shared_ptr<EventQueue> events_;
+  std::vector<CompletionEvent> pending_;
+  std::size_t index_ = 0;
+  std::uint64_t seq_ = 0;
+};
+
+/// \brief The production in-process engine client (the doc's
+/// LocalEngineClient role): submits tokenized completions to the gateway
+/// and aborts by engine id.
+class GatewayEngineClient : public IEngineClient {
+ public:
+  explicit GatewayEngineClient(EngineGateway& gateway) : gateway_(gateway) {}
+
+  StatusOr<EngineSubmission> Submit(EngineCompletion request) override {
+    CompletionSpec spec;
+    spec.prompt = std::move(request.prompt);
+    spec.params = std::move(request.params);
+    StatusOr<SubmitResult> submitted = gateway_.Submit(std::move(spec));
+    if (!submitted.ok()) return submitted.status();
+    EngineSubmission out;
+    out.request_id = std::to_string(submitted->id);
+    out.events = std::make_unique<GatewayEventStream>(submitted->events);
+    return out;
+  }
+
+  void Abort(const std::string& request_id) override {
+    gateway_.Cancel(std::stoull(request_id));
   }
 
  private:
-  /// \brief Maps pool Prepare failures onto the HTTP surface. Infrastructure
-  /// problems are 503 (with retry hints), invalid input is 400, and a
-  /// cancelled request means the client is already gone.
-  net::awaitable<void> WriteEncodeError(beast::tcp_stream& stream,
-                                        const http::request<http::string_body>& req,
-                                        const Status& status) {
-    const std::string message(status.message());
-    switch (status.code()) {
-      case absl::StatusCode::kInvalidArgument:
-        co_await WriteJsonResponse(
-            stream, req, 400,
-            MakeError(400, message.empty() ? "failed to tokenize prompt" : message, "prompt"));
-        co_return;
-      case absl::StatusCode::kCancelled:
-        co_return;  // Client vanished; further writes are pointless.
-      default:
-        // ResourceExhausted (queue full), Unavailable (pool unready),
-        // DeadlineExceeded, FailedPrecondition (shutting down), Internal.
-        co_await WriteJsonResponse(
-            stream, req, 503,
-            MakeError(503, message.empty() ? "prompt preprocessing failed" : message, "",
-                      "overloaded"),
-            "1");
-        co_return;
-    }
-  }
-
-  net::awaitable<void> RunNonStreaming(beast::tcp_stream& stream,
-                                       const http::request<http::string_body>& req,
-                                       const SubmitResult& submit) {
-    std::string text;
-    for (;;) {
-      auto batch = co_await submit.events->TakeAll();
-      if (!batch.has_value()) {
-        co_await WriteJsonResponse(stream, req, 500, MakeError(500, "request cancelled"));
-        co_return;
-      }
-      for (const CompletionEvent& event : *batch) {
-        if (event.kind == CompletionEvent::Kind::kDelta) {
-          text += event.delta;
-          continue;
-        }
-        if (event.kind == CompletionEvent::Kind::kError) {
-          co_await WriteJsonResponse(stream, req, event.admission ? 503 : 500,
-                                     MakeError(event.admission ? 503 : 500, event.message, "",
-                                               event.admission ? "overloaded" : ""),
-                                     event.admission ? "1" : nullptr);
-          co_return;
-        }
-        co_await WriteJsonResponse(
-            stream, req, 200,
-            MakeCompletionResponse(std::to_string(submit.id), model_, created_, text,
-                                   FinishReasonName(event.reason), event.prompt_tokens,
-                                   event.completion_tokens));
-        co_return;
-      }
-    }
-  }
-
-  net::awaitable<void> RunStreaming(beast::tcp_stream& stream,
-                                    const http::request<http::string_body>& req,
-                                    const SubmitResult& submit) {
-    StreamState state;
-    for (;;) {
-      auto batch = co_await submit.events->TakeAll();
-      if (!batch.has_value()) co_return;  // Cancelled; teardown closes us.
-      // One write per batch: syscalls scale with engine steps, not tokens.
-      for (const CompletionEvent& event : *batch) {
-        if (co_await WriteStreamEvent(stream, req, submit, state, event)) co_return;
-      }
-    }
-  }
-
-  /// \brief Writes one event. Returns true when the response is complete.
-  /// Callers hand TakeAll() batches here, so each engine step costs one
-  /// write. The finish reason rides on the last content chunk.
-  net::awaitable<bool> WriteStreamEvent(beast::tcp_stream& stream,
-                                        const http::request<http::string_body>& req,
-                                        const SubmitResult& submit, StreamState& state,
-                                        const CompletionEvent& event) {
-    const std::string id = std::to_string(submit.id);
-    auto ensure_header = [&]() -> net::awaitable<void> {
-      if (state.header_written) co_return;
-      co_await WriteSseHeader(stream, req);
-      state.header_written = true;
-    };
-
-    if (event.kind == CompletionEvent::Kind::kDelta) {
-      co_await ensure_header();
-      std::string payload = MakeSseChunk(id, model_, created_, state.held_delta, {});
-      state.held_delta = event.delta;
-      co_await WriteChunk(stream, std::move(payload));
-      co_return false;
-    }
-    if (event.kind == CompletionEvent::Kind::kFinish) {
-      co_await ensure_header();
-      std::string payload =
-          MakeSseChunk(id, model_, created_, state.held_delta, FinishReasonName(event.reason));
-      state.held_delta.clear();
-      payload +=
-          MakeSseUsageChunk(id, model_, created_, event.prompt_tokens, event.completion_tokens);
-      payload += kSseDone;
-      co_await WriteChunk(stream, std::move(payload));
-      co_await FinishChunkedBody(stream);
-      co_return true;
-    }
-    // kError: without a streamed byte yet the response is still a clean
-    // HTTP error; otherwise terminate the stream best-effort.
-    if (!state.header_written) {
-      co_await WriteJsonResponse(stream, req, event.admission ? 503 : 500,
-                                 MakeError(event.admission ? 503 : 500, event.message, "",
-                                           event.admission ? "overloaded" : ""),
-                                 event.admission ? "1" : nullptr);
-      co_return true;
-    }
-    std::string payload = MakeSseChunk(id, model_, created_, state.held_delta, {});
-    state.held_delta.clear();
-    payload += kSseDone;
-    co_await WriteChunk(stream, std::move(payload));
-    co_await FinishChunkedBody(stream);
-    co_return true;
-  }
-
-  std::string model_;
-  sampling::SamplingParams defaults_;
   EngineGateway& gateway_;
-  TokenizerPool& pool_;
-  std::atomic<std::uint64_t> next_prep_id_{1};
-  std::int64_t created_;
 };
+
+std::vector<std::string> ResolveApiKeys(const FrontendConfig& frontend) {
+  std::vector<std::string> keys = frontend.api_keys;
+  if (const char* env = std::getenv("INFERX_API_KEY")) {
+    if (env[0] != '\0') keys.push_back(env);
+  }
+  return keys;
+}
 
 }  // namespace
 
@@ -317,11 +140,13 @@ void MergeGenerationConfig(const GenerationConfig& gen, sampling::SamplingParams
 Status EngineConfig::Validate() const {
   INFERX_RETURN_IF_ERROR(model.device.Validate());
   INFERX_RETURN_IF_ERROR(parallel.Validate());
+  INFERX_RETURN_IF_ERROR(cache.Validate());
   return OkStatus();
 }
 
 Status RunServe(const ServeParams& params) {
   return Guarded([&]() -> Status {
+    INFERX_RETURN_IF_ERROR(params.engine.Validate());
     const std::string tokenizer_path =
         params.engine.model.ResolvedTokenizerDir() + "/tokenizer.json";
     // Decode side only: the engine thread owns this instance exclusively;
@@ -332,9 +157,10 @@ Status RunServe(const ServeParams& params) {
     // The pool's workers load their tokenizer instances in parallel while
     // the gateway loads weights below; the startup gate then verifies both
     // finished before any request is accepted.
-    TokenizerPoolConfig pool_config = params.frontend.tokenizer;
+    PromptPoolConfig pool_config = params.frontend.tokenizer;
     pool_config.tokenizer_path = tokenizer_path;
-    TokenizerPool pool(io, pool_config);
+    INFERX_RETURN_IF_ERROR(pool_config.Validate());
+    std::shared_ptr<PromptProcessorPool> pool = CreatePromptProcessorPool(io, pool_config);
 
     const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
     const unsigned threads_count = std::clamp(hardware, 2u, 4u);
@@ -348,14 +174,27 @@ Status RunServe(const ServeParams& params) {
       EngineGateway gateway(io, params.engine.model, params.engine.cache,
                             params.engine.scheduler, params.engine.execution, decode_tokenizer,
                             params.engine.parallel);
+      GatewayEngineClient engine_client(gateway);
+      MetricsService metrics;
+      auto draining = std::make_shared<std::atomic<bool>>(false);
+
+      HandlerConfig handler_config;
+      handler_config.model_name = params.engine.model.ServedName();
+      handler_config.created = static_cast<std::int64_t>(std::time(nullptr));
+      handler_config.default_sampling = params.frontend.default_sampling;
+      handler_config.api_keys = ResolveApiKeys(params.frontend);
+      OpenAiHandler handler(
+          std::move(handler_config), *pool, engine_client, metrics,
+          [draining] { return draining->load(); },
+          /*engine_ready=*/[draining] { return !draining->load(); });
+
       // Startup gate: refuse to serve rather than fall back to encoding on
-      // an I/O thread (docs/tokenizer_process_pool.md).
-      const Status ready = pool.WaitUntilReady(pool_config.startup_timeout);
+      // an I/O thread (docs/tokenizer_design.md).
+      const Status ready = pool->WaitUntilReady(pool_config.startup_timeout);
       if (!ready.ok()) throw std::runtime_error(std::string(ready.message()));
 
-      InferxDispatcher dispatcher(params, gateway, pool);
       HttpServer server(io, params.frontend.host,
-                        static_cast<std::uint16_t>(params.frontend.port), dispatcher);
+                        static_cast<std::uint16_t>(params.frontend.port), handler);
       server.Listen();
 
       // SIGINT/SIGTERM: stop accepting, reject new preprocessing, let
@@ -364,26 +203,28 @@ Status RunServe(const ServeParams& params) {
       const std::chrono::milliseconds grace_ms = pool_config.shutdown_grace;
       net::signal_set signals(io, SIGINT, SIGTERM);
       auto grace = std::make_shared<net::steady_timer>(io);
-      signals.async_wait(
-          [&server, &gateway, &pool, &io, grace, grace_ms](boost::system::error_code ec, int) {
-            if (ec) return;
-            const auto deadline = std::chrono::steady_clock::now() + grace_ms;
-            server.Stop();                   // Stop accepting new connections.
-            pool.BeginDrain();               // Rejects new work; drains queued jobs.
-            gateway.RequestStop();           // Engine drains live requests, then exits.
-            grace->expires_after(grace_ms);  // Hard backstop (stuck GPU call).
-            grace->async_wait([&io, grace](boost::system::error_code timer_ec) {
-              if (!timer_ec) io.stop();
-            });
-            net::co_spawn(
-                io,
-                [&gateway, &pool, &io, deadline]() -> net::awaitable<void> {
-                  co_await gateway.WaitDrained();
-                  co_await pool.JoinUntil(deadline);
-                  io.stop();
-                },
-                net::detached);
-          });
+      signals.async_wait([&server, &gateway, pool, &io, grace, grace_ms, draining](
+                             boost::system::error_code ec, int) {
+        if (ec) return;
+        const auto deadline = std::chrono::steady_clock::now() + grace_ms;
+        draining->store(true);
+        server.SetDraining(true);        // New non-health requests get 503.
+        server.Stop();                   // Stop accepting new connections.
+        pool->BeginDrain();              // Rejects new work; drains queued jobs.
+        gateway.RequestStop();           // Engine drains live requests, then exits.
+        grace->expires_after(grace_ms);  // Hard backstop (stuck GPU call).
+        grace->async_wait([&io, grace](boost::system::error_code timer_ec) {
+          if (!timer_ec) io.stop();
+        });
+        net::co_spawn(
+            io,
+            [&gateway, pool, &io, deadline]() -> net::awaitable<void> {
+              co_await gateway.WaitDrained();
+              co_await pool->JoinUntil(deadline);
+              io.stop();
+            },
+            net::detached);
+      });
 
       io.run();
       for (std::thread& worker : workers) worker.join();
@@ -392,9 +233,9 @@ Status RunServe(const ServeParams& params) {
     } catch (...) {
       io.stop();
       for (std::thread& worker : workers) worker.join();
-      throw;  // Unwinds: pool destructor stops and joins the workers.
+      throw;  // Unwinds: pool/server destructors stop and join the workers.
     }
   });
 }
 
-}  // namespace inferx::server
+}  // namespace inferx
