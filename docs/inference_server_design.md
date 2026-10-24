@@ -1,5 +1,10 @@
 # Production-Grade Modern C++ Inference Server
 
+> Historical proposal. For the redesign grounded in the current InferX server,
+> see [Server architecture redesign](server_architecture.md), including UML,
+> class APIs, ownership, lifecycle, and migration steps. The repository-state
+> assumptions below predate the implementation and are not current facts.
+
 **Design for an Asio-based OpenAI-compatible ingress/orchestration server inspired by vLLM**
 
 | Item | Value |
@@ -765,19 +770,24 @@ using Deadline = std::optional<Clock::time_point>;
 #include <utility>
 #include <vector>
 
+#include <boost/beast/http/fields.hpp>
+#include <boost/beast/http/verb.hpp>
+
 #include "llm/server/status.h"
 
 namespace llm::server {
 
-using HeaderMap = std::vector<std::pair<std::string, std::string>>;
+// Beast-native types: the parser already produces `http::verb`, and
+// `http::fields` gives RFC 7230 case-insensitive header lookup, `set`
+// (replace-once) semantics, and move-from-message ownership.
+using HeaderMap = boost::beast::http::fields;
+using HttpMethod = boost::beast::http::verb;  // allowlisted by the session
 using Body = std::vector<std::byte>;
 
-enum class HttpMethod : std::uint8_t {
-  kGet, kPost, kPut, kPatch, kDelete, kOptions, kHead
-};
+bool IsSupportedMethod(HttpMethod method) noexcept;
 
 struct HttpRequest {
-  HttpMethod method = HttpMethod::kGet;
+  HttpMethod method = HttpMethod::get;
   std::string target;                 // request-target, including query
   std::string path;                   // decoded path, without query
   std::string query;
@@ -2228,13 +2238,11 @@ boost::asio::awaitable<RouteResult> ChatCompletionsHandler::Handle(
     co_return co_await response_.ConsumeUnary(ctx, *engine_request, accepted);
   }
 
-  HeaderMap headers{
-      {"Content-Type", "text/event-stream; charset=utf-8"},
-      {"Cache-Control", "no-cache, no-transform"},
-      {"X-Accel-Buffering", "no"},
-      {"Connection", "keep-alive"},
-      {"X-Request-Id", ctx.client_request_id().str()},
-  };
+  HeaderMap headers;
+  headers.set("Content-Type", "text/event-stream; charset=utf-8");
+  headers.set("Cache-Control", "no-cache, no-transform");
+  headers.set("X-Accel-Buffering", "no");
+  headers.set("X-Request-Id", ctx.client_request_id().str());
   auto begun = co_await ctx.stream().Begin(200, std::move(headers));
   if (!begun) co_return begun.error();
 
@@ -2306,20 +2314,26 @@ boost::asio::awaitable<Result<void>> SseWriter::Begin(int status,
 
   boost::beast::http::response<boost::beast::http::empty_body> res{
       static_cast<boost::beast::http::status>(status), 11};
-  for (auto& [name, value] : headers) {
-    if (!IsValidHeaderName(name) || !IsValidHeaderValue(value)) {
+  for (const auto& field : headers) {
+    if (!IsValidHeaderName(field.name_string()) ||
+        !IsValidHeaderValue(field.value())) {
       co_return ApiError{500, ApiErrorKind::kInternal, "internal_error",
                          "invalid_response_header", "invalid response header",
                          std::nullopt, std::nullopt, false};
     }
-    res.set(name, value);
   }
+  res.base() = std::move(headers);
+  // Chunked framing (RFC 9112 §7.1) keeps the persistent connection valid and
+  // lets HTTP/1.1 proxies stream instead of buffering; every frame below is a
+  // real chunk and WriteDone emits the zero-length last chunk.
+  res.chunked(true);
   res.keep_alive(true);
 
   boost::system::error_code ec;
   stream_.expires_after(write_timeout_);
   co_await boost::beast::http::async_write_header(
-      stream_, res, boost::asio::redirect_error(boost::asio::use_awaitable, ec));
+      stream_, serializer_for(res),
+      boost::asio::redirect_error(boost::asio::use_awaitable, ec));
   if (ec) co_return MapTransportError(ec);
 
   committed_ = true;
@@ -2328,7 +2342,7 @@ boost::asio::awaitable<Result<void>> SseWriter::Begin(int status,
 
 boost::asio::awaitable<Result<void>> SseWriter::WriteEvent(
     std::string_view json) {
-  if (!committed_ || aborted_) co_return ClosedStreamError();
+  if (!committed_ || aborted_ || finished_) co_return ClosedStreamError();
   if (!IsValidUtf8(json)) co_return ProtocolError("engine emitted invalid UTF-8");
 
   std::string frame;
@@ -2336,17 +2350,20 @@ boost::asio::awaitable<Result<void>> SseWriter::WriteEvent(
   frame.append("data: ");
   frame.append(json);
   frame.append("\n\n");
-  // One coalesced frame per await. No unbounded queue exists here: the caller
+  // One coalesced chunk per await. No unbounded queue exists here: the caller
   // cannot produce the next frame until this write completes, which is the
   // backpressure contract.
   co_return co_await WriteAll(std::move(frame));
 }
 
 boost::asio::awaitable<Result<void>> SseWriter::WriteAll(std::string bytes) {
+  std::vector<boost::asio::const_buffer> buffers;
+  AppendChunk(buffers, boost::beast::http::make_chunk(
+                           boost::asio::buffer(bytes)));
   boost::system::error_code ec;
   stream_.expires_after(write_timeout_);
   co_await boost::asio::async_write(
-      stream_, boost::asio::buffer(bytes),
+      stream_, buffers,
       boost::asio::redirect_error(boost::asio::use_awaitable, ec));
   if (ec) {
     aborted_ = true;
@@ -2355,6 +2372,9 @@ boost::asio::awaitable<Result<void>> SseWriter::WriteAll(std::string bytes) {
   bytes_written_ += bytes.size();
   co_return Result<void>{};
 }
+
+// WriteDone coalesces the "data: [DONE]" chunk with
+// http::make_chunk_last() so a slow peer sees the stream end atomically.
 ```
 
 The actual `SseWriter` must also handle TLS streams (templated on the stream type or type-erased via a small `IByteStream`), keep-alive comments, and cancellation of a pending write. It must never buffer an unbounded number of events; if output coalescing is added, it must be bounded by `StreamLimits::coalesce_max_bytes`.

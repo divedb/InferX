@@ -1,82 +1,93 @@
-/// \brief Response writer for the HTTP sessions
-/// (docs/inference_server_design.md §7.3/§9.1, reconciled to InferX).
-///
-/// One writer per HTTP exchange. Unary responses go through WriteJson;
-/// streaming responses commit headers via BeginStream and then write SSE
-/// frames directly — no unbounded queue exists, which is the doc's
-/// backpressure contract: the caller cannot produce the next frame until
-/// the previous write completes. All write methods return false on socket
-/// failure (the caller must cancel engine work and stop writing) instead
-/// of throwing, so handlers stay exception-free on the hot path.
 #ifndef INFERX_SERVER_SSE_WRITER_H_
 #define INFERX_SERVER_SSE_WRITER_H_
 
 #include <chrono>
-#include <cstdint>
+#include <cstddef>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
-#include <boost/asio.hpp>
-#include <boost/beast.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/buffer.hpp>
+#include <boost/beast/core/tcp_stream.hpp>
 
-#include "nlohmann/json.hpp"
+#include "inferx/server/http_types.h"
+#include "inferx/server/status.h"
 
-namespace inferx {
+namespace inferx::server {
 
-namespace net = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
-
-class ResponseWriter {
+/// \brief Streaming response writer contract. After `Begin` succeeds the
+///        HTTP status can no longer change; every method must be called on
+///        the session strand.
+class IStreamWriter {
  public:
-  using Header = std::pair<std::string, std::string>;
+  virtual ~IStreamWriter() = default;
 
-  /// The stream must outlive the writer. Each write applies the write
-  /// timeout to the underlying tcp_stream. `keep_alive` is declared on
-  /// every response per the request's preference.
-  ResponseWriter(beast::tcp_stream& stream, bool keep_alive,
-                 std::chrono::milliseconds write_timeout = std::chrono::milliseconds(30000))
-      : stream_(stream), keep_alive_(keep_alive), write_timeout_(write_timeout) {}
+  /// Sends status line and headers exactly once.
+  virtual boost::asio::awaitable<Result<void>> Begin(int status,
+                                                     HeaderMap headers) = 0;
 
-  ResponseWriter(const ResponseWriter&) = delete;
-  ResponseWriter& operator=(const ResponseWriter&) = delete;
+  /// Writes one SSE data frame: "data: " + json + "\n\n". `json` must be
+  /// valid UTF-8 and must not contain raw newlines outside JSON string
+  /// escapes; the writer does not parse it.
+  virtual boost::asio::awaitable<Result<void>> WriteEvent(
+      std::string_view json) = 0;
 
-  /// \brief One complete JSON response. Exactly-once: the second call
-  /// returns false without writing.
-  net::awaitable<bool> WriteJson(int status, const nlohmann::json& body,
-                                 std::vector<Header> extra_headers = {});
+  /// Writes an SSE comment, e.g. ": keep-alive\n\n".
+  virtual boost::asio::awaitable<Result<void>> WriteComment(
+      std::string_view comment) = 0;
 
-  /// \brief Empty-bodied status response (e.g. vLLM's /health).
-  net::awaitable<bool> WriteEmpty(int status);
+  /// Writes the OpenAI terminal frame: "data: [DONE]\n\n".
+  virtual boost::asio::awaitable<Result<void>> WriteDone() = 0;
 
-  /// \brief Commits SSE headers exactly once (200,
-  /// text/event-stream; charset=utf-8, no-cache/no-transform,
-  /// X-Accel-Buffering: no). After this the HTTP status is fixed.
-  net::awaitable<bool> BeginStream();
+  /// Best-effort terminal cleanup. Never throws; no writes after Abort.
+  virtual void Abort() noexcept = 0;
 
-  /// \brief Writes raw SSE bytes (frames are composed by the caller via
-  /// the api.h helpers). One write per await; no coalescing buffer.
-  net::awaitable<bool> WriteRaw(std::string_view bytes);
-
-  /// \brief Writes the terminal `data: [DONE]\n\n`; idempotent per writer.
-  net::awaitable<bool> WriteDone();
-
-  bool committed() const { return committed_; }
-  bool failed() const { return failed_; }
-
- private:
-  net::awaitable<bool> WriteAll(std::string_view bytes);
-
-  beast::tcp_stream& stream_;
-  bool keep_alive_ = true;
-  std::chrono::milliseconds write_timeout_;
-  bool committed_ = false;
-  bool failed_ = false;
-  bool done_written_ = false;
+  [[nodiscard]] virtual bool committed() const noexcept = 0;
+  [[nodiscard]] virtual std::size_t bytes_written() const noexcept = 0;
 };
 
-}  // namespace inferx
+/// \brief SSE framing over a Beast TCP stream using chunked transfer
+///        coding (RFC 9112 §7.1): `make_chunk` frames each event and
+///        `make_chunk_last` terminates the body. One coalesced write per
+///        await: the caller cannot produce the next frame until the
+///        current write completes, which is the backpressure contract.
+class SseWriter final : public IStreamWriter {
+ public:
+  /// The stream must outlive the writer. All methods must be called on the
+  /// strand owning `strand_executor`; `write_timeout` applies to each write.
+  SseWriter(boost::asio::any_io_executor strand_executor,
+            boost::beast::tcp_stream& stream,
+            std::chrono::milliseconds write_timeout);
+
+  boost::asio::awaitable<Result<void>> Begin(int status,
+                                             HeaderMap headers) override;
+  boost::asio::awaitable<Result<void>> WriteEvent(
+      std::string_view json) override;
+  boost::asio::awaitable<Result<void>> WriteComment(
+      std::string_view comment) override;
+  /// Writes the OpenAI terminal frame and the zero-length last chunk in one
+  /// write; the stream is finished afterwards.
+  boost::asio::awaitable<Result<void>> WriteDone() override;
+  void Abort() noexcept override;
+
+  [[nodiscard]] bool committed() const noexcept override;
+  [[nodiscard]] std::size_t bytes_written() const noexcept override;
+
+ private:
+  boost::asio::awaitable<Result<void>> WriteAll(std::string bytes);
+  boost::asio::awaitable<Result<void>> WriteBuffers(
+      std::vector<boost::asio::const_buffer> buffers);
+  boost::asio::any_io_executor strand_;
+  boost::beast::tcp_stream& stream_;
+  std::chrono::milliseconds write_timeout_;
+  bool committed_ = false;
+  bool finished_ = false;
+  bool aborted_ = false;
+  std::size_t bytes_written_ = 0;
+};
+
+}  // namespace inferx::server
 
 #endif  // INFERX_SERVER_SSE_WRITER_H_

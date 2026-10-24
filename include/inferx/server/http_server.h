@@ -1,82 +1,83 @@
-// The coroutine HTTP/1.1 front end for `inferx serve`
-// (docs/inference_server_design.md §5-6, reconciled to InferX): an accept
-// loop and one session coroutine per connection over Boost.Beast. This
-// layer owns framing, limits, keep-alive, drain state, and the standard
-// error envelopes (404/405/413); all API semantics live behind
-// RequestHandler (implemented by openai_handlers.cc).
 #ifndef INFERX_SERVER_HTTP_SERVER_H_
 #define INFERX_SERVER_HTTP_SERVER_H_
 
-#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
-#include <boost/asio.hpp>
-#include <boost/beast.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/awaitable.hpp>
 
-#include "inferx/server/sse_writer.h"
+#include "inferx/server/connection.h"
+#include "inferx/server/engine_client.h"
+#include "inferx/server/middleware.h"
+#include "inferx/server/router.h"
+#include "inferx/server/server_config.h"
+#include "inferx/server/services.h"
+#include "inferx/server/status.h"
 
-namespace inferx {
+namespace inferx::server {
 
-namespace net = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
-
-/// \brief One HTTP exchange handed to the handler. The handler must write
-/// exactly one response (unary via writer.WriteJson, streaming via
-/// BeginStream + raw frames); write failures surface as `false` returns
-/// from the writer so the handler can cancel engine work.
-struct HttpExchange {
-  http::request<http::string_body> request;
-  std::string method;
-  std::string path;    ///< Target without the query string.
-  std::string target;  ///< Full request target.
-  ResponseWriter writer;
+struct BoundEndpoint {
+  std::string host;
+  std::uint16_t port = 0;
+  bool tls = false;
 };
 
-class RequestHandler {
- public:
-  virtual ~RequestHandler() = default;
-
-  /// \brief Handles one request. Returns true when a route matched (the
-  /// response has been written); false makes the session emit a 404
-  /// envelope. Method mismatches are the handler's 405 to emit.
-  virtual net::awaitable<bool> Handle(HttpExchange& exchange) = 0;
+enum class DrainPolicy : std::uint8_t {
+  kFinishActive,
+  kCancelImmediately,
 };
 
+/// \brief Server lifecycle: validate, bind, accept, drain, stop.
+///
+/// `Start` must be called once, from a coroutine on the server executor
+/// (the io_context the listener and sessions share). `BeginDrain` is
+/// thread-safe and idempotent.
 class HttpServer {
  public:
-  HttpServer(net::io_context& io, std::string host, std::uint16_t port,
-             RequestHandler& handler);
+  HttpServer(ServerConfig config, std::shared_ptr<IEngineClient> engine,
+             std::shared_ptr<IModelCatalog> models,
+             std::shared_ptr<HealthService> health,
+             std::shared_ptr<MetricsService> metrics,
+             std::shared_ptr<AdmissionController> admission,
+             std::shared_ptr<Router> router,
+             std::shared_ptr<MiddlewareChain> middleware);
+  ~HttpServer();
 
-  /// \brief Binds and starts accepting; returns the bound port (useful
-  /// when port 0 is requested). Throws on bind failure.
-  std::uint16_t Listen();
+  HttpServer(const HttpServer&) = delete;
+  HttpServer& operator=(const HttpServer&) = delete;
+  HttpServer(HttpServer&&) = delete;
+  HttpServer& operator=(HttpServer&&) = delete;
 
-  /// \brief Stops accepting new connections. Idempotent; in-flight
-  /// sessions finish on their own.
-  void Stop();
+  /// Validates config, binds, starts accepting, and returns the bound
+  /// address. Marks the server ready when no engine probe is required.
+  [[nodiscard]] boost::asio::awaitable<Result<BoundEndpoint>> Start();
 
-  /// \brief Latches drain mode: new non-health requests get 503 with
-  /// `Connection: close`. Idempotent; thread-safe.
-  void SetDraining(bool draining);
+  /// Waits until a drain completes and all sessions are gone.
+  [[nodiscard]] boost::asio::awaitable<void> Run();
 
-  bool draining() const { return draining_->load(); }
+  /// Thread-safe; idempotent. Stops accepting, marks readiness false, and
+  /// applies the drain policy to active requests.
+  void BeginDrain(DrainPolicy policy) noexcept;
+
+  /// Idempotent. Call after Run() or BeginDrain().
+  [[nodiscard]] boost::asio::awaitable<void> Stop();
+
+  [[nodiscard]] BoundEndpoint local_endpoint() const;
+  [[nodiscard]] bool serving() const noexcept;
+  [[nodiscard]] std::size_t active_connections() const noexcept;
+  [[nodiscard]] std::size_t active_requests() const noexcept;
 
  private:
-  net::awaitable<void> ListenLoop();
-  net::awaitable<void> Session(beast::tcp_stream stream);
-
-  net::io_context& io_;
-  std::string host_;
-  std::uint16_t port_;
-  RequestHandler& handler_;
-  std::shared_ptr<net::ip::tcp::acceptor> acceptor_;
-  std::shared_ptr<std::atomic<bool>> draining_ = std::make_shared<std::atomic<bool>>(false);
+  struct Impl;
+  // Shared: the drain sequence spawned by BeginDrain keeps it alive even if
+  // the HttpServer object is destroyed first.
+  std::shared_ptr<Impl> impl_;
 };
 
-}  // namespace inferx
+}  // namespace inferx::server
 
 #endif  // INFERX_SERVER_HTTP_SERVER_H_

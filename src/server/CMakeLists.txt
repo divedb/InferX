@@ -1,58 +1,44 @@
-# inferx_prompt_service -- the tokenizer subsystem's serving components
-# (docs/tokenizer_design.md): the tokenizers-cpp facade, the bounded
-# prompt-processor pool, and the incremental detokenizer. Deliberately free
-# of engine dependencies so front ends and tests can link it standalone.
-#
-# inferx_http -- the vLLM-aligned HTTP surface (docs/inference_server_design.md):
-# framing/lifecycle (http_server), the response writer with SSE semantics,
-# the OpenAI handlers, the wire schemas, the stable error model, and
-# metrics. Depends on the engine only through the IEngineClient interface,
-# so the whole surface is testable with a fake engine and no engine link.
-#
-# inferx_server -- `inferx serve` composition: the in-process engine client
-# adapter over EngineGateway plus RunServe lifecycle wiring.
-inferx_add_library(
-  NAME prompt_service
-  SRCS
-    chat_template.cc
-    ../tokenizer/tokenizer.cc
-    prompt_processor_pool.cc
-    detokenizer.cc
-  DEPS inferx::core inferx::boost nlohmann_json::nlohmann_json
-  PRIVATE_DEPS absl::status absl::statusor absl::strings
-)
-
-if(INFERX_ENABLE_TOKENIZERS)
-  target_link_libraries(inferx_prompt_service PUBLIC inferx::tokenizers)
-endif()
-
-inferx_add_library(
-  NAME http
-  SRCS
-    api.cc
-    http_server.cc
-    sse_writer.cc
-    metrics.cc
-    openai_handlers.cc
-  DEPS inferx::core inferx::boost inferx::beast inferx::prompt_service
-    inferx::sampling nlohmann_json::nlohmann_json
-  PRIVATE_DEPS
-    absl::status
-    absl::statusor
-    absl::strings
-)
+# inferx_server -- OpenAI-compatible HTTP ingress/orchestration layer
+# (docs/inference_server_design.md). Phase 1: HTTP foundation and lifecycle --
+# Asio/Beast HTTP/1.1 server, router, middleware skeleton, config, JSON
+# codec, request IDs, health endpoints, /v1/models, keep-alive, limits,
+# graceful shutdown. Engine-backed endpoints arrive in later phases.
 
 inferx_add_library(
   NAME server
+  HDRS
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/api_error_mapper.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/connection.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/engine_client.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/engine_types.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/http_server.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/http_types.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/json_codec.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/middleware.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/request_context.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/routes.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/router.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/server_config.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/services.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/sse_writer.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/status.h
   SRCS
-    serve.cc
-    engine_gateway.cc
-    generation_config.cc
-  DEPS inferx::engine inferx::http inferx::prompt_service inferx::boost
-  PRIVATE_DEPS
+    api_error_mapper.cc
+    engine_client.cc
+    http_server.cc
+    http_session.cc
+    http_types.cc
+    json_codec.cc
+    middleware.cc
+    request_context.cc
+    routes.cc
+    router.cc
+    server_config.cc
+    services.cc
+    sse_writer.cc
+  INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/include
+  DEPS
+    inferx::boost
     inferx::beast
     nlohmann_json::nlohmann_json
-    absl::flat_hash_map
-    absl::status
-    absl::statusor
 )
