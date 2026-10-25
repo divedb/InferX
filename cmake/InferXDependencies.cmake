@@ -99,3 +99,4 @@ target_include_directories(inferx_minja INTERFACE
   "${PROJECT_SOURCE_DIR}/third_party/minja/include")
 target_link_libraries(inferx_minja INTERFACE nlohmann_json::nlohmann_json)
 add_library(inferx::minja ALIAS inferx_minja)
+

@@ -47,12 +47,19 @@ struct ServeConfig {
 
 /// \brief Runs the OpenAI-compatible HTTP server until shutdown.
 ///
-/// Validates the configuration, serves the model over HTTP, and returns
-/// after a complete drain.
+/// This is the composition root of the serving stack. Validates the
+/// configuration, then builds the stack in construction order — model
+/// loading (checkpoint weights onto the device, memory profiling, the KV
+/// cache pool, warm-up), the engine client over the scheduler, and the
+/// HTTP frontend — serves until a shutdown signal drains the frontend,
+/// and tears down in reverse: bounded frontend stop, then engine
+/// shutdown.
 ///
 /// \param config Resolved serving configuration (already environment-merged).
-/// \return       OK after the server drains, or the first configuration or
-///               fatal error.
+/// \return       OK after a complete drain and engine shutdown, or the
+///               first configuration or fatal error. An error from the
+///               final engine shutdown means the engine must not be
+///               destroyed; the supervisor terminates the process.
 Status RunServe(const ServeConfig& config);
 
 }  // namespace inferx
