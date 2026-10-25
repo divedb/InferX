@@ -1,0 +1,7 @@
+{
+  "pad_token": "<|endoftext|>",
+  "additional_special_tokens": [
+    "<|im_start|>",
+    "<|image_pad|>"
+  ]
+}

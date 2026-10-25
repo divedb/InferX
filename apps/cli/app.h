@@ -4,10 +4,6 @@
 #include <string>
 #include <string_view>
 
-#ifndef INFERX_VERSION
-#define INFERX_VERSION "0.1.0-dev"
-#endif
-
 namespace inferx::cli {
 
 /// Default checkpoint directory pre-filled into model options.
@@ -25,6 +21,7 @@ class InferxCli {
     // Set the default behavior for subcommands: allow 0 or 1 subcommand to be
     // specified.
     app_.require_subcommand(0, 1);
+
     // Registered before the commands so subcommands inherit the flag; the
     // console normalizes the friendlier "--help=all" spelling onto it.
     app_.set_help_all_flag("--help-all", "Show all options, including advanced ones");
@@ -44,7 +41,6 @@ class InferxCli {
 
  private:
   void RegisterCommands();
-  int ParseCommandLine(int argc, const char* const argv[]);
 
   CLI::App app_;
 };

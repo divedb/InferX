@@ -22,10 +22,9 @@ void InferxCli::RegisterCommands() {
   RegisterVersion(app_);
 }
 
-int InferxCli::ParseCommandLine(int argc, const char* const argv[]) { return 0; }
-
 int InferxCli::Run(int argc, char** argv) {
   Console console(app_, std::cout, std::cerr);
+
   try {
     return console.Parse(argc, argv);
   } catch (const CommandError& e) {

@@ -90,3 +90,12 @@ target_include_directories(inferx_beast INTERFACE
   "${PROJECT_SOURCE_DIR}/third_party/beast/include")
 target_link_libraries(inferx_beast INTERFACE inferx::boost)
 add_library(inferx::beast ALIAS inferx_beast)
+
+# minja: header-only Jinja subset for HuggingFace chat templates
+# (google/minja pinned at 021c2293). Used by the tokenizer subsystem's
+# ApplyChatTemplate; renders over nlohmann::ordered_json values.
+add_library(inferx_minja INTERFACE)
+target_include_directories(inferx_minja INTERFACE
+  "${PROJECT_SOURCE_DIR}/third_party/minja/include")
+target_link_libraries(inferx_minja INTERFACE nlohmann_json::nlohmann_json)
+add_library(inferx::minja ALIAS inferx_minja)

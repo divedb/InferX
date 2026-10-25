@@ -57,10 +57,10 @@ struct ModelConfig {
     return served_model_name.empty() ? model_dir : served_model_name;
   }
 
-  /// \brief The directory holding tokenizer.json; falls back to model_dir if tokenizer_dir is
-  ///        empty.
+  /// \brief The directory tokenizer assets load from: tokenizer_dir when set,
+  ///        otherwise the checkpoint directory.
   ///
-  /// \return The directory holding tokenizer.json.
+  /// \return The resolved tokenizer directory.
   std::string ResolvedTokenizerDir() const {
     return tokenizer_dir.empty() ? model_dir : tokenizer_dir;
   }

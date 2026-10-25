@@ -1,0 +1,14 @@
+{
+  "eos_token": {
+    "content": "<|im_end|>",
+    "special": true
+  },
+  "pad_token": "<|im_end|>",
+  "unk_token": "<unk>",
+  "additional_special_tokens": [
+    "<|im_start|>"
+  ],
+  "model_max_length": 4096,
+  "truncation_side": "left",
+  "chat_template": "{{ bos_token }}{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}"
+}

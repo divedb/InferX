@@ -9,35 +9,17 @@
 #include <string_view>
 #include <vector>
 
-#include "absl/log/log.h"
 #include "absl/strings/ascii.h"
 #include "inferx/core/device_runtime.h"
+#include "inferx/core/logging.h"
 
 namespace inferx {
 namespace {
 
-constexpr std::array kAllTypes = {DeviceType::kCpu, DeviceType::kCuda, DeviceType::kHip};
-
-// Order in which `auto` tries accelerators.
-constexpr std::array kAcceleratorPreference = {DeviceType::kCuda, DeviceType::kHip};
-
-// Device stores its ordinal in an int8_t, so larger values cannot be named.
-constexpr int kMaxOrdinal = 127;
-
-std::optional<DeviceType> ParseType(std::string_view name) {
-  for (DeviceType type : kAllTypes) {
-    if (name == DeviceTypeToString(type)) {
-      return type;
-    }
-  }
-
-  return std::nullopt;
-}
-
 std::string KnownTypes() {
   std::string out = "auto";
 
-  for (DeviceType type : kAllTypes) {
+  for (DeviceType type : kSupportedDeviceTypes) {
     out += '/';
     out += DeviceTypeToString(type);
   }
@@ -51,8 +33,8 @@ Status ValidateIds(const std::vector<int>& ids) {
       return InvalidArgumentError("device ids must be non-negative, got ", ids[i]);
     }
 
-    if (ids[i] > kMaxOrdinal) {
-      return InvalidArgumentError("device id ", ids[i], " is too large (maximum ", kMaxOrdinal,
+    if (ids[i] > Device::kMaxOrdinal) {
+      return InvalidArgumentError("device id ", ids[i], " is too large (maximum ", Device::kMaxOrdinal,
                                   ")");
     }
 
@@ -78,7 +60,7 @@ std::optional<Device> PickAccelerator() {
 
     const StatusOr<int> count = (*provider)->DeviceCount();
     if (!count.ok()) {
-      LOG(WARNING) << "auto: could not probe " << DeviceTypeToString(type)
+      INFERX_LOG(WARNING) << "auto: could not probe " << DeviceTypeToString(type)
                    << " devices: " << count.status();
       continue;
     }
@@ -87,15 +69,15 @@ std::optional<Device> PickAccelerator() {
     const Device candidate = Device::For(type, 0);
     StatusOr<DeviceRuntime*> runtime = RuntimeFor(candidate);
     if (!runtime.ok()) {
-      LOG(WARNING) << "auto: skipping " << candidate.ToString() << ": " << runtime.status();
+      INFERX_LOG(WARNING) << "auto: skipping " << candidate.ToString() << ": " << runtime.status();
       continue;
     }
     const StatusOr<DeviceProperties> properties = (*runtime)->GetProperties();
     if (!properties.ok()) {
-      LOG(WARNING) << "auto: skipping " << candidate.ToString() << ": " << properties.status();
+      INFERX_LOG(WARNING) << "auto: skipping " << candidate.ToString() << ": " << properties.status();
       continue;
     }
-    LOG(INFO) << "auto: selected " << candidate.ToString() << " (" << (*properties).name << ")";
+    INFERX_LOG(INFO) << "auto: selected " << candidate.ToString() << " (" << (*properties).name << ")";
     return candidate;
   }
   return std::nullopt;
@@ -110,6 +92,7 @@ StatusOr<DeviceSpec> ParseDeviceSpec(std::string_view device,
   if (name.empty()) {
     return InvalidArgumentError("--device is empty; want one of ", KnownTypes());
   }
+
   if (name.find(':') != std::string::npos) {
     return InvalidArgumentError("--device takes only a device type, got '", device,
                                 "'; give ordinals with --device-ids");
@@ -124,7 +107,7 @@ StatusOr<DeviceSpec> ParseDeviceSpec(std::string_view device,
     return DeviceSpec{};
   }
 
-  const std::optional<DeviceType> type = ParseType(name);
+  const std::optional<DeviceType> type = ParseDeviceType(name);
   if (!type) {
     return InvalidArgumentError("unknown device type '", name, "' (want one of ", KnownTypes(),
                                 ")");
@@ -152,7 +135,7 @@ StatusOr<std::vector<Device>> ResolveDevices(const DeviceSpec& spec) {
     if (std::optional<Device> accelerator = PickAccelerator()) {
       return std::vector<Device>{*accelerator};
     }
-    LOG(INFO) << "auto: no usable accelerator found; selected cpu";
+    INFERX_LOG(INFO) << "auto: no usable accelerator found; selected cpu";
     return std::vector<Device>{Device::Cpu()};
   }
 
@@ -177,7 +160,9 @@ Status DeviceConfig::Validate() const {
 
 StatusOr<std::vector<Device>> DeviceConfig::Resolve() const {
   const StatusOr<DeviceSpec> spec = ParseDeviceSpec(device, device_ids);
+
   if (!spec.ok()) return spec.status();
+
   return ResolveDevices(*spec);
 }
 

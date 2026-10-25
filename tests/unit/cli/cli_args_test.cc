@@ -11,9 +11,9 @@
 #include "gtest/gtest.h"
 
 #include "cli/args/dataset_args.h"
-#include "inferx/server/generation_config.h"
+#include "inferx/config/generation_config.h"
 #include "inferx/ops/attention.h"
-#include "inferx/server/serve.h"
+#include "inferx/config/merge_config.h"
 #include "cli/args/engine_args.h"
 #include "cli/args/model_config_args.h"
 #include "cli/args/sampling_args.h"
@@ -184,44 +184,125 @@ TEST(ModelConfigArgsTest, RejectsInvalidValues) {
   }
 }
 
-TEST(GenerationConfigResolveTest, ModeSemantics) {
-  // "vllm" always keeps engine defaults.
-  auto none = GenerationConfig::Resolve("models/foo", "vllm");
-  ASSERT_TRUE(none.ok());
-  EXPECT_FALSE(none->has_value());
-
-  // "auto" with no generation_config.json is normal, not an error.
-  none = GenerationConfig::Resolve("/nonexistent-inferx-model-dir", "auto");
-  ASSERT_TRUE(none.ok());
-  EXPECT_FALSE(none->has_value());
-
-  // An explicit directory must exist and load.
-  auto missing = GenerationConfig::Resolve("/nonexistent-inferx-model-dir",
-                                           "/nonexistent-inferx-model-dir");
-  EXPECT_FALSE(missing.ok());
-}
-
-TEST(GenerationConfigResolveTest, LoadsExplicitDirectory) {
+/// Writes `content` to a fresh generation config file; returns its path.
+std::string WriteGenerationConfig(const std::string& name, const std::string& content) {
   const std::string dir = "/tmp/inferx_generation_config_test";
   std::filesystem::create_directories(dir);
-  { std::ofstream(dir + "/generation_config.json") << R"({"temperature": 0.7})"; }
-  auto loaded = GenerationConfig::Resolve("models/foo", dir);
-  ASSERT_TRUE(loaded.ok());
-  ASSERT_TRUE(loaded->has_value());
-  ASSERT_TRUE((*loaded)->temperature.has_value());
-  EXPECT_FLOAT_EQ(*(*loaded)->temperature, 0.7f);
+  const std::string path = dir + "/" + name + ".json";
+  { std::ofstream(path) << content; }
+  return path;
 }
 
-TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
-  auto gen = GenerationConfig::FromJson(
-      R"({"temperature": 0.6, "top_p": 0.95, "top_k": 20,)"
-      R"( "repetition_penalty": 1.05, "max_new_tokens": 512})");
-  ASSERT_TRUE(gen.ok());
-  ASSERT_TRUE(gen->temperature.has_value());
-  EXPECT_FLOAT_EQ(*gen->temperature, 0.6f);
+TEST(LoadGenerationConfigTest, AutoWithoutFileIsDefaults) {
+  ModelConfig config;
+  config.model_dir = "/nonexistent-inferx-model-dir";  // generation_config stays "auto".
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_FLOAT_EQ(loaded->temperature, 1.0f);
+  EXPECT_EQ(loaded->top_k, 0);
+  EXPECT_EQ(loaded->max_new_tokens, 0);
+}
+
+TEST(LoadGenerationConfigTest, NonAutoValueIsAFilePathThatMustExist) {
+  ModelConfig config;
+  config.generation_config = "/nonexistent-inferx-model-dir/generation_config.json";
+  EXPECT_FALSE(LoadGenerationConfig(config).ok());
+  // "vllm" is not a mode here: any non-"auto" value is a path.
+  config.generation_config = "vllm";
+  EXPECT_FALSE(LoadGenerationConfig(config).ok());
+}
+
+TEST(LoadGenerationConfigTest, LoadsExplicitFile) {
+  const std::string path =
+      WriteGenerationConfig("explicit", R"({"temperature": 0.7, "top_p": 0.9})");
+  ModelConfig config;
+  config.model_dir = "models/foo";
+  config.generation_config = path;
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_FLOAT_EQ(loaded->temperature, 0.7f);
+  EXPECT_FLOAT_EQ(loaded->top_p, 0.9f);
+  // Absent keys keep the struct defaults (mirroring SamplingParams).
+  EXPECT_FLOAT_EQ(loaded->min_p, 0.0f);
+}
+
+TEST(LoadGenerationConfigTest, AutoLoadsFromModelDir) {
+  // Its own directory: "auto" must read <model_dir>/generation_config.json
+  // specifically, not any other JSON in a shared temp dir.
+  const std::string dir = "/tmp/inferx_generation_config_model_dir";
+  std::filesystem::create_directories(dir);
+  { std::ofstream(dir + "/generation_config.json") << R"({"temperature": 0.6})"; }
+  ModelConfig config;
+  config.model_dir = dir;  // "auto" is the default mode.
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_FLOAT_EQ(loaded->temperature, 0.6f);
+}
+
+TEST(LoadGenerationConfigTest, OverrideMergesOnlyNamedKeys) {
+  const std::string path =
+      WriteGenerationConfig("override", R"({"temperature": 0.7, "top_p": 0.9})");
+  ModelConfig config;
+  config.generation_config = path;
+  // The override replaces temperature and adds max_new_tokens; the file's
+  // top_p must survive untouched.
+  config.override_generation_config = R"({"temperature": 0.5, "max_new_tokens": 64})";
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_FLOAT_EQ(loaded->temperature, 0.5f);
+  EXPECT_FLOAT_EQ(loaded->top_p, 0.9f);
+  EXPECT_EQ(loaded->max_new_tokens, 64);
+
+  // A malformed or non-object override is an error, not a silent no-op.
+  config.override_generation_config = "{not json";
+  EXPECT_FALSE(LoadGenerationConfig(config).ok());
+  config.override_generation_config = "[1, 2]";
+  EXPECT_FALSE(LoadGenerationConfig(config).ok());
+}
+
+TEST(LoadGenerationConfigTest, ReadsThroughConfigViewWithKeyedErrors) {
+  const std::string path = WriteGenerationConfig("bad_temperature", R"({"temperature": "hot"})");
+  ModelConfig config;
+  config.generation_config = path;
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_FALSE(loaded.ok());
+  // ConfigView reports the offending key in the error.
+  EXPECT_NE(loaded.status().message().find("temperature"), std::string::npos);
+}
+
+TEST(LoadGenerationConfigTest, RejectsMalformedValues) {
+  const auto expect_reject = [](const std::string& content) {
+    const std::string path = WriteGenerationConfig("bad", content);
+    ModelConfig config;
+    config.generation_config = path;
+    EXPECT_FALSE(LoadGenerationConfig(config).ok()) << content;
+  };
+  expect_reject("{not json");
+  expect_reject("[1, 2]");
+  expect_reject(R"({"max_new_tokens": -8})");
+  expect_reject(R"({"top_k": -3})");   // Only -1 means "disabled".
+  expect_reject(R"({"top_k": 2.5})");  // Non-integer.
+}
+
+TEST(LoadGenerationConfigTest, NormalizesHfDisabledTopK) {
+  const std::string path = WriteGenerationConfig("topk_disabled", R"({"top_k": -1})");
+  ModelConfig config;
+  config.generation_config = path;
+  auto loaded = LoadGenerationConfig(config);
+  ASSERT_TRUE(loaded.ok()) << loaded.status();
+  EXPECT_EQ(loaded->top_k, 0);
+}
+
+TEST(GenerationConfigTest, MergeAppliesValuesAndHonorsExplicitFields) {
+  GenerationConfig gen;
+  gen.temperature = 0.6f;
+  gen.top_p = 0.95f;
+  gen.top_k = 20;
+  gen.repetition_penalty = 1.05f;
+  gen.max_new_tokens = 512;
 
   sampling::SamplingParams merged;
-  inferx::MergeGenerationConfig(*gen, &merged);
+  inferx::MergeGenerationConfig(gen, &merged);
   EXPECT_FLOAT_EQ(merged.temperature, 0.6f);
   EXPECT_FLOAT_EQ(merged.top_p, 0.95f);
   EXPECT_EQ(merged.top_k, 20u);
@@ -232,28 +313,24 @@ TEST(GenerationConfigTest, FromJsonParsesAndMerges) {
   sampling::SamplingParams explicit_wins;
   explicit_wins.temperature = 0.1f;
   explicit_wins.max_tokens = 8;
-  inferx::MergeGenerationConfig(*gen, &explicit_wins, {"temperature", "max-tokens"});
+  inferx::MergeGenerationConfig(gen, &explicit_wins, {"temperature", "max-tokens"});
   EXPECT_FLOAT_EQ(explicit_wins.temperature, 0.1f);
   EXPECT_EQ(explicit_wins.max_tokens, 8u);
   EXPECT_FLOAT_EQ(explicit_wins.top_p, 0.95f);
 }
 
-TEST(GenerationConfigTest, HfDisabledTopKMapsToZero) {
-  auto gen = GenerationConfig::FromJson(R"({"top_k": -1})");
-  ASSERT_TRUE(gen.ok());
-  sampling::SamplingParams merged;
-  inferx::MergeGenerationConfig(*gen, &merged);
-  EXPECT_EQ(merged.top_k, 0u);
-}
-
-TEST(GenerationConfigTest, EmptyJsonKeepsDefaults) {
-  auto gen = GenerationConfig::FromJson("{}");
-  ASSERT_TRUE(gen.ok());
+TEST(GenerationConfigTest, DefaultsMergeAsNoOp) {
+  // All-default config: every field mirrors the SamplingParams defaults,
+  // so merging changes nothing (including max_tokens staying at its
+  // engine default because max_new_tokens == 0).
+  GenerationConfig gen;
   sampling::SamplingParams defaults;
   const sampling::SamplingParams untouched = defaults;
-  inferx::MergeGenerationConfig(*gen, &defaults);
-  EXPECT_EQ(defaults.temperature, untouched.temperature);
-  EXPECT_EQ(defaults.top_p, untouched.top_p);
+  inferx::MergeGenerationConfig(gen, &defaults);
+  EXPECT_FLOAT_EQ(defaults.temperature, untouched.temperature);
+  EXPECT_FLOAT_EQ(defaults.top_p, untouched.top_p);
+  EXPECT_EQ(defaults.top_k, untouched.top_k);
+  EXPECT_EQ(defaults.max_tokens, untouched.max_tokens);
 }
 
 TEST(SamplingArgsTest, TracksExplicitFields) {

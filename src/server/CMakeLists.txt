@@ -1,44 +1,26 @@
-# inferx_server -- OpenAI-compatible HTTP ingress/orchestration layer
-# (docs/inference_server_design.md). Phase 1: HTTP foundation and lifecycle --
-# Asio/Beast HTTP/1.1 server, router, middleware skeleton, config, JSON
-# codec, request IDs, health endpoints, /v1/models, keep-alive, limits,
-# graceful shutdown. Engine-backed endpoints arrive in later phases.
-
+# inferx_server -- the serving frontend library (docs/server_design.md):
+# the serve entry seam today; the HTTP core (§14.2) grows here. Exceptions
+# stay enabled for this target only (A10, R-3).
+#
+# The engine boundary header lives with the engine's public headers
+# (inferx/engine/engine_client.h, namespace inferx): the server consumes it
+# header-only and never links the engine library. The reverse direction is
+# enforced at configure time by inferx_assert_not_linked
+# (tests/server/CMakeLists.txt).
 inferx_add_library(
   NAME server
   HDRS
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/api_error_mapper.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/connection.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/engine_client.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/engine_types.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/http_server.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/http_types.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/json_codec.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/middleware.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/request_context.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/routes.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/router.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/server_config.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/services.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/sse_writer.h
-    ${PROJECT_SOURCE_DIR}/include/inferx/server/status.h
+    ${PROJECT_SOURCE_DIR}/include/inferx/server/serve.h
   SRCS
-    api_error_mapper.cc
-    engine_client.cc
-    http_server.cc
-    http_session.cc
-    http_types.cc
-    json_codec.cc
-    middleware.cc
-    request_context.cc
-    routes.cc
-    router.cc
-    server_config.cc
-    services.cc
-    sse_writer.cc
+    serve.cc
   INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/include
   DEPS
-    inferx::boost
-    inferx::beast
-    nlohmann_json::nlohmann_json
+    inferx::config
 )
+
+# inferx_server_main -- the standalone server binary (§3.5). Phase 0 stub;
+# Phase 1 replaces main.cc with the real lifecycle entry.
+add_executable(inferx_server_main main.cc)
+target_link_libraries(inferx_server_main PRIVATE inferx::server)
+target_compile_options(inferx_server_main PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)

@@ -34,3 +34,6 @@ benchmarks/qwen3/comparison.*
 *.log
 .zcode/
 *.sqlite
+
+# Local sanitizer build (like build-dbg)
+/build-tsan/

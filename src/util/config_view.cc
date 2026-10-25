@@ -161,6 +161,7 @@ StatusOr<std::vector<int64_t>> ConfigView::IntList(std::string_view key) const {
 StatusOr<std::vector<std::string>> ConfigView::StrList(std::string_view key) const {
   std::vector<std::string> out;
   const json* v = Find(key);
+
   if (v == nullptr) return out;
   if (!v->is_array()) return WrongType(PathOf(key), "array of strings", *v);
 

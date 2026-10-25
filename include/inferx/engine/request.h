@@ -11,47 +11,15 @@
 
 #include "absl/types/span.h"
 #include "inferx/core/status.h"
+#include "inferx/engine/request_types.h"
 #include "inferx/sampling/sampling_params.h"
 #include "inferx/tokenizer/id.h"
 
 namespace inferx {
 
-/// \brief Unique identifier for a request.
-using RequestId = std::uint64_t;
-
-/// \brief Lifecycle state of a request.
-///
-/// Legal transitions:
-///
-///   kWaiting        -> kRunning   | kFinished
-///   kRunning        -> kPreempted | kFinished
-///   kPreempted      -> kWaiting   | kFinished
-///   kFinished       -> (terminal)
-///
-/// Any non-terminal state may move to kFinished (e.g. client abort).
-/// Structured output may add a grammar-compilation wait state when it lands
-/// (executor.md 11.3); it is deliberately absent until it has callers.
-enum class RequestStatus : std::uint8_t {
-  kWaiting = 0,  ///< Queued and eligible for scheduling.
-  kRunning,      ///< Admitted by the scheduler and currently active.
-  kPreempted,    ///< Preempted; KV resources released, awaiting rescheduling.
-  kFinished,     ///< Terminal state. See FinishReason for the cause.
-};
-
-/// \brief Represents the reason a request finished, if its status is kFinished.
-enum class FinishReason : std::uint8_t {
-  kStopped = 0,   ///< Generation stopped normally (EOS, stop token/string, etc.).
-  kLengthCapped,  ///< Reached the configured generation/token limit.
-  kAborted,       ///< Explicitly cancelled or aborted by the caller.
-  kError,         ///< Terminated because of an execution/runtime error.
-};
-
-/// \brief Which stop condition fired when FinishReason is kStopped.
-///
-/// monostate: none/EOS; TokenId: a stop token id; std::string: a stop string.
-using StopReason = std::variant<std::monostate, TokenId, std::string>;
-
-/// \brief A single generation request and its mutable per-request state.
+/// \brief A single generation request and its mutable per-request state.///        The request vocabulary (RequestId, RequestStatus, FinishReason,
+///        StopReason) lives in request_types.h, shared with the serving
+///        boundary.
 ///
 /// Token storage: prompt and generated tokens live in ONE contiguous vector
 /// (`all_token_ids_`), with the prompt occupying `[0, num_prompt_tokens())`

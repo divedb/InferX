@@ -20,8 +20,7 @@ struct DeviceSpec {
   std::vector<Device> devices;  ///< The requested devices, in the order given.
 };
 
-/// \brief Parses the `--device` and `--device-ids` values. Syntax only: it
-/// never touches a runtime.
+/// \brief Parses the `--device` and `--device-ids` values.
 ///
 /// Rules:
 ///  - `device` is "auto" or one of the device type names (case-insensitive).

@@ -1,5 +1,6 @@
 add_subdirectory(core)       # element types, tensors, status, memory, runtimes
 add_subdirectory(config)     # device flag parsing, validation, resolution
+add_subdirectory(tokenizer)  # HFTokenizer, TokenizerPool, ModelConfig resolution
 add_subdirectory(util)       # typed views over HuggingFace JSON configs
 add_subdirectory(cache)      # paged KV block pool + prefix cache
 add_subdirectory(ops)        # portable compute ops + cpu/cuda backends
@@ -9,4 +10,4 @@ add_subdirectory(engine)     # scheduling and orchestration
 add_subdirectory(dist)       # collectives + tensor-parallel topology
 add_subdirectory(bench)      # benchmark entry points
 add_subdirectory(diagnostic) # numerical debugging
-add_subdirectory(server)     # HTTP serving layer
+add_subdirectory(server)     # HTTP serving frontend (docs/server_design.md)

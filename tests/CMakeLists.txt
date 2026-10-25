@@ -9,7 +9,9 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 # Suites register themselves next to their sources; each call goes through
-# the inferx_add_test helper (cmake/InferxHelpers.cmake).
+# the inferx_add_test helper (cmake/InferxHelpers.cmake). Server tests
+# (mock engine, boundary checks) live in tests/server per §2.1.
 add_subdirectory(unit)
 add_subdirectory(integration)
 add_subdirectory(regression)
+add_subdirectory(server)

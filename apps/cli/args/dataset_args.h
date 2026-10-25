@@ -1,7 +1,5 @@
-// Prompt-source options shared by `bench latency` / `bench throughput`
-// (vLLM: --dataset-name, --dataset-path, and the random dataset's lens).
-// Conversion turns the stringly CLI surface into the typed DatasetParams.
 #pragma once
+
 #include <CLI/CLI.hpp>
 #include <optional>
 #include <string>
@@ -27,8 +25,7 @@ struct DatasetArgs {
         ->capture_default_str()
         ->check(CLI::IsMember(bench::DatasetNameValues()));
     g->add_option("--dataset-path", path, "Path to the dataset")->type_name("PATH");
-    g->add_option("--input-len", input_len,
-                  "Input length of prompts for the random dataset")
+    g->add_option("--input-len", input_len, "Input length of prompts for the random dataset")
         ->type_name("N")
         ->capture_default_str()
         ->check(CLI::PositiveNumber);

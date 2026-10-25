@@ -1,5 +1,52 @@
 # Bug fixes
 
+## 2026-10-24: HTTP lifecycle test hangs after drain completes
+
+`HttpServerLifecycleTest.InFlightRequestFinishesDuringDrain` could finish its
+request/drain checks and hang in `ServerInstance` destruction waiting for the
+`Stop()` future. Reproduced before the fix with a 10-second process timeout
+(exit 124). All I/O worker threads could already have exited.
+
+Root cause: the test fixture did not hold an Asio executor work guard.
+Once drain closed the listener and sessions, `io_context::run()` could exhaust
+its work and stop. `EnsureIoRunning()` checked `stopped()` before queuing
+`Stop()`, leaving a check/submission race. Its recovery path also launched
+`run()` threads on an empty restarted context before submitting `Stop()`;
+those threads could immediately exit again. Additionally, it called
+`restart()` before joining the previous threads, contrary to Asio's requirement
+that no run/poll calls remain unfinished. The coroutine had not vanished:
+it was queued on an executor with no running workers. An un-awaited timer
+object does not keep an io_context running.
+
+Fix: `ServerInstance` owns an `executor_work_guard` from before worker startup
+until the shutdown future completes. `StopAndJoin()` submits and awaits
+`Stop()`, releases the guard, then joins workers after their work drains
+naturally. Teardown is idempotent; lifecycle tests use the same shutdown path.
+No production server change is needed for this particular fixture bug.
+Applications owning the executor must likewise keep it running while awaiting
+server lifecycle operations.
+
+Regression coverage: `StopAfterDrainHasCompleted` deliberately waits for the
+server to reach stopped state before submitting `Stop()`, checks future
+completion within two seconds, and verifies natural executor exhaustion and
+repeated teardown. The original in-flight drain test remains covered.
+
+The full run also exposed an invalid-config test that cleared `model_id` but
+left valid served aliases. It now clears both. Startup-failure cleanup releases
+the work guard and joins worker threads before throwing, avoiding termination
+from destructing joinable threads during constructor unwinding.
+
+Validation:
+
+```sh
+cmake --build build-dbg --target inferx_server_http_test -j 4
+timeout 10s build-dbg/tests/unit/server/inferx_server_http_test --gtest_brief=1
+timeout 10s build-dbg/tests/unit/server/inferx_server_http_test --gtest_filter=HttpServerLifecycleTest.InFlightRequestFinishesDuringDrain:HttpServerLifecycleTest.StopAfterDrainHasCompleted --gtest_repeat=100 --gtest_brief=1
+```
+
+Result: all 27 HTTP tests passed; both drain regressions passed 100 repetitions
+(200 test executions). Socket tests ran outside the sandbox for loopback access.
+
 ## 2026-09-22: EventQueue notification channel data race
 
 `EventQueue` used `boost::asio::experimental::channel` for its one-slot

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "absl/strings/str_cat.h"
 
@@ -26,6 +29,13 @@ enum class DeviceType : uint8_t {
   kHip = 2,   ///< AMD HIP GPU.
 };
 
+/// An array of all supported device types.
+constexpr std::array kSupportedDeviceTypes = {DeviceType::kCpu, DeviceType::kCuda,
+                                              DeviceType::kHip};
+
+/// An array of accelerator device types (CUDA, HIP) in order of preference for auto-selection.
+constexpr std::array kAcceleratorPreference = {DeviceType::kCuda, DeviceType::kHip};
+
 /// \brief Returns a string representation of the device type.
 ///
 /// \param kind The device type to convert to a string.
@@ -45,6 +55,20 @@ constexpr const char* DeviceTypeToString(DeviceType kind) {
   return "unknown";
 }
 
+/// \brief Parses a string into a DeviceType.
+///
+/// \param name The name of the device type.
+/// \return     The corresponding DeviceType, or std::nullopt if the name is unknown.
+constexpr std::optional<DeviceType> ParseDeviceType(std::string_view name) {
+  for (DeviceType type : kSupportedDeviceTypes) {
+    if (name == DeviceTypeToString(type)) {
+      return type;
+    }
+  }
+
+  return std::nullopt;
+}
+
 /// \brief Identifies one device as a (kind, ordinal) pair.
 ///
 /// `Device` is the currency of every placement decision in the engine: which
@@ -58,6 +82,9 @@ constexpr const char* DeviceTypeToString(DeviceType kind) {
 ///             cross-device copies are explicit, never implicit.
 class Device {
  public:
+  /// The maximum device ordinal supported by the engine.
+  static constexpr int kMaxOrdinal = 256;
+
   /// \brief The canonical CPU device. Always (kCpu, 0).
   static constexpr Device Cpu() { return Device(DeviceType::kCpu, 0); }
 

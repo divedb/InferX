@@ -186,3 +186,60 @@ function(inferx_add_test)
     set_tests_properties(${INFERX_TEST_NAME} PROPERTIES ${_properties})
   endif()
 endfunction()
+
+# inferx_assert_not_linked()
+#
+# Configuration-time dependency-direction guard: fails configuration if any
+# target named in FROM transitively links FORBIDDEN. Walks LINK_LIBRARIES
+# and INTERFACE_LINK_LIBRARIES; non-target entries (flags, files) are
+# skipped and $<LINK_ONLY:...> wrappers are unwrapped.
+#
+# Parameters:
+#   FROM:     target names to check (may contain targets that do not exist
+#             in this configuration; those are skipped)
+#   FORBIDDEN: target name that must not appear in any FROM closure
+function(inferx_assert_not_linked)
+  cmake_parse_arguments(INFERX_ANL "" "FORBIDDEN" "FROM" ${ARGN})
+  if(NOT INFERX_ANL_FORBIDDEN)
+    message(FATAL_ERROR "inferx_assert_not_linked: FORBIDDEN is required")
+  endif()
+  if(INFERX_ANL_UNPARSED_ARGUMENTS)
+    message(FATAL_ERROR "inferx_assert_not_linked: unknown arguments: "
+      "${INFERX_ANL_UNPARSED_ARGUMENTS}")
+  endif()
+
+  foreach(_root IN LISTS INFERX_ANL_FROM)
+    if(NOT TARGET "${_root}")
+      continue()
+    endif()
+    set(_seen "")
+    set(_stack "${_root}")
+    while(_stack)
+      list(POP_FRONT _stack _cur)
+      if(_cur IN_LIST _seen)
+        continue()
+      endif()
+      list(APPEND _seen "${_cur}")
+      if(_cur STREQUAL "${INFERX_ANL_FORBIDDEN}")
+        message(FATAL_ERROR
+          "dependency direction violated: ${_root} (transitively) links "
+          "${INFERX_ANL_FORBIDDEN}; the engine must not depend on the "
+          "server library (docs/server_design.md §3.5)")
+      endif()
+      if(NOT TARGET "${_cur}")
+        continue()
+      endif()
+      get_target_property(_libs "${_cur}" LINK_LIBRARIES)
+      get_target_property(_ilibs "${_cur}" INTERFACE_LINK_LIBRARIES)
+      foreach(_dep IN LISTS _libs ITEMS ${_ilibs})
+        if(NOT _dep)
+          continue()
+        endif()
+        string(REGEX REPLACE "^\\$<LINK_ONLY:(.+)>$" "\\1" _dep "${_dep}")
+        if(TARGET "${_dep}")
+          list(APPEND _stack "${_dep}")
+        endif()
+      endforeach()
+    endwhile()
+  endforeach()
+endfunction()

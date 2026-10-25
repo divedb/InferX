@@ -21,21 +21,21 @@ inferx_add_library(
     cli/commands.h
   SRCS
     cli/app.cc
-    cli/bench/bench.cc
-    cli/bench/latency.cc
-    cli/bench/throughput.cc
-    cli/bench/workload.cc
-    cli/chat.cc
-    cli/collect_env.cc
-    cli/complete.cc
+    cli/cmd/bench/bench.cc
+    cli/cmd/bench/latency.cc
+    cli/cmd/bench/throughput.cc
+    cli/cmd/bench/workload.cc
+    cli/cmd/chat.cc
+    cli/cmd/collect_env.cc
+    cli/cmd/complete.cc
     cli/diagnostic/diagnostic.cc
     cli/diagnostic/replay_logits.cc
-    cli/help.cc
-    cli/launch/launch.cc
-    cli/launch/render.cc
-    cli/run_batch.cc
-    cli/serve.cc
-    cli/version.cc
+    cli/cmd/help.cc
+    cli/cmd/launch/launch.cc
+    cli/cmd/launch/render.cc
+    cli/cmd/run_batch.cc
+    cli/cmd/serve.cc
+    cli/cmd/version.cc
   DEPS inferx::cli_presentation inferx::bench inferx::diagnostic inferx::server
 )
 
